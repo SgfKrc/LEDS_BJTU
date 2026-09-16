@@ -59,10 +59,12 @@ from config import (
     INFERENCE_ENGINE,
     TOTAL_MODEL_LAYERS, DEFAULT_LAYER_CONFIG,
 )
+from koakuma_engine import backend_capabilities, select_backend
 
 import model_config as mc
 
 logger = logging.getLogger(__name__)
+_IMPORTED_INFERENCE_ENGINE = INFERENCE_ENGINE
 
 
 def _select_layer_runtime() -> Tuple[str, torch.dtype]:
@@ -299,60 +301,22 @@ class ModelManager:
         # 动态读取 config（api_server 会在运行时改写 config 模块属性）
         import config as _cfg
 
-        # TP 孤岛：显式指定或已启用即优先（网关节点专用，详见调研方案 §2.1）
-        if getattr(_cfg, "INFERENCE_ENGINE", INFERENCE_ENGINE) == "island":
-            logger.info("引擎: island (手动指定)")
-            return "island"
-        if getattr(_cfg, "ISLAND_ENABLED", False) and getattr(_cfg, "ISLAND_BASE_URL", ""):
-            logger.info("引擎: island (QLH_ISLAND_ENABLED 已启用)")
-            return "island"
+        runtime_requested = getattr(_cfg, "INFERENCE_ENGINE", INFERENCE_ENGINE)
+        requested = (
+            INFERENCE_ENGINE
+            if INFERENCE_ENGINE != _IMPORTED_INFERENCE_ENGINE
+            else runtime_requested
+        )
 
-        # 手动覆盖
-        if INFERENCE_ENGINE == "pytorch":
-            logger.info("引擎: PyTorch (手动指定)")
-            return "pytorch"
-        if INFERENCE_ENGINE == "llama_cpp":
-            logger.info("引擎: llama.cpp (手动指定)")
-            return "llama_cpp"
-
-        # 自动检测
-        has_cuda = torch.cuda.is_available()
-
-        # 进一步检查设备画像
-        if profile:
-            tier = profile.get("tier", "laptop")
-            # 检查所有 GPU（而非仅选中 GPU），避免游戏本默认选集显时误判
-            gpus = profile.get("gpus", [])
-            any_cuda_gpu = any(
-                g.get("cuda_available", False)
-                for g in gpus
-            ) if gpus else has_cuda
-            # 单个选中 GPU 的 CUDA 状态（向后兼容）
-            gpu_info = profile.get("gpu", {})
-            selected_cuda = gpu_info.get("cuda_available", False) if gpu_info else False
-
-            # 关键修正：只要任意 GPU 有 CUDA，就认为 CUDA 可用
-            profile_has_cuda = any_cuda_gpu or selected_cuda
-
-            # edge / mobile 档位强制 llama.cpp（即使有 CUDA 也会被层拆分逻辑处理）
-            if tier in ("edge", "mobile") and not profile_has_cuda:
-                logger.info(f"引擎: llama.cpp (设备档位={tier}, 无 CUDA)")
-                return "llama_cpp"
-            # ultrabook 档位 + 无 CUDA → llama.cpp
-            if tier == "ultrabook" and not profile_has_cuda:
-                logger.info(f"引擎: llama.cpp (ultrabook, 集显)")
-                return "llama_cpp"
-
-            # 更新 has_cuda 为综合检测结果
-            has_cuda = profile_has_cuda
-
-        # 最终判定
-        if has_cuda:
-            logger.info("引擎: PyTorch + bitsandbytes (CUDA 可用)")
-            return "pytorch"
-        else:
-            logger.info("引擎: llama.cpp + GGUF (CPU/集显)")
-            return "llama_cpp"
+        selected = select_backend(
+            profile,
+            requested=requested,
+            cuda_available=torch.cuda.is_available(),
+            island_enabled=bool(getattr(_cfg, "ISLAND_ENABLED", False)),
+            island_base_url=str(getattr(_cfg, "ISLAND_BASE_URL", "") or ""),
+        )
+        logger.info("Koakuma backend: %s", selected)
+        return selected
 
     # ================================================================
     # 量化配置工厂（PyTorch 专用）
@@ -3018,6 +2982,17 @@ class ModelManager:
     def is_island(self) -> bool:
         """是否使用 TP 孤岛引擎。"""
         return self._engine_type == "island"
+
+    @property
+    def backend_id(self) -> str:
+        return self.engine_type
+
+    @property
+    def capabilities(self):
+        return backend_capabilities(self.engine_type)
+
+    def supports(self, capability: str) -> bool:
+        return self.capabilities.supports(capability)
 
     def get_device(self) -> torch.device:
         """获取当前模型所在设备（PyTorch 引擎）"""

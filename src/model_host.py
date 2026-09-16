@@ -16,12 +16,30 @@ ModelManager 等价。
 import threading
 from typing import Any, Optional, Protocol
 
+from koakuma_engine import (
+    BackendCapabilities,
+    backend_capabilities,
+    backend_id_for,
+    select_backend,
+)
+
 
 class InferenceHost(Protocol):
     """推理宿主协议：行为由 model_module.ModelManager 提供（阶段 1 由
     inference-svc 以 HTTP 契约实现同构接口）。"""
 
     def select_engine(self, profile): ...
+
+    @property
+    def engine_type(self) -> str: ...
+
+    @property
+    def backend_id(self) -> str: ...
+
+    @property
+    def capabilities(self) -> BackendCapabilities: ...
+
+    def supports(self, capability: str) -> bool: ...
 
     def load_model(self, engine, quant_type, use_compile, model_id): ...
 
@@ -118,6 +136,51 @@ class ModelHost:
             "do_sample": True,
         })
         object.__setattr__(self, "full_chat_execution_lock", threading.RLock())
+
+    @property
+    def engine_type(self) -> str:
+        """Public backend identity; implementation details stay behind the host."""
+
+        own_id = object.__getattribute__(self, "__dict__").get("_engine_type")
+        if own_id:
+            return str(own_id)
+        manager = object.__getattribute__(self, "_manager")
+        if isinstance(manager, _LazyModelManager):
+            manager = object.__getattribute__(manager, "_instance")
+            if manager is None:
+                return ""
+        return backend_id_for(manager, default="")
+
+    @property
+    def backend_id(self) -> str:
+        return self.engine_type
+
+    @property
+    def capabilities(self) -> BackendCapabilities:
+        return backend_capabilities(self.engine_type)
+
+    def supports(self, capability: str) -> bool:
+        return self.capabilities.supports(capability)
+
+    def select_engine(self, profile: dict | None = None) -> str:
+        """Select the node backend through the Koakuma boundary."""
+
+        try:
+            import config as _cfg
+
+            requested = getattr(_cfg, "INFERENCE_ENGINE", "auto")
+            island_enabled = bool(getattr(_cfg, "ISLAND_ENABLED", False))
+            island_base_url = str(getattr(_cfg, "ISLAND_BASE_URL", "") or "")
+        except Exception:
+            requested = "auto"
+            island_enabled = False
+            island_base_url = ""
+        return select_backend(
+            profile,
+            requested=requested,
+            island_enabled=island_enabled,
+            island_base_url=island_base_url,
+        )
 
     def attach(self, name: str, value: Any) -> None:
         """注册自有属性（存于 ModelHost 自身，不走 manager 代理）。

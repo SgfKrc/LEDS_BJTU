@@ -408,6 +408,13 @@ async def http_exception_with_request_id(request: Request, exc: HTTPException):
 # 推理宿主单例（阶段 0.2/0.4：api_server 与 scheduler 共享；model_manager 为
 # 兼容名，属性读写代理到内部 ModelManager）
 from model_host import model_host
+from koakuma_engine import (
+    Capability,
+    accepted_backend_requests,
+    backend_id_for,
+    registered_backends,
+    runtime_supports,
+)
 
 model_manager = model_host
 kv_cache: "Optional[PagedKVCache]" = None  # PagedKVCache is D-tier (torch) only
@@ -2869,11 +2876,12 @@ async def load_model(req: LoadModelRequest, request: Request = None):
     global kv_cache, conversation_stats
 
     engine = req.engine.lower()
-    if engine not in ("auto", "llama_cpp", "pytorch", "island"):
+    accepted_engines = accepted_backend_requests()
+    if engine not in accepted_engines:
         raise coded_http_error(
             400,
             "MODEL_ENGINE_UNSUPPORTED",
-            f"不支持的引擎: {engine}，可选: auto, llama_cpp, pytorch, island",
+            f"不支持的引擎: {engine}，可选: {', '.join(accepted_engines)}",
         )
 
     _validate_model_load_request(req.model_id, engine)
@@ -2929,8 +2937,8 @@ async def load_model(req: LoadModelRequest, request: Request = None):
             if model_manager.is_loaded:
                 model_host.model_loaded = True
                 model_host.current_quant = model_manager.quant_type or (
-                    "gguf" if model_manager._engine_type == "llama_cpp"
-                    else "island" if model_manager._engine_type == "island"
+                    "gguf" if backend_id_for(model_manager) == "llama_cpp"
+                    else "island" if backend_id_for(model_manager) == "island"
                     else QUANT_TYPE
                 )
                 _init_kv_cache()
@@ -3515,10 +3523,10 @@ def _ensure_local_task_provider() -> None:
 def _active_task_graph_model_identity() -> Optional[ModelIdentity]:
     if not model_host.model_loaded or not model_manager.is_loaded:
         return None
-    engine = str(getattr(model_manager, "_engine_type", "") or "")
+    engine = backend_id_for(model_manager)
     model_path = str(getattr(model_manager, "_model_path", "") or "")
     model_id = str(getattr(model_manager, "active_model_id", "") or "")
-    if engine not in {"pytorch", "llama_cpp", "island"} or not model_id or not model_path:
+    if engine not in registered_backends() or not model_id or not model_path:
         return None
     if engine == "island":
         # 孤岛模型无本地 artifact：以"端点指纹 + 后端模型名"替代文件摘要，
@@ -4161,7 +4169,7 @@ def _execute_task_graph_chat_with_slot(
     )
     metrics = _augment_chat_metrics(
         {
-            "engine": model_manager._engine_type,
+            "engine": backend_id_for(model_manager),
             "execution_mode": "task_graph",
             "provider": (
                 providers[0] if len(providers) == 1 else "task_graph"
@@ -4448,7 +4456,7 @@ def _execute_chat_full(
             and scheduler.get_distributed_inference_enabled()
             and RUN_MODE == "distributed"
             and scheduler._effective_role() == "master"
-            and model_manager._engine_type == "pytorch"):
+            and runtime_supports(model_manager, Capability.FORWARD_LAYERS)):
         try:
             pipeline_result = scheduler.run_pipeline_safe(
                 req.message,
@@ -4509,9 +4517,9 @@ def _execute_chat_full(
                         except Exception:
                             pass
 
-                    if model_manager._engine_type in ("llama_cpp", "island"):
+                    if backend_id_for(model_manager) in ("llama_cpp", "island"):
                         followups = _generate_followups_llama(history)
-                    elif model_manager._engine_type == "pytorch":
+                    elif backend_id_for(model_manager) == "pytorch":
                         # 流水线成功后主节点仍保留首段裁剪模型，不能拿它生成追问。
                         followups = _fallback_followups(history, [])
                     else:
@@ -4536,9 +4544,9 @@ def _execute_chat_full(
         raise HTTPException(503, "distributed_required 执行失败：当前引擎未完成分布式流水线")
 
     # ---- llama.cpp / 孤岛引擎路径（整请求推理，不参与层拆分）----
-    if model_manager._engine_type in ("llama_cpp", "island"):
+    if backend_id_for(model_manager) in ("llama_cpp", "island"):
         try:
-            engine_name = model_manager._engine_type
+            engine_name = backend_id_for(model_manager)
             request_history = [
                 *history,
                 {"role": "user", "content": req.message},
@@ -4645,7 +4653,7 @@ def _execute_chat_full(
             # 孤岛路径的失败不应记成 llama.cpp（llama_cpp 路径日志保持原样）
             _engine_label = (
                 "孤岛引擎"
-                if getattr(model_manager, "_engine_type", "") == "island"
+                if backend_id_for(model_manager) == "island"
                 else "llama.cpp"
             )
             logger.error(f"{_engine_label} 推理失败: {e}", exc_info=True)
@@ -5249,7 +5257,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                                 and scheduler.get_distributed_inference_enabled()
                                 and RUN_MODE == "distributed"
                                 and scheduler._effective_role() == "master"
-                                and model_manager._engine_type == "pytorch"):
+                                and runtime_supports(
+                                    model_manager, Capability.FORWARD_LAYERS,
+                                )):
                             distributed_used = True
                             async for event in _iterate_sync_generator(scheduler.run_pipeline_stream(
                                 req.message,
@@ -5268,7 +5278,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                                 if frame:
                                     yield frame
                         # 路径 2: 单机 PyTorch 流式
-                        elif (model_manager._engine_type == "llama_cpp"
+                        elif (backend_id_for(model_manager) == "llama_cpp"
                               and model_manager.is_loaded
                               and callable(getattr(model_manager, "chat_stream", None))
                               and callable(getattr(
@@ -5289,7 +5299,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                                 frame = _token_frame(event)
                                 if frame:
                                     yield frame
-                        elif (model_manager._engine_type == "pytorch"
+                        elif (backend_id_for(model_manager) == "pytorch"
                                 and model_manager.is_loaded):
                             async for event in _iterate_sync_generator(scheduler._run_full_model_inference_stream(
                                 req.message,
@@ -5538,7 +5548,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                 and scheduler.get_distributed_inference_enabled()
                 and RUN_MODE == "distributed"
                 and scheduler._effective_role() == "master"
-                and model_manager._engine_type == "pytorch"):
+                and runtime_supports(model_manager, Capability.FORWARD_LAYERS)):
             try:
                 async for event in _iterate_sync_generator(scheduler.run_pipeline_stream(
                     req.message,
@@ -5558,7 +5568,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                 yield _error_event(str(e))
 
         # ---- 路径 2: 单机 PyTorch 流式 ----
-        elif (model_manager._engine_type == "llama_cpp"
+        elif (backend_id_for(model_manager) == "llama_cpp"
                 and model_manager.is_loaded
                 and callable(getattr(model_manager, "chat_stream", None))
                 and callable(getattr(
@@ -5581,7 +5591,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                 logger.error(f"llama.cpp 流式推理失败: {e}", exc_info=True)
                 yield _error_event(str(e))
 
-        elif (model_manager._engine_type == "pytorch"
+        elif (backend_id_for(model_manager) == "pytorch"
                 and model_manager.is_loaded):
             try:
                 async for event in _iterate_sync_generator(scheduler._run_full_model_inference_stream(
@@ -6174,7 +6184,7 @@ async def list_available_models():
         "models": pytorch_quants + gguf_quants + island_quants + external_quants,
         "current": model_host.current_quant if model_host.model_loaded else None,
         "current_engine": (
-            model_manager._engine_type
+            backend_id_for(model_manager)
             if model_host.model_loaded and model_manager.is_loaded
             else None
         ),
@@ -6576,11 +6586,12 @@ async def switch_model(req: SwitchModelRequest, request: Request = None):
 
     # 验证 engine 参数
     engine = req.engine.lower()
-    if engine not in ("auto", "llama_cpp", "pytorch", "island"):
+    accepted_engines = accepted_backend_requests()
+    if engine not in accepted_engines:
         raise coded_http_error(
             400,
             "MODEL_ENGINE_UNSUPPORTED",
-            f"不支持的引擎: {engine}，可选: auto, llama_cpp, pytorch, island",
+            f"不支持的引擎: {engine}，可选: {', '.join(accepted_engines)}",
         )
     _validate_model_load_request(req.model_id, engine)
     resolved_model_path = _resolve_model_path_for_engine(req.model_id, engine)
@@ -6622,8 +6633,8 @@ async def switch_model(req: SwitchModelRequest, request: Request = None):
                 model_host.model_loaded = True
                 # P3修复: llama_cpp 引擎无 quant_type（GGUF 自带量化），回退到 "gguf"
                 model_host.current_quant = model_manager.quant_type or (
-                    "gguf" if model_manager._engine_type == "llama_cpp"
-                    else "island" if model_manager._engine_type == "island"
+                    "gguf" if backend_id_for(model_manager) == "llama_cpp"
+                    else "island" if backend_id_for(model_manager) == "island"
                     else QUANT_TYPE
                 )
             else:
