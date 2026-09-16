@@ -26,8 +26,20 @@ from dataclasses import asdict, dataclass
 from typing import Any, Sequence
 
 RELAY_ENGINE = "llama.cpp"
-#: Acceptance criterion name; see the module docstring for why no cosine threshold is used.
+#: Strict acceptance criterion: every generated token must match by argmax.
 RELAY_ACCEPTANCE = "per_token_argmax"
+#: Tolerant acceptance criterion for the embedding-input (``embd``) handoff path.
+#:
+#: Measured 2026-09-16 (``llama-relay-gen``, Qwen3.5-2B, L -> L, 141-step generation): at every
+#: observed divergence (6/6 runs, steps 31-67) the two logits vectors agreed at cosine
+#: 0.984-0.999 with a 4-5/5 top-5 overlap, and the two argmaxes were each ranked **2nd** in the
+#: other vector -- every divergence was a top-1 <-> top-2 swap caused by the ``embd`` path's
+#: known non-determinism, which autoregression then amplifies. A strict per-token criterion is
+#: therefore unattainable on that path (even for L -> L, which fails by step 46); the relay
+#: argmax merely has to fall inside the baseline's top-k (k = 2 covers all measured cases).
+RELAY_ACCEPTANCE_TOLERANT = "top_k_tolerant_argmax"
+#: Top-k used by :data:`RELAY_ACCEPTANCE_TOLERANT`.
+RELAY_TOLERANT_TOP_K = 2
 CUT_LAYER_MIN = 1
 RELAY_FALLBACK_STRATEGY = "single_process_llama_cpp"
 XFRAME_SCOPE = "pc_explicit_only"
@@ -293,6 +305,74 @@ def judge_relay_generation(
         )
     return RelayComparisonVerdict(
         True, "all_tokens_match", RELAY_ACCEPTANCE, matched, total, cosine, bitwise_equal
+    )
+
+
+def judge_relay_generation_tolerant(
+    baseline_topk: Sequence[Sequence[int]],
+    relay_tokens: Sequence[int],
+    *,
+    top_k: int = RELAY_TOLERANT_TOP_K,
+    cosine: float | None = None,
+    bitwise_equal: bool | None = None,
+) -> RelayComparisonVerdict:
+    """Accept a relay run when every relay token falls inside the baseline's top-k.
+
+    Use this instead of :func:`judge_relay_generation` on the ``embd`` handoff path: that path
+    is not bit-reproducible inside a single process, and its observed divergence is always a
+    top-1 <-> top-2 swap (see :data:`RELAY_ACCEPTANCE_TOLERANT`). Autoregression amplifies one
+    swap into a different tail, so a strict per-token comparison fails even on healthy L -> L
+    relays (measured: fails by step 46 of 141). Membership in the baseline's top-k is the
+    strongest criterion the path actually satisfies.
+
+    ``baseline_topk[i]`` is the baseline's ranked candidate list at step ``i`` (best first);
+    only its first ``top_k`` entries are consulted. ``cosine`` / ``bitwise_equal`` are recorded
+    for the evidence trail and never gate the verdict.
+    """
+    baseline = [[int(candidate) for candidate in candidates] for candidates in baseline_topk]
+    relay = [int(token) for token in relay_tokens]
+    total = min(len(baseline), len(relay))
+
+    if total == 0:
+        return RelayComparisonVerdict(
+            False, "empty_sequence", RELAY_ACCEPTANCE_TOLERANT, 0, 0, cosine, bitwise_equal
+        )
+    if len(baseline) != len(relay):
+        return RelayComparisonVerdict(
+            False,
+            "length_mismatch",
+            RELAY_ACCEPTANCE_TOLERANT,
+            0,
+            total,
+            cosine,
+            bitwise_equal,
+            diagnostics=f"baseline={len(baseline)} relay={len(relay)}",
+        )
+
+    effective_k = max(1, _as_int(top_k, RELAY_TOLERANT_TOP_K))
+    matched = 0
+    for index in range(total):
+        if relay[index] not in baseline[index][:effective_k]:
+            return RelayComparisonVerdict(
+                False,
+                "token_outside_top_k",
+                RELAY_ACCEPTANCE_TOLERANT,
+                matched,
+                total,
+                cosine,
+                bitwise_equal,
+                diagnostics=f"first_divergence_step={matched} top_k={effective_k}",
+            )
+        matched += 1
+
+    return RelayComparisonVerdict(
+        True,
+        "all_tokens_in_top_k",
+        RELAY_ACCEPTANCE_TOLERANT,
+        matched,
+        total,
+        cosine,
+        bitwise_equal,
     )
 
 

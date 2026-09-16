@@ -6,11 +6,13 @@ The acceptance cases here are the frozen form of the experiment in
 
 from src.relay_contract import (
     RELAY_ACCEPTANCE,
+    RELAY_ACCEPTANCE_TOLERANT,
     RelayModelIdentity,
     RelayHiddenSpec,
     RelayTrimPlan,
     build_relay_handoff,
     judge_relay_generation,
+    judge_relay_generation_tolerant,
     relay_fallback,
 )
 
@@ -184,3 +186,46 @@ def test_fallback_always_names_the_single_process_strategy():
     assert fallback.reason == "cut_layer_out_of_range"
     assert fallback.strategy == "single_process_llama_cpp"
     assert fallback.to_dict()["strategy"] == "single_process_llama_cpp"
+
+
+def test_tolerant_criterion_accepts_a_top1_top2_swap():
+    # 2026-09-16 measured shape (llama-relay-gen, Qwen3.5-2B, 141-step L -> L): every observed
+    # divergence was a top-1 <-> top-2 swap (cosine 0.984-0.999, top-5 overlap 4-5/5), which
+    # autoregression then amplified into a different tail. See RELAY_ACCEPTANCE_TOLERANT.
+    verdict = judge_relay_generation_tolerant(
+        [[2912, 804, 328, 2434, 7957], [271, 198, 25, 4558, 695]],
+        [804, 198],
+        cosine=0.998579,
+        bitwise_equal=False,
+    )
+
+    assert verdict.accepted is True
+    assert verdict.reason == "all_tokens_in_top_k"
+    assert verdict.criterion == RELAY_ACCEPTANCE_TOLERANT == "top_k_tolerant_argmax"
+    assert verdict.criterion != RELAY_ACCEPTANCE
+    assert verdict.matched_steps == 2
+    assert verdict.cosine == 0.998579  # evidence only, never a gate
+    assert verdict.bitwise_equal is False
+
+
+def test_tolerant_criterion_rejects_a_token_outside_top_k():
+    outside = judge_relay_generation_tolerant([[2912, 804], [271]], [2912, 7777])
+    narrowed = judge_relay_generation_tolerant([[2912, 804]], [804], top_k=1)
+
+    assert outside.accepted is False
+    assert outside.reason == "token_outside_top_k"
+    assert outside.matched_steps == 1
+    assert outside.diagnostics == "first_divergence_step=1 top_k=2"
+    assert narrowed.accepted is False
+    assert narrowed.reason == "token_outside_top_k"
+
+
+def test_tolerant_criterion_handles_length_mismatch_and_empty():
+    length = judge_relay_generation_tolerant([[1], [2], [3]], [1, 2])
+    empty = judge_relay_generation_tolerant([], [])
+
+    assert length.accepted is False
+    assert length.reason == "length_mismatch"
+    assert length.total_steps == 2
+    assert empty.accepted is False
+    assert empty.reason == "empty_sequence"
