@@ -448,6 +448,7 @@ Invalid read of size 4
 | `embd` vs token 路径（同一 141-token prompt） | argmax `132/141` | **`141/141`、cosine min = `0.999999`** |
 | token 路径对照（连跑两次） | bitwise 一致 | bitwise 一致（不变） |
 | `llama-relay-gen` L→L 141 步贪心生成（连跑 2 次） | 第 46 / 51 步分叉 | **`全部 141 步一致`（2/2）** |
+| `llama-relay-gen-dl` **D→L 逐步生成**（A=PyTorch 每步 layer 0..3 → B=裁层 llama.cpp，141 步） | 无法进行（`embd` 每步结果不可复现） | **`全部 141 步一致`**（驱动 `drive_dl_relay.py`；报告 `local_docs/CORE-RELAY-XFRAME-01-dl-stepwise-141-2026-09-16.json`） |
 
 修法实现见 `build/cross-framework-layer-poc/patches/embd-pos-overread-fix-2026-09-16.patch`
 （`relay-check.cpp` / `relay-gen.cpp` / `embd-inject-test.cpp` 的 `pos4` 分配）。
