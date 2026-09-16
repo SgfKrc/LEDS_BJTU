@@ -11,6 +11,7 @@ import argparse
 import base64
 import hashlib
 import json
+import ntpath
 import socket
 import subprocess
 import sys
@@ -21,6 +22,10 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from src.llama_rpc_contract import RpcShardLeaseBook
 from src.llama_rpc_planner import RpcNodeProfile, RpcSplitDecision, plan_rpc_split
@@ -37,7 +42,6 @@ from scripts.llama_rpc_sim import (
 )
 
 
-ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LOCAL_MODEL = ROOT / "models" / "Qwen-1_8B-Chat.Q4_K_M.gguf"
 DEFAULT_REMOTE_ROOT = r"C:\Users\surface\Documents\LEDS_BJTU"
 DEFAULT_REMOTE_RUNTIME = DEFAULT_REMOTE_ROOT + r"\runtime\llama-cpp\b10964"
@@ -304,6 +308,214 @@ class SshTunnelHandle:
     process: subprocess.Popen[str]
     stdout_path: Path
     stderr_path: Path
+
+
+@dataclass(frozen=True)
+class RemoteAssetSyncPlan:
+    """Non-destructive transfer plan for the remote model identity file."""
+
+    source: Path
+    remote_target: str
+    remote_path: str
+    plan_sha256: str
+    source_sha256: str
+    source_size_bytes: int
+    temporary_path: str
+    backup_dir: str
+    scp_command: tuple[str, ...]
+    prepare_script: str
+    commit_script: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": str(self.source),
+            "remote_target": self.remote_target,
+            "remote_path": self.remote_path,
+            "plan_sha256": self.plan_sha256,
+            "source_sha256": self.source_sha256,
+            "source_size_bytes": self.source_size_bytes,
+            "temporary_path": self.temporary_path,
+            "backup_dir": self.backup_dir,
+            "scp_command": list(self.scp_command),
+            "prepare_script": self.prepare_script,
+            "commit_script": self.commit_script,
+        }
+
+
+def _validate_remote_asset_path(remote_path: str) -> str:
+    normalized = str(remote_path or "").replace("/", "\\")
+    drive, tail = ntpath.splitdrive(normalized)
+    if not drive or not tail.startswith("\\"):
+        raise ValueError("remote model path must be an absolute Windows path")
+    components = tail.strip("\\").split("\\")
+    if not components or any(part in {"", ".", ".."} for part in components):
+        raise ValueError("remote model path contains an unsafe component")
+    if any(char in normalized for char in ("\x00", "\r", "\n")):
+        raise ValueError("remote model path contains control characters")
+    return ntpath.normpath(normalized)
+
+
+def build_remote_asset_sync_plan(
+    source: str | Path,
+    remote_target: str,
+    remote_path: str,
+) -> RemoteAssetSyncPlan:
+    """Build a reviewable, non-destructive remote GGUF transfer plan."""
+    source_path = Path(source).expanduser().resolve()
+    if not source_path.is_file():
+        raise FileNotFoundError(f"local model not found: {source_path}")
+    target = _validate_remote_asset_path(remote_path)
+    if not remote_target or any(char in remote_target for char in ("\x00", "\r", "\n")):
+        raise ValueError("remote target contains unsafe characters")
+
+    source_sha256 = _local_hash(source_path)
+    source_size = source_path.stat().st_size
+    plan_sha256 = hashlib.sha256(
+        f"rpc-model-sync-v1\0{remote_target}\0{target}\0{source_size}\0{source_sha256}".encode("utf-8")
+    ).hexdigest().upper()
+    parent, name = ntpath.split(target)
+    temporary_path = ntpath.join(parent, f".{name}.qlh-{source_sha256[:16]}.part")
+    backup_dir = ntpath.join(parent, "_to_delete", "remote-models")
+    temporary_quote = _ps_quote(temporary_path)
+    target_quote = _ps_quote(target)
+    backup_quote = _ps_quote(backup_dir)
+    expected_quote = _ps_quote(source_sha256)
+    scp_target = f"{remote_target}:{temporary_path.replace('\\', '/')}"
+    prepare_script = f"""
+$ErrorActionPreference = 'Stop'
+$temporary = {temporary_quote}
+$backup = {backup_quote}
+New-Item -ItemType Directory -Force -Path $backup | Out-Null
+if (Test-Path -LiteralPath $temporary) {{
+  $stale = Join-Path $backup ('.part-' + [guid]::NewGuid().ToString('N'))
+  Move-Item -LiteralPath $temporary -Destination $stale
+}}
+Write-Output 'prepared'
+""".strip()
+    commit_script = f"""
+$ErrorActionPreference = 'Stop'
+$temporary = {temporary_quote}
+$target = {target_quote}
+$backup = {backup_quote}
+$expected = {expected_quote}
+if (!(Test-Path -LiteralPath $temporary)) {{ throw 'staged model file is missing' }}
+$staged = Get-Item -LiteralPath $temporary
+if ([int64]$staged.Length -ne {source_size}) {{ throw 'staged model size mismatch' }}
+$stagedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $temporary).Hash.ToUpperInvariant()
+if ($stagedHash -ne $expected) {{ throw 'staged model SHA256 mismatch' }}
+if (Test-Path -LiteralPath $target) {{
+  $currentHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash.ToUpperInvariant()
+  if ($currentHash -eq $expected) {{
+    Move-Item -LiteralPath $temporary -Destination (Join-Path $backup ('.redundant-' + [guid]::NewGuid().ToString('N')))
+    @{{ status = 'already_current'; sha256 = $currentHash }} | ConvertTo-Json -Compress
+    exit 0
+  }}
+  $backupPath = Join-Path $backup ((Split-Path -Leaf $target) + '.replaced-' + [guid]::NewGuid().ToString('N'))
+  [System.IO.File]::Replace($temporary, $target, $backupPath, $true)
+  $finalHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash.ToUpperInvariant()
+  if ($finalHash -ne $expected) {{ throw 'remote model SHA256 mismatch after replacement' }}
+  @{{ status = 'applied'; sha256 = $finalHash }} | ConvertTo-Json -Compress
+  exit 0
+}}
+Move-Item -LiteralPath $temporary -Destination $target
+$finalHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash.ToUpperInvariant()
+if ($finalHash -ne $expected) {{ throw 'remote model SHA256 mismatch after replacement' }}
+@{{ status = 'applied'; sha256 = $finalHash }} | ConvertTo-Json -Compress
+""".strip()
+    return RemoteAssetSyncPlan(
+        source=source_path,
+        remote_target=remote_target,
+        remote_path=target,
+        plan_sha256=plan_sha256,
+        source_sha256=source_sha256,
+        source_size_bytes=source_size,
+        temporary_path=temporary_path,
+        backup_dir=backup_dir,
+        scp_command=(
+            "scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+            str(source_path), scp_target,
+        ),
+        prepare_script=prepare_script,
+        commit_script=commit_script,
+    )
+
+
+def _remote_asset_state(plan: PcRpcPlan, sync_plan: RemoteAssetSyncPlan) -> dict[str, Any]:
+    script = f"""
+$path = {_ps_quote(sync_plan.remote_path)}
+if (!(Test-Path -LiteralPath $path)) {{ @{{ status = 'missing' }} | ConvertTo-Json -Compress; exit 0 }}
+$item = Get-Item -LiteralPath $path
+$hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToUpperInvariant()
+@{{ status = 'present'; size_bytes = [int64]$item.Length; sha256 = $hash }} | ConvertTo-Json -Compress
+""".strip()
+    result = _ssh(plan, script, timeout=max(20.0, min(plan.timeout_seconds, 60.0)))
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "remote model state query failed")
+    for line in reversed(result.stdout.splitlines()):
+        try:
+            state = json.loads(line.strip())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(state, dict) and state.get("status") in {"missing", "present"}:
+            return state
+    raise RuntimeError("remote model state was not returned")
+
+
+def sync_remote_model(
+    plan: PcRpcPlan,
+    *,
+    apply: bool = False,
+    confirmation_sha256: str = "",
+    transfer_timeout_seconds: float = 3600.0,
+) -> dict[str, Any]:
+    """Inspect or explicitly apply a verified, non-destructive model sync."""
+    sync_plan = build_remote_asset_sync_plan(plan.model, plan.target, plan.remote_model)
+    state = _remote_asset_state(plan, sync_plan)
+    current = (
+        state.get("status") == "present"
+        and int(state.get("size_bytes", -1)) == sync_plan.source_size_bytes
+        and str(state.get("sha256", "")).upper() == sync_plan.source_sha256
+    )
+    report: dict[str, Any] = {
+        "status": "already_current" if current else ("apply_required" if apply else "dry_run"),
+        "remote_state": state,
+        "current": current,
+        "plan": sync_plan.to_dict(),
+    }
+    if current or not apply:
+        return report
+    if confirmation_sha256.strip().upper() != sync_plan.plan_sha256:
+        raise ValueError(
+            "remote model sync requires a prior dry-run and matching "
+            "--confirm-sync-plan-sha256"
+        )
+
+    prepared = _ssh(plan, sync_plan.prepare_script, timeout=max(20.0, plan.timeout_seconds))
+    if prepared.returncode != 0:
+        raise RuntimeError(prepared.stderr.strip() or "remote model sync prepare failed")
+    uploaded = subprocess.run(
+        list(sync_plan.scp_command),
+        text=True,
+        capture_output=True,
+        timeout=max(60.0, float(transfer_timeout_seconds)),
+        check=False,
+    )
+    if uploaded.returncode != 0:
+        raise RuntimeError(uploaded.stderr.strip() or "remote model upload failed")
+    committed = _ssh(plan, sync_plan.commit_script, timeout=max(20.0, plan.timeout_seconds))
+    if committed.returncode != 0:
+        raise RuntimeError(committed.stderr.strip() or "remote model sync commit failed")
+    result = None
+    for line in reversed(committed.stdout.splitlines()):
+        try:
+            result = json.loads(line.strip())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(result, dict):
+            break
+    report["status"] = "applied"
+    report["commit"] = result or {"status": "applied"}
+    return report
 
 
 def _ssh_tunnel_command(plan: PcRpcPlan) -> list[str]:
@@ -819,6 +1031,28 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--worker-budget-mib", type=float, default=512)
     parser.add_argument("--timeout-seconds", type=float, default=120)
     parser.add_argument("--remote-threads", type=int, default=8)
+    sync_mode = parser.add_mutually_exclusive_group()
+    sync_mode.add_argument(
+        "--sync-remote-model",
+        action="store_true",
+        help="query remote GGUF state and print a verified sync plan; do not write",
+    )
+    sync_mode.add_argument(
+        "--apply-remote-model-sync",
+        action="store_true",
+        help="upload and atomically replace the remote GGUF after SHA256 verification",
+    )
+    parser.add_argument(
+        "--confirm-sync-plan-sha256",
+        default="",
+        help="plan digest emitted by a prior --sync-remote-model dry-run",
+    )
+    parser.add_argument(
+        "--asset-sync-timeout-seconds",
+        type=float,
+        default=3600,
+        help="timeout for the large model transfer only (default: 3600)",
+    )
     parser.add_argument(
         "--ssh-tunnel",
         action="store_true",
@@ -852,7 +1086,15 @@ def main(argv: list[str] | None = None) -> int:
         total_layers=args.total_layers,
     )
     try:
-        report = plan_report(plan) if not args.run else run_probe(plan, check_fallback=not args.no_fallback)
+        if args.sync_remote_model or args.apply_remote_model_sync:
+            report = sync_remote_model(
+                plan,
+                apply=args.apply_remote_model_sync,
+                confirmation_sha256=args.confirm_sync_plan_sha256,
+                transfer_timeout_seconds=args.asset_sync_timeout_seconds,
+            )
+        else:
+            report = plan_report(plan) if not args.run else run_probe(plan, check_fallback=not args.no_fallback)
     except (FileNotFoundError, OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
         report = {"status": "invalid", "error": str(exc)}
     encoded = json.dumps(report, ensure_ascii=False, indent=2)
@@ -865,7 +1107,7 @@ def main(argv: list[str] | None = None) -> int:
         print(encoded)
     else:
         print(f"status={report.get('status')} model_identity_match={report.get('model_identity_match')}")
-    return 0 if report.get("status") in {"dry_run", "passed"} else 1
+    return 0 if report.get("status") in {"dry_run", "passed", "already_current", "applied"} else 1
 
 
 if __name__ == "__main__":
