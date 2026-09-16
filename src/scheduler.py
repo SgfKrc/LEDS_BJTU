@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from model_host import InferenceHost
 
 from model_host import get_model_host
+from koakuma_engine import Capability, backend_id_for, runtime_supports
 from network_path import build_client_network_path_view
 from pipeline_capacity import PipelineCapacityError, solve_pipeline_capacity
 from qwen3_pipeline_transaction import (
@@ -1272,14 +1273,14 @@ class Scheduler:
         self._master_identity_reason: str = ""
 
         if RUN_MODE == "distributed":
-            from tcp_comm import TCPServer, detect_lan_ip, get_mac_addresses
+            from transport_port import create_server, detect_lan_ip, get_mac_addresses
 
             # 绑定到 0.0.0.0 接受所有接口连接（而非占位符 192.168.x.x）
             bind_host = host or "0.0.0.0"
             actual_port = SERVER_PORT if port is None else port
 
             try:
-                self._tcp_server = TCPServer(bind_host, actual_port)
+                self._tcp_server = create_server(bind_host, actual_port)
                 self._tcp_server.start(
                     on_message=self._on_tcp_message,
                     on_disconnect=self._on_tcp_disconnect,
@@ -1505,7 +1506,7 @@ class Scheduler:
             state = node.state.value if node is not None else "online"
 
         try:
-            from tcp_comm import MessageType
+            from transport_port import MessageType
             client.send_data(
                 {"state": state, "device_info": profile},
                 MessageType.STATUS_RES,
@@ -2409,7 +2410,7 @@ class Scheduler:
     def _get_active_pipeline_model_info(self) -> dict:
         """Describe a PyTorch artifact without requiring a full model load."""
         manager = self._host
-        if not manager or getattr(manager, "_engine_type", "") != "pytorch":
+        if not manager or not runtime_supports(manager, Capability.FORWARD_LAYERS):
             return {}
         get_descriptor = getattr(manager, "get_pipeline_descriptor", None)
         if not callable(get_descriptor):
@@ -4058,9 +4059,9 @@ class Scheduler:
 
     @staticmethod
     def _qwen3_cluster_secret() -> str:
-        from tcp_comm import _get_cluster_secret
+        from transport_port import get_cluster_secret
 
-        return str(_get_cluster_secret() or "")
+        return get_cluster_secret()
 
     def _dispatch_qwen3_loopback_messages(
         self, messages: list[dict], *, best_effort: bool = False,
@@ -5058,7 +5059,7 @@ class Scheduler:
             )
         client = getattr(self, "_tcp_client", None)
         if client is not None:
-            from tcp_comm import MessageType
+            from transport_port import MessageType
 
             client.send_data(ack, MessageType.QWEN3_PIPELINE_DRY_RUN_ACK)
 
@@ -5471,7 +5472,7 @@ class Scheduler:
         from model_sync import compute_model_sha256
 
         mgr = self._host
-        if not mgr or getattr(mgr, '_engine_type', '') != 'pytorch':
+        if not mgr or not runtime_supports(mgr, Capability.FORWARD_LAYERS):
             return ""
 
         get_descriptor = getattr(mgr, "get_pipeline_descriptor", None)
@@ -5587,7 +5588,7 @@ class Scheduler:
         if not target or not getattr(target, "is_registered", False):
             return False
         try:
-            from tcp_comm import MessageType
+            from transport_port import MessageType
 
             message = self._task_worker_control.begin_worker_hello(
                 node_id=self.get_effective_node_id(),
@@ -5643,7 +5644,7 @@ class Scheduler:
         server = self._tcp_server
         if server is None:
             raise ConnectionError("task worker TCP server is unavailable")
-        from tcp_comm import MessageType
+        from transport_port import MessageType
 
         server.send_to_client(
             node_id, message.snapshot(), MessageType.TASK_WORKER,
@@ -5653,7 +5654,7 @@ class Scheduler:
         client = getattr(self, "_tcp_client", None)
         if not client or not getattr(client, "is_registered", False):
             raise ConnectionError("task worker is not connected to its master")
-        from tcp_comm import MessageType
+        from transport_port import MessageType
 
         client.send_data(message.snapshot(), MessageType.TASK_WORKER)
 
@@ -6686,7 +6687,7 @@ class Scheduler:
             try:
                 # Keep this branch self-contained: log aggregation can be
                 # invoked independently of the inference message handlers.
-                from tcp_comm import MessageType
+                from transport_port import MessageType
 
                 entries, _ = self._host._snapshot_recent_logs()
                 filtered = self._host._filter_recent_logs(
@@ -6791,7 +6792,7 @@ class Scheduler:
             logger.warning("本地模型切换时主节点未连接，已仅清理本地分层预留")
             return False
         try:
-            from tcp_comm import MessageType
+            from transport_port import MessageType
 
             client.send_data(
                 {
@@ -7171,7 +7172,7 @@ class Scheduler:
         if not self._tcp_server or not self._tcp_server._running:
             return
         try:
-            from tcp_comm import MessageType
+            from transport_port import MessageType
             # Phase 2.1+: 快照后解锁，避免持锁进行 TCP 发送（防止锁排序问题）
             with self._nodes_lock:
                 nodes_data = [info.to_dict() for info in self.nodes.values()]
@@ -7197,7 +7198,7 @@ class Scheduler:
         if not self._tcp_server or not self._tcp_server._running:
             return
         try:
-            from tcp_comm import MessageType
+            from transport_port import MessageType
             node_data = node_info.to_dict() if node_info else {"node_id": changed_id}
             payload = {
                 "action": action,
@@ -7460,7 +7461,7 @@ class Scheduler:
 
         # 步骤 1: 发送 ROLE_TRANSFER 给目标从节点（新主节点）
         try:
-            from tcp_comm import MessageType
+            from transport_port import MessageType
             self._tcp_server.send_to_client(
                 target_node_id, cluster_info, MessageType.ROLE_TRANSFER
             )
@@ -7632,7 +7633,7 @@ class Scheduler:
         tcp_client = getattr(self, '_tcp_client', None)
         if tcp_client and tcp_client.sock:
             try:
-                from tcp_comm import MessageType
+                from transport_port import MessageType
                 # 走 send_data 的 _send_lock 发送通道，避免与心跳线程并发
                 # 写同一 TCP 字节流导致帧交叉损坏
                 tcp_client.send_data(ack_payload, MessageType.ROLE_TRANSFER_ACK)
@@ -7889,7 +7890,7 @@ class Scheduler:
 
         # 步骤 1: 发送 SPARE_MASTER_DESIGNATE
         try:
-            from tcp_comm import MessageType
+            from transport_port import MessageType
             self._tcp_server.send_to_client(
                 target_node_id, designate_data, MessageType.SPARE_MASTER_DESIGNATE
             )
@@ -7986,7 +7987,7 @@ class Scheduler:
         tcp_client = getattr(self, '_tcp_client', None)
         if tcp_client and tcp_client.sock:
             try:
-                from tcp_comm import MessageType
+                from transport_port import MessageType
                 # 走 send_data 的 _send_lock 发送通道，避免与心跳线程并发
                 # 写同一 TCP 字节流导致帧交叉损坏
                 tcp_client.send_data(ack_payload, MessageType.SPARE_MASTER_DESIGNATE_ACK)
@@ -8063,7 +8064,7 @@ class Scheduler:
         tcp_client = getattr(self, '_tcp_client', None)
         if tcp_client and tcp_client.sock:
             try:
-                from tcp_comm import MessageType
+                from transport_port import MessageType
                 # 走 send_data 的 _send_lock 发送通道，避免与心跳线程并发
                 # 写同一 TCP 字节流导致帧交叉损坏
                 tcp_client.send_data(ack_payload, MessageType.SPARE_MASTER_ACTIVATE_ACK)
@@ -8174,7 +8175,7 @@ class Scheduler:
                     "message": "新主节点已上线，请退出暂代模式。",
                 }
 
-                from tcp_comm import MessageType
+                from transport_port import MessageType
                 self._tcp_server.send_to_client(
                     spare['node_id'], deactivate_data, MessageType.SPARE_MASTER_DEACTIVATE
                 )
@@ -8484,7 +8485,7 @@ class Scheduler:
         """
         import threading as _thr
 
-        from tcp_comm import MessageType
+        from transport_port import MessageType
 
         if not self._tcp_server:
             return None
@@ -8724,7 +8725,7 @@ class Scheduler:
                         "reason": f"首次连接自动部署失败: {e}",
                     }
 
-            from tcp_comm import TCPClient
+            from transport_port import create_client
 
             previous_client = getattr(self, "_tcp_client", None)
             previous_callback = (
@@ -8769,7 +8770,7 @@ class Scheduler:
                     )
 
             advertise_port = self._tcp_server.port if self._tcp_server else SERVER_PORT
-            client = TCPClient(
+            client = create_client(
                 server_host=master_host,
                 server_port=master_port,
                 client_id=node_id,
@@ -8826,7 +8827,7 @@ class Scheduler:
 
                 # 主节点注册成功后，请求全量节点列表以同步管理面板
                 try:
-                    from tcp_comm import MessageType
+                    from transport_port import MessageType
                     client.send_data({"request": "node_list"}, MessageType.NODE_LIST_SYNC)
                 except Exception:
                     pass
@@ -8853,7 +8854,7 @@ class Scheduler:
                 try:
                     logger.info("TCP 注册认证失败，尝试刷新首次连接配置后重试: %s", reason)
                     _run_first_connect_bootstrap("auth_failed")
-                    client = TCPClient(
+                    client = create_client(
                         server_host=master_host,
                         server_port=master_port,
                         client_id=node_id,
@@ -8876,7 +8877,7 @@ class Scheduler:
                         if getattr(self, '_role_override', None) == "client":
                             _sync_runtime_node_config(node_role="client")
                         try:
-                            from tcp_comm import MessageType
+                            from transport_port import MessageType
                             client.send_data({"request": "node_list"}, MessageType.NODE_LIST_SYNC)
                         except Exception:
                             pass
@@ -8965,7 +8966,7 @@ class Scheduler:
             self._client_pending_results.pop(forward_request_id, None)
 
         try:
-            from tcp_comm import MessageType
+            from transport_port import MessageType
 
             # 发送推理请求
             infer_data = {
@@ -9627,7 +9628,7 @@ class Scheduler:
         if not client or not getattr(client, "_running", False):
             return False
         try:
-            from tcp_comm import MessageType
+            from transport_port import MessageType
 
             client.send_data(
                 {"node_id": self.get_effective_node_id()},
@@ -9792,7 +9793,7 @@ class Scheduler:
         """向从节点回传推理结果"""
         if self._tcp_server and self._tcp_server._running:
             try:
-                from tcp_comm import MessageType
+                from transport_port import MessageType
                 result_data = {
                     "task_id": task_id,
                     "forward_request_id": forward_request_id,
@@ -10188,7 +10189,7 @@ class Scheduler:
                     ensure_pipeline_assignment_available,
                     resolve_worker_model_path,
                 )
-                from tcp_comm import TCPClient
+                from transport_port import compute_local_model_sha256
 
                 tcp_client = getattr(self, "_tcp_client", None)
                 master_host = getattr(tcp_client, "server_host", "")
@@ -10198,7 +10199,7 @@ class Scheduler:
                 # manifest is only a cold-start fallback for workers that do
                 # not own the same revision locally.
                 local_model_path = resolve_worker_model_path(model_id)
-                local_sha256 = TCPClient._compute_local_model_sha256(
+                local_sha256 = compute_local_model_sha256(
                     model_path=local_model_path,
                     model_id=model_id,
                 )
@@ -10219,7 +10220,7 @@ class Scheduler:
                     )
                     local_sha256 = expected_sha256
             elif expected_sha256:
-                from tcp_comm import TCPClient
+                from transport_port import compute_local_model_sha256
                 if model_id:
                     from model_sync import (
                         ensure_model_available,
@@ -10227,7 +10228,7 @@ class Scheduler:
                     )
 
                     local_model_path = resolve_worker_model_path(model_id)
-                    local_sha256 = TCPClient._compute_local_model_sha256(
+                    local_sha256 = compute_local_model_sha256(
                         model_path=local_model_path,
                         model_id=model_id,
                     )
@@ -10243,12 +10244,12 @@ class Scheduler:
                             model_id,
                             expected_sha256,
                         )
-                        local_sha256 = TCPClient._compute_local_model_sha256(
+                        local_sha256 = compute_local_model_sha256(
                             model_path=local_model_path,
                             model_id=model_id,
                         )
                 else:
-                    local_sha256 = TCPClient._compute_local_model_sha256()
+                    local_sha256 = compute_local_model_sha256()
                 if not local_sha256:
                     raise FileNotFoundError("本节点未找到可校验的 PyTorch 模型权重")
                 if local_sha256 != expected_sha256:
@@ -10378,7 +10379,7 @@ class Scheduler:
                 raise RuntimeError(
                     f"模型层范围加载结果不一致: actual={actual_range}, expected=({start}, {end})"
                 )
-            engine = getattr(mgr, '_engine_type', '') or 'pytorch'
+            engine = backend_id_for(mgr, default='pytorch') or 'pytorch'
             if engine != 'pytorch':
                 raise RuntimeError(f"层拆分要求 PyTorch 引擎，实际为 {engine}")
             loaded_config = getattr(getattr(mgr, "model", None), "config", None)
@@ -10469,7 +10470,7 @@ class Scheduler:
 
     def _send_layer_config_ack(self, payload: dict) -> bool:
         """从节点向主节点回传层配置加载结果。"""
-        from tcp_comm import MessageType
+        from transport_port import MessageType
 
         if (
             payload.get("config_id")
@@ -10734,7 +10735,11 @@ class Scheduler:
     def _run_master_lm_head(self, hidden_states):
         """在主节点对 worker 返回的尾层 hidden states 执行 Norm + LM Head。"""
         mgr = self._host
-        if not mgr or not mgr.is_loaded or getattr(mgr, "_engine_type", "") != "pytorch":
+        if (
+            not mgr
+            or not mgr.is_loaded
+            or not runtime_supports(mgr, Capability.FORWARD_LAYERS)
+        ):
             raise RuntimeError("主节点 PyTorch 模型未加载，无法执行 LM Head")
         project = getattr(mgr, "forward_lm_head", None)
         if not callable(project):
@@ -10767,7 +10772,7 @@ class Scheduler:
             4. 序列化输出（hidden_states 或 logits，不含 KV cache）
             5. 发送 LAYER_RESULT 回主节点
         """
-        from tcp_comm import MessageType, serialize_tensor_fast
+        from transport_port import MessageType, serialize_tensor
 
         data = msg.get("data", {})
         task_id = str(data.get("task_id", "unknown") or "unknown")
@@ -10839,7 +10844,7 @@ class Scheduler:
                         f"流水线 step 越序: task={task_id}, step={step}, "
                         f"last_step={last_step}"
                     )
-            from tcp_comm import deserialize_tensor_fast
+            from transport_port import deserialize_tensor
 
             mgr = self._host
             if not mgr or not mgr.is_loaded:
@@ -10849,9 +10854,9 @@ class Scheduler:
             actual_model_type = str(
                 getattr(loaded_config, "model_type", "") or ""
             ).lower()
-            if getattr(mgr, "_engine_type", "") != "pytorch":
+            if backend_id_for(mgr) != "pytorch":
                 layer_config_invalid = True
-                raise RuntimeError(f"worker 引擎已变化: {getattr(mgr, '_engine_type', '')}")
+                raise RuntimeError(f"worker 引擎已变化: {backend_id_for(mgr)}")
             if actual_model_type != model_type:
                 layer_config_invalid = True
                 raise RuntimeError(
@@ -10890,7 +10895,7 @@ class Scheduler:
                     hs_bytes = base64.b64decode(hs_bytes)
                 elif isinstance(hs_bytes, list):
                     hs_bytes = bytes(hs_bytes)
-                hidden_states = deserialize_tensor_fast(hs_bytes)
+                hidden_states = deserialize_tensor(hs_bytes)
 
             if "attention_mask" in data and data["attention_mask"] is not None:
                 attention_mask = torch.tensor(data["attention_mask"], dtype=torch.long)
@@ -10989,7 +10994,7 @@ class Scheduler:
             if "hidden_states" in result:
                 # 中间节点：返回隐藏状态
                 hs_cpu = result["hidden_states"].detach().cpu()
-                response["hidden_states"] = serialize_tensor_fast(hs_cpu)
+                response["hidden_states"] = serialize_tensor(hs_cpu)
                 response["hidden_shape"] = list(hs_cpu.shape)
                 logger.info(
                     f"✅ 层前向完成: task={task_id}, step={step}, "
@@ -11001,7 +11006,7 @@ class Scheduler:
             if "logits" in result:
                 # 末节点：返回 logits
                 logits_cpu = result["logits"].detach().cpu()
-                response["logits"] = serialize_tensor_fast(logits_cpu)
+                response["logits"] = serialize_tensor(logits_cpu)
                 response["logits_shape"] = list(logits_cpu.shape)
                 logger.info(
                     f"✅ 层前向完成: task={task_id}, step={step}, "
@@ -11153,7 +11158,7 @@ class Scheduler:
             self._finish_local_pipeline_task(task_id)
             return False
 
-        from tcp_comm import MessageType
+        from transport_port import MessageType
         import base64
 
         payload = result_data or {}
@@ -11195,7 +11200,7 @@ class Scheduler:
             logger.error("TCP 客户端未连接，无法发送链式转发 ACK")
             return False
 
-        from tcp_comm import MessageType
+        from transport_port import MessageType
 
         payload = {
             "task_id": task_id,
@@ -11299,7 +11304,7 @@ class Scheduler:
                     if k != "_relay_to"
                 }
                 relay_data["_chain_predecessor"] = node_id
-                from tcp_comm import MessageType
+                from transport_port import MessageType
                 self._send_to_worker(relay_target, relay_data,
                                      MessageType.CHAIN_FORWARD)
                 self._handle_chain_forward_ack(
@@ -11745,7 +11750,7 @@ class Scheduler:
     def _broadcast_pipeline_abort(self, pipeline_nodes: list, task_id: str,
                                    reason: str, count_error: bool = True) -> None:
         """向所有流水线节点广播 PIPELINE_ABORT（清理各节点 + master 本地 KV cache）。"""
-        from tcp_comm import MessageType
+        from transport_port import MessageType
         failed_nodes = []
         for n in pipeline_nodes:
             node_id = n.get("node_id")
@@ -11813,7 +11818,7 @@ class Scheduler:
         Returns:
             True 发送成功，False 连接失败
         """
-        from tcp_comm import TCPClient, MessageType
+        from transport_port import create_client, MessageType
 
         addr = self._get_node_address(target_node_id)
         if not addr:
@@ -11844,7 +11849,7 @@ class Scheduler:
                             cached.disconnect()
                         except Exception:
                             pass
-                    client = TCPClient(
+                    client = create_client(
                         server_host=addr["host"],
                         server_port=addr["port"],
                         client_id=self.get_effective_node_id(),
@@ -11882,7 +11887,7 @@ class Scheduler:
     def _send_to_worker(self, worker_id: str, data: dict,
                         msg_type=None) -> None:
         """主节点 → 从节点：发送消息"""
-        from tcp_comm import MessageType
+        from transport_port import MessageType
         if msg_type is None:
             msg_type = MessageType.LAYER_FORWARD
         if not self._tcp_server or not self._tcp_server._running:
@@ -12260,7 +12265,7 @@ class Scheduler:
             {"response": str, "thinking": str, "metrics": dict, ...}
         """
         import uuid
-        from tcp_comm import MessageType, deserialize_tensor_fast, serialize_tensor_fast
+        from transport_port import MessageType, deserialize_tensor, serialize_tensor
 
         mgr = self._host
         if not mgr:
@@ -12622,7 +12627,7 @@ class Scheduler:
                     hs_cpu = local_result["hidden_states"].detach().cpu()
                     import base64 as _b64
                     forward_data["hidden_states"] = _b64.b64encode(
-                        serialize_tensor_fast(hs_cpu)
+                        serialize_tensor(hs_cpu)
                     ).decode("ascii")
                     forward_data["hidden_shape"] = list(hs_cpu.shape)
                     logger.debug(
@@ -12705,7 +12710,7 @@ class Scheduler:
             if "logits" in result and result["logits"] is not None:
                 logits_data = result["logits"]
                 if isinstance(logits_data, bytes):
-                    logits = deserialize_tensor_fast(logits_data).to(device=device)
+                    logits = deserialize_tensor(logits_data).to(device=device)
                 elif torch is not None and isinstance(logits_data, torch.Tensor):
                     logits = logits_data.to(device=device)
                 else:
@@ -12714,7 +12719,7 @@ class Scheduler:
             elif "hidden_states" in result and result["hidden_states"] is not None:
                 hidden_data = result["hidden_states"]
                 if isinstance(hidden_data, bytes):
-                    final_hidden = deserialize_tensor_fast(hidden_data)
+                    final_hidden = deserialize_tensor(hidden_data)
                 elif torch is not None and isinstance(hidden_data, torch.Tensor):
                     final_hidden = hidden_data
                 else:
@@ -13090,8 +13095,8 @@ class Scheduler:
                 _fallback_reason="model_not_loaded_for_pipeline",
                 **kwargs,
             )
-        engine_type = getattr(mgr, '_engine_type', '')
-        if engine_type and engine_type != 'pytorch':
+        engine_type = backend_id_for(mgr)
+        if engine_type and not runtime_supports(mgr, Capability.FORWARD_LAYERS):
             logger.info(
                 f"引擎类型为 {engine_type}，不支持流水线层拆分，"
                 f"使用全模型推理"
@@ -13369,7 +13374,7 @@ class Scheduler:
                 )
                 elapsed = time.time() - t0
                 metrics = {
-                    "engine": getattr(mgr, '_engine_type', 'unknown') or 'unknown',
+                    "engine": backend_id_for(mgr, default='unknown') or 'unknown',
                     "mode": "fallback_full_model_streaming",
                     "execution_mode": "fallback_full_model_streaming",
                     "distributed_requested": True,
@@ -13408,7 +13413,7 @@ class Scheduler:
                 usage = result.get("usage", {}) or {}
                 completion_tokens = usage.get("completion_tokens", 0)
                 metrics = {
-                    "engine": getattr(mgr, '_engine_type', 'unknown') or 'unknown',
+                    "engine": backend_id_for(mgr, default='unknown') or 'unknown',
                     "mode": "fallback_full_model",
                     "execution_mode": "fallback_full_model",
                     "distributed_requested": True,
@@ -13480,7 +13485,7 @@ class Scheduler:
         top_p = kwargs.pop('top_p', 0.9)
         show_thinking = bool(kwargs.pop('show_thinking', False))
         messages = kwargs.pop("messages", None) or [{"role": "user", "content": prompt}]
-        engine_name = getattr(mgr, "_engine_type", "pytorch") or "pytorch"
+        engine_name = backend_id_for(mgr, default="pytorch") or "pytorch"
         try:
             model_prompt = self._host._build_model_chat_prompt(mgr.tokenizer, messages)
             native_thinking_prompt = "<think>" in model_prompt[-128:].lower()
@@ -13600,7 +13605,7 @@ class Scheduler:
                 getattr(mgr, 'is_loaded', False)
                 or getattr(mgr, 'is_pipeline_prepared', False)
             )
-            and getattr(mgr, '_engine_type', '') == 'pytorch'
+            and runtime_supports(mgr, Capability.FORWARD_LAYERS)
         )
 
         # 获取分层配置
@@ -13701,7 +13706,7 @@ class Scheduler:
                 if str(mac).strip()
             })
             if not macs:
-                from tcp_comm import get_mac_addresses
+                from transport_port import get_mac_addresses
                 macs = sorted({
                     str(mac).strip().lower()
                     for mac in get_mac_addresses()

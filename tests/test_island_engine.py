@@ -478,6 +478,17 @@ def test_select_engine_prefers_island_when_enabled(mock_island_server, monkeypat
     assert model_module.ModelManager.select_engine() == "island"
 
 
+def test_select_engine_honors_runtime_island_override(monkeypatch):
+    model_module = _import_model_module()
+    import config
+
+    monkeypatch.setattr(config, "INFERENCE_ENGINE", "island", raising=False)
+    monkeypatch.setattr(config, "ISLAND_ENABLED", False, raising=False)
+    monkeypatch.setattr(config, "ISLAND_BASE_URL", "", raising=False)
+
+    assert model_module.ModelManager.select_engine() == "island"
+
+
 def test_select_engine_ignores_island_when_disabled(monkeypatch):
     model_module = _import_model_module()
     import config
