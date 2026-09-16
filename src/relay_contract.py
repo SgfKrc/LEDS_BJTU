@@ -21,6 +21,7 @@ the data-plane contract layer.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 from typing import Any, Sequence
 
@@ -29,6 +30,8 @@ RELAY_ENGINE = "llama.cpp"
 RELAY_ACCEPTANCE = "per_token_argmax"
 CUT_LAYER_MIN = 1
 RELAY_FALLBACK_STRATEGY = "single_process_llama_cpp"
+XFRAME_SCOPE = "pc_explicit_only"
+XFRAME_NETWORK_MODES = frozenset({"loopback", "ssh_tunnel"})
 
 _HIDDEN_WIDTH_BYTES = {"float32": 4, "float16": 2}
 
@@ -308,3 +311,70 @@ class RelayFallback:
 
 def relay_fallback(reason: str) -> RelayFallback:
     return RelayFallback(engaged=True, reason=str(reason))
+
+
+@dataclass(frozen=True)
+class RelayXFrameRequest:
+    """Explicit gate for the unverified cross-process/cross-engine relay track."""
+
+    upstream_engine: str
+    downstream_engine: str
+    network_mode: str = "loopback"
+    sequence_length: int = 1
+    temperature: float = 0.0
+    top_p: float = 1.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class RelayXFrameDecision:
+    admitted: bool
+    reason: str
+    fallback: RelayFallback
+    scope: str = XFRAME_SCOPE
+
+    def to_dict(self) -> dict[str, Any]:
+        result = asdict(self)
+        result["fallback"] = self.fallback.to_dict()
+        return result
+
+
+def admit_relay_xframe(request: RelayXFrameRequest | None) -> RelayXFrameDecision:
+    """Fail closed until D->L and network handoff have independent evidence.
+
+    This is deliberately a policy gate, not a claim that hidden-state transport is
+    production-ready.  Only deterministic PC experiments over loopback/SSH are
+    eligible; the normal caller must still provide a separate acceptance report.
+    """
+    if not isinstance(request, RelayXFrameRequest):
+        reason = "invalid_xframe_request"
+    elif request.upstream_engine != RELAY_ENGINE or request.downstream_engine != RELAY_ENGINE:
+        reason = "cross_engine_not_admitted"
+    elif str(request.network_mode).strip().lower() not in XFRAME_NETWORK_MODES:
+        reason = "network_scope_not_admitted"
+    else:
+        try:
+            sequence_length = int(request.sequence_length)
+        except (TypeError, ValueError):
+            sequence_length = 0
+        if sequence_length < 1:
+            reason = "sequence_length_invalid"
+        else:
+            try:
+                temperature = float(request.temperature)
+                top_p = float(request.top_p)
+            except (TypeError, ValueError):
+                temperature = math.nan
+                top_p = math.nan
+            if (
+                not math.isfinite(temperature)
+                or not math.isfinite(top_p)
+                or temperature != 0.0
+                or top_p != 1.0
+            ):
+                reason = "sampling_matrix_not_admitted"
+            else:
+                reason = "xframe_evidence_required"
+    return RelayXFrameDecision(False, reason, relay_fallback(reason))
