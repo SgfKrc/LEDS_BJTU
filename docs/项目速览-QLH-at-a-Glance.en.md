@@ -88,9 +88,9 @@ Distributed mode: all nodes sign in with the same Tailscale account → "Connect
 
 ## Reading map
 
-- **Mainline plan**: [Distributed Inference & Edge Optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md) · **Side-line plan**: [Externalization & Koakumix](支线开发计划-外置迁移与Koakumix-2026-09-14.md) · Historical schedule: [总体下一步计划](总体下一步计划.md)
+- **Mainline plan**: [Distributed Inference & Edge Optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md) · **Side-line plan**: Externalization & Koakumix · Historical schedule: [总体下一步计划](总体下一步计划.md)
 - **Newcomer**: [项目技术说明](项目技术说明.md) → [整体架构](整体架构.md) → [模块接口说明](模块接口说明.md)
-- **Sub-projects**: [harness plan](../harness_workbench/docs/小模型轻量推理harness工作台调研与方案.md) · [qlh-docagent](https://github.com/SgfKrc/qlh-docagent) · [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge) · [web-tool research](archive/联网搜索与轻量Fetch工具调用可行性调研与分期计划.md)
+- **Sub-projects**: [harness plan](../harness_workbench/docs/小模型轻量推理harness工作台调研与方案.md) · [qlh-docagent](https://github.com/SgfKrc/qlh-docagent) · [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge) · web-tool research
 - **Experiments & judging**: [DS3 replaces R1](DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) · [sub-1B plan](亚1B小模型专项实验计划.md) · [tests & criteria](测试与评判标准.md)
 
 *Note: most specialized documents are in Chinese (see the root README index).*
