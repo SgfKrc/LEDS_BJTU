@@ -543,6 +543,22 @@ QLH_NO_POS_FIX=1 $BIN/llama-relay-check.exe H:/qlh_models/Qwen-1_8B-Chat.Q4_K_M.
 脚本：`build/cross-framework-layer-poc/sampling_matrix_check.py`（读两份 dump，纯 numpy，跑完释放约 1.2 GB）；
 报告：`local_docs/CORE-RELAY-XFRAME-01-dl-sampling-matrix-2026-09-16.json`。
 
+### 13.7 f32 权重对照（2026-09-16，本仓库实测）
+
+目的：确认 `pos` 契约与 D→L 等价性**不依赖于权重格式**。
+
+| 步骤 | 命令要点 | 结果 |
+| --- | --- | --- |
+| baseline | `qwen35-2b-f32.gguf`（整模型 f32）+ `--tokens`（141 tokens） | 写出 141×248320 logits |
+| D→L | `qwen35-2b-f32-cut.gguf`（裁层 f32）+ `--embd torch-hs-l3.f32` | 写出 141×248320 logits |
+| 判定 | `compare_all.py` | **argmax 一致 `141/141`，cosine min `0.999999`** |
+
+**内存**：整模型 f32 为 7.8 GB（mmap 按需读），实测 **Free 9416 MB → 9458 MB**，**未出现内存压力**；
+因此 f32 对照**不需要**额外驻留 torch fp32 模型（直接复用既有的 `torch-hs-l3.f32` 导出）。
+
+**结论**：**f16 与 f32 两种格式下 D→L 141-token prefill 均为 141/141** —— 与「#28963 是 `pos` 越界读、
+与权重类型无关」的定性一致；此前"换成 F16/Q8_0 就变确定"的观感，正来自越界读到的堆内容。
+
 ### 13.4 待办
 
 - 若上游在**库侧**修复（对单段位置做广播，或扩展 header 语义），本地补丁即可移除；
