@@ -11,7 +11,9 @@ Design rules:
 * missing assets produce a named ``missing_assets`` report and nothing is executed, so the
   probe can never claim a relay run it did not perform;
 * the same contract rules as the main path are reused instead of re-deriving them here;
-* the runner is injectable, so tests exercise parsing and judgement without loading models.
+* the runner is injectable, so tests exercise parsing and judgement without loading models;
+* with ``verify_fallback`` the probe *runs* the non-relay (whole-model, token) path after any
+  rejection, so "fallback available" is proven rather than asserted.
 
 This is an acceptance probe, not a production relay supervisor.
 """
@@ -23,15 +25,19 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from src.relay_contract import RELAY_ACCEPTANCE, judge_relay_generation
+from src.relay_contract import RELAY_ACCEPTANCE, judge_relay_generation, relay_fallback
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EXPERIMENT_ROOT = ROOT / "build" / "cross-framework-layer-poc"
 DEFAULT_RUNNER = DEFAULT_EXPERIMENT_ROOT / "llama.cpp" / "build-cpu" / "bin" / "llama-relay-gen.exe"
+DEFAULT_FALLBACK_RUNNER = (
+    DEFAULT_EXPERIMENT_ROOT / "llama.cpp" / "build-cpu" / "bin" / "llama-relay-check.exe"
+)
 DEFAULT_UPSTREAM_MODEL = DEFAULT_EXPERIMENT_ROOT / "out" / "qwen35-2b-f16.gguf"
 DEFAULT_DOWNSTREAM_MODEL = DEFAULT_EXPERIMENT_ROOT / "out" / "qwen35-2b-f16-cut.gguf"
 DEFAULT_PROMPT = DEFAULT_EXPERIMENT_ROOT / "out" / "prompt-single.txt"
@@ -68,6 +74,7 @@ class RelayProbePlan:
     n_gen: int = DEFAULT_GEN
     threads: int = DEFAULT_THREADS
     timeout_seconds: float = 900.0
+    fallback_runner: Path = DEFAULT_FALLBACK_RUNNER
 
     @property
     def command(self) -> list[str]:
@@ -83,10 +90,28 @@ class RelayProbePlan:
             str(self.threads),
         ]
 
+    def fallback_command(self, dump_path: str | Path) -> list[str]:
+        """Whole-model token-path forward: the non-relay path a rejection must fall back to."""
+        return [
+            str(self.fallback_runner),
+            str(self.upstream_model),
+            "--tokens",
+            str(self.prompt),
+            "--dump",
+            str(dump_path),
+        ]
+
     def missing_assets(self) -> list[str]:
         return [
             str(path)
             for path in (self.runner, self.upstream_model, self.downstream_model, self.prompt)
+            if not path.is_file()
+        ]
+
+    def missing_fallback_assets(self) -> list[str]:
+        return [
+            str(path)
+            for path in (self.fallback_runner, self.upstream_model, self.prompt)
             if not path.is_file()
         ]
 
@@ -95,6 +120,7 @@ def build_plan(
     root: str | Path = DEFAULT_EXPERIMENT_ROOT,
     *,
     runner: str | Path = DEFAULT_RUNNER,
+    fallback_runner: str | Path = DEFAULT_FALLBACK_RUNNER,
     upstream_model: str | Path = DEFAULT_UPSTREAM_MODEL,
     downstream_model: str | Path = DEFAULT_DOWNSTREAM_MODEL,
     prompt: str | Path = DEFAULT_PROMPT,
@@ -105,6 +131,11 @@ def build_plan(
     base = Path(root).expanduser()
     return RelayProbePlan(
         runner=Path(runner).expanduser() if runner else base / "llama.cpp" / "build-cpu" / "bin" / "llama-relay-gen.exe",
+        fallback_runner=(
+            Path(fallback_runner).expanduser()
+            if fallback_runner
+            else base / "llama.cpp" / "build-cpu" / "bin" / "llama-relay-check.exe"
+        ),
         upstream_model=Path(upstream_model).expanduser() if upstream_model else base / "out" / "qwen35-2b-f16.gguf",
         downstream_model=Path(downstream_model).expanduser() if downstream_model else base / "out" / "qwen35-2b-f16-cut.gguf",
         prompt=Path(prompt).expanduser() if prompt else base / "out" / "prompt-single.txt",
@@ -138,6 +169,7 @@ def plan_report(plan: RelayProbePlan) -> dict[str, Any]:
         "criterion": RELAY_ACCEPTANCE,
         "command": " ".join(plan.command),
         "runner": str(plan.runner),
+        "fallback_runner": str(plan.fallback_runner),
         "upstream_model": str(plan.upstream_model),
         "downstream_model": str(plan.downstream_model),
         "prompt": str(plan.prompt),
@@ -164,8 +196,45 @@ def _default_runner(command: list[str], timeout: float) -> tuple[int, str]:
     return completed.returncode, (completed.stdout or "") + (completed.stderr or "")
 
 
-def run_probe(plan: RelayProbePlan, *, runner: Runner | None = None) -> dict[str, Any]:
-    """Execute the baseline/relay pair and judge the result with the relay contract."""
+def _verify_single_process(plan: RelayProbePlan, execute: Runner, *, reason: str) -> dict[str, Any]:
+    """Actually run the non-relay (whole-model, token) path after a rejection.
+
+    A rejection only counts as an available fallback when the single-process path demonstrably
+    works; otherwise the report says so instead of promising a fallback that is not there.
+    """
+    fallback = relay_fallback(reason).to_dict()
+    fallback["verify"] = "single_process_token_forward"
+
+    missing = plan.missing_fallback_assets()
+    if missing:
+        fallback.update({"single_process_ok": False, "missing_assets": missing})
+        return fallback
+
+    with tempfile.TemporaryDirectory(prefix="qlh-relay-fallback-") as temp_dir:
+        dump = Path(temp_dir) / "single-process-logits.f32"
+        command = plan.fallback_command(dump)
+        fallback["command"] = " ".join(command)
+        try:
+            returncode, output = execute(command, plan.timeout_seconds)
+        except subprocess.TimeoutExpired:
+            fallback.update({"single_process_ok": False, "reason": "fallback_timeout"})
+            return fallback
+        except (OSError, UnicodeError) as exc:
+            fallback.update(
+                {"single_process_ok": False, "reason": "fallback_unavailable", "error": str(exc)}
+            )
+            return fallback
+
+        fallback["returncode"] = returncode
+        fallback["stdout_tail"] = (output or "")[-1000:]
+        ok = returncode == 0 and dump.is_file() and dump.stat().st_size > 0
+        fallback["single_process_ok"] = ok
+        if not ok:
+            fallback["reason"] = "single_process_path_failed"
+        return fallback
+
+
+def _run_relay(plan: RelayProbePlan, *, runner: Runner | None = None) -> dict[str, Any]:
     report = plan_report(plan)
     missing = report["missing_assets"]
     if missing:
@@ -212,10 +281,29 @@ def run_probe(plan: RelayProbePlan, *, runner: Runner | None = None) -> dict[str
     return report
 
 
+def run_probe(
+    plan: RelayProbePlan,
+    *,
+    runner: Runner | None = None,
+    fallback_runner: Runner | None = None,
+    verify_fallback: bool = False,
+) -> dict[str, Any]:
+    """Run the baseline/relay pair, judge it, and optionally prove the fallback path works."""
+    report = _run_relay(plan, runner=runner)
+    if verify_fallback and report.get("status") != "accepted":
+        report["fallback"] = _verify_single_process(
+            plan,
+            fallback_runner or runner or _default_runner,
+            reason=str(report.get("status")),
+        )
+    return report
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="L -> L relay acceptance probe (per-token argmax)")
     parser.add_argument("--root", default=str(DEFAULT_EXPERIMENT_ROOT))
     parser.add_argument("--runner", default=None, help="path to llama-relay-gen")
+    parser.add_argument("--fallback-runner", default=None, help="path to llama-relay-check")
     parser.add_argument("--upstream-model", default=None)
     parser.add_argument("--downstream-model", default=None)
     parser.add_argument("--prompt", default=None)
@@ -223,12 +311,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--threads", type=int, default=DEFAULT_THREADS)
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--verify-fallback",
+        action="store_true",
+        help="after a rejection, actually run the single-process path and report whether it works",
+    )
     parser.add_argument("--json-out", default=None)
     args = parser.parse_args(argv)
 
     plan = build_plan(
         args.root,
         runner=args.runner or DEFAULT_RUNNER,
+        fallback_runner=args.fallback_runner or DEFAULT_FALLBACK_RUNNER,
         upstream_model=args.upstream_model or DEFAULT_UPSTREAM_MODEL,
         downstream_model=args.downstream_model or DEFAULT_DOWNSTREAM_MODEL,
         prompt=args.prompt or DEFAULT_PROMPT,
@@ -236,7 +330,10 @@ def main(argv: list[str] | None = None) -> int:
         threads=args.threads,
         timeout_seconds=args.timeout,
     )
-    report = plan_report(plan) if args.dry_run else run_probe(plan)
+    report = plan_report(plan) if args.dry_run else run_probe(
+        plan,
+        verify_fallback=args.verify_fallback,
+    )
     text = json.dumps(report, ensure_ascii=False, indent=2)
     print(text)
     if args.json_out:
