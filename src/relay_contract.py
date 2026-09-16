@@ -10,9 +10,10 @@ relay pipeline without re-deriving the rules:
   ``layer i + K``, so the trim offset must travel with every handoff (§7.9);
 * **boundary** -- the engine-specific last layer is never handed off; hidden crosses only
   for layer numbers ``0..n_layer-2`` (§7.3/§7.7);
-* **acceptance** -- decided by per-token **argmax**, never by a cosine threshold: the
-  ``llama_batch.embd`` path is not bit-reproducible even inside a single process
-  (§7.11.2), so ``cosine``/``bitwise_equal`` are recorded as diagnostics only;
+* **acceptance** -- decided by per-token **argmax**, never by a cosine threshold;
+  ``cosine``/``bitwise_equal`` are recorded as diagnostics only. The former apparent
+  ``embd`` non-determinism was upstream issue #28963's caller-side ``pos`` overread and
+  disappeared after supplying every M-RoPE position section (§7.11.3/§13);
 * **fallback** -- any rejection or failure falls back to single-process llama.cpp.
 
 Only stdlib is used and nothing is imported from the control plane, so this stays inside
@@ -28,17 +29,11 @@ from typing import Any, Sequence
 RELAY_ENGINE = "llama.cpp"
 #: Strict acceptance criterion: every generated token must match by argmax.
 RELAY_ACCEPTANCE = "per_token_argmax"
-#: Tolerant acceptance criterion for the embedding-input (``embd``) handoff path.
-#:
-#: Measured 2026-09-16 (``llama-relay-gen``, Qwen3.5-2B, L -> L, 141-step generation): at every
-#: observed divergence (6/6 runs, steps 31-67) the two logits vectors agreed at cosine
-#: 0.984-0.999 with a 4-5/5 top-5 overlap, and the two argmaxes were each ranked **2nd** in the
-#: other vector -- every divergence was a top-1 <-> top-2 swap caused by the ``embd`` path's
-#: known non-determinism, which autoregression then amplifies. A strict per-token criterion is
-#: therefore unattainable on that path (even for L -> L, which fails by step 46); the relay
-#: argmax merely has to fall inside the baseline's top-k (k = 2 covers all measured cases).
+#: Diagnostic-only tolerant comparison retained for investigating rejected runs. It must
+#: never admit Relay: the top-1/top-2 swaps observed before the #28963 position fix were
+#: artifacts of an out-of-bounds read, and strict per-token acceptance is now attainable.
 RELAY_ACCEPTANCE_TOLERANT = "top_k_tolerant_argmax"
-#: Top-k used by :data:`RELAY_ACCEPTANCE_TOLERANT`.
+#: Top-k used by the diagnostic comparator.
 RELAY_TOLERANT_TOP_K = 2
 CUT_LAYER_MIN = 1
 RELAY_FALLBACK_STRATEGY = "single_process_llama_cpp"
@@ -264,8 +259,7 @@ def judge_relay_generation(
     """Accept a relay run only when every generated token matches by argmax.
 
     ``cosine`` and ``bitwise_equal`` are recorded for the evidence trail but never gate the
-    verdict: the embedding-input path is not bit-reproducible (§7.11.2), and a low cosine
-    with a matching argmax is the expected shape of a healthy relay run.
+    verdict. Strict token equality remains the only acceptance criterion.
     """
     baseline = [int(token) for token in baseline_tokens]
     relay = [int(token) for token in relay_tokens]
@@ -316,18 +310,14 @@ def judge_relay_generation_tolerant(
     cosine: float | None = None,
     bitwise_equal: bool | None = None,
 ) -> RelayComparisonVerdict:
-    """Accept a relay run when every relay token falls inside the baseline's top-k.
+    """Diagnose whether relay tokens remain inside the baseline's top-k.
 
-    Use this instead of :func:`judge_relay_generation` on the ``embd`` handoff path: that path
-    is not bit-reproducible inside a single process, and its observed divergence is always a
-    top-1 <-> top-2 swap (see :data:`RELAY_ACCEPTANCE_TOLERANT`). Autoregression amplifies one
-    swap into a different tail, so a strict per-token comparison fails even on healthy L -> L
-    relays (measured: fails by step 46 of 141). Membership in the baseline's top-k is the
-    strongest criterion the path actually satisfies.
+    This result is never a production or evidence admission. It is retained to explain a
+    strict rejection; the pre-fix top-1/top-2 swaps came from #28963's position-array overread.
 
     ``baseline_topk[i]`` is the baseline's ranked candidate list at step ``i`` (best first);
     only its first ``top_k`` entries are consulted. ``cosine`` / ``bitwise_equal`` are recorded
-    for the evidence trail and never gate the verdict.
+    as diagnostics and never gate this diagnostic result.
     """
     baseline = [[int(candidate) for candidate in candidates] for candidates in baseline_topk]
     relay = [int(token) for token in relay_tokens]

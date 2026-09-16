@@ -141,8 +141,8 @@ def test_hidden_spec_reports_wire_size():
 
 
 def test_argmax_is_the_only_criterion_even_when_cosine_is_low():
-    # §7.11.2: the embd path is not bit-reproducible inside one process. A relay run that
-    # matches on argmax must still pass, otherwise the contract would reject healthy runs.
+    # Numeric diagnostics do not replace the strict token criterion. After the #28963
+    # position fix, the 141-step path reaches strict equality despite non-bitwise logits.
     verdict = judge_relay_generation(
         [11751, 13, 198, 32],
         [11751, 13, 198, 32],
@@ -188,10 +188,8 @@ def test_fallback_always_names_the_single_process_strategy():
     assert fallback.to_dict()["strategy"] == "single_process_llama_cpp"
 
 
-def test_tolerant_criterion_accepts_a_top1_top2_swap():
-    # 2026-09-16 measured shape (llama-relay-gen, Qwen3.5-2B, 141-step L -> L): every observed
-    # divergence was a top-1 <-> top-2 swap (cosine 0.984-0.999, top-5 overlap 4-5/5), which
-    # autoregression then amplified into a different tail. See RELAY_ACCEPTANCE_TOLERANT.
+def test_tolerant_diagnostic_reports_a_top1_top2_swap_without_changing_strict_acceptance():
+    # This explains a rejected run only. The old measured swaps were artifacts of #28963.
     verdict = judge_relay_generation_tolerant(
         [[2912, 804, 328, 2434, 7957], [271, 198, 25, 4558, 695]],
         [804, 198],
