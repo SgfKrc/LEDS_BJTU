@@ -220,12 +220,13 @@ class TuiSplash:
                 scan_row = (since // SCAN_STEP_TICKS) % GRID_ROWS
 
         lines = render_logo(GRID, scan_row, revealed)
-        out = ["\x1b[H", "\x1b[2J"]  # home + clear
-        out.append("")
+        # 光标归位 + 逐行覆盖 + 清到屏底：不再全屏清屏，避免"追加式"终端里出现残影/重播观感。
+        out = ["\x1b[H", "\x1b[2K\n"]
         for line in lines:
-            out.append("   " + line + "\n")
-        out.append("\n" + "   " + _fg(COLOR_SIGN) + sub_text + RESET + "\n")
-        out.append("\n" + self._line_status() + "\n")
+            out.append("   " + line + "\x1b[2K\n")
+        out.append("\n" + "   " + _fg(COLOR_SIGN) + sub_text + RESET + "\x1b[2K\n")
+        out.append("\n" + self._line_status() + "\x1b[2K\n")
+        out.append("\x1b[J")
         self._write("".join(out))
 
     # ---------------------------------------------------------------- 主流程
@@ -248,7 +249,9 @@ class TuiSplash:
         worker = threading.Thread(target=_run, name="koakumix-splash-load", daemon=True)
         worker.start()
 
-        self._write(HIDE_CURSOR)
+        # 切到备用屏（alt screen）：退出时终端自动恢复进入前的画面，
+        # 避免"清屏 + 残影"被误读为动画反复播放。
+        self._write("\x1b[?1049h" + HIDE_CURSOR)
         try:
             while True:
                 self._frame += 1
@@ -260,7 +263,8 @@ class TuiSplash:
                     break
                 time.sleep(TICK_SECONDS)
         finally:
-            self._write("\x1b[2J\x1b[H" + SHOW_CURSOR)
+            # 退出备用屏并恢复光标：终端回到进入动画前的画面
+            self._write(SHOW_CURSOR + "\x1b[?1049l")
 
         worker.join(timeout=1.0)
         if self._error is not None:
