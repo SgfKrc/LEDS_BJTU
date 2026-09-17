@@ -35,6 +35,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+try:
+    from tui_chat_screen import ChatScreen
+except ImportError:  # pragma: no cover - optional during isolated import
+    ChatScreen = None
+
+try:
+    from tui_shared import API_PATHS
+except ImportError:  # pragma: no cover - package import path
+    from .tui_shared import API_PATHS  # type: ignore
+
 IS_WINDOWS = os.name == "nt"
 
 if IS_WINDOWS:
@@ -430,9 +440,10 @@ class AnsiTerm:
         if not self.color or not style:
             return text
         codes = {
-            "title": "1;36", "ok": "32", "err": "1;31", "warn": "33",
-            "dim": "2", "sel": "7", "head": "1;37", "key": "36",
-            "input": "36", "cmd": "1;33",
+            "brand": "1;96", "title": "1;36", "ok": "32", "err": "1;31",
+            "warn": "33", "dim": "2", "muted": "2", "sel": "1;30;46",
+            "active": "1;30;46", "head": "1;97", "section": "1;37",
+            "key": "36", "input": "36", "cmd": "1;33",
         }
         code = codes.get(style)
         if not code:
@@ -1031,11 +1042,13 @@ class DistributedScreen(Screen):
     auto_refresh = False
 
     def fetch(self):
-        di = self.api.get("/cluster/config/distributed-inference")
-        layers, layers_err = self._sub("/cluster/layers")
+        di = self.api.get(API_PATHS["distributed_config"])
+        layers, layers_err = self._sub(API_PATHS["cluster_layers"])
+        capacity, capacity_err = self._sub(API_PATHS["cluster_pipeline_capacity"])
         cfg, cfg_err = self._sub("/cluster/config")
-        reshard, reshard_err = self._sub("/cluster/pipeline-reshard")
+        reshard, reshard_err = self._sub(API_PATHS["cluster_pipeline_reshard"])
         return {"di": di, "layers": layers, "layers_err": layers_err,
+                "capacity": capacity, "capacity_err": capacity_err,
                 "cfg": cfg, "cfg_err": cfg_err, "reshard": reshard,
                 "reshard_err": reshard_err}
 
@@ -1043,6 +1056,7 @@ class DistributedScreen(Screen):
         d = self.data or {}
         di = d.get("di") or {}
         layers = d.get("layers") or {}
+        capacity = d.get("capacity") or {}
         cfg = d.get("cfg") or {}
         reshard = d.get("reshard") or {}
         out = []
@@ -1052,26 +1066,82 @@ class DistributedScreen(Screen):
             onoff(di.get("enabled")), onoff(di.get("default")))))
         out.append(("", ""))
         out.append(("title", "◆ 模型分层"))
+        layout = capacity.get("pipeline_layout")
+        if capacity.get("admitted") is True and isinstance(layout, dict):
+            engines = ", ".join(str(item) for item in (layout.get("engines") or [])) or "—"
+            aggregate = layout.get("aggregate_capacity") or {}
+            required = fmt_bytes(aggregate.get("required_bytes"))
+            headroom = fmt_bytes(aggregate.get("headroom_bytes"))
+            mode = "分布式" if layout.get("is_distributed") else "本地单节点"
+            contract = str(layout.get("contract_sha256") or "")
+            contract = contract[:12] if contract else "—"
+            out.append(("", "  总层数: %s    节点数: %s    引擎: %s" % (
+                layout.get("total_layers", "—"),
+                len(layout.get("nodes") or []), engines)))
+            out.append(("", "  模式: %s    合同: %s    聚合容量: 需求 %s / 余量 %s" % (
+                mode, contract, required, headroom)))
+            device_parts = []
+            for device, item in sorted((aggregate.get("by_execution_device") or {}).items()):
+                device_parts.append("%s %s 节点" % (device, item.get("node_count", 0)))
+            if device_parts:
+                out.append(("dim", "  执行设备: " + ", ".join(device_parts)))
+            rows = []
+            for node in (layout.get("nodes") or []):
+                layer_range = node.get("layer_range") or []
+                if len(layer_range) == 2:
+                    layer_text = "[%s,%s)" % (layer_range[0], layer_range[1])
+                else:
+                    layer_text = "?"
+                capacity_view = node.get("capacity") or {}
+                endpoint = "远端" if node.get("federated") else "本地"
+                if node.get("cross_engine"):
+                    endpoint += "/跨引擎"
+                handoff = node.get("handoff_at")
+                rows.append([
+                    node.get("node_id", ""), node.get("kind", "—"), layer_text,
+                    node.get("engine", "—"), endpoint,
+                    fmt_bytes(capacity_view.get("required_bytes")),
+                    fmt_bytes(capacity_view.get("headroom_bytes")),
+                    handoff if handoff is not None else "—",
+                ])
+            if rows:
+                for ln in make_table(
+                    ["节点", "类型", "层区间", "引擎", "端", "需求", "余量", "交接"],
+                    rows, max_width=width - 2,
+                ):
+                    out.append(("", "  " + ln))
+            out.append(("dim", "  类型: local=本机层段  remote_pipeline=流水线远端节点"))
+        else:
+            status = capacity.get("status", "unavailable")
+            reason = capacity.get("reason_code") or capacity.get("reason") or "暂无可用布局"
+            out.append(("dim", "  布局状态: %s    原因: %s" % (status, reason)))
+            out.append(("dim", "  （PipelineLayout 未就绪；下方保留旧分层覆盖视图）"))
+        if d.get("layers_err"):
+            out.append(("err", "  分层查询失败: %s" % d["layers_err"]))
+        if d.get("capacity_err"):
+            out.append(("err", "  容量布局查询失败: %s" % d["capacity_err"]))
+        out.append(("", ""))
+        out.append(("title", "◆ 手动覆盖分层（兼容控制）"))
         out.append(("", "  总层数: %s    策略: %s    计算时间: %s" % (
             layers.get("total", "—"), layers.get("strategy", "—"),
             fmt_age(layers.get("computed_at")))))
-        rows = []
-        for a in (layers.get("assignments") or []):
-            rows.append([
-                a.get("node_id", ""), role_cn(a.get("role", "")),
-                "%s-%s" % (a.get("start_layer", "?"), a.get("end_layer", "?")),
-                "是" if a.get("has_embedding") else "否",
-                "是" if a.get("has_lm_head") else "否",
-                a.get("score", "—"),
+        legacy_rows = []
+        for assignment in (layers.get("assignments") or []):
+            legacy_rows.append([
+                assignment.get("node_id", ""), role_cn(assignment.get("role", "")),
+                "%s-%s" % (assignment.get("start_layer", "?"), assignment.get("end_layer", "?")),
+                "是" if assignment.get("has_embedding") else "否",
+                "是" if assignment.get("has_lm_head") else "否",
+                assignment.get("score", "—"),
             ])
-        if rows:
-            for ln in make_table(["节点", "角色", "层区间", "Embedding", "LM Head", "评分"],
-                                 rows, max_width=width - 2):
+        if legacy_rows:
+            for ln in make_table(
+                ["节点", "角色", "层区间", "Embedding", "LM Head", "评分"],
+                legacy_rows, max_width=width - 2,
+            ):
                 out.append(("", "  " + ln))
         else:
-            out.append(("dim", "  （暂无分层分配，单机模式或未启用分布式）"))
-        if d.get("layers_err"):
-            out.append(("err", "  分层查询失败: %s" % d["layers_err"]))
+            out.append(("dim", "  （暂无手动覆盖；执行布局以 PipelineLayout 为准）"))
         out.append(("", ""))
         out.append(("title", "◆ 自动重分片"))
         state = str(reshard.get("status", "inactive") or "inactive")
@@ -1580,6 +1650,8 @@ SCREEN_CLASSES = [
     DashboardScreen, NodesScreen, DistributedScreen, QueueScreen,
     DeviceScreen, LogsScreen, SettingsScreen,
 ]
+if ChatScreen is not None:
+    SCREEN_CLASSES.append(ChatScreen)
 
 
 # ============================================================
@@ -2223,14 +2295,105 @@ def cmd_chat(app, args, opts):
     sub = args[0].lower() if args else ""
     if sub == "clear":
         app.api.post("/chat/clear")
+        chat = app.find_screen("chat")
+        if chat is not None:
+            clear = getattr(chat, "_act_clear", None)
+            if callable(clear) and not getattr(chat, "streaming", False):
+                clear(None)
         return ("对话历史已清空", "ok")
-    return ("用法: /chat clear", "err")
+    if sub in {"open", "chat"}:
+        return (app.open_screen("chat") or "聊天屏不可用", "ok")
+    return ("用法: /chat clear|open", "err")
+
+
+def _chat_screen(app):
+    screen = app.find_screen("chat")
+    if screen is None or not hasattr(screen, "session_lines"):
+        return None
+    return screen
+
+
+def cmd_new_session(app, args, opts):
+    screen = _chat_screen(app)
+    if screen is None:
+        return ("聊天屏不可用", "err")
+    message = screen._act_new_session(None)
+    if message and message.startswith(("创建会话失败", "当前正在")):
+        return (message, "warn")
+    app.open_screen("chat")
+    return (message or "已开新会话", "ok")
+
+
+def cmd_sessions(app, args, opts):
+    screen = _chat_screen(app)
+    if screen is None:
+        return ("聊天屏不可用", "err")
+    screen.refresh(force=True)
+    lines = screen.session_lines()
+    app.show_output(lines or ["暂无历史会话"], title="◆ 会话列表")
+    return ("共 %d 个会话" % len(lines), "ok")
+
+
+def cmd_resume_session(app, args, opts):
+    screen = _chat_screen(app)
+    if screen is None:
+        return ("聊天屏不可用", "err")
+    result = screen.resume_session(args[0])
+    if result.startswith(("已恢复",)):
+        app.open_screen("chat")
+        return (result, "ok")
+    return (result, "err")
+
+
+def cmd_rename_session(app, args, opts):
+    screen = _chat_screen(app)
+    if screen is None:
+        return ("聊天屏不可用", "err")
+    result = screen.rename_session(" ".join(args))
+    return (result, "ok" if result.startswith("会话已") else "err")
+
+
+def cmd_delete_session(app, args, opts):
+    screen = _chat_screen(app)
+    if screen is None:
+        return ("聊天屏不可用", "err")
+    result = screen.delete_session()
+    if result.startswith("已删除"):
+        app.open_screen("chat")
+        return (result, "ok")
+    return (result, "err")
+
+
+def cmd_route(app, args, opts):
+    from tui_shared import resolve_route_arg
+
+    screen = _chat_screen(app)
+    route = resolve_route_arg(args[0]) if args else None
+    if screen is None or route is None:
+        return ("用法: /route auto|local|distributed|required", "warn")
+    screen.configure(routing_preference=route)
+    return ("聊天路由偏好: %s" % route, "ok")
+
+
+def cmd_thinking(app, args, opts):
+    screen = _chat_screen(app)
+    if screen is None or args[0].lower() not in {"on", "off", "1", "0", "true", "false"}:
+        return ("用法: /thinking on|off", "warn")
+    enabled = args[0].lower() in {"on", "1", "true"}
+    screen.configure(show_thinking=enabled)
+    return ("思考内容展示: %s" % ("开" if enabled else "关"), "ok")
 
 
 def cmd_cancel(app, args, opts):
     tid = args[0] if args else ""
     if not tid:
-        return ("用法: /cancel <任务ID>", "err")
+        screen = _chat_screen(app)
+        if screen is not None and getattr(screen, "streaming", False):
+            generation_id = getattr(screen, "generation_id", None)
+            if generation_id:
+                screen.cancel(generation_id)
+                return ("已请求取消聊天生成", "ok")
+        return ("用法: /cancel [任务ID]", "warn")
     from urllib.parse import quote
     try:
         r = app.api.post("/chat/generations/%s/cancel" % quote(tid))
@@ -2257,7 +2420,7 @@ COMMANDS = [
     {"name": "/status", "aliases": ["/st"], "usage": "/status",
      "summary": "打开系统状态总览", "handler": cmd_status},
     {"name": "/screen", "aliases": ["/goto"], "usage": "/screen <编号|名称>",
-     "summary": "跳转管理屏幕（1-7 或 名称关键字）", "handler": cmd_screen, "min_args": 1},
+     "summary": "跳转管理屏幕（1-8 或 名称关键字）", "handler": cmd_screen, "min_args": 1},
     {"name": "/refresh", "aliases": ["/r"], "usage": "/refresh",
      "summary": "立即刷新当前屏幕", "handler": cmd_refresh},
     {"name": "/model", "aliases": [],
@@ -2301,10 +2464,24 @@ COMMANDS = [
      "summary": "HTTP 请求超时", "handler": cmd_timeout, "min_args": 1, "max_args": 1},
     {"name": "/token", "aliases": [], "usage": "/token <令牌>",
      "summary": "设置日志访问 Token（留空清除）", "handler": cmd_token, "max_args": 1},
-    {"name": "/chat", "aliases": [], "usage": "/chat <clear>",
-     "summary": "清空对话历史", "handler": cmd_chat, "min_args": 1, "max_args": 1},
-    {"name": "/cancel", "aliases": [], "usage": "/cancel <任务ID>",
-     "summary": "取消生成 / 工作流任务", "handler": cmd_cancel, "min_args": 1, "max_args": 1},
+    {"name": "/chat", "aliases": [], "usage": "/chat <clear|open>",
+     "summary": "打开聊天屏或清空对话历史", "handler": cmd_chat, "min_args": 1, "max_args": 1},
+    {"name": "/new", "aliases": [], "usage": "/new",
+     "summary": "创建并切换新会话", "handler": cmd_new_session},
+    {"name": "/sessions", "aliases": [], "usage": "/sessions",
+     "summary": "列出最近会话", "handler": cmd_sessions},
+    {"name": "/resume", "aliases": [], "usage": "/resume <session_id>",
+     "summary": "恢复历史会话", "handler": cmd_resume_session, "min_args": 1, "max_args": 1},
+    {"name": "/rename", "aliases": [], "usage": "/rename <标题>",
+     "summary": "重命名当前会话", "handler": cmd_rename_session, "min_args": 1},
+    {"name": "/delete-session", "aliases": [], "usage": "/delete-session",
+     "summary": "删除当前会话", "handler": cmd_delete_session},
+    {"name": "/route", "aliases": [], "usage": "/route <auto|local|distributed|required>",
+     "summary": "设置聊天请求路由偏好", "handler": cmd_route, "min_args": 1, "max_args": 1},
+    {"name": "/thinking", "aliases": [], "usage": "/thinking <on|off>",
+     "summary": "控制 thinking 内容显示", "handler": cmd_thinking, "min_args": 1, "max_args": 1},
+    {"name": "/cancel", "aliases": [], "usage": "/cancel [任务ID]",
+     "summary": "取消聊天生成 / 工作流任务", "handler": cmd_cancel, "max_args": 1},
 ]
 
 
@@ -2318,7 +2495,8 @@ def _build_command_help_lines() -> list:
         ("集群 / 队列", ["/nodes", "/connect", "/join", "/dist", "/queue"]),
         ("日志", ["/logs", "/log"]),
         ("设置", ["/host", "/interval", "/timeout", "/token"]),
-        ("会话", ["/chat", "/cancel"]),
+        ("会话", ["/chat", "/new", "/sessions", "/resume", "/rename",
+                   "/delete-session", "/route", "/thinking", "/cancel"]),
     ]
     by_name = {c["name"]: c for c in COMMANDS}
     for title, names in groups:
@@ -2343,13 +2521,20 @@ COMMAND_HELP_TEXT = (
 # ============================================================
 
 class BaseApp:
-    def __init__(self, api: ApiClient, interval: float, is_plain: bool):
+    def __init__(self, api: ApiClient, interval: float, is_plain: bool,
+                 *, chat_options=None):
         self.api = api
         self.interval = interval
         self.is_plain = is_plain
         self.screens = [cls(self) for cls in SCREEN_CLASSES]
+        self.initial_screen = None
         self.exit_requested = False     # True 时主循环退出
         self.shutdown_backend = False   # 退出前是否已请求后端优雅关闭
+        if chat_options:
+            chat = self.find_screen("chat")
+            configure = getattr(chat, "configure", None)
+            if callable(configure):
+                configure(**chat_options)
 
     def reset_screens(self):
         """后端地址变化后清除各屏幕缓存数据。"""
@@ -2368,6 +2553,10 @@ class BaseApp:
                 return self.screens[n - 1]
             return None
         low = key.lower()
+        if low in {"chat", "conversation", "对话"}:
+            for screen in self.screens:
+                if screen.name == "对话":
+                    return screen
         for s in self.screens:
             if low in s.name.lower():
                 return s
@@ -2426,8 +2615,8 @@ class BaseApp:
 class InteractiveApp(BaseApp):
     """全屏 ANSI 交互模式。"""
 
-    def __init__(self, api, interval, term: AnsiTerm):
-        super().__init__(api, interval, is_plain=False)
+    def __init__(self, api, interval, term: AnsiTerm, *, chat_options=None):
+        super().__init__(api, interval, is_plain=False, chat_options=chat_options)
         self.term = term
         self.menu_idx = 0
         self.current = None       # None=主菜单
@@ -2441,6 +2630,9 @@ class InteractiveApp(BaseApp):
 
     # ---- 主循环 ----
     def run(self) -> int:
+        if self.initial_screen is not None:
+            self.current = self.initial_screen
+            self.current.refresh(force=True)
         while not self.exit_requested:
             if self.current is not None:
                 self.current.refresh()
@@ -2507,15 +2699,20 @@ class InteractiveApp(BaseApp):
     def render(self):
         w, h = self.term.size()
         rows = []
-        title = " %s · %s  v%s   后端 %s" % (APP_TITLE, APP_SUBTITLE, TUI_VERSION, self.api.base_url)
-        rows.append(("title", truncate_display(title, w)))
+        rows.append(("brand", truncate_display(" KOAKUMA  /  CORE TUI", w)))
+        meta = "  %s  ·  v%s  ·  backend %s" % (
+            APP_SUBTITLE, TUI_VERSION, self.api.base_url,
+        )
+        rows.append(("muted", truncate_display(meta, w)))
         rows.append(("dim", "─" * w))
-        body_h = max(h - 4, 3)
+        body_h = max(h - 5, 3)
         if self.current is None:
             body = self._menu_lines()
             self.offset = 0
         else:
             raw = []
+            raw.append(("section", "  / %s" % self.current.name))
+            raw.append(("", ""))
             if self.current.error:
                 raw.append(("err", "错误: %s" % self.current.error))
                 raw.append(("", ""))
@@ -2549,13 +2746,19 @@ class InteractiveApp(BaseApp):
         self.term.write(frame)
 
     def _menu_lines(self):
-        lines = [("", ""), ("head", "  请选择管理功能（↑↓ 移动，Enter 进入，数字直达，q 优雅退出）"), ("", "")]
+        lines = [
+            ("", ""),
+            ("section", "  WORKSPACE"),
+            ("muted", "  ↑↓ navigate   Enter open   1-%d direct   / command" % len(self.screens)),
+            ("", ""),
+        ]
         for i, s in enumerate(self.screens):
-            marker = "»" if i == self.menu_idx else " "
-            text = "  %s %d. %s" % (marker, i + 1, s.name)
-            lines.append(("sel" if i == self.menu_idx else "", text))
+            marker = ">" if i == self.menu_idx else " "
+            text = "  %s  %d  %s" % (marker, i + 1, s.name)
+            lines.append(("active" if i == self.menu_idx else "", text))
         lines.append(("", ""))
-        lines.append(("dim", "  提示: 若后端未启动，请先运行 python src/api_server.py"))
+        lines.append(("section", "  COMMANDS"))
+        lines.append(("muted", "  /help  查看命令   /models  模型舰队   /nodes  节点   /quit  退出"))
         return lines
 
     def _hints(self):
@@ -2666,8 +2869,8 @@ class InteractiveApp(BaseApp):
 class PlainApp(BaseApp):
     """无 ANSI 的编号菜单模式：适配管道、旧终端、脚本化操作。"""
 
-    def __init__(self, api, interval):
-        super().__init__(api, interval, is_plain=True)
+    def __init__(self, api, interval, *, chat_options=None):
+        super().__init__(api, interval, is_plain=True, chat_options=chat_options)
 
     def run(self) -> int:
         print("=" * 64)
@@ -2676,6 +2879,10 @@ class PlainApp(BaseApp):
         print("输入 / 开头的命令（如 /help /quant int4）可直接操作")
         print("=" * 64)
         try:
+            if self.initial_screen is not None:
+                self._screen_loop(self.initial_screen)
+                if self.exit_requested:
+                    return 0
             while True:
                 if not self._main_menu():
                     break
@@ -2827,6 +3034,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-color", action="store_true", help="关闭彩色输出")
     p.add_argument("--no-splash", action="store_true",
                    help="跳过启动动画（灰蓝 Koakuma splash；非 TTY 与 --plain 下本就自动跳过）")
+    p.add_argument("--auto-start", action="store_true",
+                   help="统一入口使用进程内 daemon 线程启动本机后端")
+    p.add_argument("--screen", default=None,
+                   help="进入交互 TUI 后立即打开的屏幕（如 chat/对话）")
+    p.add_argument("--route", default="auto",
+                   choices=("auto", "local_only", "distributed_preferred", "distributed_required"),
+                   help="聊天屏初始请求路由偏好")
+    p.add_argument("--thinking", action="store_true",
+                   help="聊天屏请求并显示后端返回的 thinking 内容")
     p.add_argument("--version", action="version",
                    version="qlh-tui-admin %s" % TUI_VERSION)
     p.add_argument("command", nargs="?", default=None, metavar="命令",
@@ -2914,10 +3130,40 @@ def main(argv=None) -> int:
     if command_tail:
         parser.error("unrecognized arguments: %s" % " ".join(command_tail))
 
+    supervisor = None
+    if args.auto_start:
+        try:
+            from tui_backend import BackendStartupError, BackendSupervisor
+
+            supervisor = BackendSupervisor(
+                host=args.host, port=args.port,
+                probe_timeout=min(2.0, args.timeout),
+            )
+            if not args.plain and not args.no_splash:
+                # 把冷启动放进 splash 的 loader：用户在等待导入/设备探测/API
+                # lifespan 时始终看到受控动画，而不是后端日志流。
+                from tui_splash import play_splash
+
+                play_splash(
+                    supervisor.ensure_ready,
+                    status=lambda: supervisor.status_message,
+                    min_show=1.0,
+                )
+            else:
+                # --plain/--no-splash 仍给启动者简洁状态，不暴露后端日志。
+                if args.plain:
+                    print("Koakuma: 正在准备本机后端…")
+                supervisor.ensure_ready()
+                if args.plain:
+                    print("Koakuma: %s" % supervisor.status_message)
+        except BackendStartupError as exc:
+            _force_utf8_stdout()
+            print("[错误] %s" % exc)
+            return 1
+
     if not args.plain:
-        # 启动动画（灰蓝 Koakuma splash）：与"后端健康探测"并行，既播动画又不空等；
-        # 非 TTY（管道/CI）与 --no-splash 自动跳过；动画任何异常都不阻断启动。
-        if not args.no_splash:
+        # 已有后端时仍播放短 splash；未启动后端时上面的 loader 已负责冷启动。
+        if not args.no_splash and supervisor is None:
             try:
                 from tui_splash import play_splash  # 同目录（src/）
 
@@ -2933,13 +3179,24 @@ def main(argv=None) -> int:
                     except Exception:  # noqa: BLE001 - 后端未起也算正常，启动流程继续
                         return None
 
-                play_splash(_probe_health, min_show=1.0)
+                play_splash(_probe_health, status="进入 Koakuma TUI", min_show=0.8)
             except Exception:  # noqa: BLE001 - splash 失败绝不阻断 TUI
                 pass
         term = AnsiTerm(color=not args.no_color)
         try:
             with term:
-                app = InteractiveApp(api, interval, term)
+                app = InteractiveApp(
+                    api, interval, term,
+                    chat_options={
+                        "routing_preference": args.route,
+                        "show_thinking": args.thinking,
+                    },
+                )
+                if args.screen:
+                    app.initial_screen = app.find_screen(args.screen)
+                    if app.initial_screen is None:
+                        print("[错误] 未找到屏幕: %s" % args.screen)
+                        return 2
                 rc = app.run()
                 if app.shutdown_backend:
                     print("后端已优雅退出，所有资源已清理。")
@@ -2956,7 +3213,19 @@ def main(argv=None) -> int:
 
     _force_utf8_stdout()                  # --plain 管道/重定向下防 »/emoji GBK 崩溃
     try:
-        return PlainApp(api, interval).run()
+        app = PlainApp(
+            api, interval,
+            chat_options={
+                "routing_preference": args.route,
+                "show_thinking": args.thinking,
+            },
+        )
+        if args.screen:
+            app.initial_screen = app.find_screen(args.screen)
+            if app.initial_screen is None:
+                print("[错误] 未找到屏幕: %s" % args.screen)
+                return 2
+        return app.run()
     except (EOFError, KeyboardInterrupt):
         print()
         print("再见！")

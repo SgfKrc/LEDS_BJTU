@@ -12,19 +12,16 @@ def test_help_is_local_and_does_not_spawn(monkeypatch, capsys):
     assert called == []
 
 
-def test_chat_dispatches_to_core_chat(monkeypatch):
+def test_chat_fixture_uses_zero_dependency_smoke(monkeypatch):
     seen = {}
 
-    def fake_run(command, **kwargs):
-        seen["command"] = command
-        seen["kwargs"] = kwargs
-        return type("Result", (), {"returncode": 0})()
+    def fake_smoke(path):
+        seen["path"] = path
+        return 0
 
-    monkeypatch.setattr(qlh.subprocess, "run", fake_run)
+    monkeypatch.setattr(qlh, "_load_fixture_smoke", fake_smoke)
     assert qlh.main(["chat", "--fixture", "fixtures/chat.sse"]) == 0
-    assert os.path.normpath(seen["command"][1]).endswith(os.path.normpath("src/tui_chat.py"))
-    assert seen["command"][2:] == ["--fixture", "fixtures/chat.sse"]
-    assert seen["kwargs"]["cwd"] == str(qlh.ROOT)
+    assert seen["path"] == "fixtures/chat.sse"
 
 
 def test_models_is_a_plain_tui_command(monkeypatch):
@@ -38,3 +35,42 @@ def test_models_is_a_plain_tui_command(monkeypatch):
     assert qlh.main(["models"]) == 3
     assert os.path.normpath(seen[0][1]).endswith(os.path.normpath("src/tui_admin.py"))
     assert seen[0][2] == "models"
+
+
+def test_no_args_enters_unified_tui_and_auto_starts(monkeypatch):
+    seen = {}
+
+    class FakeTui:
+        @staticmethod
+        def main(args):
+            seen["args"] = args
+            return 0
+
+    monkeypatch.setattr(qlh, "_load_tui_admin", lambda: FakeTui)
+    assert qlh.main([]) == 0
+    assert seen["args"] == ["--auto-start", "--screen", "chat"]
+
+
+def test_chat_url_enters_unified_tui_without_remote_autostart(monkeypatch):
+    seen = {}
+
+    class FakeTui:
+        @staticmethod
+        def main(args):
+            seen["args"] = args
+            return 0
+
+    monkeypatch.setattr(qlh, "_load_tui_admin", lambda: FakeTui)
+    assert qlh.main(["chat", "--host", "http://100.100.52.106:8000",
+                     "--route", "distributed_preferred"]) == 0
+    assert seen["args"] == [
+        "--screen", "chat", "--host", "100.100.52.106", "--port", "8000",
+        "--route", "distributed_preferred",
+    ]
+
+
+def test_chat_help_is_local(capsys):
+    assert qlh.main(["chat", "--help"]) == 0
+    output = capsys.readouterr().out
+    assert "qlh chat" in output
+    assert "--fixture" in output

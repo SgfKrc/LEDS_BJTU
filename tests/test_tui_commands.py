@@ -129,6 +129,29 @@ class FakeApi:
         return {"status": "ok"}
 
 
+def test_interactive_render_uses_core_cli_visual_hierarchy():
+    class CaptureTerm:
+        def __init__(self):
+            self.output = ""
+
+        def size(self):
+            return 100, 24
+
+        def paint(self, text, style):
+            return text
+
+        def write(self, text):
+            self.output += text
+
+    term = CaptureTerm()
+    app = t.InteractiveApp(FakeApi(), 3.0, term)
+    app.render()
+    assert "KOAKUMA  /  CORE TUI" in term.output
+    assert "WORKSPACE" in term.output
+    assert "COMMANDS" in term.output
+    assert ">  1  " in term.output
+
+
 class FakeApp(t.BaseApp):
     def __init__(self, api=None):
         super().__init__(api or FakeApi(), 3.0, is_plain=True)
@@ -211,6 +234,69 @@ class TestDistributedScreen:
         assert "状态: 待命" in rendered
         assert "Epoch: 1" in rendered
         assert ("GET", "/cluster/pipeline-reshard") in app.api.calls
+
+    def test_pipeline_layout_is_the_read_only_execution_view(self, app):
+        class LayoutApi(FakeApi):
+            def get(self, path, params=None, with_log_token=False):
+                if path == "/cluster/pipeline-capacity":
+                    return {
+                        "status": "ready",
+                        "admitted": True,
+                        "pipeline_layout": {
+                            "total_layers": 24,
+                            "is_distributed": True,
+                            "engines": ["llama_cpp", "pytorch"],
+                            "contract_sha256": "abcdef0123456789",
+                            "aggregate_capacity": {
+                                "required_bytes": 4096,
+                                "headroom_bytes": 2048,
+                                "by_execution_device": {
+                                    "cpu": {"node_count": 1},
+                                    "cuda": {"node_count": 1},
+                                },
+                            },
+                            "nodes": [
+                                {
+                                    "node_id": "master",
+                                    "kind": "local",
+                                    "layer_range": [0, 12],
+                                    "engine": "pytorch",
+                                    "federated": False,
+                                    "cross_engine": False,
+                                    "capacity": {
+                                        "required_bytes": 2048,
+                                        "headroom_bytes": 1024,
+                                    },
+                                },
+                                {
+                                    "node_id": "n1",
+                                    "kind": "remote_pipeline",
+                                    "layer_range": [12, 24],
+                                    "engine": "llama_cpp",
+                                    "federated": True,
+                                    "cross_engine": True,
+                                    "handoff_at": 12,
+                                    "capacity": {
+                                        "required_bytes": 2048,
+                                        "headroom_bytes": 1024,
+                                    },
+                                },
+                            ],
+                        },
+                    }
+                return super().get(path, params, with_log_token)
+
+        screen = t.DistributedScreen(FakeApp(LayoutApi()))
+        screen.refresh(force=True)
+        rendered = "\n".join(text for _style, text in screen.lines(160))
+
+        assert "模式: 分布式" in rendered
+        assert "合同: abcdef012345" in rendered
+        assert "remote_pipeline" in rendered
+        assert "llama_cpp" in rendered
+        assert "远端/跨引擎" in rendered
+        assert "12" in rendered
+        assert "执行布局以 PipelineLayout 为准" in rendered
 
 
 class TestModelCommands:
@@ -340,6 +426,28 @@ class TestScreenAndMisc:
         msg, style = app.exec_command("/chat clear")
         assert style == "ok"
         assert ("POST", "/chat/clear", None) in app.api.calls
+
+    def test_chat_screen_is_registered_and_openable(self, app):
+        msg, style = app.exec_command("/screen chat")
+        assert style == "ok"
+        assert "对话" in msg
+        assert app.find_screen("chat").name == "对话"
+
+    def test_route_and_thinking_commands_configure_chat_screen(self, app):
+        msg, style = app.exec_command("/route required")
+        assert style == "ok"
+        assert app.find_screen("chat").routing_preference == "distributed_required"
+        msg, style = app.exec_command("/thinking on")
+        assert style == "ok"
+        assert app.find_screen("chat").show_thinking is True
+
+    def test_cancel_without_id_uses_active_chat_generation(self, app):
+        chat = app.find_screen("chat")
+        chat.streaming = True
+        chat.generation_id = "gen-chat"
+        msg, style = app.exec_command("/cancel")
+        assert style == "ok"
+        assert any(c[0] == "POST" and "gen-chat" in c[1] for c in app.api.calls)
 
 
 class TestStatusRefreshScreen:

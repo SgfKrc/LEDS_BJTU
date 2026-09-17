@@ -38,8 +38,10 @@ from __future__ import annotations
 import json
 import re
 import sys
+import threading
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Callable, Dict, Iterator, List, Optional
 
 from tui_sse import SSEDecoder, decode_json_event
@@ -134,8 +136,11 @@ class ChatScreen:
         #: 最近一次 done 的展示行（由 `format_metrics` 生成）与原始 metrics
         self.last_status: Optional[str] = None
         self.last_metrics: Optional[dict] = None
+        self.thinking_text = ""
         #: 测试可注入的传输层：接收请求体，产出 payload dict 序列
         self._transport = transport
+        self._state_lock = threading.RLock()
+        self._send_thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
     # Screen 鸭子契约
@@ -144,35 +149,50 @@ class ChatScreen:
     def refresh(self, force: bool = False):
         """拉取会话列表（失败不致命，绝不让界面崩溃）。"""
         if self.api is None:
-            return
+            return self.data
+        if not force and self.data is not None:
+            return self.data
         try:
             self.data = self.api.get(API_PATHS["sessions"])
             self.error = None
         except Exception as e:
             self.error = "会话列表获取失败: %s" % e
+        return self.data
 
     def fetch(self):
         self.refresh(force=True)
         return self.data
 
     def lines(self, width: int) -> list:
+        with self._state_lock:
+            messages = tuple(self.messages[-self.MAX_MESSAGES:])
+            session_id = self.session_id
+            routing_preference = self.routing_preference
+            streaming = self.streaming
+            last_status = self.last_status
+            error = self.error
+            thinking_text = self.thinking_text
         out: list = []
         out.append(("head", "对话   会话: %s   路由: %s" % (
-            self.session_id or "（默认）", self.routing_preference)))
+            session_id or "（默认）", routing_preference)))
         out.append(("", ""))
-        if not self.messages:
+        if not messages:
             out.append(("dim", "  还没有消息。按 i 输入并发送。"))
-        for role, text in self.messages[-self.MAX_MESSAGES:]:
+        for role, text in messages:
             out.append(("title", "你: ") if role == "user" else ("ok", "模型: "))
             for ln in wrap_display(sanitize(text), max(8, width - 4)):
                 out.append(("", "  " + ln))
             out.append(("", ""))
-        if self.streaming:
+        if thinking_text and self.show_thinking:
+            out.append(("dim", "  思考:"))
+            for ln in wrap_display(sanitize(thinking_text), max(8, width - 6)):
+                out.append(("dim", "    " + ln))
+        if streaming:
             out.append(("warn", "  …生成中（x 取消）"))
-        if self.last_status:
-            out.append(("dim", "  " + self.last_status))
-        if self.error:
-            out.append(("warn", "  ! %s" % self.error))
+        if last_status:
+            out.append(("dim", "  " + last_status))
+        if error:
+            out.append(("warn", "  ! %s" % error))
         return out
 
     def actions(self) -> list:
@@ -192,84 +212,240 @@ class ChatScreen:
         text = ui.prompt("你: ")
         if not text or not text.strip():
             return None
-        self.send(text.strip())
+        if not self.start_send(text.strip()):
+            return "当前已有生成任务，请先取消"
         return None
 
     def _act_new_session(self, ui) -> Optional[str]:
-        self.session_id = None
-        self.messages = []
-        self.last_status = None
-        self.last_metrics = None
-        return "已开新会话（下一次发送会创建）"
+        if self.streaming:
+            return "当前正在生成，请先取消"
+        new_id = None
+        if self.api is not None:
+            try:
+                created = self.api.post(API_PATHS["sessions"], {
+                    "title": "新对话",
+                }) or {}
+                new_id = created.get("id") or created.get("session_id")
+            except Exception as exc:
+                return "创建会话失败: %s" % exc
+        with self._state_lock:
+            self.session_id = new_id
+            self.messages = []
+            self.last_status = None
+            self.last_metrics = None
+            self.thinking_text = ""
+        return "已创建新会话: %s" % new_id if new_id else "已开新会话（下一次发送会创建）"
 
     def _act_clear(self, ui) -> Optional[str]:
-        self.messages = []
+        if self.streaming:
+            return "当前正在生成，请先取消"
+        with self._state_lock:
+            self.messages = []
+            self.last_status = None
+            self.last_metrics = None
+            self.thinking_text = ""
         return "本屏已清空"
 
     def _act_cancel(self, ui) -> Optional[str]:
-        if not self.streaming or not self.generation_id:
+        with self._state_lock:
+            active = self.streaming
+            generation_id = self.generation_id
+        if not active or not generation_id:
             return "当前没有进行中的生成"
-        self.cancel(self.generation_id)
+        self.cancel(generation_id)
         return "已请求取消"
 
     # ------------------------------------------------------------------
     # 核心：发送与流式接收
     # ------------------------------------------------------------------
 
+    def _begin_send(self, message: str) -> bool:
+        with self._state_lock:
+            if self.streaming:
+                return False
+            self.messages.append(("user", message))
+            self.messages.append(("assistant", ""))
+            self.streaming = True
+            self.error = None
+            self.thinking_text = ""
+            # 客户端预生成 ID，首个 token 前即可取消。
+            self.generation_id = "gen_%s" % uuid.uuid4().hex[:12]
+            return True
+
+    def start_send(self, message: str) -> bool:
+        """在后台线程消费流，保证 ANSI TUI 可以持续重绘增量 token。"""
+        if not self._begin_send(message):
+            return False
+        worker = threading.Thread(
+            target=self._consume, args=(message,),
+            name="qlh-tui-chat-stream", daemon=True,
+        )
+        with self._state_lock:
+            self._send_thread = worker
+        worker.start()
+        return True
+
+    def _set_assistant(self, text: str) -> None:
+        with self._state_lock:
+            if self.messages and self.messages[-1][0] == "assistant":
+                self.messages[-1] = ("assistant", text)
+
     def send(self, message: str) -> None:
-        """发送一条消息并**同步**消费流式响应（按现有 TUI 主循环模型）。"""
-        self.messages.append(("user", message))
-        self.messages.append(("assistant", ""))
-        self.streaming = True
-        self.error = None
+        """同步消费一条消息，供脚本和单元测试使用。"""
+        if self._begin_send(message):
+            self._consume(message)
+
+    def _consume(self, message: str) -> None:
         acc: List[str] = []
         try:
             for payload in self.iter_payloads(message):
                 if payload.get("start"):
-                    if payload.get("generation_id"):
-                        self.generation_id = payload["generation_id"]
-                    if payload.get("session_id"):
-                        self.session_id = payload["session_id"]
+                    with self._state_lock:
+                        if payload.get("generation_id"):
+                            self.generation_id = payload["generation_id"]
+                        if payload.get("session_id"):
+                            self.session_id = payload["session_id"]
                 elif "token" in payload:
                     piece = payload.get("token")
                     if isinstance(piece, str) and piece:
                         acc.append(piece)
-                        self.messages[-1] = ("assistant", "".join(acc))
+                        self._set_assistant("".join(acc))
+                elif "thinking" in payload:
+                    piece = payload.get("thinking")
+                    if isinstance(piece, str) and piece:
+                        with self._state_lock:
+                            self.thinking_text += piece
                 elif payload.get("done"):
-                    self.last_metrics = payload.get("metrics") or None
-                    self.last_status = format_metrics(
-                        self.last_metrics,
-                        history_committed=payload.get("history_committed"),
-                    )
-                    if payload.get("session_id"):
-                        self.session_id = payload["session_id"]
+                    metrics = payload.get("metrics") or None
+                    with self._state_lock:
+                        self.last_metrics = metrics
+                        self.last_status = format_metrics(
+                            metrics,
+                            history_committed=payload.get("history_committed"),
+                        )
+                        if payload.get("session_id"):
+                            self.session_id = payload["session_id"]
+                        thinking = payload.get("thinking_content")
+                        if isinstance(thinking, str):
+                            self.thinking_text = thinking
                     # done.response 是权威完整文本，用它兜底（避免增量拼接误差）
                     final = payload.get("response")
-                    if isinstance(final, str) and final:
-                        self.messages[-1] = ("assistant", final)
+                    if isinstance(final, str):
+                        self._set_assistant(final)
                 elif payload.get("cancelled"):
                     partial = payload.get("partial")
                     if isinstance(partial, str) and partial:
-                        self.messages[-1] = ("assistant", partial)
-                    if payload.get("session_id"):
-                        self.session_id = payload["session_id"]
-                    self.error = "已被取消"
+                        self._set_assistant(partial)
+                    with self._state_lock:
+                        if payload.get("session_id"):
+                            self.session_id = payload["session_id"]
+                        self.error = "已被取消"
                 elif payload.get("error"):
-                    self.error = "后端错误: %s" % payload.get("error")
+                    with self._state_lock:
+                        self.error = "后端错误: %s" % payload.get("error")
         except Exception as e:  # 网络/解析异常都不应让 TUI 崩溃
-            self.error = "请求失败: %s" % e
+            with self._state_lock:
+                self.error = "请求失败: %s" % e
         finally:
-            self.streaming = False
-            self.generation_id = None
-            if (not acc and self.messages
-                    and self.messages[-1][0] == "assistant" and not self.messages[-1][1]):
-                self.messages.pop()   # 未收到任何内容时清掉占位
+            with self._state_lock:
+                self.streaming = False
+                self.generation_id = None
+                self._send_thread = None
+                if (not acc and self.messages
+                        and self.messages[-1][0] == "assistant"
+                        and not self.messages[-1][1]):
+                    self.messages.pop()   # 未收到任何内容时清掉占位
+
+    def configure(self, *, routing_preference: Optional[str] = None,
+                  show_thinking: Optional[bool] = None) -> None:
+        """配置统一 TUI 启动时的请求偏好。"""
+        with self._state_lock:
+            if routing_preference in {
+                "auto", "local_only", "distributed_preferred", "distributed_required",
+            }:
+                self.routing_preference = routing_preference
+            if show_thinking is not None:
+                self.show_thinking = bool(show_thinking)
+
+    def resume_session(self, session_id: str) -> str:
+        """切换并恢复一个会话，供统一 TUI 命令复用。"""
+        if self.streaming:
+            return "当前正在生成，请先取消"
+        if self.api is None:
+            return "聊天屏未连接后端"
+        target = str(session_id or "").strip()
+        if not target:
+            return "会话 ID 不能为空"
+        path = API_PATHS["sessions_activate"].format(
+            session_id=urllib.parse.quote(target, safe=""),
+        )
+        try:
+            data = self.api.post(path) or {}
+            messages = data.get("messages") or []
+            restored = []
+            for item in messages:
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role") or "").lower()
+                text = item.get("content", item.get("text", ""))
+                if role in {"user", "assistant", "system"} and isinstance(text, str):
+                    restored.append((role, text))
+            with self._state_lock:
+                self.session_id = target
+                self.messages = restored
+                self.error = None
+            return "已恢复会话: %s" % target
+        except Exception as exc:
+            with self._state_lock:
+                self.error = "会话恢复失败: %s" % exc
+            return self.error
+
+    def rename_session(self, title: str) -> str:
+        """重命名当前会话。"""
+        with self._state_lock:
+            target = self.session_id
+        title = str(title or "").strip()
+        if not target:
+            return "当前没有可重命名的会话"
+        if not title:
+            return "标题不能为空"
+        if self.api is None:
+            return "聊天屏未连接后端"
+        try:
+            self.api.put(API_PATHS["sessions_detail"].format(
+                session_id=urllib.parse.quote(target, safe=""),
+            ), {"title": title})
+            return "会话已重命名: %s" % title
+        except Exception as exc:
+            return "重命名会话失败: %s" % exc
+
+    def delete_session(self) -> str:
+        """删除当前会话并清理本屏状态。"""
+        if self.streaming:
+            return "当前正在生成，请先取消"
+        with self._state_lock:
+            target = self.session_id
+        if not target or self.api is None:
+            return "当前没有可删除的会话"
+        try:
+            self.api.delete(API_PATHS["sessions_detail"].format(
+                session_id=urllib.parse.quote(target, safe=""),
+            ))
+            self._act_new_session(None)
+            return "已删除会话: %s" % target
+        except Exception as exc:
+            return "删除会话失败: %s" % exc
+
+    # ------------------------------------------------------------------
+    # 兼容旧 API 的流读取实现
+    # ------------------------------------------------------------------
 
     def iter_payloads(self, message: str) -> Iterator[dict]:
         """产出事件的 JSON payload（dict）。默认走 urllib；测试可注入 transport。"""
         body = build_interactive_request(
             message,
             session_id=self.session_id,
+            generation_id=self.generation_id,
             routing_preference=self.routing_preference,
             show_thinking=self.show_thinking,
             max_new_tokens=self.max_new_tokens,

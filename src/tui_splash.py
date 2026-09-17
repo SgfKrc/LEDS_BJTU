@@ -1,4 +1,4 @@
-"""Koakumix 启动动画（零依赖 ANSI 实现）——灰蓝配色。
+"""Koakuma 启动动画（零依赖 ANSI 实现）——灰蓝配色。
 
 风格仿 `tools/docagent/patchouli/splash.py`（PATCHOULI 启动屏）：
 半块像素字（``▀``：fg 占上半、bg 占下半）+ 打字机逐列显现 + 扫描线 + 窄色条 spinner。
@@ -23,7 +23,7 @@ import os
 import sys
 import threading
 import time
-from typing import Callable, TypeVar
+from typing import Callable, TypeVar, Union
 
 T = TypeVar("T")
 
@@ -163,7 +163,7 @@ class TuiSplash:
 
     def __init__(
         self,
-        status: str = STATUS_TEXT,
+        status: Union[str, Callable[[], str]] = STATUS_TEXT,
         *,
         min_show: float = 1.0,
         subtitle: str = SUBTITLE,
@@ -180,6 +180,11 @@ class TuiSplash:
         self._loaded = False
         self._result: object = None
         self._error: BaseException | None = None
+        self._worker: threading.Thread | None = None
+
+    def _status(self) -> str:
+        value = self.status_text() if callable(self.status_text) else self.status_text
+        return str(value or STATUS_TEXT)
 
     # ---------------------------------------------------------------- 渲染
 
@@ -190,7 +195,7 @@ class TuiSplash:
     def _line_status(self) -> str:
         spin = SPINNER[self._frame % len(SPINNER)]
         bar = _bg(COLOR_BAR) + _fg((255, 255, 255))
-        label = f"  {spin} {self.status_text}    （任意键跳过）"
+        label = f"  {spin} {self._status()}    （任意键跳过动画）"
         return bar + BOLD + label + RESET
 
     def _anim_done(self) -> bool:
@@ -247,26 +252,32 @@ class TuiSplash:
                 self._loaded = True
 
         worker = threading.Thread(target=_run, name="koakumix-splash-load", daemon=True)
+        self._worker = worker
         worker.start()
 
         # 切到备用屏（alt screen）：退出时终端自动恢复进入前的画面，
         # 避免"清屏 + 残影"被误读为动画反复播放。
         self._write("\x1b[?1049h" + HIDE_CURSOR)
+        skip_requested = False
         try:
             while True:
                 self._frame += 1
                 self._render_frame()
-                if self._loaded and self._anim_done():
+                if self._loaded and (skip_requested or self._anim_done()):
                     if (time.monotonic() - self._t0) >= self.min_show:
                         break
-                if skip_on_key and self._key_pressed():
-                    break
+                if skip_on_key and not skip_requested and self._key_pressed():
+                    # 只跳过视觉收尾，继续显示 spinner 直到 loader 完成，
+                    # 防止用户在冷启动阶段看到无后端的 TUI。
+                    skip_requested = True
                 time.sleep(TICK_SECONDS)
         finally:
             # 退出备用屏并恢复光标：终端回到进入动画前的画面
             self._write(SHOW_CURSOR + "\x1b[?1049l")
 
-        worker.join(timeout=1.0)
+        # 跳过只跳过视觉动画，不能绕过后端就绪条件；否则 TUI 会在
+        # API 仍冷启动时进入，产生一屏误导性的连接错误。
+        worker.join()
         if self._error is not None:
             raise self._error
         return self._result  # type: ignore[return-value]
@@ -293,7 +304,12 @@ class TuiSplash:
             return False
 
 
-def play_splash(loader: Callable[[], T], *, status: str = STATUS_TEXT, min_show: float = 1.0) -> T:
+def play_splash(
+    loader: Callable[[], T],
+    *,
+    status: Union[str, Callable[[], str]] = STATUS_TEXT,
+    min_show: float = 1.0,
+) -> T:
     """便捷入口：环境不支持动画时直接执行 `loader()`。"""
     if not supported():
         return loader()
@@ -301,4 +317,13 @@ def play_splash(loader: Callable[[], T], *, status: str = STATUS_TEXT, min_show:
     try:
         return splash.play(loader)
     except BaseException:  # noqa: BLE001 - 动画失败不应阻断启动
+        # loader 的异常必须透传，不能重复执行启动副作用；只有动画本身
+        # 失败时等待已启动的 loader，不能重新执行启动副作用。
+        if splash._error is not None:
+            raise splash._error
+        if splash._worker is not None:
+            splash._worker.join()
+            if splash._error is not None:
+                raise splash._error
+            return splash._result  # type: ignore[return-value]
         return loader()

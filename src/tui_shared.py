@@ -41,6 +41,9 @@ API_PATHS = {
     "models_current": "/models/current",
     "distributed_config": "/cluster/config/distributed-inference",
     "cluster_resources": "/cluster/resources",
+    "cluster_layers": "/cluster/layers",
+    "cluster_pipeline_capacity": "/cluster/pipeline-capacity",
+    "cluster_pipeline_reshard": "/cluster/pipeline-reshard",
 }
 
 # ============================================================

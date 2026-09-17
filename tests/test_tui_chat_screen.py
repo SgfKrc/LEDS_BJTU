@@ -15,6 +15,8 @@
 import json
 import os
 import sys
+import threading
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -200,6 +202,32 @@ class TestEventDispatch:
         assert captured["session_id"] == "sess-1"
         assert captured["max_new_tokens"] == 64
         assert captured["routing_preference"] == "local_only"
+
+    def test_async_send_keeps_screen_responsive_and_sends_client_id(self):
+        entered = threading.Event()
+        release = threading.Event()
+        captured = {}
+
+        def transport(body):
+            captured.update(body)
+            entered.set()
+            yield {"start": True, "generation_id": body["generation_id"]}
+            release.wait(2)
+            yield {"token": "增量"}
+            yield {"done": True, "response": "增量"}
+
+        s = ChatScreen(FakeApp(), transport=transport)
+        assert s.start_send("x") is True
+        assert entered.wait(1)
+        assert s.streaming is True
+        assert captured["generation_id"].startswith("gen_")
+        assert s.start_send("y") is False
+        release.set()
+        deadline = time.monotonic() + 2
+        while s.streaming and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert s.streaming is False
+        assert s.messages[-1] == ("assistant", "增量")
 
 
 # ----------------------------------------------------------------------
