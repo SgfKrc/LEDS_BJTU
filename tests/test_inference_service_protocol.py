@@ -1898,8 +1898,18 @@ def test_inference_client_worker_stage(live_inference_svc):
         root_input={"messages": [{"role": "user", "content": "1+1=?"}],
                     "task_options": {}},
     )
-    result = client._execute_task_worker_stage(stage)
+    result = client.scheduler_callbacks.execute_task_worker_stage(stage)
     assert result["content"] == "候选答案内容"
+
+
+def test_inference_client_exposes_complete_scheduler_callback_bundle():
+    from inference_client import InferenceClient
+
+    client = InferenceClient(base_url="http://127.0.0.1:8010")
+    callbacks = client.scheduler_callbacks
+    assert callbacks is client.scheduler_callbacks
+    assert callbacks.execute_task_worker_stage == client.execute_task_worker_stage
+    assert callbacks.active_task_graph_model_identity == client.active_task_graph_model_identity
 
 
 def test_inference_client_kv_and_cancel(live_inference_svc):

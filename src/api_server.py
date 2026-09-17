@@ -407,7 +407,7 @@ async def http_exception_with_request_id(request: Request, exc: HTTPException):
 
 # 推理宿主单例（阶段 0.2/0.4：api_server 与 scheduler 共享；model_manager 为
 # 兼容名，属性读写代理到内部 ModelManager）
-from model_host import model_host
+from model_host import SchedulerCallbackSet, model_host
 from koakuma_engine import (
     Capability,
     accepted_backend_requests,
@@ -6880,6 +6880,12 @@ async def get_cluster_nodes():
     }
 
 
+@app.get("/api/cluster/resources")
+async def get_cluster_resources():
+    """Return the read-only aggregate CPU, RAM, and GPU resource view."""
+    return scheduler.get_aggregate_resource_view()
+
+
 @app.post("/api/cluster/nodes/{node_id}/deregister")
 async def deregister_node(node_id: str):
     """
@@ -7723,6 +7729,12 @@ async def get_pipeline_capacity_plan():
     downloads or materializes model weights.
     """
     return scheduler.get_pipeline_capacity_plan()
+
+
+@app.get("/api/cluster/pipeline-reshard")
+async def get_pipeline_reshard_status():
+    """Return the address-free, epoch-fenced automatic recovery state."""
+    return scheduler.get_pipeline_reshard_status()
 
 
 class LayerOverrideItem(BaseModel):
@@ -9890,16 +9902,20 @@ async def delete_log_file(filename: str, request: Request):
 # ============================================================
 
 # ============================================================
-# 阶段 0.2：向 model_host 挂载 scheduler 需要的回调（消除 scheduler
-# 对 api_server 的运行时反向 import）
+# API composition root: construct the scheduler's complete callback contract
+# in one step. Scheduler never imports this module or reads host private attrs.
 # ============================================================
-model_host.attach("_execute_task_worker_stage", _execute_task_worker_stage)
-model_host.attach("_active_task_graph_model_identity", _active_task_graph_model_identity)
-model_host.attach("_build_model_chat_prompt", _build_model_chat_prompt)
-model_host.attach("THINKING_SYSTEM_PROMPT", THINKING_SYSTEM_PROMPT)
-model_host.attach("_snapshot_recent_logs", _snapshot_recent_logs)
-model_host.attach("_filter_recent_logs", _filter_recent_logs)
-model_host.attach("_format_model_response", _format_model_response)
+_scheduler_callbacks = SchedulerCallbackSet(
+    active_task_graph_model_identity=_active_task_graph_model_identity,
+    execute_task_worker_stage=_execute_task_worker_stage,
+    build_model_chat_prompt=_build_model_chat_prompt,
+    thinking_system_prompt=THINKING_SYSTEM_PROMPT,
+    snapshot_recent_logs=_snapshot_recent_logs,
+    filter_recent_logs=_filter_recent_logs,
+    format_model_response=_format_model_response,
+)
+model_host.configure_scheduler_callbacks(_scheduler_callbacks)
+scheduler.configure_callbacks(_scheduler_callbacks)
 
 
 def _api_bind_hosts(host: str) -> list[str]:

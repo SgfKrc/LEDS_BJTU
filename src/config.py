@@ -158,9 +158,17 @@ MODEL_PATH = os.path.join(_APP_ROOT, "models", "qwen-1_8b-chat")       # Safeten
 GGUF_MODEL_PATH = os.path.join(_APP_ROOT, "models", "Qwen-1_8B-Chat.Q4_K_M.gguf")  # GGUF 格式
 QUANT_TYPE = "int4"                          # 量化精度: "fp16" | "int8" | "int4"
 USE_COMPILE = False                          # 算子融合（仅FP16有效，INT4下自动跳过）
+INFERENCE_ENGINE = _env_first("QLH_INFERENCE_ENGINE", default="llama_cpp").strip().lower()
+
+# The default edge path is llama.cpp and must not import PyTorch merely to
+# discover that CUDA is unavailable. Explicit PyTorch/auto mode retains the
+# device probe for the full-model runtime.
 try:
-    import torch as _torch
-    DEVICE = "cuda" if _torch.cuda.is_available() else "cpu"
+    if INFERENCE_ENGINE in {"llama_cpp", "gguf", "island"}:
+        DEVICE = "cpu"
+    else:
+        import torch as _torch
+        DEVICE = "cuda" if _torch.cuda.is_available() else "cpu"
 except ImportError:
     DEVICE = "cpu"  # 推理设备: torch 未安装时默认 CPU
 
@@ -168,7 +176,6 @@ except ImportError:
 # "auto": 自动选择 — CUDA 可用 → PyTorch + bitsandbytes, 否则 → llama.cpp + GGUF
 # "pytorch": 强制 PyTorch + Transformers（需要 CUDA 或大内存 CPU）
 # "llama_cpp": 强制 llama.cpp + GGUF（推荐 CPU / 集显设备）
-INFERENCE_ENGINE = "llama_cpp"
 # GGUF 量化文件推荐 (RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf on HuggingFace):
 #   Q4_K_M (1.16 GB) — 推荐，速度/质量最佳平衡
 #   Q5_K_M (1.31 GB) — 更高质量

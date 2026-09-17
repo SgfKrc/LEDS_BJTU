@@ -1,8 +1,9 @@
 """InferenceClient —— scheduler-svc 注入的推理宿主 HTTP 客户端（计划 §1.4）。
 
-与 `InferenceHost` Protocol（model_host.py:20-38）同构：scheduler.py 通过
-阶段 0 就绪的 `Scheduler(host=...)` 注入参数使用本客户端，**scheduler.py
-源码零改动**；api_server 进程内的 scheduler 继续使用进程内 model_host，
+与 `InferenceHost` Protocol（model_host.py:20-64）同构：scheduler.py 通过
+`Scheduler(host=..., callbacks=client.scheduler_callbacks)` 使用本客户端；
+控制面所需的 API 辅助函数以不可变 callback bundle 显式注入。api_server
+进程内的 scheduler 继续使用进程内 model_host，
 互不影响。回退：`QLH_MONOLITH=1` 时 scheduler-svc（1.7）构造直接用
 进程内 model_host，随时一键回单进程。
 
@@ -15,13 +16,13 @@
   load_layer_range / unload_layer_range      → POST /v1/layers/{load,unload}
   kv_init / kv_free                          → POST /v1/kv/{init,free}
   cancel_generation                          → POST /v1/chat/cancel
-  _execute_task_worker_stage                 → POST /v1/worker/stage
-  _active_task_graph_model_identity          → GET /v1/models/current 推断
-  _format_model_response / _build_model_chat_prompt
+  execute_task_worker_stage                  → POST /v1/worker/stage
+  active_task_graph_model_identity           → GET /v1/models/current 推断
+  format_model_response / build_model_chat_prompt
                                              → 本地等价实现（复用
                                                inference_service.engine_host
                                                保真复制版，纯函数无需 HTTP）
-  _snapshot_recent_logs / _filter_recent_logs → 本地日志快照
+  snapshot_recent_logs / filter_recent_logs   → 本地日志快照
   model_loaded / current_quant               → GET /v1/status（带 TTL 缓存）
   full_chat_execution_lock                   → 本地 threading.RLock
 """
@@ -33,6 +34,8 @@ import time
 from typing import Any, Dict, Iterator, List, Optional
 
 import requests
+
+from model_host import SchedulerCallbackSet
 
 logger = logging.getLogger("inference_client")
 
@@ -56,6 +59,7 @@ class InferenceClient:
         self._status_at = 0.0
         self._logs: List[dict] = []
         self._logs_lock = threading.Lock()
+        self._scheduler_callbacks: Optional[SchedulerCallbackSet] = None
 
     # ------------------------------------------------------------------
     # 内部：HTTP 封装 + 状态缓存
@@ -251,9 +255,9 @@ class InferenceClient:
         return self._post("/v1/chat/cancel", {"generation_id": generation_id})
 
     # ------------------------------------------------------------------
-    # scheduler 调用面：task-worker Stage 与模型身份
+    # scheduler callback bundle：task-worker Stage 与模型身份
     # ------------------------------------------------------------------
-    def _execute_task_worker_stage(self, stage_request, cancel_event=None) -> dict:
+    def execute_task_worker_stage(self, stage_request, cancel_event=None) -> dict:
         """远程执行 task-worker Stage（scheduler 调用面 → /v1/worker/stage）。"""
         from dataclasses import asdict
 
@@ -265,7 +269,7 @@ class InferenceClient:
             raise RuntimeError("remote Stage executor returned non-object output")
         return result
 
-    def _active_task_graph_model_identity(self):
+    def active_task_graph_model_identity(self):
         """从 /v1/models/current 推断当前模型身份（等价 api_server 版语义）。"""
         try:
             info = self._get("/v1/models/current")
@@ -291,29 +295,29 @@ class InferenceClient:
             return None
 
     # ------------------------------------------------------------------
-    # scheduler 调用面：辅助纯函数（本地等价实现，复用保真复制版）
+    # scheduler callback bundle：辅助纯函数（本地等价实现，复用保真复制版）
     # ------------------------------------------------------------------
-    def _format_model_response(self, text: str, show_thinking: bool,
-                               native_thinking_prompt: bool = False):
+    def format_model_response(self, text: str, show_thinking: bool,
+                              native_thinking_prompt: bool = False):
         from inference_service.engine_host import _format_model_response as _f
 
         return _f(text, show_thinking, native_thinking_prompt=native_thinking_prompt)
 
-    def _build_model_chat_prompt(self, tokenizer, messages, system_prompt=None,
-                                 assistant_prefill=None) -> str:
+    def build_model_chat_prompt(self, tokenizer, messages, system_prompt=None,
+                                assistant_prefill=None) -> str:
         from inference_service.engine_host import _build_model_chat_prompt as _b
 
         return _b(tokenizer, messages, system_prompt=system_prompt,
                   assistant_prefill=assistant_prefill)
 
     # ------------------------------------------------------------------
-    # scheduler 调用面：日志快照（本地记录，等价语义）
+    # scheduler callback bundle：日志快照（本地记录，等价语义）
     # ------------------------------------------------------------------
-    def _snapshot_recent_logs(self) -> tuple:
+    def snapshot_recent_logs(self) -> tuple:
         with self._logs_lock:
             return list(self._logs), len(self._logs)
 
-    def _filter_recent_logs(self, entries, level="", name="", limit=200) -> list:
+    def filter_recent_logs(self, entries, level="", name="", limit=200) -> list:
         out = []
         for e in entries:
             if level and e.get("level", "").lower() != level.lower():
@@ -324,6 +328,32 @@ class InferenceClient:
             if len(out) >= limit:
                 break
         return out
+
+    @property
+    def scheduler_callbacks(self) -> SchedulerCallbackSet:
+        """Return the complete scheduler dependency bundle for this remote host.
+
+        The bundle is built once so scheduler construction has no dependency on
+        mutation order or private attributes of the host implementation.
+        """
+        with self._lock:
+            callbacks = self._scheduler_callbacks
+            if callbacks is None:
+                from inference_service.engine_host import THINKING_SYSTEM_PROMPT
+
+                callbacks = SchedulerCallbackSet(
+                    active_task_graph_model_identity=(
+                        self.active_task_graph_model_identity
+                    ),
+                    execute_task_worker_stage=self.execute_task_worker_stage,
+                    build_model_chat_prompt=self.build_model_chat_prompt,
+                    thinking_system_prompt=THINKING_SYSTEM_PROMPT,
+                    snapshot_recent_logs=self.snapshot_recent_logs,
+                    filter_recent_logs=self.filter_recent_logs,
+                    format_model_response=self.format_model_response,
+                )
+                self._scheduler_callbacks = callbacks
+            return callbacks
 
     def _record_local_log(self, level: str, name: str, message: str) -> None:
         with self._logs_lock:

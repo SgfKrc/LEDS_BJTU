@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from scheduler import Scheduler
 from tcp_comm import TCPClient
+from model_host import SchedulerCallbackSet
 
 
 def main() -> int:
@@ -51,11 +52,19 @@ def main() -> int:
         }
 
     scheduler = Scheduler()
-    # 阶段 0.2：host 注入（替代旧的 sys.modules["api_server"] fake）
+    # The worker process receives an explicit scheduler callback bundle.
     scheduler._host = SimpleNamespace(
         full_chat_execution_lock=threading.RLock(),
-        _execute_task_worker_stage=execute_stage,
     )
+    scheduler.configure_callbacks(SchedulerCallbackSet(
+        active_task_graph_model_identity=lambda: None,
+        execute_task_worker_stage=execute_stage,
+        build_model_chat_prompt=lambda tokenizer, messages, **kwargs: "",
+        thinking_system_prompt="thinking",
+        snapshot_recent_logs=lambda: ([], 0),
+        filter_recent_logs=lambda entries, **kwargs: list(entries),
+        format_model_response=lambda text, **kwargs: (text, None),
+    ))
     scheduler._role_override = "client"
     scheduler.get_effective_node_id = lambda: args.node_id
     scheduler._task_worker_capabilities = lambda: capabilities

@@ -203,3 +203,26 @@ class TestApiResponseKeys:
         assert body["network_path"] == network_path
         assert body["nodes"]["master"]["network_path"] == network_path
         assert body["nodes_ready"] is True
+
+    def test_cluster_resources_is_read_only_aggregate_projection(
+            self, client, monkeypatch):
+        projection = {
+            "schema_version": 1,
+            "scope": "cluster",
+            "is_distributed": True,
+            "node_count": 2,
+            "available_node_count": 2,
+            "remote_available_count": 1,
+            "available": {"local": {"node_id": "master"}, "remote": []},
+            "totals": {"logical_cores": 16, "ram_available_gb": 20},
+        }
+        monkeypatch.setattr(
+            api_server_mod.scheduler,
+            "get_aggregate_resource_view",
+            lambda: dict(projection),
+        )
+
+        response = client.get("/api/cluster/resources")
+
+        assert response.status_code == 200
+        assert response.json() == projection

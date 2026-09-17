@@ -19,10 +19,13 @@
 - truncate(n): 回滚尾部 n 个 token，回收完整空页并保留尾页复用
 - 支持 device / dtype 参数，张量在正确设备上分配
 
-依赖: torch
+依赖: torch（仅在实际创建/读写张量时延迟导入）
 """
 
+from __future__ import annotations
+
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -35,7 +38,16 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, List, Mapping, Tuple, Optional
 
-import torch
+
+
+class _LazyTorch:
+    """Resolve torch only when the D-tier cache actually touches a tensor."""
+
+    def __getattr__(self, name: str):
+        return getattr(importlib.import_module("torch"), name)
+
+
+torch = _LazyTorch()
 
 from config import PAGE_SIZE, MAX_PAGE_NUM, MAX_SEQ_LEN
 from cache_unit_layout import CacheUnitLayout

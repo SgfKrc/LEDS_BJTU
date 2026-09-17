@@ -24,16 +24,22 @@ import threading
 import time
 import uuid
 from enum import Enum
-from typing import Optional, Callable, TYPE_CHECKING
+from typing import Any, Mapping, Optional, Callable, TYPE_CHECKING
 from dataclasses import dataclass, field
 
 if TYPE_CHECKING:
-    from model_host import InferenceHost
+    from model_host import InferenceHost, SchedulerCallbacks
 
 from model_host import get_model_host
 from koakuma_engine import Capability, backend_id_for, runtime_supports
 from network_path import build_client_network_path_view
 from pipeline_capacity import PipelineCapacityError, solve_pipeline_capacity
+from pipeline_node_contract import (
+    PipelineNodeContractError,
+    build_aggregate_resource_view,
+    pipeline_layout_from_capacity_plan,
+)
+from pipeline_reshard import PipelineArtifactAvailability, PipelineReshardCoordinator
 from qwen3_pipeline_transaction import (
     Qwen3PipelineDryRunTransaction,
     Qwen3PipelineProtocolError,
@@ -1029,10 +1035,17 @@ class Scheduler:
     - 流水线请求队列（PipelineQueue）
     """
 
-    def __init__(self, host: Optional["InferenceHost"] = None):
-        # 推理宿主（阶段 0.2 注入）：默认使用全局单例（api_server 构造时
-        # 可显式传入，阶段 1 起可替换为远程 inference-svc 适配器）
+    def __init__(
+        self,
+        host: Optional["InferenceHost"] = None,
+        callbacks: Optional["SchedulerCallbacks"] = None,
+    ):
+        # 推理宿主默认使用全局单例；回调由 API composition root 以具名
+        # Protocol bundle 注入，避免 scheduler 反向依赖 api_server。
         self._host = host if host is not None else get_model_host()
+        self._callbacks = callbacks if callbacks is not None else getattr(
+            self._host, "scheduler_callbacks", None,
+        )
         self.nodes: dict[str, NodeInfo] = {}
         self._current_task: Optional[InferenceTask] = None
         self._infer_tasks: dict[str, InferenceTask] = {}
@@ -1042,8 +1055,11 @@ class Scheduler:
         self._startup_cancel_event = threading.Event()
         self.on_task_complete: Optional[Callable] = None
 
-        # TCP 服务端（分布式模式下启动）
-        self._tcp_server = None  # 延迟导入，避免循环依赖
+        # TCP 服务端（分布式模式下启动）。回调线程通过
+        # _tcp_callback_context 绑定触发事件的具体 server；普通控制面
+        # 线程则读取 _tcp_server_default。
+        self._tcp_server_default = None  # 延迟导入，避免循环依赖
+        self._tcp_callback_context = threading.local()
         # TCP 客户端（从节点连接主节点后创建）。必须在此默认初始化，
         # 否则从未连接过主节点的实例在错误路径直接访问
         # self._tcp_client 会抛 AttributeError 而不是优雅返回 False
@@ -1121,6 +1137,10 @@ class Scheduler:
         self._gemma4_sidecar_python_override: Optional[str] = None
         self._model_runtime_contract_lock = threading.RLock()
         self._active_pipeline_capacity_plan: Optional[dict] = None
+        # Recovery is control-plane state. A candidate is never published to
+        # an executor before its capacity, artifact, and epoch gates pass.
+        self._pipeline_reshard_coordinator: Optional[PipelineReshardCoordinator] = None
+        self._pipeline_reshard_last_decision: Optional[dict] = None
         self._prepared_layer_configs: dict[str, dict] = {}
         # 同时到达的分布式请求都可能要求权威同步，必须用计数而非
         # 布尔值，避免前一个请求结束时把后一个请求降级为普通推送。
@@ -1280,13 +1300,18 @@ class Scheduler:
             actual_port = SERVER_PORT if port is None else port
 
             try:
-                self._tcp_server = create_server(bind_host, actual_port)
-                self._tcp_server.start(
-                    on_message=self._on_tcp_message,
-                    on_disconnect=self._on_tcp_disconnect,
-                )
-                self._tcp_server.on_registration_confirmed = (
-                    self._on_tcp_registration_confirmed
+                server = create_server(bind_host, actual_port)
+                self._tcp_server = server
+                server.start(
+                    on_message=self._bind_tcp_server_callback(
+                        server, self._on_tcp_message,
+                    ),
+                    on_disconnect=self._bind_tcp_server_callback(
+                        server, self._on_tcp_disconnect,
+                    ),
+                    on_registration_confirmed=self._bind_tcp_server_callback(
+                        server, self._on_tcp_registration_confirmed,
+                    ),
                 )
             except Exception as e:
                 self._tcp_server = None
@@ -1408,9 +1433,62 @@ class Scheduler:
         logger.info("调度器已停止")
 
     @property
+    def _tcp_server(self):
+        """Return the server bound to the current TCP callback thread.
+
+        The default is used by ordinary scheduler work.  Receive callbacks
+        use a thread-local binding supplied when each server is registered,
+        so a second server cannot redirect an existing scheduler instance.
+        """
+        callback_server = getattr(self._tcp_callback_context, "server", None)
+        return callback_server or self._tcp_server_default
+
+    @_tcp_server.setter
+    def _tcp_server(self, value):
+        self._tcp_server_default = value
+
+    def _bind_tcp_server_callback(self, server, callback):
+        """Bind one control-plane event to its explicit TCPServer source."""
+        def bound_callback(*args, **kwargs):
+            previous = getattr(self._tcp_callback_context, "server", None)
+            self._tcp_callback_context.server = server
+            try:
+                return callback(*args, **kwargs)
+            finally:
+                if previous is None:
+                    try:
+                        del self._tcp_callback_context.server
+                    except AttributeError:
+                        pass
+                else:
+                    self._tcp_callback_context.server = previous
+
+        return bound_callback
+
+    @property
     def inference_host(self) -> "InferenceHost":
         """Return the host selected for this scheduler instance."""
         return self._host
+
+    @property
+    def inference_callbacks(self) -> Optional["SchedulerCallbacks"]:
+        """Return the explicit callback bundle selected for this scheduler."""
+        return self._callbacks
+
+    def configure_callbacks(self, callbacks: "SchedulerCallbacks") -> None:
+        """Set one complete callback bundle; individual callback ordering is irrelevant."""
+        if callbacks is None:
+            raise TypeError("scheduler callbacks are required")
+        self._callbacks = callbacks
+
+    def _require_callbacks(self) -> "SchedulerCallbacks":
+        callbacks = self._callbacks
+        if callbacks is None:
+            callbacks = getattr(self._host, "scheduler_callbacks", None)
+            self._callbacks = callbacks
+        if callbacks is None:
+            raise RuntimeError("scheduler callbacks are not configured")
+        return callbacks
 
     # ================================================================
     # 节点管理
@@ -3090,6 +3168,205 @@ class Scheduler:
             })
         return records
 
+    def _pipeline_node_metadata(self) -> dict[str, dict]:
+        """Project live scheduler nodes into opaque layout-location metadata."""
+        local_node_id = (
+            "master" if self._effective_role() == "master"
+            else self.get_effective_node_id()
+        )
+        with self._nodes_lock:
+            snapshot = list(self.nodes.items())
+        return {
+            node_id: {
+                "is_local": node_id == local_node_id,
+                # Public plans distinguish local/remote without exporting an
+                # address that belongs to the transport control plane.
+                "location": "local" if node_id == local_node_id else f"node:{node_id}",
+                "kind": "local" if node_id == local_node_id else "remote_pipeline",
+                "federated": node_id != local_node_id,
+                "engine": "pytorch",
+            }
+            for node_id, _node in snapshot
+        }
+
+    def _attach_pipeline_node_contract(self, plan: dict) -> dict:
+        """Attach the canonical node layout or reject a malformed admission."""
+        if not isinstance(plan, dict) or plan.get("admitted") is not True:
+            return plan
+        result = dict(plan)
+        try:
+            layout = pipeline_layout_from_capacity_plan(
+                result, node_metadata=self._pipeline_node_metadata(),
+            )
+        except PipelineNodeContractError as exc:
+            result.update({
+                "status": "rejected",
+                "admitted": False,
+                "reason_code": "pipeline_node_contract_invalid",
+                "reason": str(exc),
+                "assignments": [],
+                "pipeline_layout": None,
+            })
+            return result
+        result["pipeline_layout"] = layout.to_dict()
+        return result
+
+    def _activate_pipeline_reshard_coordinator(self, plan: Mapping[str, Any]) -> None:
+        """Bind a ready capacity plan to an epoch-fenced recovery topology."""
+        try:
+            layout = pipeline_layout_from_capacity_plan(
+                plan, node_metadata=self._pipeline_node_metadata(),
+            )
+            coordinator = PipelineReshardCoordinator(layout)
+        except (PipelineNodeContractError, ValueError) as exc:
+            logger.warning("未启用自动重分片合同: %s", exc)
+            with self._layer_config_lock:
+                self._pipeline_reshard_coordinator = None
+                self._pipeline_reshard_last_decision = {
+                    "status": "unavailable",
+                    "reason_code": "pipeline_reshard_layout_invalid",
+                    "reason": str(exc),
+                }
+            return
+        with self._layer_config_lock:
+            self._pipeline_reshard_coordinator = coordinator
+            self._pipeline_reshard_last_decision = {
+                "status": "active",
+                "reason_code": "",
+                "epoch": coordinator.epoch,
+            }
+
+    def _stage_pipeline_reshard_after_disconnect(self, node_id: str) -> Optional[dict]:
+        """Re-solve an active topology after a worker loss without writeback."""
+        if self._effective_role() != "master":
+            return None
+        with self._layer_config_lock:
+            coordinator = self._pipeline_reshard_coordinator
+        if coordinator is None or node_id not in {
+            item.node_id for item in coordinator.layout.nodes
+        }:
+            return None
+        get_descriptor = getattr(self._host, "get_pipeline_descriptor", None)
+        descriptor = get_descriptor() if callable(get_descriptor) else {}
+        if not isinstance(descriptor, dict) or not descriptor:
+            report = {
+                "status": "rejected",
+                "accepted": False,
+                "reason_code": "pipeline_reshard_descriptor_unavailable",
+            }
+        else:
+            from config import PIPELINE_CAPACITY_SAFETY_MARGIN
+
+            server = self._tcp_server
+            get_client_ids = getattr(server, "get_client_ids", None)
+            connected_ids = (
+                set(get_client_ids()) if callable(get_client_ids)
+                else set(getattr(server, "clients", {}).keys()) if server else set()
+            )
+            connected_ids.update({"master", self.get_effective_node_id()})
+            connected_ids.difference_update(self._task_worker_full_model_ids())
+
+            failed_node_ids = {node_id}
+            snapshot = getattr(coordinator, "snapshot", None)
+            if callable(snapshot):
+                for staged in snapshot().get("staged", []):
+                    failed_node_ids.update(
+                        str(item) for item in staged.get("failed_node_ids", [])
+                        if str(item)
+                    )
+
+            decision = coordinator.stage_failure(
+                failed_node_ids,
+                descriptor=descriptor,
+                capacity_nodes=self._get_pipeline_capacity_nodes(connected_ids),
+                node_metadata=self._pipeline_node_metadata(),
+                safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
+            )
+            report = decision.to_dict()
+        with self._layer_config_lock:
+            self._pipeline_reshard_last_decision = report
+        logger.warning(
+            "节点断线自动重分片计划: node=%s status=%s reason=%s",
+            node_id, report.get("status", ""), report.get("reason_code", ""),
+        )
+        return report
+
+    def _commit_ready_pipeline_reshard(self, plan: Mapping[str, Any]) -> Optional[bool]:
+        """Commit the staged epoch after the matching load transaction is ready."""
+        with self._layer_config_lock:
+            coordinator = self._pipeline_reshard_coordinator
+        if coordinator is None:
+            return None
+        staged = tuple(coordinator.snapshot().get("staged", []))
+        if not staged:
+            return None
+        plan_id = str(plan.get("plan_id", "") or "")
+        matching = next((
+            item for item in staged if item.get("capacity_plan_id") == plan_id
+        ), None)
+        if matching is None:
+            with self._layer_config_lock:
+                self._pipeline_reshard_last_decision = {
+                    "status": "rejected",
+                    "reason_code": "pipeline_reshard_plan_mismatch",
+                }
+            logger.error(
+                "重分片事务计划不匹配，拒绝发布: active=%s staged=%s",
+                plan_id, [item.get("capacity_plan_id", "") for item in staged],
+            )
+            return False
+        staged_plan = coordinator.staged_plan(str(matching.get("plan_id", "")))
+        if staged_plan is None:
+            return False
+        try:
+            ready_layout = pipeline_layout_from_capacity_plan(
+                plan, node_metadata=self._pipeline_node_metadata(),
+            )
+        except PipelineNodeContractError:
+            return False
+        if ready_layout.contract_sha256 != staged_plan.candidate_layout.contract_sha256:
+            return False
+        # Reaching ready proves the master materialized its segment and every
+        # worker ACKed its own model identity, range, and boundary duties.
+        for requirement in staged_plan.requirements:
+            coordinator.record_artifact(PipelineArtifactAvailability(
+                node_id=requirement.node_id,
+                model_sha256=requirement.model_sha256,
+                artifact_kind=requirement.artifact_kind,
+                layer_range=requirement.layer_range,
+                artifact_sha256=requirement.artifact_sha256,
+                verified=True,
+                has_embedding=requirement.has_embedding,
+                has_lm_head=requirement.has_lm_head,
+            ))
+        committed = coordinator.commit(
+            staged_plan.plan_id, expected_epoch=staged_plan.base_epoch,
+        )
+        with self._layer_config_lock:
+            self._pipeline_reshard_last_decision = committed.to_dict()
+        if not committed.accepted:
+            logger.error("重分片 epoch 提交被拒绝: %s", committed.reason_code)
+        return committed.accepted
+
+    def get_pipeline_reshard_status(self) -> dict:
+        """Return an address-free recovery projection for the API and TUI."""
+        with self._layer_config_lock:
+            coordinator = self._pipeline_reshard_coordinator
+            last = (
+                dict(self._pipeline_reshard_last_decision)
+                if self._pipeline_reshard_last_decision else None
+            )
+        if coordinator is None:
+            return {"status": "inactive", "epoch": 0, "last_decision": last}
+        snapshot = coordinator.snapshot()
+        return {
+            "status": snapshot["status"],
+            "epoch": snapshot["epoch"],
+            "active_contract_sha256": snapshot["layout"]["contract_sha256"],
+            "staged": snapshot["staged"],
+            "last_decision": last,
+        }
+
     def get_pipeline_capacity_plan(
         self, eligible_node_ids: Optional[set[str]] = None,
         *, descriptor: Optional[dict] = None,
@@ -3133,10 +3410,10 @@ class Scheduler:
                     transaction_snapshot = None
                     transaction_plan = None
             if active:
-                return active
+                return self._attach_pipeline_node_contract(active)
             if transaction_snapshot and transaction_plan:
                 transaction_plan.update(transaction_snapshot)
-                return transaction_plan
+                return self._attach_pipeline_node_contract(transaction_plan)
 
         if descriptor is None:
             get_descriptor = getattr(self._host, "get_pipeline_descriptor", None)
@@ -3177,7 +3454,7 @@ class Scheduler:
         result["computed_at"] = time.time()
         result["transaction_phase"] = "planned" if result.get("admitted") else "rejected"
         result.setdefault("require_distributed", bool(require_distributed))
-        return result
+        return self._attach_pipeline_node_contract(result)
 
     def _build_manual_pipeline_capacity_plan(
         self, assignments: list[dict], *, descriptor: Optional[dict] = None,
@@ -3277,7 +3554,7 @@ class Scheduler:
                 for item in planned
             ],
         }
-        return {
+        return self._attach_pipeline_node_contract({
             "schema_version": 1,
             "status": "admitted",
             "admitted": True,
@@ -3287,6 +3564,7 @@ class Scheduler:
             ).hexdigest(),
             "model_id": str(descriptor.get("model_id", "") or ""),
             "model_type": str(descriptor.get("model_type", "") or ""),
+            "model_sha256": str(descriptor.get("model_sha256", "") or ""),
             "total_layers": total_layers,
             "raw_model_bytes": sum(layer_bytes) + embedding_bytes
             + per_node_bytes + output_bytes,
@@ -3301,7 +3579,7 @@ class Scheduler:
             "single_node_full_model_candidates": [],
             "aggregate_only": len(planned) > 1,
             "computed_at": time.time(),
-        }
+        })
 
     def _normalize_manual_assignments(self, assignments: list) -> list:
         """补齐手动区间的运行字段，并按节点能力放置 Embedding/LM Head。"""
@@ -5554,7 +5832,7 @@ class Scheduler:
                 full_model_loaded and getattr(self._host, "layer_range", None) is None
             )
             if full_model_loaded:
-                identity = self._host._active_task_graph_model_identity()
+                identity = self._require_callbacks().active_task_graph_model_identity()
                 if identity is not None and identity.engine in engines:
                     models.append({
                         "model_id": identity.model_id,
@@ -5995,7 +6273,7 @@ class Scheduler:
             )
             with self._host.full_chat_execution_lock:
                 with self._inference_lock:
-                    output = self._host._execute_task_worker_stage(
+                    output = self._require_callbacks().execute_task_worker_stage(
                         request, active.cancel_event,
                     )
             if not isinstance(output, dict):
@@ -6689,8 +6967,9 @@ class Scheduler:
                 # invoked independently of the inference message handlers.
                 from transport_port import MessageType
 
-                entries, _ = self._host._snapshot_recent_logs()
-                filtered = self._host._filter_recent_logs(
+                callbacks = self._require_callbacks()
+                entries, _ = callbacks.snapshot_recent_logs()
+                filtered = callbacks.filter_recent_logs(
                     entries,
                     level=data.get("level", ""),
                     name=data.get("name", ""),
@@ -7097,8 +7376,12 @@ class Scheduler:
                 client_id, "update", node_info
             )
         self.deregister_node(client_id)
+        reshard = self._stage_pipeline_reshard_after_disconnect(client_id)
         if need_push:
-            self.push_layer_config_to_clients()
+            if reshard and reshard.get("accepted"):
+                self.request_authoritative_layer_sync(require_distributed=True)
+            else:
+                self.push_layer_config_to_clients()
 
     def _on_master_connection_lost(self, source_client=None) -> None:
         """Worker-side cleanup when PIPELINE_DONE/ABORT can no longer arrive."""
@@ -8465,6 +8748,17 @@ class Scheduler:
         """获取所有节点详情列表"""
         self._refresh_http_client_states()
         return list(self._snapshot_nodes(self._get_local_network_path_view()).values())
+
+    def get_aggregate_resource_view(self) -> dict:
+        """Return the read-only aggregate resource view used by the top layer."""
+        self._refresh_http_client_states()
+        local_node_id = (
+            "master" if self._effective_role() == "master"
+            else self.get_effective_node_id()
+        )
+        with self._nodes_lock:
+            nodes = [info.to_dict() for info in self.nodes.values()]
+        return build_aggregate_resource_view(nodes, local_node_id=local_node_id)
 
     # L5: 多节点日志聚合
     def request_node_logs(self, node_id: str, limit: int = 100,
@@ -10436,6 +10730,8 @@ class Scheduler:
                 "phase": phase,
                 "plan_id": plan_id,
                 "layer_range": [start, end],
+                "has_embedding": has_embed,
+                "has_lm_head": has_lm,
                 "model_sha256": local_sha256 or expected_sha256,
                 "model_type": actual_model_type,
                 "engine": engine,
@@ -10504,6 +10800,7 @@ class Scheduler:
 
         commit_config_id = ""
         abort_details = None
+        activated_plan = None
         with self._layer_config_lock:
             expected = self._layer_config_expected.get(client_id)
             if not expected:
@@ -10599,6 +10896,16 @@ class Scheduler:
                     and data.get("model_type") == expected.get("model_type")
                     and data.get("engine") == "pytorch"
                     and (
+                        "has_embedding" not in data
+                        or bool(data.get("has_embedding"))
+                        == bool(expected.get("has_embedding"))
+                    )
+                    and (
+                        "has_lm_head" not in data
+                        or bool(data.get("has_lm_head"))
+                        == bool(expected.get("has_lm_head"))
+                    )
+                    and (
                         not expected.get("plan_id")
                         or data.get("plan_id") == expected.get("plan_id")
                     )
@@ -10622,6 +10929,7 @@ class Scheduler:
                             active_plan["computed_at"] = time.time()
                             active_plan["transaction_phase"] = "ready"
                             self._active_pipeline_capacity_plan = active_plan
+                            activated_plan = dict(active_plan)
                 elif prepared:
                     self._layer_config_pushed.discard(client_id)
                     self._layer_config_retry_state.pop(client_id, None)
@@ -10668,6 +10976,13 @@ class Scheduler:
         if abort_details is not None:
             self._abort_pipeline_load_transaction(*abort_details)
             return
+        if activated_plan is not None:
+            reshard_committed = self._commit_ready_pipeline_reshard(activated_plan)
+            if reshard_committed is None:
+                self._activate_pipeline_reshard_coordinator(activated_plan)
+            elif not reshard_committed:
+                with self._layer_config_lock:
+                    self._active_pipeline_capacity_plan = None
         if commit_config_id:
             self._commit_pipeline_load_transaction(commit_config_id)
             return
@@ -12380,9 +12695,10 @@ class Scheduler:
 
         # ---- Step 2: Tokenize ----
         chat_messages = messages or [{"role": "user", "content": prompt}]
-        thinking_prompt = getattr(self._host, "THINKING_SYSTEM_PROMPT", None) if show_thinking else None
+        callbacks = self._require_callbacks()
+        thinking_prompt = callbacks.thinking_system_prompt if show_thinking else None
         thinking_prefill = "【思考】\n" if show_thinking else None
-        model_prompt = self._host._build_model_chat_prompt(
+        model_prompt = callbacks.build_model_chat_prompt(
             tokenizer,
             chat_messages,
             system_prompt=thinking_prompt,
@@ -12826,7 +13142,7 @@ class Scheduler:
             )
             raw_new_text = ""
 
-        new_text, thinking_content = self._host._format_model_response(
+        new_text, thinking_content = self._require_callbacks().format_model_response(
             raw_new_text,
             show_thinking,
             native_thinking_prompt=native_thinking_prompt,
@@ -13329,13 +13645,14 @@ class Scheduler:
 
         try:
             messages = kwargs.pop("messages", None) or [{"role": "user", "content": prompt}]
+            callbacks = self._require_callbacks()
             if show_thinking and not any(item.get("role") == "system" for item in messages):
                 messages = [
-                    {"role": "system", "content": self._host.THINKING_SYSTEM_PROMPT},
+                    {"role": "system", "content": callbacks.thinking_system_prompt},
                     *messages,
                 ]
             try:
-                fallback_prompt = self._host._build_model_chat_prompt(mgr.tokenizer, messages)
+                fallback_prompt = callbacks.build_model_chat_prompt(mgr.tokenizer, messages)
                 native_thinking_prompt = "<think>" in fallback_prompt[-128:].lower()
             except Exception:
                 native_thinking_prompt = False
@@ -13367,7 +13684,7 @@ class Scheduler:
                         else:
                             _stream_callback({"token": chunk})
                 raw_response_text = "".join(full_text_parts)
-                response_text, thinking_content = self._host._format_model_response(
+                response_text, thinking_content = callbacks.format_model_response(
                     raw_response_text,
                     show_thinking,
                     native_thinking_prompt=native_thinking_prompt,
@@ -13405,7 +13722,7 @@ class Scheduler:
                     _cancel_event=cancel_event,
                 )
                 raw_response_text = result.get("content", "")
-                response_text, thinking_content = self._host._format_model_response(
+                response_text, thinking_content = callbacks.format_model_response(
                     raw_response_text,
                     show_thinking,
                     native_thinking_prompt=native_thinking_prompt,
@@ -13470,6 +13787,12 @@ class Scheduler:
             yield {"done": True, "error": "模型未加载"}
             return
 
+        try:
+            callbacks = self._require_callbacks()
+        except RuntimeError as e:
+            yield {"done": True, "error": str(e)}
+            return
+
         self._inference_lock.acquire()
         try:
             ensure_full = getattr(mgr, "ensure_full_model", None)
@@ -13487,7 +13810,7 @@ class Scheduler:
         messages = kwargs.pop("messages", None) or [{"role": "user", "content": prompt}]
         engine_name = backend_id_for(mgr, default="pytorch") or "pytorch"
         try:
-            model_prompt = self._host._build_model_chat_prompt(mgr.tokenizer, messages)
+            model_prompt = callbacks.build_model_chat_prompt(mgr.tokenizer, messages)
             native_thinking_prompt = "<think>" in model_prompt[-128:].lower()
         except Exception:
             native_thinking_prompt = bool(
@@ -13559,7 +13882,7 @@ class Scheduler:
             self._inference_lock.release()
 
         raw_response_text = "".join(full_text_parts)
-        response_text, thinking_content = self._host._format_model_response(
+        response_text, thinking_content = callbacks.format_model_response(
             raw_response_text,
             show_thinking,
             native_thinking_prompt=native_thinking_prompt,

@@ -65,6 +65,23 @@ def _capabilities():
     }
 
 
+def _scheduler_callbacks(*, identity=None, execute=None):
+    from model_host import SchedulerCallbackSet
+
+    def unexpected_execute(*args, **kwargs):
+        raise AssertionError("unexpected task-worker stage execution")
+
+    return SchedulerCallbackSet(
+        active_task_graph_model_identity=identity or (lambda: None),
+        execute_task_worker_stage=execute or unexpected_execute,
+        build_model_chat_prompt=lambda tokenizer, messages, **kwargs: "",
+        thinking_system_prompt="thinking",
+        snapshot_recent_logs=lambda: ([], 0),
+        filter_recent_logs=lambda entries, **kwargs: list(entries),
+        format_model_response=lambda text, **kwargs: (text, None),
+    )
+
+
 def _android_capabilities(*, resource_admitted=True):
     return {
         "stage_types": ["full_inference"],
@@ -1289,9 +1306,6 @@ def test_scheduler_does_not_advertise_a_layer_partition_as_full_model(
     fake_api = SimpleNamespace(
         model_loaded=True,
         model_manager=SimpleNamespace(_instance=partition_manager),
-        _active_task_graph_model_identity=lambda: pytest.fail(
-            "a layer partition must not compute or advertise full model identity"
-        ),
     )
     monkeypatch.setattr(scheduler, "_host", fake_api)
 
@@ -1317,10 +1331,10 @@ def test_scheduler_advertises_modelhost_loaded_model_without_legacy_is_loaded(
     fake_host = SimpleNamespace(
         has_loaded_model=lambda: True,
         layer_range=None,
-        _active_task_graph_model_identity=lambda: identity,
     )
     scheduler = Scheduler()
     monkeypatch.setattr(scheduler, "_host", fake_host)
+    scheduler.configure_callbacks(_scheduler_callbacks(identity=lambda: identity))
 
     capabilities = scheduler._task_worker_capabilities()
 
@@ -1363,9 +1377,9 @@ def test_scheduler_worker_gate_blocks_hello_and_rejects_stale_offer(
     scheduler._task_worker_control.receive_on_worker(ack.snapshot())
     monkeypatch.setattr(scheduler, "_host", SimpleNamespace(
         full_chat_execution_lock=threading.RLock(),
-        _execute_task_worker_stage=lambda *args: pytest.fail(
-            "a disabled worker must not execute a Stage"
-        ),
+    ))
+    scheduler.configure_callbacks(_scheduler_callbacks(
+        execute=lambda *args: pytest.fail("a disabled worker must not execute a Stage"),
     ))
     now_ms = int(time.time() * 1000)
     root_input = {"message": "hello"}
@@ -1435,13 +1449,15 @@ def test_scheduler_worker_executes_one_admitted_stage_and_returns_result(
     scheduler._tcp_client = Client()
     fake_api = SimpleNamespace(
         full_chat_execution_lock=threading.RLock(),
-        _execute_task_worker_stage=lambda request, cancel_event: {
+    )
+    monkeypatch.setattr(scheduler, "_host", fake_api)
+    scheduler.configure_callbacks(_scheduler_callbacks(
+        execute=lambda request, cancel_event: {
             "content": f"remote:{request.stage_id}",
             "usage": {"total_tokens": 3},
             "model": "qwen-1_8b",
         },
-    )
-    monkeypatch.setattr(scheduler, "_host", fake_api)
+    ))
     root_input = {"message": "hello", "messages": []}
     dependencies = {}
     now_ms = int(time.time() * 1000)
@@ -1986,8 +2002,8 @@ def test_scheduler_worker_replays_duplicate_offer_without_second_execution(
 
     monkeypatch.setattr(scheduler, "_host", SimpleNamespace(
         full_chat_execution_lock=threading.RLock(),
-        _execute_task_worker_stage=execute,
     ))
+    scheduler.configure_callbacks(_scheduler_callbacks(execute=execute))
     now_ms = int(time.time() * 1000)
     root_input = {"message": "hello"}
     offer = build_message(
@@ -2066,8 +2082,8 @@ def test_scheduler_worker_lease_renew_extends_active_execution(monkeypatch):
 
     monkeypatch.setattr(scheduler, "_host", SimpleNamespace(
         full_chat_execution_lock=threading.RLock(),
-        _execute_task_worker_stage=execute,
     ))
+    scheduler.configure_callbacks(_scheduler_callbacks(execute=execute))
     now_ms = int(time.time() * 1000)
     root_input = {"message": "hello"}
     offer = build_message(
@@ -2165,8 +2181,8 @@ def test_scheduler_worker_cancel_ack_is_replayed_without_stage_error(
 
     monkeypatch.setattr(scheduler, "_host", SimpleNamespace(
         full_chat_execution_lock=threading.RLock(),
-        _execute_task_worker_stage=execute,
     ))
+    scheduler.configure_callbacks(_scheduler_callbacks(execute=execute))
     now_ms = int(time.time() * 1000)
     root_input = {"message": "hello"}
     offer = build_message(
@@ -2259,8 +2275,8 @@ def test_scheduler_worker_replays_cached_result_after_send_failure(monkeypatch):
 
     monkeypatch.setattr(scheduler, "_host", SimpleNamespace(
         full_chat_execution_lock=threading.RLock(),
-        _execute_task_worker_stage=execute,
     ))
+    scheduler.configure_callbacks(_scheduler_callbacks(execute=execute))
     now_ms = int(time.time() * 1000)
     root_input = {"message": "hello"}
     offer = build_message(
@@ -2343,9 +2359,9 @@ def test_scheduler_worker_does_not_resurrect_an_expired_lease(monkeypatch):
     scheduler._tcp_client = Client()
     monkeypatch.setattr(scheduler, "_host", SimpleNamespace(
         full_chat_execution_lock=threading.RLock(),
-        _execute_task_worker_stage=lambda request, cancel_event: (
-            time.sleep(0.3) or {"content": "too late"}
-        ),
+    ))
+    scheduler.configure_callbacks(_scheduler_callbacks(
+        execute=lambda request, cancel_event: time.sleep(0.3) or {"content": "too late"},
     ))
     now_ms = int(time.time() * 1000)
     root_input = {"message": "hello"}
@@ -2429,9 +2445,9 @@ def test_scheduler_worker_lease_uses_duration_across_wall_clock_skew(
     scheduler._tcp_client = Client()
     monkeypatch.setattr(scheduler, "_host", SimpleNamespace(
         full_chat_execution_lock=threading.RLock(),
-        _execute_task_worker_stage=lambda request, cancel_event: {
-            "content": "clock independent"
-        },
+    ))
+    scheduler.configure_callbacks(_scheduler_callbacks(
+        execute=lambda request, cancel_event: {"content": "clock independent"},
     ))
     now_ms = 1000
     root_input = {"message": "hello"}
