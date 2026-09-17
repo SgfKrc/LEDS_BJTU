@@ -341,6 +341,32 @@ class RemoteAssetSyncPlan:
             "commit_script": self.commit_script,
         }
 
+    def as_pipeline_artifact_availability(
+        self, node_id: str, total_layers: int, *, sync_status: str,
+    ) -> Any:
+        """Expose a verified full-GGUF sync result to the reshard contract.
+
+        The caller may use this only after ``sync_remote_model`` reports
+        ``already_current`` or ``applied``.  The source file is a whole-model
+        GGUF, so it covers every decoder layer in the declared topology.
+        """
+        if sync_status not in {"already_current", "applied"}:
+            raise ValueError(
+                "pipeline artifact availability requires a successful sync result",
+            )
+        from src.pipeline_reshard import PipelineArtifactAvailability
+
+        return PipelineArtifactAvailability(
+            node_id=node_id,
+            model_sha256=self.source_sha256,
+            artifact_kind="gguf",
+            layer_range=(0, int(total_layers)),
+            artifact_sha256=self.source_sha256,
+            verified=True,
+            has_embedding=True,
+            has_lm_head=True,
+        )
+
 
 def _validate_remote_asset_path(remote_path: str) -> str:
     normalized = str(remote_path or "").replace("/", "\\")

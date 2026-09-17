@@ -72,6 +72,28 @@ def test_remote_asset_sync_plan_is_sha_verified_and_non_destructive(tmp_path: Pa
     assert "Remove-Item" not in sync_plan.prepare_script + sync_plan.commit_script
     assert "--model" not in sync_plan.scp_command
 
+    availability = sync_plan.as_pipeline_artifact_availability(
+        "rpc-edge", 25, sync_status="already_current",
+    )
+    assert availability.layer_range == (0, 25)
+    assert availability.model_sha256 == sync_plan.source_sha256
+    assert availability.artifact_kind == "gguf"
+
+
+def test_remote_asset_plan_is_not_availability_before_success(tmp_path: Path):
+    model = tmp_path / "qwen.gguf"
+    model.write_bytes(b"not-synced")
+    sync_plan = build_remote_asset_sync_plan(
+        model,
+        "surface@100.100.52.106",
+        r"C:\Users\surface\Documents\LEDS_BJTU\models\qwen.gguf",
+    )
+
+    with pytest.raises(ValueError, match="successful sync"):
+        sync_plan.as_pipeline_artifact_availability(
+            "rpc-edge", 25, sync_status="dry_run",
+        )
+
 
 def test_remote_asset_sync_plan_rejects_relative_or_traversal_paths(tmp_path: Path):
     model = tmp_path / "qwen.gguf"
