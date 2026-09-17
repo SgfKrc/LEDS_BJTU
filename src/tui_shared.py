@@ -50,6 +50,10 @@ API_PATHS = {
     "cluster_log_aggregate": "/cluster/nodes/log-aggregate",
     # 设备画像（后端所在机器）
     "device_profile": "/device/profile",
+    # 2026-09-17 按后端真实返回对齐（此前沿用旧 TUI 假设，导致多屏显示"无数据"）
+    "health": "/health",
+    "system_status": "/status",
+    "models_list": "/models",
 }
 
 # ============================================================

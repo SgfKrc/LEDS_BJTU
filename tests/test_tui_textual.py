@@ -3,7 +3,8 @@
 要点：
 * ``tui_api``（协议层）是纯标准库，**没有** textual 也必须能 import 并正确报错；
 * Textual 外壳在**后端不可用**时也必须能安全启动（只显示错误，不崩）；
-* 五个 Tab（聊天/状态/模型/分布式/关于）与外层 Splash→Main 切换必须存在。
+* 九屏（聊天/状态/模型/分布式/节点/队列/日志/设备/设置）侧栏导航与外层 Splash→Main 切换必须存在；
+* 各屏按后端**真实字段**渲染（回归 2026-09-17 的接线错位），聊天后端错误必须可见。
 
 缺 textual 时整个模块跳过（Edge 之外的极简环境仍可跑其余测试）。
 """
@@ -128,8 +129,164 @@ def test_shell_survives_backend_absent():
     _run(_main())
 
 
+#: 后端**真实**返回形状（2026-09-17 实测，保留关键字段名）——用于回归"接线是否对上"。
+#: 早期实现沿用旧 TUI 假设（/models/current、resources.nodes、logs.lines、profile.os、
+#: cpu.model、queue.tasks），真机下表现为"只有一行/不显示"。
+LIVE_SHAPES = {
+    "/health": {"status": "ok"},
+    "/status": {
+        "model_loaded": False, "model_name": "Qwen/Qwen-1.8B-Chat", "active_model_id": None,
+        "engine": "", "run_mode": "distributed", "node_role": "master", "node_id": "master",
+        "max_nodes": 3, "current_quant": "int4", "conversation_turns": 0,
+        "pipeline_prepared": False,
+    },
+    "/models": {
+        "models": [{"model_id": "qwen-1_8b", "name": "Qwen-1.8B-Chat",
+                    "available_formats": ["safetensors", "gguf"],
+                    "preferred_engine": "pytorch", "is_available": True,
+                    "unavailable_reason": ""}],
+        "active_model_id": None,
+    },
+    "/cluster/resources": {
+        "scope": "cluster", "node_count": 1, "available_node_count": 1,
+        "available": {
+            "local": {"node_id": "master", "role": "NodeRole.MASTER", "state": "online",
+                      "available": True,
+                      "cpu": {"physical_cores": 14, "logical_cores": 20},
+                      "ram": {"total_gb": 15.6, "available_gb": 6.5},
+                      "gpu": {"count": 2, "cuda_count": 0, "vram_total_gb": 4.0,
+                              "vram_free_gb": 0.0}},
+            "remote": [],
+        },
+        "totals": {"physical_cores": 14, "logical_cores": 20, "ram_total_gb": 15.6,
+                   "ram_available_gb": 6.5, "gpu_count": 2, "cuda_gpu_count": 0,
+                   "vram_total_gb": 4.0, "vram_free_gb": 0.0},
+    },
+    "/cluster/nodes": {"nodes": [{"node_id": "master", "role": "master", "node_type": "pc",
+                                  "state": "online", "address": "100.90.76.108:8888",
+                                  "hostname": "localhost", "avg_rtt_ms": 0}],
+                       "count": 1, "online_count": 1},
+    "/cluster/queue": {"running": True, "paused": False, "strategy": "mlfq", "queue_size": 0,
+                       "max_size": 100, "q0_depth": 0, "q1_depth": 0, "q2_depth": 0,
+                       "q0": [], "q1": [], "q2": [], "completed_count": 0, "current_task": None,
+                       "aging_params": {"q0_max_tokens": 128, "q1_max_tokens": 512}},
+    "/cluster/nodes/log-aggregate": {"local": {"node_id": "master",
+                                               "logs": ["line-1", "line-2"]},
+                                     "workers": [], "total_workers": 0, "limit": 50},
+    "/device/profile": {
+        "tier": "laptop", "tier_label": "游戏本 / 独显本", "score_total": 23.8,
+        "platform": {"os": "Windows", "os_version": "10.0.19045", "hostname": "DESKTOP-X",
+                     "machine": "AMD64", "architecture": "64bit", "python_version": "3.12.10"},
+        "cpu": {"model_name": "13th Gen Intel(R) Core(TM) i9-13900H",
+                "physical_cores": 14, "logical_cores": 20, "usage_percent": 10.3},
+        "ram": {"total_gb": 15.6, "available_gb": 6.5, "percent_used": 58.7},
+        "disk": {"free_gb": 121.1, "total_gb": 503.1, "path": "G:\\models"},
+        "gpus": [{"name": "RTX 4060", "gpu_type": "discrete", "cuda_available": False,
+                  "vram_total_gb": 4.0, "driver_version": ""}],
+        "warnings": [], "recommendations": [],
+    },
+}
+
+
+def _rows(screen, selector):
+    from textual.widgets import DataTable
+
+    table = screen.query_one(selector, DataTable)
+    return [[str(cell) for cell in table.get_row(key)] for key in table.rows]
+
+
+class _StubApi:
+    """按真实形状应答的假后端（暴露给多个用例复用）。"""
+
+    base_url = "http://stub:8000"
+    host = "127.0.0.1"
+    port = 8000
+    timeout = 5.0
+    log_token = ""
+
+    def get(self, path, **kwargs):
+        return LIVE_SHAPES.get(path, {})
+
+
+def test_live_backend_shapes_render_every_page():
+    """回归：各页必须按后端**真实**字段渲染（2026-09-17 实测形状）。"""
+    from textual.widgets import Static
+
+    from tui_textual import KoakumaApp
+
+    async def _main():
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.5), interval=3)
+        app.api = _StubApi()
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.show_main()
+            await pilot.pause(2.0)
+            screen = app.screen
+
+            models = _rows(screen, "#models-table")
+            assert models and models[0][1] == "qwen-1_8b", models
+            assert models[0][3] == "safetensors, gguf", models
+
+            resources = _rows(screen, "#resources-table")
+            assert resources[0][0] == "master" and "14 / 20" in resources[0][2], resources
+            assert "合计" in resources[-1][0], resources
+
+            nodes = _rows(screen, "#nodes-table")
+            assert nodes[0][0] == "master" and "在线" in nodes[0][3], nodes
+
+            queue = _rows(screen, "#queue-table")
+            assert [row[0] for row in queue] == ["[b]Q0[/]", "[b]Q1[/]", "[b]Q2[/]"], queue
+
+            device = str(screen.query_one("#device-pane", Static).render())
+            assert "Windows 10.0.19045" in device and "i9-13900H" in device, device
+            assert screen.log_line_count == 2, screen.log_line_count
+
+            status = " ".join(f"{row[0]}={row[1]}" for row in _rows(screen, "#status-table"))
+            assert "运行模式=distributed" in status, status
+            assert "Qwen-1.8B-Chat（未加载）" in status, status
+
+    _run(_main())
+
+
+def test_chat_done_error_is_surfaced(monkeypatch):
+    """回归：``/chat/stream`` 的 ``done.error``（如"模型加载失败"）必须显示出来。
+
+    早先只看 done.response/metrics，会把错误吞掉 → 用户看到"没有回复也没有原因"。
+    """
+    from textual.widgets import Input, Static
+
+    import tui_textual as tt
+
+    def fake_stream(api, message, **kwargs):
+        yield {"start": True, "generation_id": "gen-1"}
+        yield {"done": True, "error": "本地回退模型加载失败: llama-cpp-python 未安装"}
+
+    monkeypatch.setattr(tt, "iter_chat_payloads", fake_stream)
+
+    async def _main():
+        app = tt.KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.5))
+        async with app.run_test() as pilot:
+            app.show_main()
+            await pilot.pause()
+            pane = app.screen.query_one("#chat-pane")
+            box = pane.query_one("#chat-input", Input)
+            box.focus()
+            box.value = "你好"
+            await pilot.press("enter")
+            rendered = ""
+            deadline = time.time() + 6
+            while time.time() < deadline:
+                await pilot.pause(0.1)
+                rendered = str(pane.query_one("#chat-status", Static).render())
+                if "错误" in rendered:
+                    break
+            assert "后端错误" in rendered, rendered
+            assert "llama-cpp-python" in rendered or "模型加载失败" in rendered, rendered
+
+    _run(_main())
+
+
 def test_chat_pane_help_and_unknown_command():
-    from textual.widgets import Input, RichLog
+    from textual.widgets import Input, Static
 
     from tui_textual import ChatPane, KoakumaApp
 
@@ -144,7 +301,8 @@ def test_chat_pane_help_and_unknown_command():
             box.focus()
             await pilot.press("enter")
             await pilot.pause()
-            assert pane.query_one(RichLog) is not None
+            assert "可用命令" in pane.chat_buffer
+            assert pane.query_one("#chat-log", Static) is not None
             # 未识别命令不应触发网络请求，只提示
             box.value = "/nonexistent"
             box.focus()

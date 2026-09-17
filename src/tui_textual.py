@@ -93,11 +93,11 @@ BAR_EMPTY = "░"
 #: 侧栏导航页表：(key, 页名, 一句话说明)
 PAGES: List[Tuple[str, str, str]] = [
     ("chat", "聊天", "SSE 流式对话 · /help 查看命令"),
-    ("status", "状态", "运行概览 · /health /status /models/current"),
-    ("models", "模型", "模型列表与当前加载 · /models"),
-    ("cluster", "分布式", "集群资源与分层容量 · /cluster/resources"),
+    ("status", "状态", "运行概览 · /health /status /models"),
+    ("models", "模型", "模型注册表（19 个内置）· /models"),
+    ("cluster", "分布式", "集群资源合计 · /cluster/resources"),
     ("nodes", "节点", "成员与角色 · /cluster/nodes"),
-    ("queue", "队列", "请求队列与调度策略 · /cluster/queue"),
+    ("queue", "队列", "MLFQ 三级队列 · /cluster/queue"),
     ("logs", "日志", "聚合日志（末尾 200 行）· /cluster/nodes/log-aggregate"),
     ("device", "设备", "本机设备画像与 GPU · /device/profile"),
     ("settings", "设置", "会话参数与依赖边界"),
@@ -149,13 +149,16 @@ Screen { background: $surface; }
 /* ---------------------------------------------------------------- 内容 */
 #models-table, #resources-table, #nodes-table, #queue-table,
 #status-table, #logs-log { height: 1fr; }
-#status-pane { height: auto; color: $text-muted; }
+#status-pane, #queue-pane, #logs-pane { height: auto; color: $text-muted; }
 #device-pane, #settings-pane { height: auto; }
 #gpu-table { height: auto; max-height: 14; }
 
 /* ---------------------------------------------------------------- 聊天 */
-#chat-log { height: 1fr; border: round $primary 20%; padding: 0 1; }
-#chat-status { padding: 0 1; height: 1; color: $text-muted; }
+/* 对话文本用 Static + 缓冲渲染：Textual 8 的 RichLog.write() 不支持 end=，
+   逐 token 流式写入会抛 TypeError —— 表现为"聊天得不到回复"。 */
+#chat-scroll { height: 1fr; border: round $primary 20%; padding: 0 1; }
+#chat-log { height: auto; }
+#chat-status { padding: 0 1; height: auto; min-height: 1; color: $text-muted; }
 #chat-input { dock: bottom; }
 """
 
@@ -176,6 +179,23 @@ def kv(label: str, value: Any) -> str:
     """键值行：标签定宽 12 列，值缺省显示 em dash（各页排版统一）。"""
     text = "—" if value in (None, "") else str(value)
     return f"  {label:<12} {text}"
+
+
+def _join(value: Any, sep: str = ", ") -> str:
+    if isinstance(value, (list, tuple)):
+        return sep.join(str(item) for item in value) or "—"
+    return "—" if value in (None, "") else str(value)
+
+
+def _log_lines(source: Any, node_id: str) -> List[str]:
+    """把 ``{node_id, logs: [...]}`` 形状的日志段摊平成 ``[node] 行``。"""
+    if not isinstance(source, dict):
+        return []
+    name = source.get("node_id") or node_id
+    lines = source.get("logs") or source.get("lines") or []
+    if isinstance(lines, str):
+        lines = lines.splitlines()
+    return [f"[{name}] {line}" for line in lines]
 
 
 class SplashScreen(Screen):
@@ -237,10 +257,45 @@ class SplashScreen(Screen):
 class ChatPane(Vertical):
     """聊天页：SSE 流式输出（等价旧 ChatScreen 的事件处理）。"""
 
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.chat_buffer = ""
+
     def compose(self) -> ComposeResult:
-        yield RichLog(id="chat-log", markup=True, wrap=True, highlight=False)
+        with VerticalScroll(id="chat-scroll"):
+            yield Static("", id="chat-log", markup=True)
         yield Static("就绪。输入消息并回车发送；/help 查看命令", id="chat-status")
         yield Input(placeholder="输入消息…（/help 查看命令）", id="chat-input")
+
+    # ------------------------------------------------------------ 缓冲与渲染
+
+    def write_line(self, text: str) -> None:
+        """追加一整行（命令输出 / 用户输入）。"""
+        self.chat_buffer += ("\n" if self.chat_buffer else "") + text
+        self.render_chat()
+
+    def append_chunk(self, piece: str) -> None:
+        """流式追加 token（不换行）；整体重渲染由 Static 承担。"""
+        self.chat_buffer += piece
+        self.render_chat()
+
+    def replace_transcript(self, text: str) -> None:
+        self.chat_buffer = text
+        self.render_chat()
+
+    def clear_chat(self) -> None:
+        self.chat_buffer = ""
+        self.render_chat()
+
+    def render_chat(self) -> None:
+        self.query_one("#chat-log", Static).update(self.chat_buffer)
+        try:
+            self.query_one("#chat-scroll", VerticalScroll).scroll_end(animate=False)
+        except Exception:  # noqa: BLE001 - 挂载早期可能尚无滚动容器
+            pass
+
+    def set_status(self, text: str) -> None:
+        self.query_one("#chat-status", Static).update(text or "完成")
 
     # ------------------------------------------------------------ 发送
 
@@ -249,21 +304,21 @@ class ChatPane(Vertical):
         if not text:
             return
         event.input.value = ""
-        log = self.query_one("#chat-log", RichLog)
         if text in {"/help", "/?"}:
-            log.write("[b]可用命令[/]\n"
-                      "  [b]/help[/]                    显示本帮助\n"
-                      "  [b]/route[/] auto|local|distributed|required   路由偏好\n"
-                      "  [b]/thinking[/] on|off         是否展示思考流\n"
-                      "  [b]/clear[/]                   清空当前会话显示\n"
-                      "  [b]/cancel[/]                  取消正在生成的请求\n"
-                      "  [b]/quit[/]                    退出外壳（后端保持运行）")
+            self.write_line(
+                "[b]可用命令[/]\n"
+                "  [b]/help[/]                    显示本帮助\n"
+                "  [b]/route[/] auto|local|distributed|required   路由偏好\n"
+                "  [b]/thinking[/] on|off         是否展示思考流\n"
+                "  [b]/clear[/]                   清空当前会话显示\n"
+                "  [b]/cancel[/]                  取消正在生成的请求\n"
+                "  [b]/quit[/]                    退出外壳（后端保持运行）")
             return
         if text == "/quit":
             self.app.exit()
             return
         if text == "/clear":
-            log.clear()
+            self.clear_chat()
             return
         if text.startswith("/route "):
             value = text.split(" ", 1)[1].strip()
@@ -297,8 +352,8 @@ class ChatPane(Vertical):
             self.query_one("#chat-status", Static).update(f"[red]未知命令: {text}")
             return
 
-        log.write(f"[b $accent]你[/] {text}")
-        log.write("[dim]assistant[/] ")
+        self.write_line(f"[b $accent]你[/] {text}")
+        self.write_line("[dim]assistant[/] ")
         self.stream_reply(text)
 
     @work(thread=True, exclusive=True, group="chat")
@@ -307,6 +362,7 @@ class ChatPane(Vertical):
         app = self.app
         acc: List[str] = []
         status = "…"
+        error_text = ""
         try:
             for payload in iter_chat_payloads(
                 app.api,
@@ -329,37 +385,36 @@ class ChatPane(Vertical):
                         self.app.call_from_thread(
                             self.append_chunk, f"[dim italic]{payload['thinking']}[/]")
                 elif payload.get("done"):
+                    # 后端把失败放在 done.error（例如"本地回退模型加载失败"）；
+                    # 早先只看 response/metrics，会把错误吞掉，界面表现为"没回复也没原因"。
+                    if payload.get("error"):
+                        error_text = str(payload["error"])
                     final = payload.get("response")
                     if isinstance(final, str) and final and "".join(acc) != final:
                         self.app.call_from_thread(self.replace_transcript, final)
                     if payload.get("session_id"):
                         app.session_id = payload["session_id"]
-                    status = format_metrics(
-                        payload.get("metrics") or None,
-                        history_committed=payload.get("history_committed"),
-                    )
+                    if not error_text:
+                        status = format_metrics(
+                            payload.get("metrics") or None,
+                            history_committed=payload.get("history_committed"),
+                        )
                 elif payload.get("cancelled"):
                     status = "已被取消"
                 elif payload.get("error"):
-                    status = f"[red]后端错误: {payload['error']}"
+                    error_text = str(payload["error"])
         except Exception as exc:  # noqa: BLE001 - 网络异常不应让界面崩溃
-            status = f"[red]请求失败: {exc}"
+            error_text = f"{type(exc).__name__}: {exc}"
         finally:
             app.generation_id = None
+            if error_text:
+                first = error_text.strip().splitlines()[0]
+                status = f"[red]后端错误: {first}[/]"
+                self.app.call_from_thread(self.append_chunk, f"[red]✗ {error_text}[/]")
             self.app.call_from_thread(self.set_status, status)
 
     # ------------------------------------------------------------ UI 更新（主线程）
-
-    def append_chunk(self, piece: str) -> None:
-        self.query_one("#chat-log", RichLog).write(piece, end="")
-
-    def replace_transcript(self, text: str) -> None:
-        log = self.query_one("#chat-log", RichLog)
-        log.write("")
-        log.write(text)
-
-    def set_status(self, text: str) -> None:
-        self.query_one("#chat-status", Static).update(text or "完成")
+    # write_line / append_chunk / replace_transcript / set_status 见上方"缓冲与渲染"段。
 
 
 class MainScreen(Screen):
@@ -377,6 +432,8 @@ class MainScreen(Screen):
         super().__init__()
         self.page_index = 0
         self.health_text = "…"
+        self.model_text = "…"
+        self.log_line_count = 0
 
     # ------------------------------------------------------------ 版式
 
@@ -412,12 +469,14 @@ class MainScreen(Screen):
                     yield Static(PAGES[4][2], classes="page-hint")
                     yield DataTable(id="nodes-table")
                 with Vertical(id="page-queue", classes="page"):
-                    yield Static("队列 · 请求与调度", classes="page-title")
+                    yield Static("队列 · MLFQ 三级调度", classes="page-title")
                     yield Static(PAGES[5][2], classes="page-hint")
+                    yield Static("加载中…", id="queue-pane")
                     yield DataTable(id="queue-table")
                 with Vertical(id="page-logs", classes="page"):
                     yield Static("日志 · 聚合视图", classes="page-title")
                     yield Static(PAGES[6][2], classes="page-hint")
+                    yield Static("加载中…", id="logs-pane")
                     yield RichLog(id="logs-log", markup=False, wrap=True)
                 with Vertical(id="page-device", classes="page"):
                     yield Static("设备 · 本机画像", classes="page-title")
@@ -503,11 +562,15 @@ class MainScreen(Screen):
 
     def on_mount(self) -> None:
         self.query_one("#status-table", DataTable).add_columns("项目", "值")
-        self.query_one("#models-table", DataTable).add_columns("", "模型", "格式", "引擎", "状态")
-        self.query_one("#resources-table", DataTable).add_columns("节点", "运行模式", "就绪", "任务")
-        self.query_one("#nodes-table", DataTable).add_columns("节点", "角色", "主机", "地址")
-        self.query_one("#queue-table", DataTable).add_columns("任务", "类型", "状态", "节点")
-        self.query_one("#gpu-table", DataTable).add_columns("", "名称", "类型", "CUDA", "显存GB")
+        self.query_one("#models-table", DataTable).add_columns(
+            "", "模型 ID", "名称", "格式", "引擎", "状态")
+        self.query_one("#resources-table", DataTable).add_columns(
+            "节点", "角色 / 状态", "CPU 物理/逻辑", "内存 总/可用", "GPU 数/CUDA", "显存 总/可用")
+        self.query_one("#nodes-table", DataTable).add_columns(
+            "节点", "角色", "类型", "状态", "地址", "RTT")
+        self.query_one("#queue-table", DataTable).add_columns("队列", "深度", "上限(tokens)", "任务")
+        self.query_one("#gpu-table", DataTable).add_columns(
+            "", "名称", "类型", "CUDA", "显存GB", "驱动")
         self.query_one("#settings-pane", Static).update(self.settings_text())
         self.refresh_topbar()
         self.action_reload()
@@ -532,8 +595,9 @@ class MainScreen(Screen):
             self.query_one("#nav-summary", Static).update(
                 "[b $accent]后端[/]\n"
                 f"{api.host}:{api.port}\n"
-                f"[dim]健康[/] {self.health_text}   [dim]刷新[/] {self.app.interval:.0f}s\n"
-                f"[dim]当前[/] {page[1]}")
+                f"[dim]健康[/] {self.health_text}\n"
+                f"[dim]模型[/] {self.model_text}\n"
+                f"[dim]刷新[/] {self.app.interval:.0f}s   [dim]当前[/] {page[1]}")
         except Exception:  # noqa: BLE001 - 挂载期间可能尚未就绪
             pass
 
@@ -541,11 +605,14 @@ class MainScreen(Screen):
 
     @work(thread=True, exclusive=True, group="main")
     def action_reload(self) -> None:
-        health = self.fetch_json("/health")
-        status = self.fetch_json("/status")
-        current = self.fetch_json(API_PATHS["models_current"])
+        # 端点/字段以 2026-09-17 实测的后端真实结构为准：
+        #   /status → model_name / model_loaded / active_model_id / engine / run_mode / node_*
+        #   /models → {models: [...], active_model_id}（19 个内置模型）
+        health = self.fetch_json(API_PATHS["health"])
+        status = self.fetch_json(API_PATHS["system_status"])
+        registry = self.fetch_json(API_PATHS["models_list"])
         resources = self.fetch_json(API_PATHS["cluster_resources"])
-        self.app.call_from_thread(self.apply_data, health, status, current, resources)
+        self.app.call_from_thread(self.apply_data, health, status, registry, resources)
 
     def fetch_json(self, path: str) -> Dict[str, Any]:
         try:
@@ -555,92 +622,134 @@ class MainScreen(Screen):
             return {"_error": str(exc)}
 
     def apply_data(self, health: Dict[str, Any], status: Dict[str, Any],
-                   current: Dict[str, Any], resources: Dict[str, Any]) -> None:
-        self.fill_status(health, status, current)
-        self.fill_models(current)
+                   registry: Dict[str, Any], resources: Dict[str, Any]) -> None:
+        self.fill_status(health, status, registry)
+        self.fill_models(registry, status)
         self.fill_resources(resources)
         self.refresh_topbar()
 
     # ------------------------------------------------------------ 状态页
 
     def fill_status(self, health: Dict[str, Any], status: Dict[str, Any],
-                    current: Dict[str, Any]) -> None:
+                    registry: Dict[str, Any]) -> None:
         pane = self.query_one("#status-pane", Static)
         table = self.query_one("#status-table", DataTable)
         table.clear()
         if "_error" in health:
             self.health_text = "[red]不可达[/]"
+            self.model_text = "—"
             pane.update(f"[red]后端不可达[/]  ·  {health['_error']}")
             table.add_row("后端地址", self.app.api.base_url)
             table.add_row("连接状态", "[red]不可达[/]")
             table.add_row("提示", "确认后端在运行（qlh 会自动拉起本机后端）")
             return
+
         self.health_text = "[green]ok[/]"
-        pane.update(f"[green]后端可用[/]  ·  {self.app.api.base_url}")
+        loaded = bool(status.get("model_loaded"))
+        model_name = status.get("model_name") or "—"
+        active = status.get("active_model_id") or registry.get("active_model_id")
+        self.model_text = str(active) if active else ("[yellow]未加载[/]" if not loaded else "—")
+        if loaded:
+            pane.update(f"[green]后端可用[/]  ·  模型已加载  ·  {self.app.api.base_url}")
+        else:
+            pane.update(f"[green]后端可用[/]  ·  [yellow]模型未加载[/]（此时聊天会返回后端错误）"
+                        f"  ·  {self.app.api.base_url}")
         table.add_row("后端地址", self.app.api.base_url)
         table.add_row("健康", str(health.get("status") or health.get("ok") or "ok"))
-        if isinstance(status, dict) and "_error" not in status:
-            table.add_row("节点角色", status.get("node_role") or "—")
-            table.add_row("节点 ID", status.get("node_id") or "—")
-            table.add_row("最大节点数", status.get("max_nodes") or "—")
-        model = current.get("model_id") or current.get("name") or "—"
-        table.add_row("当前模型", str(model))
-        table.add_row("引擎", str(current.get("engine") or "—"))
-        table.add_row("模型格式", str(current.get("format") or "—"))
+        table.add_row("运行模式", str(status.get("run_mode") or "—"))
+        table.add_row("节点角色", f"{status.get('node_role') or '—'} · {status.get('node_id') or '—'}")
+        table.add_row("最大节点数", str(status.get("max_nodes", "—")))
+        table.add_row("模型", f"{model_name}（{'已加载' if loaded else '未加载'}）")
+        table.add_row("当前模型 ID", str(active or "—（未加载）"))
+        table.add_row("引擎", str(status.get("engine") or "—（未加载）"))
+        table.add_row("量化", str(status.get("current_quant") or "—"))
+        table.add_row("流水线", "已准备" if status.get("pipeline_prepared") else "未准备")
+        table.add_row("对话轮次", str(status.get("conversation_turns", "—")))
+        table.add_row("可用模型数", str(len(registry.get("models") or []))
+                      if "_error" not in registry else "—")
         table.add_row("路由偏好", self.app.routing_preference)
         table.add_row("刷新间隔", f"{self.app.interval:.0f} 秒")
 
     # ------------------------------------------------------------ 模型页
 
-    def fill_models(self, current: Dict[str, Any]) -> None:
+    def fill_models(self, registry: Dict[str, Any], status: Dict[str, Any]) -> None:
+        """``/models`` → ``{models: [...], active_model_id}``（19 个内置模型）。
+
+        此前误用 ``/models/current``——它只返回 ``{loaded, quant_type, model_id}``
+        且未加载时 ``model_id`` 为 null，于是页面显示"后端未返回模型列表"。
+        """
         table = self.query_one("#models-table", DataTable)
         table.clear()
-        if "_error" in current:
-            table.add_row("", "[red]后端不可用[/]", "", "", current["_error"])
+        if "_error" in registry:
+            table.add_row("", "[red]后端不可用[/]", "", "", "", registry["_error"])
             return
-        rows = current.get("models") or current.get("items") or []
-        if not rows and (current.get("model_id") or current.get("name")):
-            rows = [current]
-        if not rows:
-            table.add_row("", "[dim]（这里空着 = 后端未返回模型列表）[/]", "", "", "")
+        rows = registry.get("models")
+        if not isinstance(rows, list) or not rows:
+            table.add_row("", "[dim]（后端未返回模型列表）[/]", "", "", "", "")
             return
-        active = str(current.get("model_id") or current.get("name") or "")
+        active = registry.get("active_model_id") or status.get("active_model_id")
         for item in rows[:64]:
             if not isinstance(item, dict):
                 continue
-            model_id = str(item.get("model_id") or item.get("name") or "—")
+            model_id = str(item.get("model_id") or "—")
+            if item.get("is_available") is False:
+                state = f"[yellow]不可用[/] {item.get('unavailable_reason') or ''}".strip()
+            else:
+                state = "[green]可用[/]"
             table.add_row(
                 "[green]◆[/]" if model_id == active else "",
                 model_id,
-                str(item.get("format") or "—"),
-                str(item.get("engine") or "—"),
-                str(item.get("status") or item.get("state") or "—"),
+                str(item.get("name") or "—"),
+                _join(item.get("available_formats")),
+                str(item.get("preferred_engine") or "—"),
+                state,
             )
 
     # ------------------------------------------------------------ 分布式页
 
     def fill_resources(self, resources: Dict[str, Any]) -> None:
+        """``/cluster/resources`` → ``{available: {local, remote}, totals}``。
+
+        此前按顶层 ``nodes`` 解析——真实返回里没有该键，于是页面显示"无在线节点"。
+        """
         table = self.query_one("#resources-table", DataTable)
         table.clear()
         if "_error" in resources:
-            table.add_row("[red]不可用[/]", resources["_error"], "", "")
+            table.add_row("[red]不可用[/]", resources["_error"], "", "", "", "")
             return
-        nodes = resources.get("nodes") or []
-        if isinstance(nodes, dict):
-            nodes = [{"node_id": key, **(value if isinstance(value, dict) else {})}
-                     for key, value in nodes.items()]
+        available = resources.get("available") or {}
+        nodes: List[Dict[str, Any]] = []
+        if isinstance(available.get("local"), dict):
+            nodes.append(available["local"])
+        if isinstance(available.get("remote"), list):
+            nodes.extend(item for item in available["remote"] if isinstance(item, dict))
         if not nodes:
-            table.add_row("[dim]（无在线节点）[/]", str(resources.get("mode") or "—"), "—", "—")
+            table.add_row("[dim]（无在线节点）[/]", str(resources.get("scope") or "—"),
+                          "", "", "", "")
             return
         for node in nodes[:64]:
-            if not isinstance(node, dict):
-                continue
-            memory = node.get("ram_available_gb") or node.get("ram_total_gb")
+            cpu = node.get("cpu") or {}
+            ram = node.get("ram") or {}
+            gpu = node.get("gpu") or {}
             table.add_row(
-                str(node.get("node_id") or node.get("id") or "—"),
-                str(node.get("mode") or node.get("role") or "—"),
-                "[green]就绪[/]" if node.get("ready") else "[yellow]未就绪[/]",
-                f"RAM {memory} GiB" if memory else str(node.get("current_task") or "—"),
+                str(node.get("node_id") or "—"),
+                f"{node.get('role') or '—'} / "
+                f"{'[green]在线[/]' if node.get('available') else '[yellow]离线[/]'}",
+                f"{cpu.get('physical_cores', '—')} / {cpu.get('logical_cores', '—')}",
+                f"{ram.get('total_gb', '—')} / {ram.get('available_gb', '—')} GB",
+                f"{gpu.get('count', '—')} / {gpu.get('cuda_count', '—')}",
+                f"{gpu.get('vram_total_gb', '—')} / {gpu.get('vram_free_gb', '—')} GB",
+            )
+        totals = resources.get("totals") or {}
+        if totals:
+            table.add_row(
+                "[b]合计[/]",
+                f"{resources.get('available_node_count', '—')}/"
+                f"{resources.get('node_count', '—')} 可用",
+                f"{totals.get('physical_cores', '—')} / {totals.get('logical_cores', '—')}",
+                f"{totals.get('ram_total_gb', '—')} / {totals.get('ram_available_gb', '—')} GB",
+                f"{totals.get('gpu_count', '—')} / {totals.get('cuda_gpu_count', '—')}",
+                f"{totals.get('vram_total_gb', '—')} / {totals.get('vram_free_gb', '—')} GB",
             )
 
     # ------------------------------------------------------------ 运维面（节点/队列/日志）
@@ -663,71 +772,102 @@ class MainScreen(Screen):
         table = self.query_one("#nodes-table", DataTable)
         table.clear()
         if "_error" in nodes:
-            table.add_row("[red]不可用[/]", nodes["_error"], "", "")
+            table.add_row("[red]不可用[/]", nodes["_error"], "", "", "", "")
             return
         items = nodes.get("nodes")
         if isinstance(items, dict):  # {node_id: {...}} 形状
             items = [{"node_id": key, **(value if isinstance(value, dict) else {})}
                      for key, value in items.items()]
         if not items:
-            table.add_row("[dim]（无节点数据）[/]", "—", "—", "—")
+            table.add_row("[dim]（无节点数据）[/]", "", "", "", "", "")
             return
         for node in items[:64]:
             if not isinstance(node, dict):
                 continue
+            state = str(node.get("state") or ("online" if node.get("is_available") else "—"))
+            colored = {"online": "[green]在线[/]", "offline": "[red]离线[/]"}.get(state, state)
+            rtt = node.get("avg_rtt_ms")
             table.add_row(
-                str(node.get("node_id") or node.get("id") or "—"),
-                str(node.get("role") or node.get("node_role") or "—"),
-                str(node.get("hostname") or "—"),
-                str(node.get("address") or node.get("host") or "—"),
+                str(node.get("node_id") or "—"),
+                str(node.get("role") or "—"),
+                str(node.get("node_type") or "—"),
+                colored,
+                str(node.get("address") or "—"),
+                f"{rtt:.0f} ms" if isinstance(rtt, (int, float)) else "—",
             )
 
     def fill_queue(self, queue: Dict[str, Any]) -> None:
+        """``/cluster/queue`` → MLFQ：``q0/q1/q2`` + ``*_depth`` + ``completed_count``。
+
+        此前按 ``tasks`` 解析——真实返回里没有该键（是三级队列），故只能显示"队列空闲"。
+        """
+        pane = self.query_one("#queue-pane", Static)
         table = self.query_one("#queue-table", DataTable)
         table.clear()
         if "_error" in queue:
-            table.add_row("[red]不可用[/]", queue["_error"], "", "")
+            pane.update(f"[red]队列不可用[/]  ·  {queue['_error']}")
             return
-        items = queue.get("tasks") or queue.get("queue") or queue.get("items") or []
-        if not items:
-            size = queue.get("queue_size", "—")
-            cap = queue.get("max_size", "—")
-            strategy = queue.get("strategy", "—")
-            table.add_row("[dim]队列空闲[/]", f"容量 {size}/{cap}", f"策略 {strategy}", "—")
-            return
-        for task in items[:64]:
-            if not isinstance(task, dict):
-                continue
+        if queue.get("paused"):
+            state = "[yellow]已暂停[/]"
+        elif queue.get("running"):
+            state = "[green]运行中[/]"
+        else:
+            state = "[yellow]未运行[/]"
+        pane.update(
+            f"{state}  ·  策略 {queue.get('strategy') or '—'}"
+            f"  ·  队列 {queue.get('queue_size', '—')}/{queue.get('max_size', '—')}"
+            f"  ·  已完成 {queue.get('completed_count', '—')}"
+            f"  ·  当前任务 {queue.get('current_task') or '无'}")
+        aging = queue.get("aging_params") or {}
+        limits = {"q0": aging.get("q0_max_tokens", 128),
+                  "q1": aging.get("q1_max_tokens", 512),
+                  "q2": None}
+        for level in ("q0", "q1", "q2"):
+            tasks = queue.get(level) or []
+            depth = queue.get(f"{level}_depth", len(tasks))
+            preview = ", ".join(
+                str(task.get("task_id") or task.get("id") or "task")
+                for task in tasks[:3] if isinstance(task, dict)
+            ) or "[dim]空[/]"
+            if len(tasks) > 3:
+                preview += f" … +{len(tasks) - 3}"
             table.add_row(
-                str(task.get("task_id") or task.get("id") or "—"),
-                str(task.get("type") or task.get("stage") or "—"),
-                str(task.get("status") or task.get("state") or "—"),
-                str(task.get("node_id") or task.get("worker") or "—"),
+                f"[b]{level.upper()}[/]",
+                str(depth),
+                str(limits[level]) if limits[level] else "不限",
+                preview,
             )
 
     def fill_logs(self, logs: Dict[str, Any]) -> None:
         view = self.query_one("#logs-log", RichLog)
+        pane = self.query_one("#logs-pane", Static)
         view.clear()
         if "_error" in logs:
-            view.write(f"[后端日志不可用] {logs['_error']}")
-            view.write("提示：聚合日志可能需要 X-QLH-Log-Token（qlh --log-token …）。")
+            pane.update(f"[red]后端日志不可用[/]  ·  {logs['_error']}"
+                        "（聚合日志可能需要 X-QLH-Log-Token，见 qlh --log-token）")
+            self.log_line_count = 0
             return
-        lines = logs.get("lines") or logs.get("entries") or logs.get("logs") or []
-        if isinstance(lines, str):
-            lines = lines.splitlines()
-        if isinstance(lines, dict):
-            flat: List[str] = []
-            for name, value in lines.items():
-                if isinstance(value, list):
-                    flat.extend(f"{name}: {item}" for item in value)
-                else:
-                    flat.append(f"{name}: {value}")
-            lines = flat
-        if not lines:
+        # 真实结构：{local: {node_id, logs: [...]}, workers: [...], limit, total_workers}
+        lines = _log_lines(logs.get("local"), "local")
+        workers = logs.get("workers") or []
+        if isinstance(workers, dict):
+            worker_items = [{"node_id": key, **(value if isinstance(value, dict) else {})}
+                            for key, value in workers.items()]
+        else:
+            worker_items = [item for item in workers if isinstance(item, dict)]
+        for item in worker_items:
+            lines.extend(_log_lines(item, "worker"))
+        shown = lines[-200:]
+        self.log_line_count = len(shown)
+        pane.update(f"共 {len(lines)} 行（显示末尾 {len(shown)}）"
+                    f"  ·  local + {len(worker_items)} worker"
+                    f"  ·  total_workers={logs.get('total_workers', 0)}"
+                    f"  ·  limit={logs.get('limit', '—')}")
+        if not shown:
             view.write("（后端未返回日志行）")
             return
-        for line in lines[-200:]:
-            view.write(str(line))
+        for line in shown:
+            view.write(line)
 
     # ------------------------------------------------------------ 设备页
 
@@ -742,23 +882,29 @@ class MainScreen(Screen):
         table.clear()
         if "_error" in profile:
             pane.update(f"[red]设备画像不可用[/]\n{profile['_error']}")
-            table.add_row("", "[dim]（画像不可用，无 GPU 数据）[/]", "", "", "")
+            table.add_row("", "[dim]（画像不可用，无 GPU 数据）[/]", "", "", "", "")
             return
-        os_info = profile.get("os") or {}
-        os_text = (f"{os_info.get('system', '')} {os_info.get('release', '')}".strip()
-                   if isinstance(os_info, dict) else str(os_info))
+        # 真实结构：platform.{os,os_version,hostname,machine}、cpu.model_name、disk
+        platform = profile.get("platform") or {}
+        os_text = " ".join(
+            str(platform.get(key) or "") for key in ("os", "os_version")).strip()
         cpu = profile.get("cpu") or {}
         ram = profile.get("ram") or profile.get("memory") or {}
         disk = profile.get("disk") or {}
         lines = [
             kv("操作系统", os_text or "—"),
-            kv("主机名", profile.get("hostname")),
-            kv("CPU", cpu.get("model") or cpu.get("brand")),
-            kv("核心", f"物理 {cpu.get('physical_cores', '—')} / 逻辑 {cpu.get('logical_cores', '—')}"),
-            kv("内存", f"总量 {ram.get('total_gb', '—')} GB / 可用 {ram.get('available_gb', '—')} GB"),
+            kv("主机名", platform.get("hostname")),
+            kv("架构", f"{platform.get('machine', '—')} · {platform.get('architecture', '—')}"
+                       f" · Python {platform.get('python_version', '—')}"),
+            kv("CPU", cpu.get("model_name")),
+            kv("核心", f"物理 {cpu.get('physical_cores', '—')} / 逻辑 {cpu.get('logical_cores', '—')}"
+                       f" · 使用率 {cpu.get('usage_percent', '—')}%"),
+            kv("内存", f"总量 {ram.get('total_gb', '—')} GB / 可用 {ram.get('available_gb', '—')} GB"
+                       f" · 已用 {ram.get('percent_used', '—')}%"),
         ]
         if disk:
-            lines.append(kv("磁盘", f"剩余 {disk.get('free_gb', '—')} GB / 总 {disk.get('total_gb', '—')} GB"))
+            lines.append(kv("磁盘", f"剩余 {disk.get('free_gb', '—')} GB / "
+                                    f"总 {disk.get('total_gb', '—')} GB（{disk.get('path', '—')}）"))
         lines.append(kv("档位评估", f"{profile.get('tier_label', '—')} "
                                     f"({profile.get('tier', '—')}) · 评分 {profile.get('score_total', '—')}"))
         for item in (profile.get("recommendations") or [])[:5]:
@@ -770,7 +916,7 @@ class MainScreen(Screen):
         gpus = profile.get("gpus") or []
         selected = profile.get("selected_gpu_index", 0)
         if not gpus:
-            table.add_row("", "[dim]（未检测到 GPU）[/]", "—", "—", "—")
+            table.add_row("", "[dim]（未检测到 GPU）[/]", "", "", "", "")
             return
         for index, gpu in enumerate(gpus):
             if not isinstance(gpu, dict):
@@ -781,6 +927,7 @@ class MainScreen(Screen):
                 str(gpu.get("gpu_type") or "—"),
                 "[green]支持[/]" if gpu.get("cuda_available") else "[yellow]不支持[/]",
                 str(gpu.get("vram_total_gb", "—")),
+                str(gpu.get("driver_version") or "—"),
             )
 
     # ------------------------------------------------------------ 动作
