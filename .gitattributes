@@ -5,3 +5,5 @@ packaging/build-launcher.bat text eol=crlf
 setup_all_envs.bat text eol=crlf
 # submodule 初始化脚本同理（cmd 对 LF-only 的 if/goto 解析会崩）
 scripts/init-submodules.bat text eol=crlf
+# TUI 启动脚本同理
+start_tui.bat text eol=crlf

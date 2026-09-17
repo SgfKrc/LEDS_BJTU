@@ -16,6 +16,7 @@ def _usage() -> str:
     return (
         "QLH core TUI\n"
         "  qlh                         进入统一 TUI（本机后端自动启动）\n"
+        "  qlh [options]               同上；选项直通统一入口（--port/--no-splash/--plain/--route…）\n"
         "  qlh chat [--host URL] [--route auto|local_only|distributed_preferred|distributed_required]\n"
         "  qlh chat --fixture PATH     离线回放零依赖聊天屏 fixture\n"
         "  qlh admin [tui_admin.py options]\n"
@@ -94,6 +95,15 @@ def main(argv: list[str] | None = None) -> int:
     if args[0] in {"-h", "--help"}:
         print(_usage())
         return 0
+    if args[0].startswith("-"):
+        # 裸选项（`qlh --no-splash` / `qlh --port 9000`）等价 `qlh chat <options>`：
+        # 让启动脚本可直接透传参数（start_tui.* 走的就是这条路）。
+        # 未识别选项由 _chat_args 抛 ValueError -> 友好报错，不会误启动后端。
+        try:
+            return _run_unified(_chat_args(args))
+        except ValueError as exc:
+            print("[错误] %s" % exc)
+            return 2
 
     command = args.pop(0).lower()
     if command == "chat":
