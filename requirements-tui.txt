@@ -1,0 +1,9 @@
+# QLH TUI rich shell —— **可选**增强（Textual）。
+#
+# 这是零依赖标准库 TUI（src/tui_admin.py）之上的可选外壳：
+#   * 装了本文件 -> `qlh` 走 Textual 外壳（src/tui_textual.py），观感对齐 docagent/patchouli；
+#   * 没装         -> `qlh` 自动回退标准库 TUI，Edge / 最小安装保持零依赖边界。
+#
+# 安装：python -m pip install -r requirements-tui.txt
+# 关闭：qlh --tui-engine builtin   （强制标准库外壳）
+textual>=8,<9
