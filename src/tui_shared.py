@@ -44,6 +44,10 @@ API_PATHS = {
     "cluster_layers": "/cluster/layers",
     "cluster_pipeline_capacity": "/cluster/pipeline-capacity",
     "cluster_pipeline_reshard": "/cluster/pipeline-reshard",
+    # 只读运维面（Textual 外壳的节点/队列/日志屏）
+    "cluster_nodes": "/cluster/nodes",
+    "cluster_queue": "/cluster/queue",
+    "cluster_log_aggregate": "/cluster/nodes/log-aggregate",
 }
 
 # ============================================================

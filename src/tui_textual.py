@@ -226,7 +226,7 @@ class ChatPane(Vertical):
         log.write("[dim]assistant[/] ")
         self.stream_reply(text)
 
-    @work(thread=True, exclusive=True)
+    @work(thread=True, exclusive=True, group="chat")
     def stream_reply(self, message: str) -> None:
         """在后台线程消费 SSE；所有 UI 更新都回到主线程执行。"""
         app = self.app
@@ -299,7 +299,7 @@ class MainScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Static(id="banner")
-        with TabbedContent("聊天", "状态", "模型", "分布式", "关于", id="tabs"):
+        with TabbedContent("聊天", "状态", "模型", "分布式", "节点", "队列", "日志", "关于", id="tabs"):
             with TabPane("聊天", id="tab-chat"):
                 yield ChatPane(id="chat-pane")
             with TabPane("状态", id="tab-status"):
@@ -308,6 +308,12 @@ class MainScreen(Screen):
                 yield DataTable(id="models-table")
             with TabPane("分布式", id="tab-distributed"):
                 yield DataTable(id="resources-table")
+            with TabPane("节点", id="tab-nodes"):
+                yield DataTable(id="nodes-table")
+            with TabPane("队列", id="tab-queue"):
+                yield DataTable(id="queue-table")
+            with TabPane("日志", id="tab-logs"):
+                yield RichLog(id="logs-log", markup=False, wrap=True)
             with TabPane("关于", id="tab-about"):
                 yield Static(self.about_text(), id="about-pane", classes="about")
         yield Footer()
@@ -326,12 +332,16 @@ class MainScreen(Screen):
             f"[dim]{self.app.api.base_url} · Tab 切换 · r 刷新 · q 退出[/]")
         self.query_one("#models-table", DataTable).add_columns("模型", "格式", "引擎", "状态")
         self.query_one("#resources-table", DataTable).add_columns("节点", "运行模式", "就绪", "任务")
+        self.query_one("#nodes-table", DataTable).add_columns("节点", "角色", "主机", "地址")
+        self.query_one("#queue-table", DataTable).add_columns("任务", "类型", "状态", "节点")
         self.action_reload()
+        self.load_pages()
         self.set_interval(self.app.interval, self.action_reload)
+        self.set_interval(self.app.interval, self.load_pages)
 
     # ------------------------------------------------------------ 只读数据
 
-    @work(thread=True, exclusive=True)
+    @work(thread=True, exclusive=True, group="main")
     def action_reload(self) -> None:
         health = self.fetch_json("/health")
         current = self.fetch_json(API_PATHS["models_current"])
@@ -408,6 +418,92 @@ class MainScreen(Screen):
                 f"RAM {memory} GiB" if memory else str(node.get("current_task") or "—"),
             )
 
+    # ------------------------------------------------------------ 运维面（节点/队列/日志）
+
+    @work(thread=True, exclusive=True, group="pages")
+    def load_pages(self) -> None:
+        """拉取节点/队列/日志三屏的只读数据（失败只显示错误，不伪造内容）。"""
+        nodes = self.fetch_json(API_PATHS["cluster_nodes"])
+        queue = self.fetch_json(API_PATHS["cluster_queue"])
+        logs = self.fetch_json(API_PATHS["cluster_log_aggregate"])
+        self.app.call_from_thread(self.apply_pages, nodes, queue, logs)
+
+    def apply_pages(self, nodes: Dict[str, Any], queue: Dict[str, Any],
+                    logs: Dict[str, Any]) -> None:
+        self.fill_nodes(nodes)
+        self.fill_queue(queue)
+        self.fill_logs(logs)
+
+    def fill_nodes(self, nodes: Dict[str, Any]) -> None:
+        table = self.query_one("#nodes-table", DataTable)
+        table.clear()
+        if "_error" in nodes:
+            table.add_row("[red]不可用[/]", nodes["_error"], "", "")
+            return
+        items = nodes.get("nodes")
+        if isinstance(items, dict):  # {node_id: {...}} 形状
+            items = [{"node_id": key, **(value if isinstance(value, dict) else {})}
+                     for key, value in items.items()]
+        if not items:
+            table.add_row("—", "—", "—", "无节点数据")
+            return
+        for node in items[:64]:
+            if not isinstance(node, dict):
+                continue
+            table.add_row(
+                str(node.get("node_id") or node.get("id") or "—"),
+                str(node.get("role") or node.get("node_role") or "—"),
+                str(node.get("hostname") or "—"),
+                str(node.get("address") or node.get("host") or "—"),
+            )
+
+    def fill_queue(self, queue: Dict[str, Any]) -> None:
+        table = self.query_one("#queue-table", DataTable)
+        table.clear()
+        if "_error" in queue:
+            table.add_row("[red]不可用[/]", queue["_error"], "", "")
+            return
+        items = queue.get("tasks") or queue.get("queue") or queue.get("items") or []
+        if not items:
+            size = queue.get("queue_size", "—")
+            cap = queue.get("max_size", "—")
+            strategy = queue.get("strategy", "—")
+            table.add_row(f"队列 {size}/{cap}", f"策略 {strategy}", "空闲", "—")
+            return
+        for task in items[:64]:
+            if not isinstance(task, dict):
+                continue
+            table.add_row(
+                str(task.get("task_id") or task.get("id") or "—"),
+                str(task.get("type") or task.get("stage") or "—"),
+                str(task.get("status") or task.get("state") or "—"),
+                str(task.get("node_id") or task.get("worker") or "—"),
+            )
+
+    def fill_logs(self, logs: Dict[str, Any]) -> None:
+        view = self.query_one("#logs-log", RichLog)
+        view.clear()
+        if "_error" in logs:
+            view.write(f"[后端日志不可用] {logs['_error']}")
+            view.write("提示：聚合日志可能需要 X-QLH-Log-Token（qlh --log-token …）。")
+            return
+        lines = logs.get("lines") or logs.get("entries") or logs.get("logs") or []
+        if isinstance(lines, str):
+            lines = lines.splitlines()
+        if isinstance(lines, dict):
+            flat: List[str] = []
+            for name, value in lines.items():
+                if isinstance(value, list):
+                    flat.extend(f"{name}: {item}" for item in value)
+                else:
+                    flat.append(f"{name}: {value}")
+            lines = flat
+        if not lines:
+            view.write("（后端未返回日志行）")
+            return
+        for line in lines[-200:]:
+            view.write(str(line))
+
     # ------------------------------------------------------------ 动作
 
     def action_quit_app(self) -> None:
@@ -446,7 +542,7 @@ class KoakumaApp(App):
             self.set_interval(0.2, self.refresh_splash_status)
             self.start_backend()
 
-    @work(thread=True, exclusive=True)
+    @work(thread=True, exclusive=True, group="backend")
     def start_backend(self) -> None:
         """在启动屏展示期间把本机后端拉起来（阶段文本实时写回启动屏）。"""
         try:

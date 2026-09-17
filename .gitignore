@@ -36,6 +36,9 @@ Thumbs.db
 logs/*.log
 logs/*.err
 logs/*.out
+# logs/ 下的一次性调试脚本与临时产物（保留 .gitkeep 与运行日志本身）
+logs/*.py
+logs/*.json
 logs/sd15/
 packaging/*.log
 src/import_time.log
