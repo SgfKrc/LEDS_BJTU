@@ -82,8 +82,8 @@ BAR_EMPTY = "░"
 
 CSS = """
 Screen { background: $surface; }
-#splash-logo { color: $accent; text-align: center; padding: 1 0 0 0; }
-#splash-bar { color: $accent; text-align: center; padding: 1 0 0 0; }
+#splash-logo { color: #8fa8c4; text-align: center; padding: 1 0 0 0; }
+#splash-bar { color: #6b8aa8; text-align: center; padding: 1 0 0 0; }
 #splash-status { color: $text; text-align: center; padding: 0 0 1 0; }
 #splash-hint { text-align: center; color: $text-disabled; }
 #banner { padding: 0 2; color: $text-muted; }

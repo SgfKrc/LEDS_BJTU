@@ -7,3 +7,6 @@ setup_all_envs.bat text eol=crlf
 scripts/init-submodules.bat text eol=crlf
 # TUI 启动脚本同理
 start_tui.bat text eol=crlf
+# 统一入口的别名薄壳（koakuma = qlh）
+koakuma.bat text eol=crlf
+qlh.bat text eol=crlf

@@ -71,3 +71,16 @@ def test_chat_help_is_local(capsys):
     output = capsys.readouterr().out
     assert "qlh chat" in output
     assert "--fixture" in output
+
+
+def test_koakuma_is_an_alias_of_qlh():
+    """`koakuma` 与 `qlh` 等价：两个薄壳必须转发到同一个入口（qlh.py）。"""
+    from pathlib import Path
+
+    root = Path(qlh.__file__).resolve().parent
+    bat = (root / "koakuma.bat").read_text(encoding="utf-8")
+    sh = (root / "koakuma.sh").read_text(encoding="utf-8")
+    assert "qlh.py" in bat, "koakuma.bat 必须调用 qlh.py"
+    assert "qlh.py" in sh, "koakuma.sh 必须调用 qlh.py"
+    assert "%*" in bat, "koakuma.bat 必须原样透传参数"
+    assert '"$@"' in sh, "koakuma.sh 必须原样透传参数"

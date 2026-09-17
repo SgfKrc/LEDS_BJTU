@@ -16,15 +16,21 @@
 
 `src/tui_admin.py`（纯 Python 标准库，零第三方依赖）是 QLH 的统一终端面，覆盖 8 个屏幕：聊天、系统总览、节点管理、分布式与分层、请求队列、设备画像、日志、设置。分布式页直接显示 `PipelineLayout` 的布局与聚合容量，适用于无浏览器环境（SSH、服务器、树莓派等），支持 Windows 10+ / Linux / macOS。
 
-页面通过 HTTP 与后端 API 交互（默认 `http://127.0.0.1:8000/api`）；本机统一入口会在当前 TUI 进程内按需启动后端并等待健康检查，远程地址只探测目标后端。交互模式的冷启动会显示 Koakuma 启动动画，后端启动状态在动画中更新；后端控制台日志不会穿透 TUI，仍保留在 `logs/` 及日志屏中。`--no-splash` 可关闭动画，`--plain` 只输出简短启动状态，适合 CI/管道。
+页面通过 HTTP 与后端 API 交互（默认 `http://127.0.0.1:8000/api`）；本机统一入口会在当前进程内按需启动后端并等待健康检查，远程地址只探测目标后端。交互模式默认使用 **Textual 外壳**（`src/tui_textual.py`，2026-09-17 起）：启动屏把 **Koakuma 大标题与启动条放在一起**（标题灰蓝 `#8fa8c4`，条在标题正下方），冷启动阶段以「**少女祈祷中：<阶段>**」实时反馈（检查本地后端 → 加载后端组件 → 启动 API 服务 → 等待健康检查），就绪后自动进入主界面。后端控制台日志不会穿透 TUI，仍保留在 `logs/` 及日志屏中。`--tui-engine builtin` 回退标准库 TUI（过渡期），未安装 Textual 时也会自动回退。
 
 ## 二、全局 `qlh` 命令（推荐）
 
-主仓的统一入口是 `qlh`：无参数或 `chat` 进入零依赖聊天屏，`tui/ui` 进入同一 TUI，`status`/`models` 执行不启动后端的单命令查询。`admin` 保留为管理入口兼容命令。源码检出时使用根目录的 `qlh.bat`（Windows）或 `qlh.sh`（Linux/macOS）；主路径不依赖 Textual/httpx。
+主仓的统一入口是 `qlh`：无参数或 `chat` 进入交互外壳，`tui/ui` 进入同一 TUI，`status`/`models` 执行不启动后端的单命令查询。`admin` 保留为管理入口兼容命令。源码检出时使用根目录的 `qlh.bat`（Windows）或 `qlh.sh`（Linux/macOS）。
+
+**`koakuma` 是 `qlh` 的等价别名**：根目录的 `koakuma.bat` / `koakuma.sh` 转发到同一个 `qlh.py`，参数原样透传（Windows cmd 不支持 shell alias，故用同名薄壳实现，跨 shell/跨平台通用）。
+
+依赖边界：**交互外壳需要 Textual**（`requirements-tui.txt`；Edge 同装，见 `requirements-edge.txt`），协议层 `src/tui_api.py` 为纯标准库，因此单命令/CI 路径不需要 UI 依赖。
 
 ```bash
 qlh chat --host http://127.0.0.1:8000
 qlh chat --route distributed_preferred --thinking
+koakuma                      # 等价于 qlh
+koakuma chat --route distributed_preferred
 qlh admin --plain
 qlh models
 ```
