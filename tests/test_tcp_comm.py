@@ -773,6 +773,38 @@ class TestFastTensorSerialization:
 class TestTCPServerConnectionManagement:
     """测试 TCPServer 注册拒绝、连接表线程安全与回调日志。"""
 
+    def test_callback_does_not_reflectively_rewrite_control_plane_owner(self):
+        """数据面事件不得通过 bound-method owner 改写控制面字段。"""
+        received = threading.Event()
+
+        class Owner:
+            def __init__(self):
+                self._tcp_server = "explicit-owner-binding"
+
+            def on_message(self, _client_id, _message):
+                received.set()
+
+        owner = Owner()
+        server = TCPServer(host="127.0.0.1", port=0)
+        server.on_message = owner.on_message
+        server._running = True
+        srv_sock, cli_sock = socket.socketpair()
+        thread = threading.Thread(
+            target=server._handle_client,
+            args=(srv_sock, ("127.0.0.1", 54320), "pending_54320"),
+            daemon=True,
+        )
+        try:
+            thread.start()
+            cli_sock.sendall(build_message(MessageType.STATUS_RES, {"ok": True}))
+            assert received.wait(2)
+            assert owner._tcp_server == "explicit-owner-binding"
+        finally:
+            server._running = False
+            cli_sock.close()
+            thread.join(timeout=2)
+            server.stop()
+
     def test_registration_uses_advertised_endpoint_not_peer_port(self):
         """节点服务地址应使用 advertised_address，peer_addr 保留临时源端口。"""
         server = TCPServer(host="127.0.0.1", port=0)
@@ -1744,8 +1776,7 @@ class TestTCPLifecycleRaceMatrix:
                 MessageType.NODE_LIST_SYNC,
             )
 
-        server.on_registration_confirmed = push_after_ack
-        server.start()
+        server.start(on_registration_confirmed=push_after_ack)
         port = server.sock.getsockname()[1]
         client = TCPClient(
             server_host="127.0.0.1",
