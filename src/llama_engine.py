@@ -140,7 +140,19 @@ class LlamaCppEngine:
             n_ctx: 上下文窗口大小（默认 4096，边缘设备建议 2048）
             n_threads: CPU 推理线程数（默认自动检测：物理核心数）
             chat_format: 对话格式（默认自动检测，Qwen 用 "chatml"）
-            **kwargs: 传递给 llama_cpp.Llama 的额外参数
+            **kwargs: 透传给 `llama_cpp.Llama` 的额外参数。经实测（llama-cpp-python 0.3.35）
+                可用且与本项目的容量/放置相关者：
+
+                * `tensor_split` / `main_gpu` / `split_mode` —— 多设备切分；
+                * `use_mmap` / `use_mlock` —— 页映射与常驻（**注意**：llama.cpp CLI 的
+                  `--load-mode {mmap|none|dio|mlock|mmap+mlock}` 与 `--fit-target`
+                  在 Python 绑定中**不存在**，无法透传；只有 `use_mmap` 这个布尔开关）；
+                * `kv_overrides` —— **运行时覆盖 GGUF 元数据**（如需改 `*.block_count` /
+                  `*.nextn_predict_layers` 等架构 KV，这是唯一通道）；
+                * `numa` / `op_offload` / `flash_attn` / `swa_full` / `type_k` / `type_v`。
+
+                **⚠️ 注意**：llama.cpp CLI 的 `--override-tensor`（按张量指定 buffer type）
+                同样**未在 Python 绑定中暴露**，无法经此通道使用。
         """
         from config import MAX_SEQ_LEN
 
@@ -419,13 +431,26 @@ class LlamaCppEngine:
         gpu_layers: int = -1,
         require_gpu_layers: int = 0,
         mtmd_use_gpu: bool = True,
+        **llama_kwargs,
     ) -> Dict[str, Any]:
         """G4.5 便捷加载：gemma4 原生工件（受管目录）+ GPU 预算门 + 互斥规则。
 
         - 缺省工件路径从 models/gemma4-native/gemma4-native.lock.json 读取；
         - gpu_layers=-1 时按显存预算自动估算（部分 offload）；
         - 显存不足（低于 require_gpu_layers 对应预算）时 fail-closed。
+
+        Args:
+            **llama_kwargs: 透传给底层 `llama_cpp.Llama` 的额外加载参数
+                （与 `load_model(**kwargs)` 同一通道）。详见 `load_model` 的说明。
         """
+        # 显式拒绝会与本方法的预算门冲突的参数，避免静默覆盖语义。
+        _conflicting = {"n_gpu_layers"}
+        _bad = sorted(_conflicting & set(llama_kwargs))
+        if _bad:
+            raise ValueError(
+                f"{', '.join(_bad)} 由本方法的 gpu_layers/require_gpu_layers 预算门管理，"
+                "请改用 gpu_layers 形参（不通过 **llama_kwargs 传入）"
+            )
         if isinstance(gpu_layers, bool) or not isinstance(gpu_layers, int):
             raise ValueError("gpu_layers must be an integer")
         if gpu_layers < -1 or gpu_layers > 36:
@@ -472,7 +497,9 @@ class LlamaCppEngine:
         if not gguf_file.is_file() or not mmproj_file.is_file():
             raise FileNotFoundError("gemma4-native 工件缺失：检查 models/gemma4-native/ 与冻结记录")
 
-        load_kwargs: Dict[str, Any] = {}
+        # 额外加载参数（tensor_split / use_mmap / use_mlock / kv_overrides /
+        # split_mode / main_gpu / numa / op_offload 等）先落入，再由预算门决定 n_gpu_layers。
+        load_kwargs: Dict[str, Any] = dict(llama_kwargs)
         if gpu_layers > 0:
             load_kwargs["n_gpu_layers"] = int(gpu_layers)
         elif gpu_layers == -1:
