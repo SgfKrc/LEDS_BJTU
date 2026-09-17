@@ -58,6 +58,13 @@ def test_shell_boots_then_switches_to_main():
         async with app.run_test() as pilot:
             await pilot.pause()
             assert isinstance(app.screen, SplashScreen), "应先显示启动屏"
+            splash = app.screen
+            from textual.widgets import Static
+
+            status = str(splash.query_one("#splash-status", Static).render())
+            assert "少女祈祷中" in status, "启动行应以「少女祈祷中：」开头"
+            bar = str(splash.query_one("#splash-bar", Static).render())
+            assert "█" in bar and "░" in bar, "标题下方应有跑马灯启动条"
             app.show_main()
             await pilot.pause()
             assert isinstance(app.screen, MainScreen), "应切换到主界面"

@@ -15,8 +15,6 @@ import importlib.util
 import os
 import subprocess
 import sys
-import threading
-import time
 import urllib.parse
 from pathlib import Path
 
@@ -141,50 +139,22 @@ def _shell_options(translated: list[str]) -> dict:
     }
 
 
-def _ensure_backend_visible(supervisor) -> None:
-    """后端冷启动的**跨终端可靠**反馈：单行 CR 进度。
-
-    刻意不用自绘 ANSI 动画/alt-screen：实测在传统 conhost 下不可见（见 tui_textual 头注释）。
-    ``\\r`` 回列首在所有终端都有效，因此阶段状态一定可见。
-    """
-    box: dict = {}
-
-    def _work() -> None:
-        try:
-            box["started"] = supervisor.ensure_ready()
-        except BaseException as exc:  # noqa: BLE001 - 交回主线程
-            box["error"] = exc
-
-    thread = threading.Thread(target=_work, name="qlh-backend-start", daemon=True)
-    thread.start()
-    frames = "|/-\\"
-    index = 0
-    while thread.is_alive():
-        sys.stdout.write(f"\r{frames[index % 4]} Koakuma: {supervisor.status_message} …  ")
-        sys.stdout.flush()
-        index += 1
-        time.sleep(0.2)
-    sys.stdout.write("\r" + " " * 72 + "\r")
-    sys.stdout.flush()
-    if box.get("error") is not None:
-        raise box["error"]
-
-
 def _run_textual_shell(args: list[str]) -> int:
-    """统一入口：本机后端就绪（带可见进度）后进入 Textual 外壳。"""
+    """统一入口：进入 Textual 外壳。
+
+    本机后端冷启动**不在这里等**——把 ``BackendSupervisor`` 交给外壳，由启动屏
+    （LOGO + 启动条 + 「少女祈祷中：…」状态行）承载全过程，避免"先纯文本等待、
+    再进 TUI"的两段式。
+    """
     _ensure_src_on_path()
     translated = _chat_args(args)
     options = _shell_options(translated)
 
-    from tui_backend import BackendStartupError, BackendSupervisor
-
-    supervisor = BackendSupervisor(host=options["host"], port=options["port"])
+    supervisor = None
     if options["auto_start"]:
-        try:
-            _ensure_backend_visible(supervisor)
-        except BackendStartupError as exc:
-            print("[错误] %s" % exc)
-            return 1
+        from tui_backend import BackendSupervisor
+
+        supervisor = BackendSupervisor(host=options["host"], port=options["port"])
 
     from tui_textual import run as run_textual
 
@@ -194,6 +164,7 @@ def _run_textual_shell(args: list[str]) -> int:
         interval=options["interval"],
         routing_preference=options["route"],
         show_thinking=options["thinking"],
+        supervisor=supervisor,
     ))
 
 

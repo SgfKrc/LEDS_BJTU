@@ -8,12 +8,19 @@
 * Textual 自己处理终端适配（VT 检测、字体无关布局、Rich 渲染、鼠标/滚动/焦点），
   并在 Windows Terminal 与传统 conhost 上都可用。
 
+启动体验（2026-09-17 用户要求）：
+
+* **标题页与启动条合体**：LOGO 下方紧跟一条跑马灯启动条 + 状态行，不再"先纯文本等待、
+  再进 TUI"两段式；
+* 状态文案统一以 **「少女祈祷中：」** 开头（避免与标题 ``Koakuma`` 重复）；
+* 后端冷启动（``BackendSupervisor.ensure_ready``）在启动屏的 worker 线程里执行，
+  阶段文本实时反映到启动条下方。
+
 边界：
 
 * Textual 是**主仓 TUI 的依赖**（``requirements-tui.txt``；Edge 同样安装，见
   ``requirements-edge.txt``）；协议层 ``src/tui_api.py`` 仍是纯标准库，
   因此**非 UI 路径**（单命令、CI）不需要装 Textual。
-* 后端冷启动仍由外层 ``BackendSupervisor`` 承载；本外壳负责启动后的界面与实时反馈。
 
 用法（由 ``qlh`` 调用）::
 
@@ -30,7 +37,7 @@ from typing import Any, Dict, List, Optional
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import (
     DataTable,
@@ -66,10 +73,18 @@ LOGO = (
     "  ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝╚═╝  ╚═╝\n"
 )
 
+#: 启动行前缀（用户 2026-09-17 指定：不用 "Koakuma:"，避免与标题重复）
+SPLASH_PREFIX = "少女祈祷中："
+BAR_WIDTH = 30
+BAR_MARQUEE = 9
+BAR_BLOCK = "█"
+BAR_EMPTY = "░"
+
 CSS = """
 Screen { background: $surface; }
 #splash-logo { color: $accent; text-align: center; padding: 1 0 0 0; }
-#splash-status { text-align: center; color: $text-muted; padding: 1 0; }
+#splash-bar { color: $accent; text-align: center; padding: 1 0 0 0; }
+#splash-status { color: $text; text-align: center; padding: 0 0 1 0; }
 #splash-hint { text-align: center; color: $text-disabled; }
 #banner { padding: 0 2; color: $text-muted; }
 #chat-log { height: 1fr; border: round $primary 30%; padding: 0 1; }
@@ -94,28 +109,55 @@ def _fmt_bytes(value: Any) -> str:
 
 
 class SplashScreen(Screen):
-    """启动屏：Rich 大 LOGO + 阶段状态（替代自绘 ANSI splash）。"""
+    """启动屏：LOGO + **启动条** + 状态行（三段一体，见模块头注释）。
+
+    ``wait_for_backend=True`` 时**不自动进入**主界面——由 ``KoakumaApp`` 在后端就绪后
+    调用 ``show_main()``；否则短暂展示后自动进入。
+    """
 
     BINDINGS = [Binding("escape,enter,space", "finish", "进入", show=False)]
 
-    def __init__(self, *, status: str = "进入 Koakuma TUI") -> None:
+    def __init__(self, *, status: str = "准备启动", wait_for_backend: bool = False) -> None:
         super().__init__()
-        self._splash_status = status
+        self.splash_status = status
+        self.wait_for_backend = bool(wait_for_backend)
+        self.bar_pos = 0
+
+    # ------------------------------------------------------------ 渲染
 
     def compose(self) -> ComposeResult:
         yield Static(LOGO, id="splash-logo")
-        yield Static(self._splash_status, id="splash-status")
-        yield Static("q / ctrl+c 退出 · r 刷新 · 任意键进入", id="splash-hint")
+        yield Static(self.bar_text(), id="splash-bar")
+        yield Static(self.status_line(), id="splash-status")
+        yield Static("q / ctrl+c 退出 · 任意键进入", id="splash-hint")
 
     def on_mount(self) -> None:
-        # 短暂展示后自动进入主界面（不做长时间阻塞，避免"看起来卡住"）。
-        self.set_timer(1.1, self.action_finish)
+        self.set_interval(0.09, self.tick_bar)
+        if not self.wait_for_backend:
+            self.set_timer(0.6, self.action_finish)
+
+    def bar_text(self) -> str:
+        cells = [BAR_EMPTY] * BAR_WIDTH
+        for offset in range(BAR_MARQUEE):
+            cells[(self.bar_pos + offset) % BAR_WIDTH] = BAR_BLOCK
+        return "".join(cells)
+
+    def status_line(self) -> str:
+        return f"{SPLASH_PREFIX}{self.splash_status}"
+
+    def tick_bar(self) -> None:
+        self.bar_pos = (self.bar_pos + 1) % BAR_WIDTH
+        try:
+            self.query_one("#splash-bar", Static).update(self.bar_text())
+        except Exception:  # noqa: BLE001 - 启动屏可能已被替换
+            pass
 
     def set_status(self, text: str) -> None:
-        self._splash_status = text
+        """更新启动条下方的阶段文本（由后端启动 worker 的进度驱动）。"""
+        self.splash_status = text
         try:
-            self.query_one("#splash-status", Static).update(text)
-        except Exception:  # noqa: BLE001 - 启动屏可能已被替换
+            self.query_one("#splash-status", Static).update(self.status_line())
+        except Exception:  # noqa: BLE001
             pass
 
     def action_finish(self) -> None:
@@ -156,7 +198,8 @@ class ChatPane(Vertical):
                 self.app.routing_preference = mapping[value]
                 self.query_one("#chat-status", Static).update(f"路由偏好 → {mapping[value]}")
             else:
-                self.query_one("#chat-status", Static).update("[red]用法: /route auto|local|distributed|required")
+                self.query_one("#chat-status", Static).update(
+                    "[red]用法: /route auto|local|distributed|required")
             return
         if text.startswith("/thinking "):
             value = text.split(" ", 1)[1].strip().lower()
@@ -303,7 +346,7 @@ class MainScreen(Screen):
             return {"_error": str(exc)}
 
     def apply_data(self, health: Dict[str, Any], current: Dict[str, Any],
-                resources: Dict[str, Any]) -> None:
+                   resources: Dict[str, Any]) -> None:
         self.query_one("#status-pane", Static).update(self.status_text(health, current))
         self.fill_models(current)
         self.fill_resources(resources)
@@ -379,17 +422,52 @@ class KoakumaApp(App):
     CSS = CSS
 
     def __init__(self, api: ApiClient, *, interval: float = 5.0,
-                 routing_preference: str = "auto", show_thinking: bool = False) -> None:
+                 routing_preference: str = "auto", show_thinking: bool = False,
+                 supervisor: Any = None) -> None:
         super().__init__()
         self.api = api
         self.interval = float(interval)
         self.routing_preference = routing_preference
         self.show_thinking = show_thinking
+        #: 传入 BackendSupervisor 即在启动屏内完成冷启动（LOGO + 启动条同屏反馈）
+        self.supervisor = supervisor
         self.session_id: Optional[str] = None
         self.generation_id: Optional[str] = None
 
+    # ------------------------------------------------------------ 启动流程
+
     def on_mount(self) -> None:
-        self.push_screen(SplashScreen())
+        waiting = self.supervisor is not None
+        self.push_screen(SplashScreen(
+            status="检查本地后端" if waiting else "连接后端",
+            wait_for_backend=waiting,
+        ))
+        if waiting:
+            self.set_interval(0.2, self.refresh_splash_status)
+            self.start_backend()
+
+    @work(thread=True, exclusive=True)
+    def start_backend(self) -> None:
+        """在启动屏展示期间把本机后端拉起来（阶段文本实时写回启动屏）。"""
+        try:
+            self.supervisor.ensure_ready()
+        except BaseException as exc:  # noqa: BLE001 - 交回主线程展示
+            self.call_from_thread(self.backend_failed, str(exc))
+            return
+        self.call_from_thread(self.show_main)
+
+    def refresh_splash_status(self) -> None:
+        if self.supervisor is None:
+            return
+        screen = self.screen
+        if isinstance(screen, SplashScreen):
+            screen.set_status(self.supervisor.status_message)
+
+    def backend_failed(self, message: str) -> None:
+        screen = self.screen
+        if isinstance(screen, SplashScreen):
+            screen.wait_for_backend = False
+            screen.set_status(f"[red]后端启动失败[/]：{message}（按任意键进入界面查看状态）")
 
     def show_main(self) -> None:
         """从启动屏切到主界面（重复调用安全）。"""
@@ -399,11 +477,15 @@ class KoakumaApp(App):
 
 
 def run(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, *, interval: float = 5.0,
-        routing_preference: str = "auto", show_thinking: bool = False) -> int:
-    """启动 Textual 外壳（供 qlh.py 调用）。"""
+        routing_preference: str = "auto", show_thinking: bool = False,
+        supervisor: Any = None) -> int:
+    """启动 Textual 外壳（供 qlh.py 调用）。
+
+    ``supervisor`` 非空时，本机后端冷启动在**启动屏内**完成（LOGO + 启动条同屏）。
+    """
     api = ApiClient(host=host, port=port)
     KoakumaApp(api, interval=interval, routing_preference=routing_preference,
-               show_thinking=show_thinking).run()
+               show_thinking=show_thinking, supervisor=supervisor).run()
     return 0
 
 
