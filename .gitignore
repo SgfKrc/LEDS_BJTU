@@ -5,6 +5,8 @@ __pycache__/
 .venv/
 .venv-test/
 .venv-edge/
+# RPC 版 llama-cpp-python 实验环境（GGML_RPC=ON，见 local_docs/CORE-LLAMA-PC-RPC-01-*.md）
+.venv-llama-rpc/
 venv/
 env/
 
