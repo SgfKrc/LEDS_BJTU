@@ -16,6 +16,14 @@
 * 后端冷启动（``BackendSupervisor.ensure_ready``）在启动屏的 worker 线程里执行，
   阶段文本实时反映到启动条下方。
 
+主界面版式（2026-09-17 用户反馈后重做）：
+
+* **导航移到左侧竖栏**（原先顶部 Tab）：形成"左窄右宽"版式，分栏按**黄金比例**
+  0.382 : 0.618 分割（``#nav`` = 38%，``#content`` = 62%，即 ``1fr``）；
+* 侧栏带 ``min-width``/``max-width`` 兜底，窄终端（80 列）与宽终端都不会失衡；
+* **每页统一排版规范**：``.page-title``（页名）→ ``.page-hint``（一句话说明 + 数据源）
+  → 内容面板（表格/日志/键值），错误与空态样式一致，不再"裸放一个表"。
+
 边界：
 
 * Textual 是**主仓 TUI 的依赖**（``requirements-tui.txt``；Edge 同样安装，见
@@ -32,22 +40,24 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import (
+    ContentSwitcher,
     DataTable,
     Footer,
     Header,
     Input,
+    Label,
+    ListItem,
+    ListView,
     RichLog,
     Static,
-    TabbedContent,
-    TabPane,
 )
 
 SRC = Path(__file__).resolve().parent
@@ -80,19 +90,73 @@ BAR_MARQUEE = 9
 BAR_BLOCK = "█"
 BAR_EMPTY = "░"
 
+#: 侧栏导航页表：(key, 页名, 一句话说明)
+PAGES: List[Tuple[str, str, str]] = [
+    ("chat", "聊天", "SSE 流式对话 · /help 查看命令"),
+    ("status", "状态", "运行概览 · /health /status /models/current"),
+    ("models", "模型", "模型列表与当前加载 · /models"),
+    ("cluster", "分布式", "集群资源与分层容量 · /cluster/resources"),
+    ("nodes", "节点", "成员与角色 · /cluster/nodes"),
+    ("queue", "队列", "请求队列与调度策略 · /cluster/queue"),
+    ("logs", "日志", "聚合日志（末尾 200 行）· /cluster/nodes/log-aggregate"),
+    ("device", "设备", "本机设备画像与 GPU · /device/profile"),
+    ("settings", "设置", "会话参数与依赖边界"),
+]
+
 CSS = """
 Screen { background: $surface; }
+
+/* ---------------------------------------------------------------- 启动屏 */
 #splash-logo { color: #8fa8c4; text-align: center; padding: 1 0 0 0; }
 #splash-bar { color: #6b8aa8; text-align: center; padding: 1 0 0 0; }
 #splash-status { color: $text; text-align: center; padding: 0 0 1 0; }
 #splash-hint { text-align: center; color: $text-disabled; }
-#banner { padding: 0 2; color: $text-muted; }
-#chat-log { height: 1fr; border: round $primary 30%; padding: 0 1; }
-#chat-status { padding: 0 2; height: auto; }
+
+/* ------------------------------------------------- 主界面骨架（左窄右宽） */
+#topbar { height: 1; padding: 0 1; color: $text-muted; background: $panel; }
+#body { height: 1fr; }
+
+/* 黄金分割：38% : 62%（≈0.382 : 0.618），并给窄/宽终端兜底 */
+#sidebar {
+    width: 38%;          /* 黄金分割窄侧（0.382 : 0.618） */
+    min-width: 18;       /* 窄终端兜底：侧栏不被压到不可读 */
+    height: 1fr;
+    background: $panel;
+    border-right: solid $primary 25%;
+}
+#nav { height: 1fr; padding: 1 0; }
+#nav-summary {
+    height: auto;
+    padding: 0 1 1 1;
+    border-top: solid $primary 20%;
+    color: $text-muted;
+}
+#nav ListItem { padding: 0 1; }
+#nav ListItem Label { width: 1fr; }
+#nav > ListItem.--highlight { background: $primary 35%; text-style: bold; }
+
+#content { width: 1fr; height: 1fr; }
+
+/* ------------------------------------------------- 每页统一排版规范 */
+.page { height: 1fr; padding: 1 2; }
+.page-title { height: 1; color: $accent; text-style: bold; }
+.page-hint { height: 1; color: $text-muted; margin-bottom: 1; }
+.panel { height: 1fr; }
+.scroll-panel { height: 1fr; }
+.empty { color: $text-disabled; }
+.error { color: $error; }
+
+/* ---------------------------------------------------------------- 内容 */
+#models-table, #resources-table, #nodes-table, #queue-table,
+#status-table, #logs-log { height: 1fr; }
+#status-pane { height: auto; color: $text-muted; }
+#device-pane, #settings-pane { height: auto; }
+#gpu-table { height: auto; max-height: 14; }
+
+/* ---------------------------------------------------------------- 聊天 */
+#chat-log { height: 1fr; border: round $primary 20%; padding: 0 1; }
+#chat-status { padding: 0 1; height: 1; color: $text-muted; }
 #chat-input { dock: bottom; }
-#status-pane { padding: 1 2; }
-.about { padding: 1 2; }
-DataTable { height: auto; max-height: 100%; }
 """
 
 
@@ -106,6 +170,12 @@ def _fmt_bytes(value: Any) -> str:
             return f"{num:.1f} {unit}"
         num /= 1024.0
     return f"{num:.1f} PiB"
+
+
+def kv(label: str, value: Any) -> str:
+    """键值行：标签定宽 12 列，值缺省显示 em dash（各页排版统一）。"""
+    text = "—" if value in (None, "") else str(value)
+    return f"  {label:<12} {text}"
 
 
 class SplashScreen(Screen):
@@ -165,12 +235,12 @@ class SplashScreen(Screen):
 
 
 class ChatPane(Vertical):
-    """聊天 Tab：SSE 流式输出（等价旧 ChatScreen 的事件处理）。"""
+    """聊天页：SSE 流式输出（等价旧 ChatScreen 的事件处理）。"""
 
     def compose(self) -> ComposeResult:
         yield RichLog(id="chat-log", markup=True, wrap=True, highlight=False)
         yield Static("就绪。输入消息并回车发送；/help 查看命令", id="chat-status")
-        yield Input(placeholder="输入消息…", id="chat-input")
+        yield Input(placeholder="输入消息…（/help 查看命令）", id="chat-input")
 
     # ------------------------------------------------------------ 发送
 
@@ -181,8 +251,13 @@ class ChatPane(Vertical):
         event.input.value = ""
         log = self.query_one("#chat-log", RichLog)
         if text in {"/help", "/?"}:
-            log.write("[b]可用命令[/] /help /clear /route auto|local|distributed|required "
-                      "/thinking on|off /cancel /quit")
+            log.write("[b]可用命令[/]\n"
+                      "  [b]/help[/]                    显示本帮助\n"
+                      "  [b]/route[/] auto|local|distributed|required   路由偏好\n"
+                      "  [b]/thinking[/] on|off         是否展示思考流\n"
+                      "  [b]/clear[/]                   清空当前会话显示\n"
+                      "  [b]/cancel[/]                  取消正在生成的请求\n"
+                      "  [b]/quit[/]                    退出外壳（后端保持运行）")
             return
         if text == "/quit":
             self.app.exit()
@@ -288,90 +363,189 @@ class ChatPane(Vertical):
 
 
 class MainScreen(Screen):
-    """主界面：聊天 + 状态 + 模型 + 分布式 + 关于。"""
+    """主界面：左侧导航（黄金比例分栏）+ 右侧内容区（9 屏）。"""
 
     BINDINGS = [
         Binding("r", "reload", "刷新"),
+        Binding("]", "next_page", "下一屏"),
+        Binding("[", "prev_page", "上一屏"),
         Binding("q", "quit_app", "退出"),
         Binding("ctrl+c", "quit_app", "退出", show=False),
     ]
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.page_index = 0
+        self.health_text = "…"
+
+    # ------------------------------------------------------------ 版式
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield Static(id="banner")
-        with TabbedContent("聊天", "状态", "模型", "分布式", "节点", "队列", "日志",
-                           "设备", "设置", id="tabs"):
-            with TabPane("聊天", id="tab-chat"):
-                yield ChatPane(id="chat-pane")
-            with TabPane("状态", id="tab-status"):
-                yield VerticalScroll(Static("加载中…", id="status-pane"))
-            with TabPane("模型", id="tab-models"):
-                yield DataTable(id="models-table")
-            with TabPane("分布式", id="tab-distributed"):
-                yield DataTable(id="resources-table")
-            with TabPane("节点", id="tab-nodes"):
-                yield DataTable(id="nodes-table")
-            with TabPane("队列", id="tab-queue"):
-                yield DataTable(id="queue-table")
-            with TabPane("日志", id="tab-logs"):
-                yield RichLog(id="logs-log", markup=False, wrap=True)
-            with TabPane("设备", id="tab-device"):
-                with VerticalScroll():
-                    yield Static("加载中…", id="device-pane", classes="about")
-                    yield DataTable(id="gpu-table")
-            with TabPane("设置", id="tab-settings"):
-                yield VerticalScroll(Static("", id="settings-pane", classes="about"))
+        yield Static(id="topbar")
+        with Horizontal(id="body"):
+            with Vertical(id="sidebar"):
+                with ListView(id="nav"):
+                    for key, label, _hint in PAGES:
+                        yield ListItem(Label(f" {label}"), id=f"nav-{key}")
+                yield Static(id="nav-summary")
+            with ContentSwitcher(initial=f"page-{PAGES[0][0]}", id="content"):
+                with Vertical(id="page-chat", classes="page"):
+                    yield Static("聊天", classes="page-title")
+                    yield Static(PAGES[0][2], classes="page-hint")
+                    yield ChatPane(id="chat-pane")
+                with Vertical(id="page-status", classes="page"):
+                    yield Static("状态 · 运行概览", classes="page-title")
+                    yield Static(PAGES[1][2], classes="page-hint")
+                    yield Static("加载中…", id="status-pane")
+                    yield DataTable(id="status-table")
+                with Vertical(id="page-models", classes="page"):
+                    yield Static("模型 · 注册表与当前加载", classes="page-title")
+                    yield Static(PAGES[2][2], classes="page-hint")
+                    yield DataTable(id="models-table")
+                with Vertical(id="page-cluster", classes="page"):
+                    yield Static("分布式 · 集群资源", classes="page-title")
+                    yield Static(PAGES[3][2], classes="page-hint")
+                    yield DataTable(id="resources-table")
+                with Vertical(id="page-nodes", classes="page"):
+                    yield Static("节点 · 成员与角色", classes="page-title")
+                    yield Static(PAGES[4][2], classes="page-hint")
+                    yield DataTable(id="nodes-table")
+                with Vertical(id="page-queue", classes="page"):
+                    yield Static("队列 · 请求与调度", classes="page-title")
+                    yield Static(PAGES[5][2], classes="page-hint")
+                    yield DataTable(id="queue-table")
+                with Vertical(id="page-logs", classes="page"):
+                    yield Static("日志 · 聚合视图", classes="page-title")
+                    yield Static(PAGES[6][2], classes="page-hint")
+                    yield RichLog(id="logs-log", markup=False, wrap=True)
+                with Vertical(id="page-device", classes="page"):
+                    yield Static("设备 · 本机画像", classes="page-title")
+                    yield Static(PAGES[7][2], classes="page-hint")
+                    with VerticalScroll(classes="scroll-panel"):
+                        yield Static("加载中…", id="device-pane")
+                        yield DataTable(id="gpu-table")
+                with Vertical(id="page-settings", classes="page"):
+                    yield Static("设置 · 会话与边界", classes="page-title")
+                    yield Static(PAGES[8][2], classes="page-hint")
+                    with VerticalScroll(classes="scroll-panel"):
+                        yield Static("", id="settings-pane")
         yield Footer()
+
+    # ------------------------------------------------------------ 切屏
+
+    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        """侧栏高亮即切屏（↑↓ 浏览，无需回车）。"""
+        if event.item is not None and event.item.id:
+            self.switch_page(event.item.id.removeprefix("nav-"))
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        """鼠标点击/回车同样切屏。"""
+        if event.item is not None and event.item.id:
+            self.switch_page(event.item.id.removeprefix("nav-"))
+
+    def switch_page(self, key: str) -> None:
+        keys = [item[0] for item in PAGES]
+        if key not in keys:
+            return
+        self.page_index = keys.index(key)
+        try:
+            self.query_one("#content", ContentSwitcher).current = f"page-{key}"
+        except Exception:  # noqa: BLE001 - 切屏期间节点可能未挂载
+            pass
+
+    def action_next_page(self) -> None:
+        self.set_page((self.page_index + 1) % len(PAGES))
+
+    def action_prev_page(self) -> None:
+        self.set_page((self.page_index - 1) % len(PAGES))
+
+    def set_page(self, index: int) -> None:
+        """按序号切屏，并同步侧栏高亮（键位与鼠标两条路径保持一致）。"""
+        key = PAGES[index % len(PAGES)][0]
+        self.switch_page(key)
+        try:
+            self.query_one("#nav", ListView).index = index
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ------------------------------------------------------------ 文本
 
     def about_text(self) -> str:
         return (
-            f"[b $accent]Koakuma[/] · QLH 分布式边缘推理 · Textual 外壳\n\n"
-            f"后端: {self.app.api.base_url}\n"
-            f"快捷键: [b]r[/] 刷新 · [b]q[/] 退出 · [b]/help[/] 聊天命令\n\n"
-            f"依赖边界: 本 UI 需要 Textual（requirements-tui.txt，Edge 同装）；\n"
-            f"协议层 src/tui_api.py 为纯标准库，单命令/CI 路径无需 UI 依赖。"
+            "[b $accent]Koakuma[/] · QLH 分布式边缘推理 · Textual 外壳\n"
+            + kv("后端地址", self.app.api.base_url)
+            + "\n"
+            + kv("界面", "9 屏（左栏切换 / [ ] 上下屏 / r 刷新 / q 退出）")
+            + "\n"
+            + kv("依赖边界", "外壳需 Textual（requirements-tui.txt，Edge 同装）；")
+            + "\n"
+            + kv("", "协议层 src/tui_api.py 纯标准库，单命令/CI 不依赖 UI")
         )
 
     def settings_text(self) -> str:
-        """设置屏：本地会话参数（旧管理 TUI 的「设置」语义，多为启动参数固化）。"""
+        """设置页：本地会话参数（旧管理 TUI 的「设置」语义，多为启动参数固化）。"""
         api = self.app.api
         return (
-            "[b $accent]◆ 会话设置[/]（当前会话生效；可用 --host/--port/--interval 等启动参数固化）\n\n"
-            f"  后端主机 host : {api.host}   （支持 Tailscale IP，如 100.x.x.x）\n"
-            f"  后端端口 port : {api.port}\n"
-            f"  完整地址      : {api.base_url}\n"
-            f"  请求超时      : {api.timeout:.0f} 秒\n"
-            f"  自动刷新间隔  : {self.app.interval:.0f} 秒（状态/模型/分布式/节点/队列/日志/设备）\n"
-            f"  日志 Token    : {'已设置' if api.log_token else '未设置（聚合日志可能需要 --log-token）'}\n"
-            f"  路由偏好      : {self.app.routing_preference}\n"
-            f"  thinking 展示 : {'on' if self.app.show_thinking else 'off'}\n"
-            "\n"
-            + self.about_text()
+            "[b $accent]会话设置[/][dim]（当前会话生效；可用启动参数固化）[/]\n"
+            + kv("host", f"{api.host}（支持 Tailscale IP，如 100.x.x.x）") + "\n"
+            + kv("port", api.port) + "\n"
+            + kv("完整地址", api.base_url) + "\n"
+            + kv("请求超时", f"{api.timeout:.0f} 秒") + "\n"
+            + kv("自动刷新", f"{self.app.interval:.0f} 秒（状态/模型/分布式/节点/队列/设备）") + "\n"
+            + kv("日志 Token", "已设置" if api.log_token else "未设置（聚合日志可能需要 --log-token）") + "\n"
+            + kv("路由偏好", self.app.routing_preference) + "\n"
+            + kv("thinking", "on" if self.app.show_thinking else "off") + "\n"
+            + "\n" + self.about_text()
         )
 
+    # ------------------------------------------------------------ 挂载
+
     def on_mount(self) -> None:
-        self.query_one("#banner", Static).update(
-            f"[dim]{self.app.api.base_url} · Tab 切换 · r 刷新 · q 退出[/]")
-        self.query_one("#models-table", DataTable).add_columns("模型", "格式", "引擎", "状态")
+        self.query_one("#status-table", DataTable).add_columns("项目", "值")
+        self.query_one("#models-table", DataTable).add_columns("", "模型", "格式", "引擎", "状态")
         self.query_one("#resources-table", DataTable).add_columns("节点", "运行模式", "就绪", "任务")
         self.query_one("#nodes-table", DataTable).add_columns("节点", "角色", "主机", "地址")
         self.query_one("#queue-table", DataTable).add_columns("任务", "类型", "状态", "节点")
-        self.query_one("#gpu-table", DataTable).add_columns("#", "名称", "类型", "CUDA", "显存GB")
+        self.query_one("#gpu-table", DataTable).add_columns("", "名称", "类型", "CUDA", "显存GB")
         self.query_one("#settings-pane", Static).update(self.settings_text())
+        self.refresh_topbar()
         self.action_reload()
         self.load_pages()
         self.load_device()
         self.set_interval(self.app.interval, self.action_reload)
         self.set_interval(self.app.interval, self.load_pages)
+        self.set_interval(self.app.interval, self.refresh_topbar)
+
+    def refresh_topbar(self) -> None:
+        page = PAGES[self.page_index]
+        self.query_one("#topbar", Static).update(
+            f"[dim]后端[/] {self.app.api.base_url}"
+            f"   [dim]·[/]   [dim]当前[/] {page[1]}"
+            f"   [dim]·[/]   [dim]r 刷新 · [ ] 上下屏 · q 退出[/]")
+        self.update_sidebar(page)
+
+    def update_sidebar(self, page: Tuple[str, str, str]) -> None:
+        """左栏底部摘要：让黄金分割的窄侧不只是空导航（宽终端尤其明显）。"""
+        api = self.app.api
+        try:
+            self.query_one("#nav-summary", Static).update(
+                "[b $accent]后端[/]\n"
+                f"{api.host}:{api.port}\n"
+                f"[dim]健康[/] {self.health_text}   [dim]刷新[/] {self.app.interval:.0f}s\n"
+                f"[dim]当前[/] {page[1]}")
+        except Exception:  # noqa: BLE001 - 挂载期间可能尚未就绪
+            pass
 
     # ------------------------------------------------------------ 只读数据
 
     @work(thread=True, exclusive=True, group="main")
     def action_reload(self) -> None:
         health = self.fetch_json("/health")
+        status = self.fetch_json("/status")
         current = self.fetch_json(API_PATHS["models_current"])
         resources = self.fetch_json(API_PATHS["cluster_resources"])
-        self.app.call_from_thread(self.apply_data, health, current, resources)
+        self.app.call_from_thread(self.apply_data, health, status, current, resources)
 
     def fetch_json(self, path: str) -> Dict[str, Any]:
         try:
@@ -380,44 +554,70 @@ class MainScreen(Screen):
         except ApiError as exc:
             return {"_error": str(exc)}
 
-    def apply_data(self, health: Dict[str, Any], current: Dict[str, Any],
-                   resources: Dict[str, Any]) -> None:
-        self.query_one("#status-pane", Static).update(self.status_text(health, current))
+    def apply_data(self, health: Dict[str, Any], status: Dict[str, Any],
+                   current: Dict[str, Any], resources: Dict[str, Any]) -> None:
+        self.fill_status(health, status, current)
         self.fill_models(current)
         self.fill_resources(resources)
+        self.refresh_topbar()
 
-    def status_text(self, health: Dict[str, Any], current: Dict[str, Any]) -> str:
+    # ------------------------------------------------------------ 状态页
+
+    def fill_status(self, health: Dict[str, Any], status: Dict[str, Any],
+                    current: Dict[str, Any]) -> None:
+        pane = self.query_one("#status-pane", Static)
+        table = self.query_one("#status-table", DataTable)
+        table.clear()
         if "_error" in health:
-            return f"[red]后端不可达[/]\n{health['_error']}"
-        status = health.get("status") or health.get("ok") or "ok"
-        lines = [f"后端: [green]{status}[/] · {self.app.api.base_url}"]
+            self.health_text = "[red]不可达[/]"
+            pane.update(f"[red]后端不可达[/]  ·  {health['_error']}")
+            table.add_row("后端地址", self.app.api.base_url)
+            table.add_row("连接状态", "[red]不可达[/]")
+            table.add_row("提示", "确认后端在运行（qlh 会自动拉起本机后端）")
+            return
+        self.health_text = "[green]ok[/]"
+        pane.update(f"[green]后端可用[/]  ·  {self.app.api.base_url}")
+        table.add_row("后端地址", self.app.api.base_url)
+        table.add_row("健康", str(health.get("status") or health.get("ok") or "ok"))
+        if isinstance(status, dict) and "_error" not in status:
+            table.add_row("节点角色", status.get("node_role") or "—")
+            table.add_row("节点 ID", status.get("node_id") or "—")
+            table.add_row("最大节点数", status.get("max_nodes") or "—")
         model = current.get("model_id") or current.get("name") or "—"
-        lines.append(f"当前模型: [b]{model}[/] · 引擎: {current.get('engine') or '—'}")
-        if current.get("format"):
-            lines.append(f"格式: {current['format']}")
-        return "\n".join(lines)
+        table.add_row("当前模型", str(model))
+        table.add_row("引擎", str(current.get("engine") or "—"))
+        table.add_row("模型格式", str(current.get("format") or "—"))
+        table.add_row("路由偏好", self.app.routing_preference)
+        table.add_row("刷新间隔", f"{self.app.interval:.0f} 秒")
+
+    # ------------------------------------------------------------ 模型页
 
     def fill_models(self, current: Dict[str, Any]) -> None:
         table = self.query_one("#models-table", DataTable)
         table.clear()
         if "_error" in current:
-            table.add_row("[red]不可用[/]", current["_error"], "", "")
+            table.add_row("", "[red]后端不可用[/]", "", "", current["_error"])
             return
         rows = current.get("models") or current.get("items") or []
         if not rows and (current.get("model_id") or current.get("name")):
             rows = [current]
         if not rows:
-            table.add_row("—", "—", "—", "后端未返回模型列表")
+            table.add_row("", "[dim]（这里空着 = 后端未返回模型列表）[/]", "", "", "")
             return
+        active = str(current.get("model_id") or current.get("name") or "")
         for item in rows[:64]:
             if not isinstance(item, dict):
                 continue
+            model_id = str(item.get("model_id") or item.get("name") or "—")
             table.add_row(
-                str(item.get("model_id") or item.get("name") or "—"),
+                "[green]◆[/]" if model_id == active else "",
+                model_id,
                 str(item.get("format") or "—"),
                 str(item.get("engine") or "—"),
                 str(item.get("status") or item.get("state") or "—"),
             )
+
+    # ------------------------------------------------------------ 分布式页
 
     def fill_resources(self, resources: Dict[str, Any]) -> None:
         table = self.query_one("#resources-table", DataTable)
@@ -430,7 +630,7 @@ class MainScreen(Screen):
             nodes = [{"node_id": key, **(value if isinstance(value, dict) else {})}
                      for key, value in nodes.items()]
         if not nodes:
-            table.add_row("—", str(resources.get("mode") or "—"), "—", "无节点数据")
+            table.add_row("[dim]（无在线节点）[/]", str(resources.get("mode") or "—"), "—", "—")
             return
         for node in nodes[:64]:
             if not isinstance(node, dict):
@@ -439,7 +639,7 @@ class MainScreen(Screen):
             table.add_row(
                 str(node.get("node_id") or node.get("id") or "—"),
                 str(node.get("mode") or node.get("role") or "—"),
-                "是" if node.get("ready") else "否",
+                "[green]就绪[/]" if node.get("ready") else "[yellow]未就绪[/]",
                 f"RAM {memory} GiB" if memory else str(node.get("current_task") or "—"),
             )
 
@@ -459,63 +659,6 @@ class MainScreen(Screen):
         self.fill_queue(queue)
         self.fill_logs(logs)
 
-    # ------------------------------------------------------------ 设备画像
-
-    @work(thread=True, exclusive=True, group="device")
-    def load_device(self) -> None:
-        profile = self.fetch_json(API_PATHS["device_profile"])
-        self.app.call_from_thread(self.fill_device, profile)
-
-    def fill_device(self, profile: Dict[str, Any]) -> None:
-        pane = self.query_one("#device-pane", Static)
-        table = self.query_one("#gpu-table", DataTable)
-        table.clear()
-        if "_error" in profile:
-            pane.update(f"[red]设备画像不可用[/]\n{profile['_error']}")
-            return
-        os_info = profile.get("os") or {}
-        os_text = (f"{os_info.get('system', '')} {os_info.get('release', '')}".strip()
-                   if isinstance(os_info, dict) else str(os_info))
-        cpu = profile.get("cpu") or {}
-        ram = profile.get("ram") or profile.get("memory") or {}
-        disk = profile.get("disk") or {}
-        lines = ["[b $accent]◆ 本机设备画像（后端所在机器）[/]", ""]
-        lines.append(f"  操作系统 : {os_text or '—'}    主机名: {profile.get('hostname', '—')}")
-        lines.append(
-            f"  CPU      : {cpu.get('model') or cpu.get('brand') or '—'}"
-            f"    物理核 {cpu.get('physical_cores', '—')} / 逻辑核 {cpu.get('logical_cores', '—')}"
-        )
-        lines.append(
-            f"  内存     : 总量 {ram.get('total_gb', '—')} GB    可用 {ram.get('available_gb', '—')} GB"
-        )
-        if disk:
-            lines.append(
-                f"  磁盘     : 剩余 {disk.get('free_gb', '—')} GB / 总 {disk.get('total_gb', '—')} GB"
-            )
-        tier = f"{profile.get('tier_label', '—')} ({profile.get('tier', '—')})"
-        lines.append(f"  档位评估 : {tier}    总评分 {profile.get('score_total', '—')}")
-        for item in (profile.get("recommendations") or [])[:5]:
-            lines.append(f"  [green]建议: {item}[/]")
-        for item in (profile.get("warnings") or [])[:5]:
-            lines.append(f"  [yellow]警告: {item}[/]")
-        pane.update("\n".join(lines))
-
-        gpus = profile.get("gpus") or []
-        selected = profile.get("selected_gpu_index", 0)
-        if not gpus:
-            table.add_row("—", "（未检测到 GPU）", "—", "—", "—")
-            return
-        for index, gpu in enumerate(gpus):
-            if not isinstance(gpu, dict):
-                continue
-            table.add_row(
-                ("*%d" % index) if index == selected else str(index),
-                str(gpu.get("name") or "—"),
-                str(gpu.get("gpu_type") or "—"),
-                "支持" if gpu.get("cuda_available") else "不支持",
-                str(gpu.get("vram_total_gb", "—")),
-            )
-
     def fill_nodes(self, nodes: Dict[str, Any]) -> None:
         table = self.query_one("#nodes-table", DataTable)
         table.clear()
@@ -527,7 +670,7 @@ class MainScreen(Screen):
             items = [{"node_id": key, **(value if isinstance(value, dict) else {})}
                      for key, value in items.items()]
         if not items:
-            table.add_row("—", "—", "—", "无节点数据")
+            table.add_row("[dim]（无节点数据）[/]", "—", "—", "—")
             return
         for node in items[:64]:
             if not isinstance(node, dict):
@@ -550,7 +693,7 @@ class MainScreen(Screen):
             size = queue.get("queue_size", "—")
             cap = queue.get("max_size", "—")
             strategy = queue.get("strategy", "—")
-            table.add_row(f"队列 {size}/{cap}", f"策略 {strategy}", "空闲", "—")
+            table.add_row("[dim]队列空闲[/]", f"容量 {size}/{cap}", f"策略 {strategy}", "—")
             return
         for task in items[:64]:
             if not isinstance(task, dict):
@@ -585,6 +728,60 @@ class MainScreen(Screen):
             return
         for line in lines[-200:]:
             view.write(str(line))
+
+    # ------------------------------------------------------------ 设备页
+
+    @work(thread=True, exclusive=True, group="device")
+    def load_device(self) -> None:
+        profile = self.fetch_json(API_PATHS["device_profile"])
+        self.app.call_from_thread(self.fill_device, profile)
+
+    def fill_device(self, profile: Dict[str, Any]) -> None:
+        pane = self.query_one("#device-pane", Static)
+        table = self.query_one("#gpu-table", DataTable)
+        table.clear()
+        if "_error" in profile:
+            pane.update(f"[red]设备画像不可用[/]\n{profile['_error']}")
+            table.add_row("", "[dim]（画像不可用，无 GPU 数据）[/]", "", "", "")
+            return
+        os_info = profile.get("os") or {}
+        os_text = (f"{os_info.get('system', '')} {os_info.get('release', '')}".strip()
+                   if isinstance(os_info, dict) else str(os_info))
+        cpu = profile.get("cpu") or {}
+        ram = profile.get("ram") or profile.get("memory") or {}
+        disk = profile.get("disk") or {}
+        lines = [
+            kv("操作系统", os_text or "—"),
+            kv("主机名", profile.get("hostname")),
+            kv("CPU", cpu.get("model") or cpu.get("brand")),
+            kv("核心", f"物理 {cpu.get('physical_cores', '—')} / 逻辑 {cpu.get('logical_cores', '—')}"),
+            kv("内存", f"总量 {ram.get('total_gb', '—')} GB / 可用 {ram.get('available_gb', '—')} GB"),
+        ]
+        if disk:
+            lines.append(kv("磁盘", f"剩余 {disk.get('free_gb', '—')} GB / 总 {disk.get('total_gb', '—')} GB"))
+        lines.append(kv("档位评估", f"{profile.get('tier_label', '—')} "
+                                    f"({profile.get('tier', '—')}) · 评分 {profile.get('score_total', '—')}"))
+        for item in (profile.get("recommendations") or [])[:5]:
+            lines.append(f"  [green]建议[/]         {item}")
+        for item in (profile.get("warnings") or [])[:5]:
+            lines.append(f"  [yellow]警告[/]         {item}")
+        pane.update("\n".join(lines))
+
+        gpus = profile.get("gpus") or []
+        selected = profile.get("selected_gpu_index", 0)
+        if not gpus:
+            table.add_row("", "[dim]（未检测到 GPU）[/]", "—", "—", "—")
+            return
+        for index, gpu in enumerate(gpus):
+            if not isinstance(gpu, dict):
+                continue
+            table.add_row(
+                "[green]◆[/]" if index == selected else "",
+                str(gpu.get("name") or "—"),
+                str(gpu.get("gpu_type") or "—"),
+                "[green]支持[/]" if gpu.get("cuda_available") else "[yellow]不支持[/]",
+                str(gpu.get("vram_total_gb", "—")),
+            )
 
     # ------------------------------------------------------------ 动作
 

@@ -49,7 +49,7 @@ def _run(coro):
 
 
 def test_shell_boots_then_switches_to_main():
-    from textual.widgets import TabbedContent
+    from textual.widgets import ContentSwitcher, ListView
 
     from tui_textual import KoakumaApp, MainScreen, SplashScreen
 
@@ -68,14 +68,38 @@ def test_shell_boots_then_switches_to_main():
             app.show_main()
             await pilot.pause()
             assert isinstance(app.screen, MainScreen), "应切换到主界面"
-            tabs = app.screen.query_one("#tabs", TabbedContent)
-            assert tabs.tab_count == 9, (
-                "应有 聊天/状态/模型/分布式/节点/队列/日志/设备/设置 九个 Tab")
+            nav = app.screen.query_one("#nav", ListView)
+            sidebar = app.screen.query_one("#sidebar")
+            content = app.screen.query_one("#content", ContentSwitcher)
+            items = list(app.screen.query("#nav ListItem"))
+            assert len(items) == 9, (
+                "侧栏应有 聊天/状态/模型/分布式/节点/队列/日志/设备/设置 九项")
+            assert [item.id for item in items] == [
+                "nav-chat", "nav-status", "nav-models", "nav-cluster", "nav-nodes",
+                "nav-queue", "nav-logs", "nav-device", "nav-settings"]
             for widget_id in ("#nodes-table", "#queue-table", "#logs-log",
-                              "#device-pane", "#gpu-table", "#settings-pane"):
+                              "#device-pane", "#gpu-table", "#settings-pane",
+                              "#status-table", "#topbar"):
                 assert app.screen.query_one(widget_id) is not None, widget_id
             settings = str(app.screen.query_one("#settings-pane", Static).render())
             assert "会话设置" in settings and "依赖边界" in settings, "设置屏应含会话参数与关于信息"
+
+            # 版式：左窄右宽，分栏按黄金比例 ≈ 0.382 : 0.618
+            await pilot.pause()
+            total = sidebar.size.width + content.size.width
+            assert 0 < sidebar.size.width < content.size.width, "导航栏应在左且窄于内容区"
+            assert abs(sidebar.size.width / total - 0.382) < 0.03, (
+                f"黄金比例分栏偏离过多: {sidebar.size.width}/{total}")
+
+            # 键位切屏：[ ] 上下屏，侧栏高亮同步
+            assert content.current == "page-chat"
+            await pilot.press("]")
+            await pilot.pause()
+            assert content.current == "page-status", "应切到第二屏"
+            assert nav.index == 1, "侧栏高亮应与内容同步"
+            await pilot.press("[")
+            await pilot.pause()
+            assert content.current == "page-chat", "应切回第一屏"
 
     _run(_main())
 
