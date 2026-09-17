@@ -299,7 +299,8 @@ class MainScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Static(id="banner")
-        with TabbedContent("聊天", "状态", "模型", "分布式", "节点", "队列", "日志", "关于", id="tabs"):
+        with TabbedContent("聊天", "状态", "模型", "分布式", "节点", "队列", "日志",
+                           "设备", "设置", id="tabs"):
             with TabPane("聊天", id="tab-chat"):
                 yield ChatPane(id="chat-pane")
             with TabPane("状态", id="tab-status"):
@@ -314,8 +315,12 @@ class MainScreen(Screen):
                 yield DataTable(id="queue-table")
             with TabPane("日志", id="tab-logs"):
                 yield RichLog(id="logs-log", markup=False, wrap=True)
-            with TabPane("关于", id="tab-about"):
-                yield Static(self.about_text(), id="about-pane", classes="about")
+            with TabPane("设备", id="tab-device"):
+                with VerticalScroll():
+                    yield Static("加载中…", id="device-pane", classes="about")
+                    yield DataTable(id="gpu-table")
+            with TabPane("设置", id="tab-settings"):
+                yield VerticalScroll(Static("", id="settings-pane", classes="about"))
         yield Footer()
 
     def about_text(self) -> str:
@@ -327,6 +332,23 @@ class MainScreen(Screen):
             f"协议层 src/tui_api.py 为纯标准库，单命令/CI 路径无需 UI 依赖。"
         )
 
+    def settings_text(self) -> str:
+        """设置屏：本地会话参数（旧管理 TUI 的「设置」语义，多为启动参数固化）。"""
+        api = self.app.api
+        return (
+            "[b $accent]◆ 会话设置[/]（当前会话生效；可用 --host/--port/--interval 等启动参数固化）\n\n"
+            f"  后端主机 host : {api.host}   （支持 Tailscale IP，如 100.x.x.x）\n"
+            f"  后端端口 port : {api.port}\n"
+            f"  完整地址      : {api.base_url}\n"
+            f"  请求超时      : {api.timeout:.0f} 秒\n"
+            f"  自动刷新间隔  : {self.app.interval:.0f} 秒（状态/模型/分布式/节点/队列/日志/设备）\n"
+            f"  日志 Token    : {'已设置' if api.log_token else '未设置（聚合日志可能需要 --log-token）'}\n"
+            f"  路由偏好      : {self.app.routing_preference}\n"
+            f"  thinking 展示 : {'on' if self.app.show_thinking else 'off'}\n"
+            "\n"
+            + self.about_text()
+        )
+
     def on_mount(self) -> None:
         self.query_one("#banner", Static).update(
             f"[dim]{self.app.api.base_url} · Tab 切换 · r 刷新 · q 退出[/]")
@@ -334,8 +356,11 @@ class MainScreen(Screen):
         self.query_one("#resources-table", DataTable).add_columns("节点", "运行模式", "就绪", "任务")
         self.query_one("#nodes-table", DataTable).add_columns("节点", "角色", "主机", "地址")
         self.query_one("#queue-table", DataTable).add_columns("任务", "类型", "状态", "节点")
+        self.query_one("#gpu-table", DataTable).add_columns("#", "名称", "类型", "CUDA", "显存GB")
+        self.query_one("#settings-pane", Static).update(self.settings_text())
         self.action_reload()
         self.load_pages()
+        self.load_device()
         self.set_interval(self.app.interval, self.action_reload)
         self.set_interval(self.app.interval, self.load_pages)
 
@@ -433,6 +458,63 @@ class MainScreen(Screen):
         self.fill_nodes(nodes)
         self.fill_queue(queue)
         self.fill_logs(logs)
+
+    # ------------------------------------------------------------ 设备画像
+
+    @work(thread=True, exclusive=True, group="device")
+    def load_device(self) -> None:
+        profile = self.fetch_json(API_PATHS["device_profile"])
+        self.app.call_from_thread(self.fill_device, profile)
+
+    def fill_device(self, profile: Dict[str, Any]) -> None:
+        pane = self.query_one("#device-pane", Static)
+        table = self.query_one("#gpu-table", DataTable)
+        table.clear()
+        if "_error" in profile:
+            pane.update(f"[red]设备画像不可用[/]\n{profile['_error']}")
+            return
+        os_info = profile.get("os") or {}
+        os_text = (f"{os_info.get('system', '')} {os_info.get('release', '')}".strip()
+                   if isinstance(os_info, dict) else str(os_info))
+        cpu = profile.get("cpu") or {}
+        ram = profile.get("ram") or profile.get("memory") or {}
+        disk = profile.get("disk") or {}
+        lines = ["[b $accent]◆ 本机设备画像（后端所在机器）[/]", ""]
+        lines.append(f"  操作系统 : {os_text or '—'}    主机名: {profile.get('hostname', '—')}")
+        lines.append(
+            f"  CPU      : {cpu.get('model') or cpu.get('brand') or '—'}"
+            f"    物理核 {cpu.get('physical_cores', '—')} / 逻辑核 {cpu.get('logical_cores', '—')}"
+        )
+        lines.append(
+            f"  内存     : 总量 {ram.get('total_gb', '—')} GB    可用 {ram.get('available_gb', '—')} GB"
+        )
+        if disk:
+            lines.append(
+                f"  磁盘     : 剩余 {disk.get('free_gb', '—')} GB / 总 {disk.get('total_gb', '—')} GB"
+            )
+        tier = f"{profile.get('tier_label', '—')} ({profile.get('tier', '—')})"
+        lines.append(f"  档位评估 : {tier}    总评分 {profile.get('score_total', '—')}")
+        for item in (profile.get("recommendations") or [])[:5]:
+            lines.append(f"  [green]建议: {item}[/]")
+        for item in (profile.get("warnings") or [])[:5]:
+            lines.append(f"  [yellow]警告: {item}[/]")
+        pane.update("\n".join(lines))
+
+        gpus = profile.get("gpus") or []
+        selected = profile.get("selected_gpu_index", 0)
+        if not gpus:
+            table.add_row("—", "（未检测到 GPU）", "—", "—", "—")
+            return
+        for index, gpu in enumerate(gpus):
+            if not isinstance(gpu, dict):
+                continue
+            table.add_row(
+                ("*%d" % index) if index == selected else str(index),
+                str(gpu.get("name") or "—"),
+                str(gpu.get("gpu_type") or "—"),
+                "支持" if gpu.get("cuda_available") else "不支持",
+                str(gpu.get("vram_total_gb", "—")),
+            )
 
     def fill_nodes(self, nodes: Dict[str, Any]) -> None:
         table = self.query_one("#nodes-table", DataTable)

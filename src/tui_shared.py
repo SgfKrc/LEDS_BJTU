@@ -48,6 +48,8 @@ API_PATHS = {
     "cluster_nodes": "/cluster/nodes",
     "cluster_queue": "/cluster/queue",
     "cluster_log_aggregate": "/cluster/nodes/log-aggregate",
+    # 设备画像（后端所在机器）
+    "device_profile": "/device/profile",
 }
 
 # ============================================================

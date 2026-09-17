@@ -69,9 +69,13 @@ def test_shell_boots_then_switches_to_main():
             await pilot.pause()
             assert isinstance(app.screen, MainScreen), "应切换到主界面"
             tabs = app.screen.query_one("#tabs", TabbedContent)
-            assert tabs.tab_count == 8, "应有 聊天/状态/模型/分布式/节点/队列/日志/关于 八个 Tab"
-            for widget_id in ("#nodes-table", "#queue-table", "#logs-log"):
+            assert tabs.tab_count == 9, (
+                "应有 聊天/状态/模型/分布式/节点/队列/日志/设备/设置 九个 Tab")
+            for widget_id in ("#nodes-table", "#queue-table", "#logs-log",
+                              "#device-pane", "#gpu-table", "#settings-pane"):
                 assert app.screen.query_one(widget_id) is not None, widget_id
+            settings = str(app.screen.query_one("#settings-pane", Static).render())
+            assert "会话设置" in settings and "依赖边界" in settings, "设置屏应含会话参数与关于信息"
 
     _run(_main())
 
