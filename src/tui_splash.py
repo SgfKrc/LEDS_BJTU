@@ -130,18 +130,30 @@ def render_logo(grid: list[list[str]], scan_row: int = -1, revealed_cols: int = 
 
 
 def _enable_vt() -> bool:
-    """尽力启用 Windows 控制台 VT 处理；失败则返回 False（调用方应跳过动画）。"""
+    """尽力启用 Windows 控制台 VT 处理；失败则返回 False（调用方走可见降级路径）。"""
     if os.name != "nt":
         return True
     try:
         import ctypes
+        from ctypes import wintypes
 
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # 必须声明 restype：默认 c_int 会把 64 位 HANDLE 截断成 32 位。
+        kernel32.GetStdHandle.restype = wintypes.HANDLE
+        kernel32.GetStdHandle.argtypes = [wintypes.DWORD]
+        kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+
         handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
-        mode = ctypes.c_uint32()
+        if not handle or handle == wintypes.HANDLE(-1).value:
+            return False
+        mode = wintypes.DWORD()
         if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
             return False
-        return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
+        enable_vt_processing = 0x0004  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        if mode.value & enable_vt_processing:
+            return True  # 已经启用（Windows Terminal 常见），无需再设置
+        return bool(kernel32.SetConsoleMode(handle, mode.value | enable_vt_processing))
     except Exception:  # noqa: BLE001
         return False
 
@@ -304,15 +316,37 @@ class TuiSplash:
             return False
 
 
+def _play_without_animation(
+    loader: Callable[[], T],
+    status: Union[str, Callable[[], str]],
+) -> T:
+    """无动画终端的**可见**降级路径（关键：绝不静默）。
+
+    后端冷启动（导入 + 设备探测 + API lifespan）最长 30 秒，若这里什么都不打印，
+    用户看到的就是「黑屏无响应」—— 这正是统一入口在无 VT 终端上的观感来源。
+    """
+    text = status() if callable(status) else status
+    print(f"Koakumix：正在启动（当前终端不支持动画，已跳过）—— {text}", flush=True)
+    print("  · 检查本地后端 → 加载后端组件 → 启动 API 服务 → 等待健康检查", flush=True)
+    print("  · 首次启动通常 3–15 秒（最长 30 秒），请勿关闭窗口", flush=True)
+    try:
+        result = loader()
+    except BaseException:
+        print("Koakumix：启动失败（见上方错误信息）", flush=True)
+        raise
+    print("Koakumix：就绪", flush=True)
+    return result
+
+
 def play_splash(
     loader: Callable[[], T],
     *,
     status: Union[str, Callable[[], str]] = STATUS_TEXT,
     min_show: float = 1.0,
 ) -> T:
-    """便捷入口：环境不支持动画时直接执行 `loader()`。"""
+    """便捷入口：环境不支持动画时走**可见的**降级路径（不再静默执行 loader）。"""
     if not supported():
-        return loader()
+        return _play_without_animation(loader, status)
     splash = TuiSplash(status=status, min_show=min_show)
     try:
         return splash.play(loader)
