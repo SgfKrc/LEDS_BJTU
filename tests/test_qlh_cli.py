@@ -38,15 +38,14 @@ def test_models_is_a_plain_tui_command(monkeypatch):
 
 
 def test_no_args_enters_unified_tui_and_auto_starts(monkeypatch):
+    """无参 `qlh` = 交互入口（Textual 外壳）+ 自动启动后端。"""
     seen = {}
 
-    class FakeTui:
-        @staticmethod
-        def main(args):
-            seen["args"] = args
-            return 0
+    def fake_shell(args):
+        seen["args"] = args
+        return 0
 
-    monkeypatch.setattr(qlh, "_load_tui_admin", lambda: FakeTui)
+    monkeypatch.setattr(qlh, "_run_textual_shell", fake_shell)
     assert qlh.main([]) == 0
     assert seen["args"] == ["--auto-start", "--screen", "chat"]
 
@@ -54,13 +53,11 @@ def test_no_args_enters_unified_tui_and_auto_starts(monkeypatch):
 def test_chat_url_enters_unified_tui_without_remote_autostart(monkeypatch):
     seen = {}
 
-    class FakeTui:
-        @staticmethod
-        def main(args):
-            seen["args"] = args
-            return 0
+    def fake_shell(args):
+        seen["args"] = args
+        return 0
 
-    monkeypatch.setattr(qlh, "_load_tui_admin", lambda: FakeTui)
+    monkeypatch.setattr(qlh, "_run_textual_shell", fake_shell)
     assert qlh.main(["chat", "--host", "http://100.100.52.106:8000",
                      "--route", "distributed_preferred"]) == 0
     assert seen["args"] == [

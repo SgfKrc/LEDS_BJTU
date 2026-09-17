@@ -3038,6 +3038,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="统一入口使用进程内 daemon 线程启动本机后端")
     p.add_argument("--screen", default=None,
                    help="进入交互 TUI 后立即打开的屏幕（如 chat/对话）")
+    p.add_argument("--tui-engine", default="auto", choices=("auto", "textual", "builtin"),
+                   help="交互外壳：auto=装了 textual 就用它（可回退），builtin=强制零依赖标准库 TUI")
     p.add_argument("--route", default="auto",
                    choices=("auto", "local_only", "distributed_preferred", "distributed_required"),
                    help="聊天屏初始请求路由偏好")
@@ -3181,6 +3183,15 @@ def main(argv=None) -> int:
 
                 play_splash(_probe_health, status="进入 Koakuma TUI", min_show=0.8)
             except Exception:  # noqa: BLE001 - splash 失败绝不阻断 TUI
+                pass
+        if _resolve_tui_engine(args.tui_engine) == "textual":
+            # 装了 textual（见 requirements-tui.txt）：交给富外壳渲染；
+            # 缺依赖时 _resolve_tui_engine 已判定为 builtin，仍走下面的标准库 TUI。
+            try:
+                from tui_textual import run as run_textual
+
+                return run_textual(args.host, args.port, interval=interval)
+            except ImportError:  # pragma: no cover - 半装/竞态环境
                 pass
         term = AnsiTerm(color=not args.no_color)
         try:

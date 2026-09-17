@@ -7,3 +7,6 @@ uvicorn[standard]==0.53.0
 psutil==7.2.2
 httpx==0.28.1
 numpy==2.5.3
+# TUI 依赖（2026-09-17 裁决：Edge 同装）。Textual 约几 MB，Edge 的
+# 「无 torch + venv ≤300MB」边界仍然成立；协议层 src/tui_api.py 仍是纯标准库。
+textual>=8,<9
