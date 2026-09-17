@@ -1,12 +1,12 @@
 # TUI 管理菜单使用指南
 
-> **命令集参考**：`/` 开头指令（模型/量化/引擎切换、队列控制、优雅退出等 27 条）的完整参考见 [TUI 指令集](TUI指令集.md)（别名/参数/选项/退出语义/与菜单对应）。
+> **命令集参考**：`/` 开头指令（模型/量化/引擎切换、队列控制、会话控制、优雅退出等 35 条）的完整参考见 [TUI 指令集](TUI指令集.md)（别名/参数/选项/退出语义/与菜单对应）。
 
 > **状态**：现行
 >
 > **生命周期**：Active（在用）
 >
-> **更新日期**：2026-08-11
+> **更新日期**：2026-09-17
 >
 > **适用范围**：QLH 终端版聊天/管理 TUI（`qlh chat`、`src/tui_admin.py`）的启动方式、参数与使用说明；实现细节与网关契约见 [TUI 适配实施计划](TUI适配实施计划.md)，功能口径以源码与本文为准
 
@@ -14,16 +14,17 @@
 
 ## 一、这是什么
 
-`src/tui_admin.py`（纯 Python 标准库，零第三方依赖）是 QLH 的终端管理面，与 Web 管理面板功能对应，覆盖 7 个屏幕：系统总览、节点管理、分布式与分层、请求队列、设备画像、日志、设置。适用于无浏览器环境（SSH、服务器、树莓派等），支持 Windows 10+ / Linux / macOS。
+`src/tui_admin.py`（纯 Python 标准库，零第三方依赖）是 QLH 的统一终端面，覆盖 8 个屏幕：聊天、系统总览、节点管理、分布式与分层、请求队列、设备画像、日志、设置。分布式页直接显示 `PipelineLayout` 的布局与聚合容量，适用于无浏览器环境（SSH、服务器、树莓派等），支持 Windows 10+ / Linux / macOS。
 
-TUI 是**纯 HTTP 客户端**：所有数据来自后端 API（默认 `http://127.0.0.1:8000/api`）。后端未运行时 TUI 无法工作，因此一键启动脚本会先确保后端就绪再进入 TUI。
+页面通过 HTTP 与后端 API 交互（默认 `http://127.0.0.1:8000/api`）；本机统一入口会在当前 TUI 进程内按需启动后端并等待健康检查，远程地址只探测目标后端。交互模式的冷启动会显示 Koakuma 启动动画，后端启动状态在动画中更新；后端控制台日志不会穿透 TUI，仍保留在 `logs/` 及日志屏中。`--no-splash` 可关闭动画，`--plain` 只输出简短启动状态，适合 CI/管道。
 
 ## 二、全局 `qlh` 命令（推荐）
 
-主仓的统一入口是 `qlh`：`chat` 进入聊天壳，`admin` 进入管理 TUI，`status`/`models` 执行不启动后端的单命令查询。源码检出时使用根目录的 `qlh.bat`（Windows）或 `qlh.sh`（Linux/macOS）。聊天壳的 Textual/httpx 依赖仍由可选环境提供，不进入 Edge 标准库 TUI。
+主仓的统一入口是 `qlh`：无参数或 `chat` 进入零依赖聊天屏，`tui/ui` 进入同一 TUI，`status`/`models` 执行不启动后端的单命令查询。`admin` 保留为管理入口兼容命令。源码检出时使用根目录的 `qlh.bat`（Windows）或 `qlh.sh`（Linux/macOS）；主路径不依赖 Textual/httpx。
 
 ```bash
 qlh chat --host http://127.0.0.1:8000
+qlh chat --route distributed_preferred --thinking
 qlh admin --plain
 qlh models
 ```
@@ -76,7 +77,7 @@ bjtu --host 100.x.x.x status        # 对远程主节点执行单命令
 
 ### `bjtu chat`（终端对话页）
 
-已安装的 Windows 主应用包通过 `QLH-TUI-Chat/QLH-TUI-Chat.exe` 运行聊天页；Linux `.deb` 使用 `/opt/qlh-edge-inference/venv`。两者都已携带 Textual/httpx，首次进入不安装依赖也不联网。它与管理 TUI 是独立进程，`tui_admin.py --plain` 和原有 `bjtu` 默认入口不变。
+源码主仓的聊天页由 `src/tui_chat_screen.py` 提供，与管理页共用同一个 TUI 进程和命令系统；`qlh chat --fixture <路径>` 使用同一零依赖聊天屏做离线回放。旧 `src/tui_chat.py` 仍可独立启动以兼容历史 Textual fixture 流程。发布包的 Bootstrap/Launcher 入口属于外部包装层，不能替代主仓核心 TUI 验收。
 
 源码检出模式仍可使用 Shell 仓库隔离的 `qlh-shell/.venv-tui`：先运行 `python ..\qlh-shell\scripts\setup_tui_env.py`，再执行 `qlh chat --host http://127.0.0.1:8000`。主应用完整安装包和干净机回归仍在发布验收队列；Edge 最小入口继续使用标准库管理 TUI。
 

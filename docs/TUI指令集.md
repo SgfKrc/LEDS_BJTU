@@ -8,13 +8,13 @@
 >
 > 适用范围：`src/tui_admin.py` 的 `/` 命令系统（`bjtu` 终端指令集）的完整参考——命令、别名、参数、选项、退出语义与契约测试。命令行为以源码 `COMMANDS` 注册表与 `tests/test_tui_commands.py` 为准；本文档与两者不一致时以源码和测试为准。
 >
-> 关联文档：[TUI 使用指南](TUI使用指南.md)（启动/参数/排障）· [TUI 适配实施计划](TUI适配实施计划.md)（7 屏契约）· 微服务架构改造计划（2.6 验收）
+> 关联文档：[TUI 使用指南](TUI使用指南.md)（启动/参数/排障）· [TUI 适配实施计划](TUI适配实施计划.md)（历史 7 屏网关契约）· [微服务架构改造计划](微服务架构改造计划.md)
 
 ---
 
 ## 一、通用规则
 
-1. **触发**：任意界面（主菜单、7 个管理屏、`--plain` 纯文本模式）输入 `/` 开头命令后按 `Enter` 执行；命令输入中按 `ESC` 取消。
+1. **触发**：任意界面（主菜单、8 个屏幕、`--plain` 纯文本模式）输入 `/` 开头命令后按 `Enter` 执行；命令输入中按 `ESC` 取消。
 2. **命令行直调（单命令模式）**：`bjtu <命令>` 直接执行一条命令后退出、不进入交互界面（如 `bjtu shutdown`、`bjtu status`、`bjtu /shutdown`），命令名不带 `/` 也可。注意：**单命令模式不会自动启动后端**——后端未运行时提示"后端未在运行"并以退出码 1 结束；请先用 `bjtu`（交互模式）或 `start_tui.bat` 启动后端。命令必须是**第一个非选项参数**（`bjtu status --port 9000`）；选项在前（`bjtu --port 9000 status`）按交互模式处理（与启动脚本判定一致）。
 3. **参数解析**：位置参数 + 选项混用。选项支持 `--key value`、`--key=value`、`--key`（布尔开关）三种写法，选项不占位置参数计数。
 4. **校验反馈**：
@@ -26,7 +26,7 @@
 
 ---
 
-## 二、命令总表（27 条）
+## 二、命令总表（35 条）
 
 ### 系统
 
@@ -34,7 +34,7 @@
 |------|------|------|------|
 | `/help` | `/h` | `/help` | 命令集帮助（分组列出全部命令） |
 | `/status` | `/st` | `/status` | 打开系统状态总览屏 |
-| `/screen` | `/goto` | `/screen <编号\|名称>` | 跳转管理屏（`1-7` 编号或名称关键字，包含匹配） |
+| `/screen` | `/goto` | `/screen <编号\|名称>` | 跳转屏幕（`1-8` 编号或名称关键字，包含匹配） |
 | `/refresh` | `/r` | `/refresh` | 立即刷新当前屏幕（仅交互模式；`--plain` 无"当前屏"概念时提示） |
 | `/quit` | `/q` `/exit` | `/quit` | 退出 TUI，**后端保持运行** |
 | `/shutdown` | `/halt` | `/shutdown [原因]` | 优雅退出：后端保存/清理资源后退出，TUI 随后退出；后端已停或失败时 TUI 保持不退出 |
@@ -89,8 +89,15 @@
 
 | 命令 | 别名 | 用法 | 说明 |
 |------|------|------|------|
-| `/chat` | — | `/chat <clear>` | 清空对话历史 |
-| `/cancel` | — | `/cancel <任务ID>` | 取消生成任务（`POST /chat/generations/{id}/cancel`）；404 时回退取消工作流（`POST /workflows/{id}/cancel`），两者都失败才报错 |
+| `/chat` | — | `/chat <clear\|open>` | 打开聊天屏或清空对话历史 |
+| `/new` | — | `/new` | 创建并切换新会话 |
+| `/sessions` | — | `/sessions` | 列出最近会话 |
+| `/resume` | — | `/resume <session_id>` | 恢复历史会话 |
+| `/rename` | — | `/rename <标题>` | 重命名当前会话 |
+| `/delete-session` | — | `/delete-session` | 删除当前会话 |
+| `/route` | — | `/route <auto\|local\|distributed\|required>` | 设置聊天请求路由偏好 |
+| `/thinking` | — | `/thinking <on\|off>` | 控制 thinking 内容展示 |
+| `/cancel` | — | `/cancel [任务ID]` | 取消聊天生成；带 ID 时兼容取消工作流 |
 
 ---
 
@@ -116,6 +123,7 @@
 | 5 设备画像（GPU 切换/自动配置） | `/gpu [序号]`、`/device auto\|profile` |
 | 6 日志查看（本地尾部/后端最近/文件列表/统计） | `/logs [行数] [--remote]`、`/log filter <级别>` |
 | 7 设置（后端地址/间隔/超时/Token/连通测试） | `/host <主机> [端口]`、`/interval <秒>`、`/timeout <秒>`、`/token <令牌>` |
+| 8 聊天 | `/chat open`、`/new`、`/sessions`、`/resume`、`/rename`、`/delete-session`、`/route`、`/thinking`、`/cancel` |
 
 > 菜单专属动作（无等价命令）：屏 2 的自动发现、转让日志、注册/注销/删除节点、转让主节点、备用主节点设置、重置身份；屏 6 的连通测试（`T`）。这些仍走菜单操作。
 
@@ -123,8 +131,8 @@
 
 ## 五、契约与测试
 
-- **命令系统单元测试**：`tests/test_tui_commands.py`（52 用例，2026-08-05 复核后全覆盖 27 条命令）——命令解析、参数校验（不足/过多/非法值）、选项解析（`--quant/--engine/--compile/--switch`）、请求构造（body 逐字段）、退出标志（`/quit` vs `/shutdown`）、后端不可达容错。新增/修改命令必须同步该文件。
-- **7 屏 × 2 角色走查**：`scripts/tui_walkthrough.py`（`--real` 为真实微服务拓扑模式，master 16 动作 + client 3 屏；默认模式为桩环境全动作走查）。
+- **命令系统单元测试**：`tests/test_tui_commands.py` 与聊天/CLI/启动测试覆盖当前 35 条命令及统一入口；本轮定向回归 **173 passed**。新增/修改命令必须同步源码 `COMMANDS`、测试与本文档。
+- **8 屏走查**：既有 7 个管理屏继续沿用 `scripts/tui_walkthrough.py`；聊天屏与统一入口由 `tests/test_tui_chat_screen.py`、`tests/test_qlh_cli.py` 和 backend supervisor 测试覆盖。
 - **契约来源**：`src/tui_admin.py` `COMMANDS` 注册表（1946 行起）是命令的唯一事实来源；`/help` 与 `bjtu --help` 输出由 `_build_command_help_lines()` 自动生成，与本文档总表一致。
 
 ---
