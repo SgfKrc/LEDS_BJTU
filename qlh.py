@@ -1,12 +1,13 @@
 """Cross-platform command entry for the unified QLH TUI.
 
-2026-09-17 起：交互入口默认使用 **Textual 外壳**（``src/tui_textual.py``），
-因为它自己承担终端适配；自绘 ANSI（``src/tui_admin.py`` + ``tui_splash.py``）在真实
-conhost 下实测不可见（见该文件头注释与 ``docs/TUI重写方案``）。
+2026-09-17 起：
 
-* ``qlh`` / ``qlh chat`` / ``qlh --port N``  -> Textual 外壳（含本机后端冷启动反馈）
-* ``qlh --tui-engine builtin``               -> 标准库 TUI（过渡期回退入口）
-* ``qlh status`` / ``qlh models`` / ``qlh admin`` -> 仍走标准库薄层（无需 UI 依赖）
+* 交互入口 = **Textual 外壳**（``src/tui_textual.py``）——自绘 ANSI 的标准库 TUI
+  （``tui_admin.py`` / ``tui_chat_screen.py`` / ``tui_splash.py``）在真实 conhost 下实测
+  不可见，已整体归档到 ``_to_delete/``（见 ``docs/TUI重写方案``）；
+* 单命令模式 = **只读薄层** ``src/tui_commands.py``（status/models/nodes/queue/device/logs/help），
+  不再依赖旧 TUI 的命令注册表；写操作请在交互界面或 API 侧完成；
+* ``--tui-engine builtin`` 保留参数但**明确报已归档**（rc=2），不静默失效。
 """
 
 from __future__ import annotations
@@ -21,17 +22,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
+#: 单命令模式支持的只读子命令（实现在 src/tui_commands.py）
+READ_ONLY_SUBCOMMANDS = ("status", "models", "nodes", "queue", "device", "logs", "help")
+
 
 def _usage() -> str:
     return (
         "QLH core TUI\n"
-        "  qlh                         进入统一 TUI（Textual 外壳；本机后端自动启动）\n"
+        "  qlh                         进入交互外壳（Textual；本机后端自动启动）\n"
         "  qlh [options]               同上；选项直通（--port/--route/--host/--thinking…）\n"
         "  qlh chat [--host URL] [--route auto|local_only|distributed_preferred|distributed_required]\n"
-        "  qlh chat --fixture PATH     离线回放聊天屏 fixture\n"
-        "  qlh --tui-engine builtin    过渡期：回退标准库 TUI\n"
-        "  qlh admin [tui_admin.py options]\n"
-        "  qlh status / qlh models     单命令模式（不起后端、无 UI 依赖）\n"
+        "  qlh chat --fixture PATH     离线回放 SSE fixture（不联网、不依赖 UI）\n"
+        "  qlh status|models|nodes|queue|device|logs|help\n"
+        "                              单命令模式（只读、不启动后端、无 UI 依赖）\n"
     )
 
 
@@ -44,13 +47,6 @@ def _ensure_src_on_path() -> str:
     if src not in sys.path:
         sys.path.insert(0, src)
     return src
-
-
-def _load_tui_admin():
-    _ensure_src_on_path()
-    import tui_admin
-
-    return tui_admin
 
 
 def _textual_available() -> bool:
@@ -69,7 +65,7 @@ def _option_value(args: list[str], name: str, default: str) -> str:
 
 
 def _run(module_script: str, args: list[str]) -> int:
-    """保留旧单命令/fixture 子进程语义，统一交互入口不经过这里。"""
+    """单命令/fixture 的子进程语义（薄层与 fixture 都走这里，保持 CLI 隔离）。"""
     completed = subprocess.run(
         [_python(), str(ROOT / module_script), *args],
         cwd=str(ROOT),
@@ -113,10 +109,6 @@ def _chat_args(args: list[str]) -> list[str]:
             translated.extend(["--screen", args[i + 1]])
             i += 2
             continue
-        if value in {"--thinking", "--plain", "--no-splash", "--no-color"}:
-            translated.append(value)
-            i += 1
-            continue
         raise ValueError("chat 不支持参数: %s" % value)
     if "--host" in translated:
         host = translated[translated.index("--host") + 1].lower()
@@ -143,8 +135,7 @@ def _run_textual_shell(args: list[str]) -> int:
     """统一入口：进入 Textual 外壳。
 
     本机后端冷启动**不在这里等**——把 ``BackendSupervisor`` 交给外壳，由启动屏
-    （LOGO + 启动条 + 「少女祈祷中：…」状态行）承载全过程，避免"先纯文本等待、
-    再进 TUI"的两段式。
+    （LOGO + 启动条 + 「少女祈祷中：…」状态行）承载全过程。
     """
     _ensure_src_on_path()
     translated = _chat_args(args)
@@ -169,13 +160,16 @@ def _run_textual_shell(args: list[str]) -> int:
 
 
 def _run_unified(args: list[str]) -> int:
-    """统一交互入口：默认 Textual 外壳；显式 builtin / 缺依赖时回退标准库 TUI。"""
+    """统一交互入口：Textual 外壳（标准库 TUI 已归档，不再回退）。"""
     if _option_value(args, "--tui-engine", "auto") == "builtin":
-        return int(_load_tui_admin().main(args))
+        print("[提示] 标准库 TUI 已归档（_to_delete/）：自绘 ANSI 在真实 conhost 下不可见。")
+        print("       交互请直接用 `qlh` / `koakuma`；只读查询见 `qlh help`。")
+        return 2
     if not _textual_available():
-        print("[提示] 未安装 textual（python -m pip install -r requirements-tui.txt）；"
-              "本次回退标准库 TUI。")
-        return int(_load_tui_admin().main(args))
+        print("[错误] 未安装 textual —— 交互外壳需要它：")
+        print("       python -m pip install -r requirements-tui.txt")
+        print("       （只读查询仍可用：qlh status / models / nodes / queue / device / logs / help）")
+        return 1
     return _run_textual_shell(args)
 
 
@@ -210,26 +204,21 @@ def main(argv: list[str] | None = None) -> int:
             if args and args[0] == "--fixture":
                 if len(args) != 2:
                     raise ValueError("--fixture 需要一个路径")
-                return _load_fixture_smoke(args[1])
+                return _run("src/tui_commands.py", ["--fixture", args[1]])
             return _run_unified(_chat_args(args))
         except ValueError as exc:
             print("[错误] %s" % exc)
             return 2
     if command == "admin":
-        return _run("src/tui_admin.py", args)
-    if command in {"status", "models"}:
-        return _run("src/tui_admin.py", [command, *args])
+        print("[提示] `qlh admin` 指向的标准库管理 TUI 已归档（_to_delete/）。")
+        print("       交互请直接运行 `qlh` / `koakuma`；只读查询见 `qlh help`。")
+        return 2
+    if command in READ_ONLY_SUBCOMMANDS:
+        return _run("src/tui_commands.py", [command, *args])
     if command in {"tui", "ui"}:
         return _run_unified(["--auto-start", "--screen", "chat", *args])
     print("unknown qlh command: %s\n\n%s" % (command, _usage()))
     return 2
-
-
-def _load_fixture_smoke(path: str) -> int:
-    _ensure_src_on_path()
-    from tui_chat_screen import smoke_from_fixture
-
-    return int(smoke_from_fixture(path))
 
 
 if __name__ == "__main__":

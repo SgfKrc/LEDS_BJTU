@@ -30,7 +30,7 @@ echo ============================================
 echo.
 
 rem ---- single-command mode: run one TUI command then exit; never starts the backend.
-rem       cmd name list must stay in sync with COMMANDS in src/tui_admin.py.
+rem       cmd name list = the read-only commands in src/tui_commands.py.
 rem       NOTE: the command must be the FIRST argument (start_tui.bat status --port 9000);
 rem       options first (start_tui.bat --port 9000 status) fall back to interactive mode.
 set "FIRST_ARG=%~1"
@@ -45,7 +45,7 @@ if defined FIRST_ARG if not defined SINGLE_CMD (
 )
 if not defined SINGLE_CMD goto interactive_mode
 
-%PYTHON_CMD% src\tui_admin.py %*
+%PYTHON_CMD% src\tui_commands.py %*
 exit /b %errorlevel%
 
 :interactive_mode

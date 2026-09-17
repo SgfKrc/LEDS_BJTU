@@ -13,18 +13,19 @@ def test_help_is_local_and_does_not_spawn(monkeypatch, capsys):
 
 
 def test_chat_fixture_uses_zero_dependency_smoke(monkeypatch):
-    seen = {}
+    """fixture 回放走薄层（纯标准库），不经 UI、不经后端。"""
+    seen = []
 
-    def fake_smoke(path):
-        seen["path"] = path
+    def fake_run(module_script, args):
+        seen.append((module_script, args))
         return 0
 
-    monkeypatch.setattr(qlh, "_load_fixture_smoke", fake_smoke)
+    monkeypatch.setattr(qlh, "_run", fake_run)
     assert qlh.main(["chat", "--fixture", "fixtures/chat.sse"]) == 0
-    assert seen["path"] == "fixtures/chat.sse"
+    assert seen == [("src/tui_commands.py", ["--fixture", "fixtures/chat.sse"])]
 
 
-def test_models_is_a_plain_tui_command(monkeypatch):
+def test_models_is_a_readonly_commands_command(monkeypatch):
     seen = []
 
     def fake_run(command, **kwargs):
@@ -33,8 +34,33 @@ def test_models_is_a_plain_tui_command(monkeypatch):
 
     monkeypatch.setattr(qlh.subprocess, "run", fake_run)
     assert qlh.main(["models"]) == 3
-    assert os.path.normpath(seen[0][1]).endswith(os.path.normpath("src/tui_admin.py"))
+    assert os.path.normpath(seen[0][1]).endswith(os.path.normpath("src/tui_commands.py"))
     assert seen[0][2] == "models"
+
+
+def test_builtin_engine_reports_archived(capsys):
+    """`--tui-engine builtin` 保留参数但明确报已归档（不静默失效）。"""
+    assert qlh.main(["--tui-engine", "builtin"]) == 2
+    out = capsys.readouterr().out
+    assert "归档" in out and "koakuma" in out
+
+
+def test_admin_command_reports_archived(capsys):
+    """`qlh admin` 指向的旧管理 TUI 已归档。"""
+    assert qlh.main(["admin"]) == 2
+    assert "归档" in capsys.readouterr().out
+
+
+def test_readonly_subcommands_route_to_thin_layer(monkeypatch):
+    """所有只读子命令统一转发到薄层（且带原样参数）。"""
+    seen = []
+    monkeypatch.setattr(qlh, "_run",
+                        lambda script, args: (seen.append((script, list(args))), 0)[1])
+    for name in ("status", "models", "nodes", "queue", "device", "logs", "help"):
+        assert qlh.main([name]) == 0
+    assert [s for s, _ in seen] == ["src/tui_commands.py"] * 7
+    assert [a[0] for _, a in seen] == ["status", "models", "nodes", "queue",
+                                       "device", "logs", "help"]
 
 
 def test_no_args_enters_unified_tui_and_auto_starts(monkeypatch):

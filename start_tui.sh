@@ -31,13 +31,13 @@ echo "============================================"
 echo
 
 # ---- 单命令模式：直接执行一条命令后退出（不启动后端）----
-#      命令名/别名清单与 src/tui_admin.py 的 COMMANDS 注册表保持一致。
+#      命令名/别名清单与 src/tui_commands.py 的只读命令表保持一致。
 #      注意：命令必须是第一个参数（start_tui.sh status --port 9000）；
 #      选项在前（start_tui.sh --port 9000 status）会回退为交互模式。
 FIRST_ARG="${1:-}"
 case "$FIRST_ARG" in
     /*|help|h|quit|q|exit|shutdown|halt|status|st|screen|goto|refresh|r|model|models|switch|load|quant|engine|presets|gpu|device|nodes|connect|join|dist|queue|logs|log|host|interval|timeout|token|chat|new|sessions|resume|rename|delete-session|route|thinking|cancel)
-        exec "$PY" src/tui_admin.py "$@"
+        exec "$PY" src/tui_commands.py "$@"
         ;;
 esac
 

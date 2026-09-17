@@ -2,7 +2,7 @@
 # ============================================================
 #  QLH 全局 bjtu 命令 (Linux / macOS)
 #
-#  用法: bjtu [launcher|ui|tui|chat|tui_admin.py 参数...]
+#  用法: bjtu [launcher|ui|tui|chat|tui_commands.py 参数...]
 #
 #  一键启动: 自动启动后端(若未运行) -> 等待就绪 -> 进入 TUI。
 #  退出 TUI 后后端继续运行; 停止后端:
@@ -52,7 +52,7 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
         echo "[错误] 未找到可用的 python3 / python。"
         exit 1
     fi
-    exec "$PY" "$PROJECT_ROOT/src/tui_admin.py" --help
+    exec "$PY" "$PROJECT_ROOT/src/tui_commands.py" help
 fi
 
 # ---- unified launcher modes ----

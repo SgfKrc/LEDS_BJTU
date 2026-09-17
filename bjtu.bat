@@ -3,7 +3,7 @@ chcp 65001 >nul
 rem ============================================================
 rem  QLH global bjtu command (Windows)
 rem
-rem  Usage: bjtu [launcher|ui|tui|chat|tui_admin.py args...]
+rem  Usage: bjtu [launcher|ui|tui|chat|tui_commands.py args...]
 rem         bjtu --help       查看 TUI 命令集与启动参数（不启动后端）
 rem
 rem  One-click launch: start backend (if not running), wait until
@@ -248,5 +248,5 @@ if not %errorlevel%==0 (
     set "PYTHON_CMD=py -3"
 )
 set PYTHONIOENCODING=utf-8
-%PYTHON_CMD% src\tui_admin.py --help
+%PYTHON_CMD% src\tui_commands.py help
 exit /b %errorlevel%

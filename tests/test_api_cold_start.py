@@ -146,18 +146,10 @@ def test_l_tier_cold_start_gguf_inference_and_tui_without_torch():
         assert result["content"] == "probe-response"
         assert "torch" not in sys.modules
 
-        import tui_admin
+        import tui_commands
 
-        class FakePlainApp:
-            def __init__(self, api, interval):
-                self.api = api
-                self.interval = interval
-
-            def run(self):
-                return 0
-
-        tui_admin.PlainApp = FakePlainApp
-        assert tui_admin.main(["--plain", "--no-splash"]) == 0
+        # 旧标准库 TUI 已归档；单命令薄层必须在**无 torch** 的子进程里可用。
+        assert tui_commands.main(["help"]) == 0
         assert "torch" not in sys.modules
         model_path.unlink(missing_ok=True)
         print("L_TIER_PROBE_OK")

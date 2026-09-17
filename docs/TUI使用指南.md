@@ -8,19 +8,23 @@
 >
 > **更新日期**：2026-09-17
 >
-> **适用范围**：QLH 终端版聊天/管理 TUI（`qlh chat`、`src/tui_admin.py`）的启动方式、参数与使用说明；实现细节与网关契约见 [TUI 适配实施计划](TUI适配实施计划.md)，功能口径以源码与本文为准
+> **适用范围**：QLH 终端版交互外壳与只读单命令（`qlh` / `qlh chat` / `src/tui_commands.py`）的启动方式、参数与使用说明；实现细节与网关契约见 [TUI 适配实施计划](TUI适配实施计划.md)，功能口径以源码与本文为准
 
 ---
 
 ## 一、这是什么
 
-`src/tui_admin.py`（纯 Python 标准库，零第三方依赖）是 QLH 的统一终端面，覆盖 8 个屏幕：聊天、系统总览、节点管理、分布式与分层、请求队列、设备画像、日志、设置。分布式页直接显示 `PipelineLayout` 的布局与聚合容量，适用于无浏览器环境（SSH、服务器、树莓派等），支持 Windows 10+ / Linux / macOS。
+交互外壳 `src/tui_textual.py`（Textual）是 QLH 的统一终端面，覆盖 **9 个屏幕**：聊天、状态、模型、分布式、节点、队列、日志、设备、设置——与旧标准库管理 TUI 的 8 屏能力面对齐，并新增「模型」屏。分布式与容量数据取自集群只读端点（`/cluster/resources`、`/cluster/layers`、`/cluster/pipeline-capacity` 等），适用于无浏览器环境（SSH、服务器、树莓派等），支持 Windows 10+ / Linux / macOS。
 
-页面通过 HTTP 与后端 API 交互（默认 `http://127.0.0.1:8000/api`）；本机统一入口会在当前进程内按需启动后端并等待健康检查，远程地址只探测目标后端。交互模式默认使用 **Textual 外壳**（`src/tui_textual.py`，2026-09-17 起）：启动屏把 **Koakuma 大标题与启动条放在一起**（标题灰蓝 `#8fa8c4`，条在标题正下方），冷启动阶段以「**少女祈祷中：<阶段>**」实时反馈（检查本地后端 → 加载后端组件 → 启动 API 服务 → 等待健康检查），就绪后自动进入主界面。后端控制台日志不会穿透 TUI，仍保留在 `logs/` 及日志屏中。`--tui-engine builtin` 回退标准库 TUI（过渡期），未安装 Textual 时也会自动回退。
+页面通过 HTTP 与后端 API 交互（默认 `http://127.0.0.1:8000/api`）；本机统一入口会在当前进程内按需启动后端并等待健康检查，远程地址只探测目标后端。交互模式默认使用 **Textual 外壳**（`src/tui_textual.py`，2026-09-17 起）：启动屏把 **Koakuma 大标题与启动条放在一起**（标题灰蓝 `#8fa8c4`，条在标题正下方），冷启动阶段以「**少女祈祷中：<阶段>**」实时反馈（检查本地后端 → 加载后端组件 → 启动 API 服务 → 等待健康检查），就绪后自动进入主界面。后端控制台日志不会穿透 TUI，仍保留在 `logs/` 及日志屏中。
+
+> **旧标准库 TUI 已归档（2026-09-17）**：`src/tui_admin.py`（3247 行）、`tui_chat_screen.py`、`tui_splash.py`、`tui_chat.py`、走查脚本 `scripts/tui_walkthrough.py` 及其专属测试已移入 `_to_delete/`（该目录不入库，可随时取回）——自绘 ANSI 在真实 conhost 下实测不可见。交互面由 Textual 承担；单命令面由**只读薄层** `src/tui_commands.py` 承担。
+
+`--tui-engine builtin` 参数保留但会**明确报「已归档」并以退出码 2 结束**（不静默回退）；未安装 Textual 时给出安装指引并以退出码 1 结束。
 
 ## 二、全局 `qlh` 命令（推荐）
 
-主仓的统一入口是 `qlh`：无参数或 `chat` 进入交互外壳，`tui/ui` 进入同一 TUI，`status`/`models` 执行不启动后端的单命令查询。`admin` 保留为管理入口兼容命令。源码检出时使用根目录的 `qlh.bat`（Windows）或 `qlh.sh`（Linux/macOS）。
+主仓的统一入口是 `qlh`：无参数或 `chat` 进入交互外壳，`tui/ui` 进入同一 TUI，`status`/`models`/`nodes`/`queue`/`device`/`logs`/`help` 执行不启动后端的**只读**单命令查询。`admin` 指向的旧管理 TUI 已归档，调用时提示并返回退出码 2。源码检出时使用根目录的 `qlh.bat`（Windows）或 `qlh.sh`（Linux/macOS）。
 
 **`koakuma` 是 `qlh` 的等价别名**：根目录的 `koakuma.bat` / `koakuma.sh` 转发到同一个 `qlh.py`，参数原样透传（Windows cmd 不支持 shell alias，故用同名薄壳实现，跨 shell/跨平台通用）。
 
@@ -31,7 +35,7 @@ qlh chat --host http://127.0.0.1:8000
 qlh chat --route distributed_preferred --thinking
 koakuma                      # 等价于 qlh
 koakuma chat --route distributed_preferred
-qlh admin --plain
+qlh nodes                            # 只读单命令（不启动后端）
 qlh models
 ```
 
@@ -61,31 +65,35 @@ bjtu tui                            # 启动后端并进入 TUI 管理界面
 qlh chat --host http://127.0.0.1:8000   # 主仓统一聊天入口
 bjtu chat --host http://127.0.0.1:8000  # 兼容入口
 bjtu --host 100.x.x.x               # 启动后端后，TUI 管理远程主节点
-bjtu --plain                        # 纯文本编号菜单
+bjtu status                         # 只读单命令（不启动后端）
 ```
 
 `bjtu launcher` 在 Windows 显示独立 Launcher GUI，在 Linux 图形入口使用同一 GUI，SSH/无图形环境可用 `qlh-launcher --tui` 编号选择页。Launcher 负责应用发现、CPU/CUDA 变体和更新检查；选择应用后仍由主应用启动载荷显示模型/网络初始化进度。`bjtu ui` 与 `bjtu tui` 是脚本/自动化场景使用的确定性入口，不依赖人工选择。
 
-**单命令模式**（执行一条 TUI 命令后立即退出，**不会自动启动后端**；后端未运行时提示"后端未在运行"并以退出码 1 结束）：
+**单命令模式**（**只读**；执行一条命令后立即退出，**不会自动启动后端**，后端未运行时提示"后端未在运行"并以退出码 1 结束）：
 
 ```bash
-bjtu shutdown                       # 优雅关闭后端（等价 /shutdown，别名 halt）
-bjtu /shutdown                      # 也支持带斜杠形式
-bjtu status                         # 打开系统状态总览后退出
-bjtu models                         # 列出可用模型/量化/引擎后退出
+bjtu status                         # 系统状态 + 当前模型
+bjtu models                         # 模型列表（* 标记当前模型）
+bjtu nodes                          # 集群节点列表
+bjtu queue                          # 请求队列与调度策略
+bjtu device                         # 本机设备画像（CPU/内存/磁盘/GPU/档位评估）
+bjtu logs                           # 聚合日志（远程需 --log-token）
+bjtu help                           # 只读命令一览
 bjtu --host 100.x.x.x status        # 对远程主节点执行单命令
+bjtu models --json                  # 机读输出（便于脚本消费）
 ```
 
-> 单命令模式与交互模式的区别：交互模式负责"启动后端 + 进入 TUI"；单命令模式只做"处理"，后端必须已在运行（可用 `bjtu` 交互模式或 `start_tui.bat` 先启动）。命令名/别名清单与 TUI 内 `/` 命令集一致（见 [TUI指令集.md](TUI指令集.md)）。
+> 单命令模式与交互模式的区别：交互模式负责"启动后端 + 进入 TUI"；单命令模式只做"处理"，后端必须已在运行（可用 `bjtu` 交互模式或 `start_tui.bat` 先启动）。命令名为**只读子集**（status/models/nodes/queue/device/logs/help），与旧 TUI 的 35 条命令注册表**不再等价**：写操作（关机、切模型、队列暂停/清理、注销节点等）请在交互外壳（`qlh`/`koakuma`）或 API 侧完成。
 > ⚠️ 命令必须是**第一个参数**（`bjtu status --port 9000`）；选项在前（`bjtu --port 9000 status`）会被当作交互模式（可能启动后端）。
 
 `bjtu tui` 的后端生命周期行为与 `start_tui.bat` / `start_tui.sh` 相同：探测 `8000` 端口（`QLH_BACKEND_PORT` 可覆盖）→ 未运行则启动后端 → 等待 `/api/health` 就绪 → 进入 TUI；退出 TUI 后后端继续运行。`bjtu ui` 则在相同检查完成后打开普通界面。
 
 ### `bjtu chat`（终端对话页）
 
-源码主仓的聊天页由 `src/tui_chat_screen.py` 提供，与管理页共用同一个 TUI 进程和命令系统；`qlh chat --fixture <路径>` 使用同一零依赖聊天屏做离线回放。旧 `src/tui_chat.py` 仍可独立启动以兼容历史 Textual fixture 流程。发布包的 Bootstrap/Launcher 入口属于外部包装层，不能替代主仓核心 TUI 验收。
+聊天页由交互外壳的 `ChatPane` 提供（SSE 流式，含 thinking / 取消 / 会话续接）；`qlh chat --fixture <路径>` 由只读薄层 `src/tui_commands.py` 做离线回放（零依赖、不联网、不经 UI）。旧 `src/tui_chat_screen.py` / `src/tui_chat.py` 已随归档移入 `_to_delete/`。发布包的 Bootstrap/Launcher 入口属于外部包装层，不能替代主仓核心 TUI 验收。
 
-源码检出模式仍可使用 Shell 仓库隔离的 `qlh-shell/.venv-tui`：先运行 `python ..\qlh-shell\scripts\setup_tui_env.py`，再执行 `qlh chat --host http://127.0.0.1:8000`。主应用完整安装包和干净机回归仍在发布验收队列；Edge 最小入口继续使用标准库管理 TUI。
+源码检出模式仍可使用 Shell 仓库隔离的 `qlh-shell/.venv-tui`：先运行 `python ..\qlh-shell\scripts\setup_tui_env.py`，再执行 `qlh chat --host http://127.0.0.1:8000`。主应用完整安装包和干净机回归仍在发布验收队列；Edge 最小入口使用只读薄层（`src/tui_commands.py`）与 Textual 外壳（Edge 环境同样安装 `textual`）。
 
 ## 四、一键启动（start_tui.bat / start_tui.sh）
 
@@ -140,8 +148,8 @@ kill "$(cat logs/backend_tui.pid)"
 # 1. 启动后端（项目根目录）
 python src/api_server.py            # 或 python -m uvicorn src.api_server:app --port 8000
 
-# 2. 另开终端启动 TUI
-python src/tui_admin.py             # 连本机 8000
+# 2. 另开终端启动交互外壳
+python qlh.py --port 8000           # 等价于 qlh（统一入口）
 ```
 
 ## 六、参数说明
@@ -152,25 +160,25 @@ python src/tui_admin.py             # 连本机 8000
 |----------|------|------|
 | `QLH_BACKEND_PORT` | `8000` | 后端端口。改动后 TUI 需用 `--port` 指向同一端口，例如 `QLH_BACKEND_PORT=8100 start_tui.bat --port 8100` |
 
-### `tui_admin.py`（也是 `bjtu` 命令透传的参数）
+### 只读单命令 `src/tui_commands.py`（取代已归档 `tui_admin.py` 的参数表）
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
-| `--host` | `127.0.0.1` | 后端地址；填 Tailscale IP（如 `100.x.x.x`）可直管远程主节点 |
+| `--host` | `127.0.0.1` | 后端地址；填 Tailscale IP（如 `100.x.x.x`）可查询远程主节点 |
 | `--port` | `8000` | 后端端口 |
-| `--plain` | 关 | 强制纯文本编号菜单（管道/CI/老终端自动降级，也可手动指定） |
-| `--interval` | `3.0` | 总览/节点/队列屏自动刷新秒数 |
 | `--timeout` | `5.0` | HTTP 请求超时秒数 |
-| `--log-token` | 空 | 远程访问日志接口所需的 `X-QLH-Log-Token`（本地模式直接读 `logs/` 目录，无需 token） |
-| `--no-color` | 关 | 关闭彩色输出 |
-| `--version` | — | 打印版本（当前 `1.0.0`） |
+| `--log-token` | 空 | 远程读取聚合日志所需的 `X-QLH-Log-Token` |
+| `--json` | 关 | 以 JSON 输出（便于脚本消费） |
+| `--fixture PATH` | 空 | 离线回放 SSE fixture（不联网、不依赖 UI） |
+
+交互外壳自身的参数见 `qlh --help` / `qlh chat --help`（如 `--port`、`--route`、`--thinking`、`--interval`）。
 
 典型用法：
 
 ```bash
-python src/tui_admin.py --host 100.x.x.x           # 管理远程 Tailscale 主节点
-python src/tui_admin.py --host 100.x.x.x --log-token xxx   # 远程模式带日志 token
-python src/tui_admin.py --plain                    # 纯文本编号菜单
+python src/tui_commands.py status --host 100.x.x.x              # 查询远程主节点状态
+python src/tui_commands.py logs --host 100.x.x.x --log-token xxx # 远程聚合日志
+python src/tui_commands.py models --json                        # 机读输出
 ```
 
 ## 七、常见问题
@@ -186,10 +194,11 @@ python src/tui_admin.py --plain                    # 纯文本编号菜单
 ## 八、自动化走查与测试
 
 - **契约测试**：`cd gateway && npm run test:tui`（44 用例：38 端点调用点 + 5 项细节 + 错误契约）。
-- **7 屏 × 2 角色走查**：`scripts/tui_walkthrough.py --host <网关> --port <端口> --mode master|client`，配套桩 `scripts/dev_stubs.py`（scheduler-svc :8020 + inference-svc :8010，`--client-mode` 模拟从节点身份）与 `src/legacy_control.py`（:8040，`/logs/*`）——**两个桩与网关均已随微服务叫停删除（2026-09-14）**，走查以其历史记录为准。
-- 2026-08-03 复核：`tui-contract` 44/44、master/client 双角色走查全部 PASS，`tui_admin.py` 自 TUI 适配完成后零改动。
+- **7 屏 × 2 角色走查**：`scripts/tui_walkthrough.py`（驱动旧 `tui_admin.py --plain`）**已随归档移入 `_to_delete/`（2026-09-17）**；其历史用法为 `--host <网关> --port <端口> --mode master|client`，配套桩 `scripts/dev_stubs.py`（scheduler-svc :8020 + inference-svc :8010，`--client-mode` 模拟从节点身份）与 `src/legacy_control.py`（:8040，`/logs/*`）——**两个桩与网关均已随微服务叫停删除（2026-09-14）**，走查以其历史记录为准。
+- 2026-08-03 复核：`tui-contract` 44/44、master/client 双角色走查全部 PASS，`tui_admin.py` 自 TUI 适配完成后零改动。（该文件已于 2026-09-17 归档）
+- 2026-09-17 归档：交互面切到 Textual 外壳（9 屏，含新「模型」屏、设备/设置补全），单命令面抽出只读薄层 `src/tui_commands.py`；回归 `pytest -k "tui or qlh or cold_start"` 93 passed / 1 skipped。
 
 ---
 
 **维护者**：QLH 开发团队
-**下次复核触发**：`tui_admin.py` 或网关契约发生变更时
+**下次复核触发**：`src/tui_textual.py` / `src/tui_commands.py` 或网关契约发生变更时
