@@ -78,7 +78,7 @@ Other models (Qwen3-4B, Gemma 4, etc.) see the root README "Post-clone asset che
 
 ```bash
 python src/api_server.py               # backend http://localhost:8000
-python -m src.tui_admin --plain --host http://127.0.0.1:8000 # mainline TUI
+python qlh.py                         # mainline TUI (Textual shell, 9 screens)
 # or the terminal UI: ./start_tui.sh (Windows: start_tui.bat, auto-starts the backend)
 python -c "import src.api_server"                                   # backend importable
 .venv-test\Scripts\python.exe -m pytest tests/ -q --collect-only    # test env ready

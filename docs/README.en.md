@@ -152,9 +152,9 @@ Project root
 │   ├── island_engine.py           # ★ TP island engine (OpenAI-compatible endpoint → single logical node, Route A)
 │   ├── external_provider.py       # ★ External inference provider + data-scope gating (Route B)
 │   ├── speculative.py             # ★ draft-verify speculative decoding (experimental, disabled, Route C)
-│   ├── tui_admin.py               # ★ Cross-platform TUI admin menu (pure stdlib, zero dependencies)
+│   ├── tui_commands.py            # ★ Read-only single-command layer (pure stdlib, zero dependencies)
 │   ├── qlh.py                     # Cross-platform core TUI command entry
-│   ├── tui_chat.py                # ★ T9 chat page (Textual + httpx; bundled in installers, optional in source)
+│   ├── tui_textual.py             # ★ Textual TUI shell (9 screens; chat + read-only ops)
 │   ├── tui_sse.py / tui_shared.py # T9 SSE incremental parser & shared layer
 │   ├── paged_kv_cache.py          # Lightweight paged KV cache (hot memory pages; optional cold disk tier)
 │   ├── tcp_comm.py                # TCP master/worker communication (long-lived conns, heartbeats, framing, tensor serialization)
@@ -582,7 +582,7 @@ Open app → Settings → switch to "Full mode" → Model management → pick di
 python src/api_server.py
 
 # Terminal 2: start the mainline TUI (the product shell is a side line)
-python -m src.tui_admin --plain --host http://127.0.0.1:8000
+python qlh.py                       # Textual shell; starts the backend if needed
 ```
 
 Once the backend is ready:
@@ -638,9 +638,9 @@ start_tui.bat                               # Windows (double-click or command l
 **Manual / advanced usage** (run `python src/api_server.py` first if the backend is not running):
 
 ```bash
-python src/tui_admin.py --host 100.x.x.x    # Manage a remote Tailscale master directly
-python src/tui_admin.py --plain             # Fall back to a plain numbered menu on old terminals/pipes
-python src/tui_admin.py --host 100.x.x.x --log-token xxx   # Remote mode with log token
+python src/tui_commands.py status --host 100.x.x.x                # Query a remote Tailscale master (read-only)
+python src/tui_commands.py models --json                          # Machine-readable read-only output
+python src/tui_commands.py logs --host 100.x.x.x --log-token xxx  # Remote aggregated logs
 bjtu --help                                 # Full command set and startup args (does not start the backend)
 ```
 

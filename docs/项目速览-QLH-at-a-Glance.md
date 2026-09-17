@@ -78,7 +78,7 @@ huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf Qwen-1_8B-Chat
 
 ```bash
 python src/api_server.py               # 后端 http://localhost:8000
-python -m src.tui_admin --plain --host http://127.0.0.1:8000 # 主线 TUI
+python qlh.py                         # 主线 TUI（Textual 外壳，9 屏）
 # 或终端版：./start_tui.sh（Windows: start_tui.bat，自动带后端）
 python -c "import src.api_server"                                   # 后端可导入
 .venv-test\Scripts\python.exe -m pytest tests/ -q --collect-only    # 测试环境就绪

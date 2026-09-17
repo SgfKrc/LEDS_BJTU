@@ -1,12 +1,14 @@
 # TUI 指令集参考
 
-> **状态**：现行
+> **状态**：已归档（Archived，2026-09-17）
 >
-> 文档生命周期：**生效中（Active）**
+> 文档生命周期：**已归档（Archived）**——所述实现已移出主仓
 >
 > 创建日期：2026-08-05
 >
-> 适用范围：`src/tui_admin.py` 的 `/` 命令系统（`bjtu` 终端指令集）的完整参考——命令、别名、参数、选项、退出语义与契约测试。命令行为以源码 `COMMANDS` 注册表与 `tests/test_tui_commands.py` 为准；本文档与两者不一致时以源码和测试为准。
+> 适用范围（**历史**）：`src/tui_admin.py` 的 `/` 命令系统（35 条）参考——命令、别名、参数、选项、退出语义与契约测试。**该实现已于 2026-09-17 归档到 `_to_delete/`**（连同 `COMMANDS` 注册表与 `tests/test_tui_commands.py`），本文档仅作历史记录保留。
+>
+> **现行替代**：交互外壳 `src/tui_textual.py`（Textual，9 屏：聊天/状态/模型/分布式/节点/队列/日志/设备/设置；聊天内 `/help`、`/route`、`/thinking`、`/clear`、`/cancel`、`/quit`）；单命令面 `src/tui_commands.py`（只读：`status`/`models`/`nodes`/`queue`/`device`/`logs`/`help`）。见 [TUI 使用指南](TUI使用指南.md)。
 >
 > 关联文档：[TUI 使用指南](TUI使用指南.md)（启动/参数/排障）· [TUI 适配实施计划](TUI适配实施计划.md)（历史 7 屏网关契约）· [微服务架构改造计划](微服务架构改造计划.md)
 
