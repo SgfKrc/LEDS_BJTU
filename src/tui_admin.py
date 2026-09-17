@@ -101,6 +101,27 @@ def format_network_path(path) -> tuple[str, str]:
     return "%s/%s" % (path_label, availability), quality_label
 
 
+def format_cluster_resource_summary(view) -> str:
+    """Format the allowlisted aggregate view without exposing node addresses."""
+    if not isinstance(view, dict) or not isinstance(view.get("totals"), dict):
+        return ""
+    totals = view["totals"]
+    mode = "分布式" if view.get("is_distributed") else "本地单节点"
+    return (
+        "聚合资源: %s | CPU %s 核 | RAM %.1f/%.1f GB | "
+        "GPU %s（CUDA %s）| VRAM %.1f/%.1f GB"
+    ) % (
+        mode,
+        totals.get("logical_cores", 0),
+        float(totals.get("ram_available_gb", 0) or 0),
+        float(totals.get("ram_total_gb", 0) or 0),
+        totals.get("gpu_count", 0),
+        totals.get("cuda_gpu_count", 0),
+        float(totals.get("vram_free_gb", 0) or 0),
+        float(totals.get("vram_total_gb", 0) or 0),
+    )
+
+
 # ============================================================
 # 一、CJK 显示宽度处理（East Asian Width）
 # ============================================================
@@ -766,9 +787,10 @@ class NodesScreen(Screen):
 
     def fetch(self):
         nodes = self.api.get("/cluster/nodes")
+        resources, _ = self._sub("/cluster/resources")
         role, _ = self._sub("/cluster/my-role")
         role = role or {}
-        result = {"nodes": nodes, "role": role}
+        result = {"nodes": nodes, "resources": resources or {}, "role": role}
         if role.get("is_master"):
             result["invite"], _ = self._sub("/cluster/invite")
             result["spare"], _ = self._sub("/cluster/spare-master")
@@ -784,6 +806,9 @@ class NodesScreen(Screen):
         out.append(("head", "本机角色: %s (%s)    节点 %s 个 / 在线 %s / 离线 %s" % (
             role_cn(role.get("node_role", "—")), role.get("node_id", "—"),
             nd.get("count", 0), nd.get("online_count", 0), nd.get("offline_count", 0))))
+        resource_summary = format_cluster_resource_summary(d.get("resources"))
+        if resource_summary:
+            out.append(("", resource_summary))
         invite = d.get("invite") or {}
         if invite:
             out.append(("", "邀请信息(供从节点连接): %s:%s    容量 %s/%s    身份校验: %s" % (
@@ -1009,14 +1034,17 @@ class DistributedScreen(Screen):
         di = self.api.get("/cluster/config/distributed-inference")
         layers, layers_err = self._sub("/cluster/layers")
         cfg, cfg_err = self._sub("/cluster/config")
+        reshard, reshard_err = self._sub("/cluster/pipeline-reshard")
         return {"di": di, "layers": layers, "layers_err": layers_err,
-                "cfg": cfg, "cfg_err": cfg_err}
+                "cfg": cfg, "cfg_err": cfg_err, "reshard": reshard,
+                "reshard_err": reshard_err}
 
     def lines(self, width: int) -> list:
         d = self.data or {}
         di = d.get("di") or {}
         layers = d.get("layers") or {}
         cfg = d.get("cfg") or {}
+        reshard = d.get("reshard") or {}
         out = []
         style = "ok" if di.get("enabled") else "warn"
         out.append(("title", "◆ 分布式推理开关"))
@@ -1044,6 +1072,24 @@ class DistributedScreen(Screen):
             out.append(("dim", "  （暂无分层分配，单机模式或未启用分布式）"))
         if d.get("layers_err"):
             out.append(("err", "  分层查询失败: %s" % d["layers_err"]))
+        out.append(("", ""))
+        out.append(("title", "◆ 自动重分片"))
+        state = str(reshard.get("status", "inactive") or "inactive")
+        last = reshard.get("last_decision") or {}
+        reason = last.get("reason_code", "") or ""
+        labels = {
+            "active": "待命", "staged": "等待工件", "ready": "可切换",
+            "inactive": "未激活", "rejected": "已拒绝",
+        }
+        state_style = "ok" if state in {"active", "ready"} else (
+            "warn" if state == "staged" else "dim"
+        )
+        out.append((state_style, "  状态: %s    Epoch: %s%s" % (
+            labels.get(state, state), reshard.get("epoch", "—"),
+            ("    原因: %s" % reason) if reason else "",
+        )))
+        if d.get("reshard_err"):
+            out.append(("err", "  重分片状态查询失败: %s" % d["reshard_err"]))
         net = cfg.get("network") or {}
         model = cfg.get("model") or {}
         if cfg:
@@ -1936,13 +1982,21 @@ def cmd_device(app, args, opts):
 def cmd_nodes(app, args, opts):
     nd = app.api.get("/cluster/nodes") or {}
     role = {}
+    resources = {}
     try:
         role = app.api.get("/cluster/my-role") or {}
+    except ApiError:
+        pass
+    try:
+        resources = app.api.get("/cluster/resources") or {}
     except ApiError:
         pass
     lines = ["本机角色: %s (%s)    节点 %s / 在线 %s / 离线 %s" % (
         role_cn(role.get("node_role", "—")), role.get("node_id", "—"),
         nd.get("count", 0), nd.get("online_count", 0), nd.get("offline_count", 0))]
+    resource_summary = format_cluster_resource_summary(resources)
+    if resource_summary:
+        lines.append(resource_summary)
     lines.append("")
     rows = []
     for n in (nd.get("nodes") or []):

@@ -40,6 +40,7 @@ API_PATHS = {
     "conversations": "/conversations",
     "models_current": "/models/current",
     "distributed_config": "/cluster/config/distributed-inference",
+    "cluster_resources": "/cluster/resources",
 }
 
 # ============================================================

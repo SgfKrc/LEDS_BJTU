@@ -46,6 +46,8 @@ class FakeApi:
             return {"node_role": "client", "node_id": "n1"}
         if path == "/cluster/config/distributed-inference":
             return {"enabled": False}
+        if path == "/cluster/pipeline-reshard":
+            return {"status": "active", "epoch": 1, "staged": []}
         if path == "/cluster/queue":
             return {"strategy": "mlfq", "paused": False, "queue_size": 0,
                     "q0_depth": 0, "q1_depth": 0, "q2_depth": 0}
@@ -85,6 +87,19 @@ class FakeApi:
         if path == "/cluster/nodes":
             return {"count": 1, "online_count": 1,
                     "nodes": [{"node_id": "n1"}]}
+        if path == "/cluster/resources":
+            return {
+                "is_distributed": False,
+                "totals": {
+                    "logical_cores": 8,
+                    "ram_available_gb": 12,
+                    "ram_total_gb": 24,
+                    "gpu_count": 1,
+                    "cuda_gpu_count": 1,
+                    "vram_free_gb": 6,
+                    "vram_total_gb": 8,
+                },
+            }
         return {}
 
     def post(self, path, body=None, params=None):
@@ -183,6 +198,19 @@ class TestExitCommands:
         msg, style = a.exec_command("/shutdown")
         assert style == "err"
         assert a.exit_requested is False
+
+
+class TestDistributedScreen:
+    def test_pipeline_reshard_state_is_rendered(self, app):
+        screen = t.DistributedScreen(app)
+
+        screen.refresh(force=True)
+        rendered = "\n".join(text for _style, text in screen.lines(100))
+
+        assert "自动重分片" in rendered
+        assert "状态: 待命" in rendered
+        assert "Epoch: 1" in rendered
+        assert ("GET", "/cluster/pipeline-reshard") in app.api.calls
 
 
 class TestModelCommands:
@@ -454,7 +482,10 @@ class TestDeviceAndNodesCommands:
         msg, style = app.exec_command("/nodes")
         assert style == "ok"
         assert "节点 1 个" in msg
-        assert "n1" in "\n".join(app.out)
+        rendered = "\n".join(app.out)
+        assert "n1" in rendered
+        assert "聚合资源: 本地单节点" in rendered
+        assert "RAM 12.0/24.0 GB" in rendered
 
     def test_nodes_shows_role(self, app):
         msg, style = app.exec_command("/nodes")
