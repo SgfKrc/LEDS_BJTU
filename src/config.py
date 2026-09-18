@@ -157,7 +157,23 @@ MODEL_NAME = "Qwen/Qwen-1.8B-Chat"          # HuggingFace 模型标识
 MODEL_PATH = os.path.join(_APP_ROOT, "models", "qwen-1_8b-chat")       # Safetensors 格式
 GGUF_MODEL_PATH = os.path.join(_APP_ROOT, "models", "Qwen-1_8B-Chat.Q4_K_M.gguf")  # GGUF 格式
 QUANT_TYPE = "int4"                          # 量化精度: "fp16" | "int8" | "int4"
-USE_COMPILE = False                          # 算子融合（仅FP16有效，INT4下自动跳过）
+USE_COMPILE = True                           # 算子融合（仅 FP16+CUDA 有效；INT4/CPU 自动跳过）
+#: torch.compile 的序列长度上限（2026-09-18 实测）：compile 在短序列有收益，但随生成步数
+#: 变长而劣化 —— gen=24 1.904× → 64 1.372× → **141 步 0.672×（反而慢 1.49×）**，
+#: 根因是 KV 增长使形状反复变化、`torch._dynamo` 的 `recompile_limit` 被 hybrid KV 的
+#: 不稳定守卫打满。MAX_SEQ_LEN 超过本值时跳过 compile（拐点在 64–141 之间，故保守取 128）。
+COMPILE_RECOMPILE_LIMIT = 64   # torch._dynamo.config.recompile_limit / cache_size_limit
+# 2026-09-18 实测（Qwen2.5-0.5B 非 hybrid，gen=141 decode）：
+#   compile 相对 eager 快 1.79×（limit=8 默认）→ **2.57×（limit=64）** ⇒ 调大 limit 有 +44% 收益。
+# transformers 自己在 chunked prefill 场景也用 64（generation/utils.py:4113-4115）。
+# ⚠️ torch >= 2.12 起该配置是 **thread-local**：须在使用线程内设置才生效。
+# 注：曾短暂存在过 COMPILE_MAX_SEQ_LEN（按序列长度跳过），依据是「长序列 compile 反而慢」，
+#     但那个结论来自取错模块的错误测量，已撤销（正确答案是长序列也快，且调大 limit 更有效）。
+# 2026-09-18 改为默认 True：装了 triton-windows 后 Windows 下才真正可用
+#（此前 PyPI 无 Windows triton ⇒ 报 TritonMissing，该开关等于是死的）。
+# 实测：mode='default' 使 12 层分段前向 1.0443 → 0.3258 ms/层，且 24 步 argmax 与 eager 一致。
+# ⚠️ compile **不是 bit-exact**（hidden max|diff|≈7.8e-2）；有严格「逐 token 一致」判据的
+#    验收（如跨框架接力）必须自行复验。triton 缺失时会自动告警并回退，不影响启动。
 INFERENCE_ENGINE = _env_first("QLH_INFERENCE_ENGINE", default="llama_cpp").strip().lower()
 
 # The default edge path is llama.cpp and must not import PyTorch merely to

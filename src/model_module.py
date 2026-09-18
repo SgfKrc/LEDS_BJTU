@@ -54,6 +54,7 @@ from transformers import (
 
 from config import (
     MODEL_NAME, MODEL_PATH, GGUF_MODEL_PATH,
+    COMPILE_RECOMPILE_LIMIT,
     QUANT_TYPE, USE_COMPILE,
     DEVICE, TRUST_REMOTE_CODE,
     INFERENCE_ENGINE,
@@ -242,6 +243,10 @@ class ModelManager:
         self._layer_load_metrics: Optional[Dict[str, Any]] = None
         self._pipeline_descriptor: Optional[Dict[str, Any]] = None
         self._pipeline_distributed_only: bool = False
+        #: torch.compile 后的内部 transformer（2026-09-18）。**不替换 self.model**，
+        #: 否则 self.model.model / self.model.transformer 的结构访问会失效
+        #: （forward_layers 与 _count_transformer_layers 都依赖它们）。
+        self._compiled_transformer: Optional[nn.Module] = None
 
         # llama.cpp 引擎（延迟导入 + 延迟加载）
         self._llama_engine = None   # LlamaCppEngine 实例
@@ -1305,6 +1310,12 @@ class ModelManager:
                 f"embed={has_embedding}, lm_head={has_lm_head}"
             )
 
+        # ---- 算子融合（2026-09-18 补齐）----
+        # 此前本路径完全没有 compile 应用点；这里与 _load_pytorch 对齐。
+        # 注意：forward_layers() 是**手动逐层**前向，吃不到整段 compile；
+        # 此处注册的编译版本供 self.model(...) / 内部 transformer(...) 的整段调用使用。
+        self._maybe_apply_compile()
+
     def _load_qwen2_layer_range(
         self,
         model_path: str,
@@ -2010,13 +2021,117 @@ class ModelManager:
         return 0
 
     def _apply_compile(self) -> None:
-        """开启 torch.compile 自动算子融合。"""
-        logger.info("开启 torch.compile 算子融合 (mode='reduce-overhead')...")
+        """开启 torch.compile 自动算子融合（2026-09-18 修正）。
+
+        两处实测修正：
+
+        * **mode 用 ``default`` 而非 ``reduce-overhead``**：后者的 CUDA Graphs 与
+          「KV cache 每步换 tensor」不兼容，解码路径会抛
+          ``RuntimeError: accessing tensor output of CUDAGraphs ...``（实测）；
+          而 ``default`` 在 12 层分段上实测 1.0443 → 0.3258 ms/层。
+        * **不替换 ``self.model``**：原实现直接 ``self.model = torch.compile(self.model)``，
+          会让 ``self.model.model`` / ``self.model.transformer`` 的结构访问失效，
+          而 ``forward_layers()`` 与 ``_count_transformer_layers()`` 都依赖它们。
+          改为编译内部 transformer 并另存 ``self._compiled_transformer``。
+
+        ⚠️ 数值提示：``mode="default"`` **不是 bit-exact**（实测 hidden ``max|diff|≈7.8e-2``，
+        fp16）。若调用方有「逐 token 一致」的验收判据（如跨框架接力），必须自行复验。
+        """
+        limit = globals().get("COMPILE_RECOMPILE_LIMIT")
+        if limit:
+            try:
+                torch._dynamo.config.recompile_limit = int(limit)
+                torch._dynamo.config.cache_size_limit = int(limit)
+                logger.info(
+                    f"  torch._dynamo recompile_limit → {limit}"
+                    f"（2026-09-18 实测：非 hybrid 长序列下有 +44% 收益）")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"  设置 recompile_limit 失败: {e}")
+        logger.info("开启 torch.compile 算子融合 (mode='default')...")
+        inner = getattr(self.model, "model", None) or getattr(self.model, "transformer", None)
+        if inner is None:
+            logger.warning("  ❌ torch.compile 启用失败: 找不到内部 transformer，回退到普通模式")
+            self._compiled_transformer = None
+            return
         try:
-            self.model = torch.compile(self.model, mode="reduce-overhead")
-            logger.info("  ✅ torch.compile 已启用 (预计 +8% 推理速度)")
+            self._compiled_transformer = torch.compile(inner, mode="default")
+            logger.info("  ✅ torch.compile 已启用 (mode='default'；解码路径不依赖 CUDA Graphs)")
+            # 退出路径配套（2026-09-18 用户裁定）：hybrid + compile 时解释器清理期可能崩溃
+            #（`_PyModule_ClearDict` 调用栈）⇒ 登记 atexit，在清理**之前**有序释放编译对象
+            # 与 CUDA 缓存，降低「退出码非零」的风险。
+            import atexit
+
+            def _release_compiled() -> None:  # pragma: no cover - 退出期路径
+                try:
+                    self._compiled_transformer = None
+                    self.model = None
+                    import gc
+
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+                except Exception:  # noqa: BLE001 - 退出期不允许再抛
+                    pass
+
+            atexit.register(_release_compiled)
         except Exception as e:
-            logger.warning(f"  ❌ torch.compile 启用失败: {e}，回退到普通模式")
+            self._compiled_transformer = None
+            hint = ""
+            if isinstance(e, UnicodeDecodeError) or "codec can't decode" in str(e):
+                hint = (
+                    "（Windows 下常见：torch/triton 内部按 GBK 解码源码失败。"
+                    "请以 UTF-8 模式启动进程，例如设置环境变量 PYTHONUTF8=1 后重试）"
+                )
+            logger.warning(f"  ❌ torch.compile 启用失败: {e}，回退到普通模式{hint}")
+
+    def _is_hybrid_architecture(self) -> bool:
+        """模型是否为「hybrid」层型（部分层不是 full attention）。
+
+        2026-09-18 B2 实测：Qwen3.5 这类 hybrid 架构 + torch.compile 会让
+        ``torch._dynamo`` 的 ``recompile_limit`` 被 hybrid KV 的不稳定守卫
+        （``transformers/cache_utils.py`` 的 ``lazy_initialization`` 里
+        ``self.device is None``）打满 ⇒ 长序列退化；且 hybrid + compile 会在
+        解释器退出期崩溃（不影响推理结果，但进程退出码非零）。
+        """
+        cfg = getattr(self.model, "config", None)
+        if cfg is None:
+            return False
+        text_cfg = getattr(cfg, "text_config", None) or cfg
+        layer_types = getattr(text_cfg, "layer_types", None) or []
+        try:
+            return any(str(item) != "full_attention" for item in layer_types)
+        except TypeError:
+            return False
+
+    def _maybe_apply_compile(self) -> None:
+        """按与 ``_load_pytorch`` 相同的条件决定是否启用算子融合。
+
+        抽出来的原因：``load_layer_range()`` 此前**没有 compile 应用点**，
+        分层节点永远拿不到融合收益（2026-09-18 补齐）。
+
+        两道保护（2026-09-18 用户裁定，依据 B1/B2 实测）：
+          * ``COMPILE_MAX_SEQ_LEN`` —— 长序列下 compile 会负收益（141 步 0.672×）；
+          * hybrid 架构 —— ``recompile_limit`` 触顶 + 退出期崩溃。
+        """
+        if not USE_COMPILE:
+            return
+        if not torch.cuda.is_available():
+            logger.warning("⚠️ torch.compile 需要 CUDA，CPU 模式下已自动跳过")
+            return
+        if self.quant_type not in (None, "fp16"):
+            logger.warning(
+                f"⚠️ torch.compile 与 {self.quant_type} 量化不兼容（实测慢 13%），已自动跳过。"
+                f"如需融合，请设置 QUANT_TYPE='fp16'。"
+            )
+            return
+        if self._is_hybrid_architecture():
+            # 2026-09-18 第五次更正后**放行**：官方 `is_compileable = False` 只影响
+            # generate() 的**自动**编译决策，并不禁止手动 torch.compile；实测 hybrid
+            # （Qwen3.5-2B）上 compile **快 1.57×** 且不随序列长度劣化。
+            # 唯一风险是解释器退出期清理崩溃 —— 已在 _apply_compile 里登记 atexit 释放。
+            logger.info("  ℹ️ 模型为 hybrid 层型：手动 compile 仍有效（实测快 1.57×），继续启用")
+        self._apply_compile()
 
     # ================================================================
     # 对话补全（统一接口，内部委托给对应引擎）
