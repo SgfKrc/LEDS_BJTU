@@ -115,6 +115,67 @@ def _detect_qwen_root_prefix(
     return max(counts, key=counts.get)
 
 
+#: Qwen 系中共享「按 key 过滤的层范围加载」的架构（key 形态 ``<root>layers.<i>.``，root 由探测得出）。
+_QWEN_LAYER_RANGE_TYPES = frozenset({"qwen2", "qwen3", "qwen3_5", "qwen3_5_text"})
+
+
+def _layer_idx_holders(layer) -> list:
+    """返回该层里「持有 layer_idx 的子模块」列表（A3）。
+
+    不同架构的 attention 子模块名不同：
+      * Qwen2 / Qwen3 的 full attention —— ``self_attn``
+      * Qwen3.5 的 linear_attention 层 —— ``linear_attn``（Qwen3_5GatedDeltaNet）
+    这些子模块用 ``layer_idx`` 索引 KV / 递归状态 cache，因此分段加载时必须把它们
+    改成**本地索引**（否则 DynamicCache 会出现稀疏空洞）。这里按属性探测，不写死名字。
+    """
+    return [sub for _name, sub in layer.named_children() if hasattr(sub, "layer_idx")]
+
+
+def _new_dynamic_cache(config=None):
+    """构造 ``DynamicCache``（A3：跨 transformers 版本兼容）。
+
+    新版（实测 5.17）支持 ``DynamicCache(config=...)``，会按 ``config.layer_types`` 建出
+    linear/full 混合层 —— hybrid 架构（Qwen3.5）**必须**这样建，否则 ``cache.layers[layer_idx]``
+    越界。旧版（4.x）没有该关键字 ⇒ 回退到空构造（对纯 full-attention 的 Qwen2 足够）。
+    """
+    from transformers.cache_utils import DynamicCache
+
+    try:
+        return DynamicCache(config=config)
+    except TypeError:
+        return DynamicCache()
+
+
+def _locate_text_transformer(model) -> tuple:
+    """定位「文本 Transformer 主体」，返回 ``(transformer, layers_attr, embedding_attr)``。
+
+    兼容三类包装（A3 泛化；**只做属性探测，不改变既有 Qwen2 的行为**）：
+      * ``model.model`` —— Qwen2 / Qwen3（``layers`` / ``embed_tokens``）
+      * ``model.model.language_model`` —— Qwen3.5 多模态外壳下的文本塔
+      * ``model.transformer`` —— 旧 Qwen / GPT-2（``h`` / ``wte``）
+
+    找不到时抛 ``RuntimeError``（不静默返回错误对象）。
+    """
+    candidates = []
+    for outer in ("model", "transformer"):
+        holder = getattr(model, outer, None)
+        if holder is None:
+            continue
+        candidates.append(holder)
+        inner = getattr(holder, "language_model", None)  # Qwen3.5 的文本塔
+        if inner is not None:
+            candidates.append(inner)
+    for candidate in candidates:
+        if hasattr(candidate, "layers"):
+            return candidate, "layers", "embed_tokens"
+        if hasattr(candidate, "h"):
+            return candidate, "h", "wte"
+    raise RuntimeError(
+        "无法定位文本 Transformer 主体"
+        "（已尝试 model / model.language_model / transformer）"
+    )
+
+
 class _LayerLoop(torch.nn.Module):
     """把「逐层循环」封装成可编译模块（A4：compile 层循环，而非整个 Qwen2Model）。
 
@@ -1227,7 +1288,9 @@ class ModelManager:
 
         # ---- 参数校验 ----
         from config import TOTAL_MODEL_LAYERS
-        config_total = int(getattr(model_config, "num_hidden_layers", 0) or 0)
+        # ★ A3：多模态外壳（如 Qwen3.5）把文本层数放在 text_config 下。
+        _text_cfg = getattr(model_config, "text_config", None) or model_config
+        config_total = int(getattr(_text_cfg, "num_hidden_layers", 0) or 0)
         declared_total = int(total_layers or config_total or TOTAL_MODEL_LAYERS)
         if total_layers and config_total and int(total_layers) != config_total:
             raise ValueError(
@@ -1251,7 +1314,9 @@ class ModelManager:
         # model.layers，两种架构都从 safetensors 中只物化本节点需要的权重。
         model_type = str(getattr(model_config, "model_type", "") or "").lower()
         load_tracker = None
-        if model_type == "qwen2":
+        # ★ A3：Qwen 系（qwen2 / qwen3 / qwen3_5 / qwen3_5_text）共享
+        #   `<root>layers.<i>.` 的 key 形态（root 由 A2 探测得出），故复用同一按 key 过滤加载器。
+        if model_type in _QWEN_LAYER_RANGE_TYPES:
             load_tracker = self._load_qwen2_layer_range(
                 path,
                 start_layer,
@@ -1295,14 +1360,10 @@ class ModelManager:
             raise RuntimeError("模型加载失败，无法进行层范围裁剪")
 
         # ---- 裁剪 Transformer 层 ----
-        if model_type == "qwen2":
-            transformer = self.model.model
-            layers_attr = "layers"
-            embedding_attr = "embed_tokens"
-        else:
-            transformer = self.model.transformer
-            layers_attr = "h"
-            embedding_attr = "wte"
+        # ★ A3：改用属性探测（model / model.language_model / transformer），
+        #   以支持 Qwen3.5 的 `model.model.language_model.layers` 包装；
+        #   Qwen2 / 旧 qwen 的探测结果与原来的硬编码分支完全一致（行为不变）。
+        transformer, layers_attr, embedding_attr = _locate_text_transformer(self.model)
 
         # 1. 保留指定范围的 Transformer 层
         all_layers = list(getattr(transformer, layers_attr))
@@ -1441,7 +1502,9 @@ class ModelManager:
             trust_remote_code=TRUST_REMOTE_CODE,
             local_files_only=True,
         )
-        total_layers = int(getattr(config, "num_hidden_layers", 0) or 0)
+        # ★ A3：多模态外壳（如 Qwen3.5）的文本层数在 text_config 下。
+        _text_cfg = getattr(config, "text_config", None) or config
+        total_layers = int(getattr(_text_cfg, "num_hidden_layers", 0) or 0)
         if total_layers <= 0:
             raise RuntimeError(f"{architecture} config 缺少 num_hidden_layers")
 
@@ -1471,6 +1534,18 @@ class ModelManager:
             selected_prefixes.append(f"{qwen_root}embed_tokens.")
         if has_lm_head:
             selected_prefixes.append("lm_head.")
+
+        # ★ A3：safetensors 的 key 与「模型属性路径」可能差一层 —— 实测 Qwen3.5 的 key 是
+        #   `model.language_model.layers.*`，而 Qwen3_5ForCausalLM 的文本塔直接挂在 `model.`
+        #   （即 `model.layers.*`）。因此需要把源前缀映射回模型属性前缀，否则
+        #   `set_module_tensor_to_device` 找不到属性。非多模态（qwen_root == "model."）时
+        #   该映射为恒等，行为与既往完全一致。
+        def model_key_of(key: str) -> str:
+            if qwen_root != "model." and key.startswith(qwen_root):
+                return "model." + key[len(qwen_root):]
+            return key
+
+        model_prefixes = [model_key_of(prefix) for prefix in selected_prefixes]
 
         target_device, target_dtype = _select_layer_runtime()
         load_tracker = _LayerRangeLoadTracker(
@@ -1528,20 +1603,22 @@ class ModelManager:
             with safe_open(shard_path, framework="pt", device="cpu") as handle:
                 for key in keys:
                     tensor = load_tracker.materialize(handle, key)
+                    # ★ A3：写入模型时用归一化后的「属性 key」（见 model_key_of）
                     set_module_tensor_to_device(
                         model,
-                        key,
+                        model_key_of(key),
                         target_device,
                         value=tensor,
                         dtype=target_dtype,
                     )
-                    loaded_keys.add(key)
+                    loaded_keys.add(model_key_of(key))
                     load_tracker.observe()
                     del tensor
 
         required_parameter_names = {
             name for name, _ in model.named_parameters()
-            if any(name.startswith(prefix) for prefix in selected_prefixes)
+            # ★ A3：用「模型属性前缀」比对（多模态时与源前缀差一层，见 model_key_of）
+            if any(name.startswith(prefix) for prefix in model_prefixes)
         }
         missing = sorted(required_parameter_names - loaded_keys)
         if missing:
@@ -2110,16 +2187,14 @@ class ModelManager:
                 self._apply_compile()
 
     def _count_transformer_layers(self) -> int:
-        """统计模型的 Transformer 层数"""
+        """统计模型的 Transformer 层数（A3：改用统一的包装器探测）。"""
         if self.model is None:
             return 0
-        # Qwen2 使用 model.model.layers
-        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
-            return len(self.model.model.layers)
-        # GPT-2 / 旧 Llama 使用 model.transformer.h
-        if hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):
-            return len(self.model.transformer.h)
-        return 0
+        try:
+            transformer, layers_attr, _ = _locate_text_transformer(self.model)
+        except RuntimeError:
+            return 0
+        return len(getattr(transformer, layers_attr, ()))
 
     def _apply_compile(self) -> None:
         """开启 torch.compile 自动算子融合（2026-09-18 修正）。
@@ -2149,8 +2224,11 @@ class ModelManager:
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"  设置 recompile_limit 失败: {e}")
         logger.info("开启 torch.compile 算子融合 (mode='default')...")
-        inner = getattr(self.model, "model", None) or getattr(self.model, "transformer", None)
-        if inner is None:
+        # ★ A3：改用统一的包装器探测（支持 Qwen3.5 的 `model.model.language_model`）——
+        #   这同时让下面 A4 的「层循环」能在 Qwen3.5 上正确取到 `.layers`。
+        try:
+            inner, _inner_layers_attr, _ = _locate_text_transformer(self.model)
+        except RuntimeError:
             logger.warning("  ❌ torch.compile 启用失败: 找不到内部 transformer，回退到普通模式")
             self._compiled_transformer = None
             return
@@ -2171,8 +2249,10 @@ class ModelManager:
                 )
                 # ⚠️ 编译前必须定成最终值：compile 把属性当 guard，若每次调用临时改再恢复
                 #    （原逐层版的补丁方式）会反复触发重编译。分段加载时本地索引才是正确的。
+                # ★ A3：用通用探测（Qwen3.5 的 linear_attention 层持有者是 `linear_attn`）
                 for local_idx, layer in enumerate(inner.layers):
-                    layer.self_attn.layer_idx = local_idx
+                    for holder in _layer_idx_holders(layer):
+                        holder.layer_idx = local_idx
                 self._compiled_layer_loop = torch.compile(
                     _LayerLoop(inner.layers, cache_arg_name), mode="default"
                 )
@@ -2915,13 +2995,17 @@ class ModelManager:
                 use_cache=use_cache,
                 apply_lm_head=apply_lm_head,
             )
-        if model_type != "qwen2":
+        # ★ A3：Qwen 系（qwen2 / qwen3 / qwen3_5 / qwen3_5_text）共用「层序列 + 按层 mask」契约；
+        #   hybrid（config 里有 layer_types）会在下面按层类型分别构造 mask。
+        if model_type not in _QWEN_LAYER_RANGE_TYPES:
             raise RuntimeError(
                 f"forward_layers 不支持模型架构: {model_type or 'unknown'}"
             )
 
         device = self.get_device()
-        transformer = self.model.model  # Qwen2Model
+        # ★ A3：用统一探测取文本 Transformer（支持 Qwen3.5 的 model.model.language_model）。
+        #   到这里 model_type 已限定为本模块支持的 Qwen 系，其层属性均为 `layers`。
+        transformer, _layers_attr, _embed_attr = _locate_text_transformer(self.model)
         dtype = next(self.model.parameters()).dtype
 
         # 检测节点角色
@@ -2981,16 +3065,24 @@ class ModelManager:
             # ★ A4：走编译版层循环时，layer_idx 已在 _apply_compile 里**永久**本地化
             #   （compile 把属性当 guard，每次临时改再恢复会反复重编译）⇒ 此时不打补丁。
             _use_compiled_loop = getattr(self, "_compiled_layer_loop", None) is not None
-            saved_layer_indices: list = []
-            if not _use_compiled_loop:
-                for layer in transformer.layers:
-                    saved_layer_indices.append(layer.self_attn.layer_idx)
+            # ★ A3：layer_idx 的持有者属性名随架构而变（Qwen2 是 `self_attn`；
+            #   Qwen3.5 的 linear_attention 层是 `linear_attn`）⇒ 按「带 layer_idx 的子模块」
+            #   通用处理，避免写死属性名。
+            layer_index_holders = [
+                (layer, _layer_idx_holders(layer)) for layer in transformer.layers
+            ]
+            saved_layer_indices: list = [
+                (holder, holder.layer_idx)
+                for _layer, holders in layer_index_holders
+                for holder in holders
+            ] if not _use_compiled_loop else []
 
             try:
                 # ---- 补丁 layer_idx 为本地索引（必须在 try 内，确保异常时恢复） ----
                 if not _use_compiled_loop:
-                    for local_idx, layer in enumerate(transformer.layers):
-                        layer.self_attn.layer_idx = local_idx
+                    for local_idx, (_layer, holders) in enumerate(layer_index_holders):
+                        for holder in holders:
+                            holder.layer_idx = local_idx
 
                 import inspect
                 first_layer_forward = transformer.layers[0].forward if len(transformer.layers) else None
@@ -3016,12 +3108,15 @@ class ModelManager:
                                 f"Qwen2 KV cache 层数不匹配: "
                                 f"cache={len(past_key_values)}, local={n_local}"
                             )
-                        cache = DynamicCache()
+                        # ★ A3：传 config —— hybrid（如 Qwen3.5）需要按 layer_types 建出
+                        #   linear/full 混合层；空 DynamicCache() 会让 `cache.layers[layer_idx]`
+                        #   越界（IndexError）。旧版 transformers 无该关键字 ⇒ 辅助函数已兼容。
+                        cache = _new_dynamic_cache(transformer.config)
                         for layer_idx, (k, v) in enumerate(past_key_values):
                             cache.update(k, v, layer_idx)
                     else:
-                        # Prefill: 创建空 DynamicCache
-                        cache = DynamicCache()
+                        # Prefill: 创建空 DynamicCache（★ A3：传 config，理由同上）
+                        cache = _new_dynamic_cache(transformer.config)
                 else:
                     cache = None
 
@@ -3062,6 +3157,9 @@ class ModelManager:
                 #   flash_attention_2 → None（flash 内核自行处理因果掩码）
                 #   sdpa + 纯因果 → None（SDPA is_causal 路径）
                 #   eager / 含填充 → 4D (batch,1,seq,seq) 因果掩码
+                # ★ A3：hybrid 判定（Qwen3.5 等会在 config 里给出 layer_types）。
+                #   刻意放在 try/else 之外 —— 任何分支（含 import 失败回退）下都必须有定义。
+                layer_types = getattr(transformer.config, "layer_types", None)
                 mask_fallback_error: Optional[Exception] = None
                 mask_parameters = {}
                 try:
@@ -3099,9 +3197,27 @@ class ModelManager:
                         and "cache_position" in mask_parameters
                     ):
                         mask_kwargs["cache_position"] = cache_position
+                    # ★ A3：hybrid（如 Qwen3.5）按 layer_types 区分层型 —— full_attention 用
+                    #   causal mask、linear_attention 用 recurrent mask ⇒ 建映射、层循环逐层取用。
                     if mask_fallback_error is None:
                         # Runtime input/cache failures are not version mismatches.
                         causal_mask = create_causal_mask(**mask_kwargs)
+                        if layer_types:  # ★ A3：hybrid 时改为「按层型查表」的映射
+                            try:
+                                from transformers.masking_utils import (
+                                    create_recurrent_attention_mask,
+                                )
+                            except ImportError as exc:  # 版本不符时明确报错，不静默出错
+                                raise RuntimeError(
+                                    "hybrid 架构需要 transformers.masking_utils."
+                                    f"create_recurrent_attention_mask: {exc}"
+                                ) from exc
+                            causal_mask = {
+                                "full_attention": causal_mask,
+                                "linear_attention": create_recurrent_attention_mask(
+                                    **mask_kwargs
+                                ),
+                            }
 
                 if mask_fallback_error is not None:
                     # transformers 4.x 回退：手动构建 4D 因果掩码
@@ -3138,6 +3254,18 @@ class ModelManager:
                 # Qwen2Model.rotary_emb 会将 position_ids 转换为 cos/sin 元组，
                 # 各 attention 层内部通过 apply_rotary_pos_emb 应用到 Q/K 上。
                 # 此步在层循环外仅计算一次，所有层共享同一份 position_embeddings。
+                # ★ A3：hybrid（Qwen3.5）用 MRoPE —— rotary 需要 (3, bs, seq)，而层需要
+                #   (bs, seq)。与 transformers 做法一致：把 position_ids 展开成 (4, bs, seq)，
+                #   rotary 取后 3 维、层取第 0 维（text 位置）。
+                layer_position_ids = position_ids
+                if layer_types:
+                    if position_ids.ndim == 2:
+                        position_ids = position_ids[None, ...].expand(
+                            4, position_ids.shape[0], -1
+                        )
+                    if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+                        layer_position_ids = position_ids[0]
+                        position_ids = position_ids[1:]
                 position_embeddings = transformer.rotary_emb(hidden_states, position_ids)
 
                 # ============================================================
@@ -3146,7 +3274,12 @@ class ModelManager:
                 # DynamicCache 由 SDPA/FlashAttention 在 forward 时原地更新，
                 # 每层的 key/value 按 layer_idx 写入 DynamicCache。
                 # ★ A4：可用时走**编译版层循环**（前置/后置逻辑完全不变 ⇒ 语义一致）。
-                layer_loop = getattr(self, "_compiled_layer_loop", None)
+                # ★ A3：hybrid 的每层 mask 不同（causal / recurrent 映射）⇒ 此时不走编译层循环
+                #   （它只支持单一份 mask），改为逐层取对应 mask —— 语义与 transformers 一致。
+                layer_loop = (
+                    getattr(self, "_compiled_layer_loop", None)
+                    if not layer_types else None
+                )
                 if layer_loop is not None:
                     hidden_states = layer_loop(
                         hidden_states,
@@ -3159,9 +3292,13 @@ class ModelManager:
                     )
                 else:
                     for i, layer in enumerate(transformer.layers):
+                        layer_mask = (
+                            causal_mask[layer_types[i]] if layer_types else causal_mask
+                        )
                         layer_kwargs = {
-                            "attention_mask": causal_mask,
-                            "position_ids": position_ids,
+                            "attention_mask": layer_mask,
+                            # ★ A3：层用 text 位置 (bs, seq)，与 rotary 的 (3, bs, seq) 区分
+                            "position_ids": layer_position_ids,
                             "position_embeddings": position_embeddings,
                             "use_cache": use_cache,
                             "cache_position": cache_position,
@@ -3214,8 +3351,9 @@ class ModelManager:
                 # ★ 无论成功/异常，必须恢复原始 layer_idx
                 #    （finally 覆盖了 layer_idx 补丁 + create_causal_mask +
                 #      rotary_emb + 层循环 + LM Head 全路径）
-                for layer, orig_idx in zip(transformer.layers, saved_layer_indices):
-                    layer.self_attn.layer_idx = orig_idx
+                # ★ A3：saved_layer_indices 现在存的是 (holder, 原值) 对（见上方补丁处）
+                for holder, orig_idx in saved_layer_indices:
+                    holder.layer_idx = orig_idx
 
     # ================================================================
     # 工具方法
