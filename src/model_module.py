@@ -164,6 +164,25 @@ def _is_hybrid_layer_types(layer_types) -> bool:
         return False
 
 
+def _hybrid_mask_index_per_layer(layer_types):
+    """把 ``layer_types`` 映射成「去重层型顺序」+「每层的 mask 索引」（B14）。
+
+    返回 ``(layer_type_order, index_per_layer)``：
+
+    * ``layer_type_order``：去重后的层型名，其**下标顺序**就是 mask 元组的下标顺序；
+    * ``index_per_layer``：每层对应的下标（用于从 mask 元组里取本层 mask）。
+
+    ⚠️ ``_apply_compile()`` 与 ``forward_layers()`` **必须**用同一份顺序（前者编译进层循环、
+    后者据此构造 mask 元组），否则 mask 会张冠李戴 ⇒ 所以两者都调用本函数，不各自实现。
+    """
+    order: list = []
+    for item in layer_types:
+        name = str(item)
+        if name not in order:
+            order.append(name)
+    return tuple(order), tuple(order.index(str(item)) for item in layer_types)
+
+
 def _new_dynamic_cache(config=None):
     """构造 ``DynamicCache``（A3：跨 transformers 版本兼容）。
 
@@ -224,10 +243,20 @@ class _LayerLoop(torch.nn.Module):
     因此调用方必须在**编译之前**把这些属性设成最终值（见 `_apply_compile`）。
     """
 
-    def __init__(self, layers: torch.nn.ModuleList, cache_arg_name: Optional[str]) -> None:
+    def __init__(
+        self,
+        layers: torch.nn.ModuleList,
+        cache_arg_name: Optional[str],
+        mask_index_per_layer: Optional[tuple] = None,
+    ) -> None:
         super().__init__()
         self.layers = layers
         self.cache_arg_name = cache_arg_name
+        # ★ B14：hybrid（如 Qwen3.5）的**每层 mask 不同**（full_attention 用 causal、
+        #   linear_attention 用 recurrent）⇒ 这里存「每层的 mask 索引」，forward 时从
+        #   attention_mask **元组**里取本层所需的那份；非 hybrid 时为 None（沿用单一份 mask）。
+        #   该索引序列来自 `_hybrid_mask_index_per_layer()`，与 forward_layers 构造元组的顺序同源。
+        self.mask_index_per_layer = mask_index_per_layer
 
     def forward(
         self,
@@ -239,9 +268,16 @@ class _LayerLoop(torch.nn.Module):
         use_cache: bool = True,
         cache: Optional[object] = None,
     ) -> torch.Tensor:
-        for layer in self.layers:
+        # ★ B14：hybrid 时 attention_mask 是「按层型索引的元组」（由 forward_layers 构造，
+        #   顺序与 `_hybrid_mask_index_per_layer()` 同源）；非 hybrid 时是单个张量。
+        #   用元组 + 静态索引序列（而非 dict）是为了让 torch.compile 好 guard。
+        for index, layer in enumerate(self.layers):
+            if self.mask_index_per_layer is not None:
+                layer_mask = attention_mask[self.mask_index_per_layer[index]]
+            else:
+                layer_mask = attention_mask
             layer_kwargs = {
-                "attention_mask": attention_mask,
+                "attention_mask": layer_mask,
                 "position_ids": position_ids,
                 "position_embeddings": position_embeddings,
                 "use_cache": use_cache,
@@ -2290,12 +2326,24 @@ class ModelManager:
                 for local_idx, layer in enumerate(inner.layers):
                     for holder in _layer_idx_holders(layer):
                         holder.layer_idx = local_idx
+                # ★ B14：hybrid（如 Qwen3.5）的每层 mask 不同 ⇒ 把「每层的 mask 索引」编译进
+                #   层循环，这样 hybrid 也能吃到 A4 的收益（此前 hybrid 被整体跳过）。
+                #   索引顺序由 `_hybrid_mask_index_per_layer()` 给出，forward_layers 用同一函数
+                #   构造 mask 元组 ⇒ 两边顺序必然一致。
+                mask_index_per_layer = None
+                _inner_layer_types = getattr(inner.config, "layer_types", None)
+                if _is_hybrid_layer_types(_inner_layer_types):
+                    _order, mask_index_per_layer = _hybrid_mask_index_per_layer(
+                        _inner_layer_types
+                    )
                 self._compiled_layer_loop = torch.compile(
-                    _LayerLoop(inner.layers, cache_arg_name), mode="default"
+                    _LayerLoop(inner.layers, cache_arg_name, mask_index_per_layer),
+                    mode="default",
                 )
                 logger.info(
                     f"  ✅ A4 层循环已编译（{len(inner.layers)} 层；layer_idx 已永久本地化；"
-                    f"cache 参数名={cache_arg_name}）"
+                    f"cache 参数名={cache_arg_name}；"
+                    f"per-layer mask={'是（hybrid）' if mask_index_per_layer else '否'}）"
                 )
             # 退出路径配套（2026-09-18 用户裁定）：hybrid + compile 时解释器清理期可能崩溃
             #（`_PyModule_ClearDict` 调用栈）⇒ 登记 atexit，在清理**之前**有序释放编译对象
@@ -3146,7 +3194,13 @@ class ModelManager:
                         #   linear/full 混合层；空 DynamicCache() 会让 `cache.layers[layer_idx]`
                         #   越界（IndexError）。旧版 transformers 无该关键字 ⇒ 辅助函数已兼容。
                         cache = _new_dynamic_cache(transformer.config)
-                        for layer_idx, (k, v) in enumerate(past_key_values):
+                        for layer_idx, item in enumerate(past_key_values):
+                            if item is None:
+                                # ★ B14（修 A3 遗留）：hybrid 的 linear_attention 层**没有 KV**
+                                #   （用 recurrent state）⇒ 收集侧留下了 None 占位以保持下标对齐，
+                                #   这里跳过它们即可（它们由模型内部的递归状态自行维护）。
+                                continue
+                            k, v = item
                             cache.update(k, v, layer_idx)
                     else:
                         # Prefill: 创建空 DynamicCache（★ A3：传 config，理由同上）
@@ -3242,7 +3296,7 @@ class ModelManager:
                     if mask_fallback_error is None:
                         # Runtime input/cache failures are not version mismatches.
                         causal_mask = create_causal_mask(**mask_kwargs)
-                        if layer_types:  # ★ A3：hybrid 时改为「按层型查表」的映射
+                        if layer_types:  # ★ A3/B14：hybrid ⇒ 按层型建 mask「元组」
                             try:
                                 from transformers.masking_utils import (
                                     create_recurrent_attention_mask,
@@ -3252,12 +3306,23 @@ class ModelManager:
                                     "hybrid 架构需要 transformers.masking_utils."
                                     f"create_recurrent_attention_mask: {exc}"
                                 ) from exc
-                            causal_mask = {
+                            # ★ B14：用「元组 + 每层索引」而非 dict —— 顺序由共享辅助
+                            #   `_hybrid_mask_index_per_layer()` 给出，与 `_apply_compile` 编译进
+                            #   层循环的索引序列**同源**（顺序错配会让 mask 张冠李戴）；
+                            #   元组 + 静态索引也比 dict 查找更利于 torch.compile 的 guard。
+                            _mask_order, mask_index_per_layer = _hybrid_mask_index_per_layer(
+                                layer_types
+                            )
+                            _known_masks = {
                                 "full_attention": causal_mask,
                                 "linear_attention": create_recurrent_attention_mask(
                                     **mask_kwargs
                                 ),
                             }
+                            # 未预期的层型会直接 KeyError（fail-loud），避免静默用错 mask
+                            causal_mask = tuple(
+                                _known_masks[name] for name in _mask_order
+                            )
 
                 if mask_fallback_error is not None:
                     # transformers 4.x 回退：手动构建 4D 因果掩码
@@ -3314,17 +3379,16 @@ class ModelManager:
                 # DynamicCache 由 SDPA/FlashAttention 在 forward 时原地更新，
                 # 每层的 key/value 按 layer_idx 写入 DynamicCache。
                 # ★ A4：可用时走**编译版层循环**（前置/后置逻辑完全不变 ⇒ 语义一致）。
-                # ★ A3：hybrid 的每层 mask 不同（causal / recurrent 映射）⇒ 此时不走编译层循环
-                #   （它只支持单一份 mask），改为逐层取对应 mask —— 语义与 transformers 一致。
-                layer_loop = (
-                    getattr(self, "_compiled_layer_loop", None)
-                    if not layer_types else None
-                )
+                # ★ B14：hybrid 也能走编译层循环了 —— `_LayerLoop` 现在按「每层 mask 索引」
+                #   从 causal_mask **元组**里取本层 mask（索引与 `_hybrid_mask_index_per_layer()`
+                #   同源）。此前 hybrid 被整体跳过，因此拿不到 A4 的 1.6–2.1× 收益。
+                layer_loop = getattr(self, "_compiled_layer_loop", None)
                 if layer_loop is not None:
                     hidden_states = layer_loop(
                         hidden_states,
                         attention_mask=causal_mask,
-                        position_ids=position_ids,
+                        # ★ 层要的是 text 位置 (bs, seq)；MRoPE 的 (3, bs, seq) 只给 rotary 用
+                        position_ids=layer_position_ids,
                         position_embeddings=position_embeddings,
                         cache_position=cache_position,
                         use_cache=use_cache,
@@ -3333,7 +3397,8 @@ class ModelManager:
                 else:
                     for i, layer in enumerate(transformer.layers):
                         layer_mask = (
-                            causal_mask[layer_types[i]] if layer_types else causal_mask
+                            causal_mask[mask_index_per_layer[i]]
+                            if layer_types else causal_mask
                         )
                         layer_kwargs = {
                             "attention_mask": layer_mask,
@@ -3367,22 +3432,32 @@ class ModelManager:
                     result["hidden_states"] = hidden_states
 
                 # ---- KV Cache: 转为 tuple 存储 ----
+                # ★ B14（修 A3 遗留）：hybrid 的 linear_attention 层**不写 KV**（用 recurrent
+                #   state）⇒ `cache.layers` 里那些位置是 None。**必须保留 None 占位**，否则
+                #   tuple 的下标会与本地层号错位 ⇒ decode 时「层数不匹配」、mask/cache 张冠李戴。
                 if use_cache and cache is not None:
                     cache_items = []
                     if hasattr(cache, "layers"):
-                        for layer_cache in cache.layers:
+                        # ★ B14：`DynamicCache(config=...)` 会按 **config** 的层数建槽，而分段加载时
+                        #   config 仍是**完整模型**的层数（例如 4 层模型取 2 层）⇒ 多出来的槽是 None。
+                        #   这里只取**本段实际拥有的层数**，与 `transformer.layers` 对齐
+                        #   （layer_idx 已被补丁成本地索引，用到的正是前 N 个槽）。
+                        for layer_cache in cache.layers[: len(transformer.layers)]:
                             if layer_cache is None:
+                                cache_items.append(None)
                                 continue
                             keys = getattr(layer_cache, "keys", None)
                             values = getattr(layer_cache, "values", None)
-                            if keys is not None and values is not None:
-                                cache_items.append((keys, values))
+                            cache_items.append(
+                                (keys, values) if keys is not None and values is not None else None
+                            )
                     else:
                         key_cache = getattr(cache, "key_cache", [])
                         value_cache = getattr(cache, "value_cache", [])
                         for keys, values in zip(key_cache, value_cache):
-                            if keys is not None and values is not None:
-                                cache_items.append((keys, values))
+                            cache_items.append(
+                                (keys, values) if keys is not None and values is not None else None
+                            )
                     if cache_items:
                         result["past_key_values"] = tuple(cache_items)
 
