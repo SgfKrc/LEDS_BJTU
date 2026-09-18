@@ -31,6 +31,16 @@ PROBE_MARKER = "QLH_EDGE_PREFLIGHT="
 
 
 def _venv_root(python_executable: Path) -> Path:
+    # Prefer the on-disk layout: a venv keeps its interpreter under ``bin/`` (POSIX)
+    # or ``Scripts/`` (Windows) next to ``pyvenv.cfg``. Deciding from the path as
+    # given (before ``resolve``) keeps symlink-shimmed venvs -- e.g. ``uv venv``,
+    # whose ``bin/python`` points at a managed base interpreter -- reporting the
+    # venv directory rather than the base interpreter that has no site packages.
+    parent = python_executable.parent
+    if parent.name.lower() in {"scripts", "bin"}:
+        candidate = parent.parent
+        if (candidate / "pyvenv.cfg").is_file():
+            return candidate
     executable = python_executable.resolve()
     if executable.parent.name.lower() in {"scripts", "bin"}:
         return executable.parent.parent
@@ -126,7 +136,10 @@ def run_preflight(
     max_startup_s: float = 15.0,
 ) -> dict[str, Any]:
     root = Path(repository_root or Path(__file__).resolve().parents[1]).resolve()
-    python_path = Path(python_executable).resolve()
+    # Do not ``resolve`` the interpreter: that would follow a venv's symlink shim
+    # (``uv venv`` and POSIX venvs in general) to the base interpreter, which lacks
+    # the venv's site packages. Passing the path as given keeps the venv active.
+    python_path = Path(python_executable)
     venv_root = _venv_root(python_path)
     size_mb = _directory_size_mb(venv_root)
     probe = _run_probe(python_path, root)

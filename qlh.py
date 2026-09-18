@@ -30,7 +30,7 @@ def _usage() -> str:
     return (
         "QLH core TUI\n"
         "  qlh                         进入交互外壳（Textual；本机后端自动启动）\n"
-        "  qlh [options]               同上；选项直通（--port/--route/--host/--thinking…）\n"
+        "  qlh [options]               同上；选项直通（--port/--route/--host/--thinking/--log-token…）\n"
         "  qlh chat [--host URL] [--route auto|local_only|distributed_preferred|distributed_required]\n"
         "  qlh chat --fixture PATH     离线回放 SSE fixture（不联网、不依赖 UI）\n"
         "  qlh status|models|nodes|queue|device|logs|help\n"
@@ -82,7 +82,7 @@ def _chat_args(args: list[str]) -> list[str]:
         if value == "--fixture":
             # Fixture mode is intentionally independent of the backend.
             return ["--fixture", args[i + 1]]
-        if value in {"--host", "--route", "--timeout", "--port", "--interval", "--tui-engine"}:
+        if value in {"--host", "--route", "--timeout", "--port", "--interval", "--tui-engine", "--log-token"}:
             if i + 1 >= len(args):
                 raise ValueError("%s 缺少参数" % value)
             item = args[i + 1]
@@ -127,6 +127,7 @@ def _shell_options(translated: list[str]) -> dict:
         "route": value_of("--route", "auto"),
         "interval": float(value_of("--interval", 5.0)),
         "thinking": "--thinking" in translated,
+        "log_token": value_of("--log-token", ""),
         "auto_start": "--auto-start" in translated,
     }
 
@@ -155,6 +156,7 @@ def _run_textual_shell(args: list[str]) -> int:
         interval=options["interval"],
         routing_preference=options["route"],
         show_thinking=options["thinking"],
+        log_token=options["log_token"],
         supervisor=supervisor,
     ))
 
@@ -196,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "qlh chat [--host URL] [--port PORT] [--interval SECONDS] "
                 "[--route auto|local_only|distributed_preferred|distributed_required] "
-                "[--thinking]\n"
+                "[--thinking] [--log-token TOKEN]\n"
                 "qlh chat --fixture PATH"
             )
             return 0

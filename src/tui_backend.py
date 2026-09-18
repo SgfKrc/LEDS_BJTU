@@ -32,6 +32,9 @@ class BackendSupervisor:
         self.host = str(host or "127.0.0.1")
         self.port = int(port)
         self.probe_timeout = max(0.2, float(probe_timeout))
+        # A refused local connection should not hold the splash screen for the
+        # full readiness timeout before the supervisor starts the backend.
+        self.initial_probe_timeout = min(self.probe_timeout, 0.2)
         self.startup_timeout = max(1.0, float(startup_timeout))
         self.server = None
         self.thread: Optional[threading.Thread] = None
@@ -48,10 +51,13 @@ class BackendSupervisor:
 
         return build_url("http", self.host, self.port) + "/api/health"
 
-    def probe(self) -> bool:
+    def probe(self, *, timeout: Optional[float] = None) -> bool:
+        effective_timeout = self.probe_timeout if timeout is None else max(
+            0.05, float(timeout),
+        )
         try:
             with urllib.request.urlopen(
-                self.health_url, timeout=self.probe_timeout,
+                self.health_url, timeout=effective_timeout,
             ) as response:
                 return 200 <= int(getattr(response, "status", 200)) < 300
         except (OSError, urllib.error.URLError, ValueError):
@@ -60,7 +66,7 @@ class BackendSupervisor:
     def ensure_ready(self) -> bool:
         """返回是否由本监督器启动了后端。"""
         self._set_status("检查本地后端")
-        if self.probe():
+        if self.probe(timeout=self.initial_probe_timeout):
             self._set_status("后端已在运行")
             return False
         if self.host.lower() not in {"127.0.0.1", "localhost", "::1"}:

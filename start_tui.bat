@@ -1,5 +1,7 @@
 @echo off
 chcp 65001 >nul
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
 rem QLH TUI one-click launcher (Windows 10+)
 rem
 rem Interactive mode now goes through the unified `qlh` entry:
@@ -9,7 +11,7 @@ rem      so there is no silent multi-minute black screen while waiting for /api/
 rem   3. the backend stops when the TUI exits (run `python src\api_server.py` to keep it up).
 rem Single-command mode (e.g. `start_tui.bat status`) runs one TUI command and exits.
 cd /d "%~dp0"
-title QLH TUI 管理菜单
+title QLH TUI
 
 rem pick python command (python first, fallback to py -3)
 set "PYTHON_CMD=python"
@@ -25,7 +27,7 @@ if not "%QLH_BACKEND_PORT%"=="" (
 )
 
 echo ============================================
-echo   QLH 分布式边缘推理 — TUI 管理菜单
+echo   QLH TUI
 echo ============================================
 echo.
 
@@ -56,6 +58,6 @@ if defined QLH_BACKEND_PORT set "PORT_ARGS=--port %BACKEND_PORT%"
 set "RC=%errorlevel%"
 if "%RC%"=="0" exit /b 0
 echo.
-echo [提示] TUI 退出异常（exit %RC%），请检查上方输出。
+echo [INFO] TUI exited with code %RC%. Check the output above.
 pause
 exit /b %RC%

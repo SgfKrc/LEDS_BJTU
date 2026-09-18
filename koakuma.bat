@@ -1,7 +1,9 @@
 @echo off
 chcp 65001 >nul
-rem Koakuma —— `qlh` 的等价别名入口（Windows）
-rem 与 qlh.bat 完全一样：同一个 Python 入口，参数原样透传。
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
+rem Koakuma is the qlh alias entry point.
+rem Keep this launcher ASCII-only for cmd.exe code-page safety.
 cd /d "%~dp0"
 set "PYTHON_CMD=python"
 where python >nul 2>nul

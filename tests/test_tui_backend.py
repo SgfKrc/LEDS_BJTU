@@ -44,8 +44,14 @@ def test_remote_backend_is_never_started(monkeypatch):
 
 def test_missing_local_backend_runs_uvicorn_in_daemon_thread(monkeypatch):
     probes = iter([False, True])
+    probe_timeouts = []
+
+    def fake_probe(self, *, timeout=None):
+        probe_timeouts.append(timeout)
+        return next(probes)
+
     monkeypatch.setattr(tui_backend.BackendSupervisor, "probe",
-                        lambda self: next(probes))
+                        fake_probe)
     servers = []
 
     class FakeServer:
@@ -77,6 +83,7 @@ def test_missing_local_backend_runs_uvicorn_in_daemon_thread(monkeypatch):
     assert servers and servers[0].ran.is_set()
     assert servers[0].config[1]["log_level"] == "warning"
     assert servers[0].config[1]["access_log"] is False
+    assert probe_timeouts == [0.2, None]
     supervisor.stop()
 
 

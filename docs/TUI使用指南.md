@@ -6,7 +6,7 @@
 >
 > **生命周期**：Active（在用）
 >
-> **更新日期**：2026-09-17
+> **更新日期**：2026-09-18
 >
 > **适用范围**：QLH 终端版交互外壳与只读单命令（`qlh` / `qlh chat` / `src/tui_commands.py`）的启动方式、参数与使用说明；实现细节与网关契约见 [TUI 适配实施计划](TUI适配实施计划.md)，功能口径以源码与本文为准
 
@@ -14,7 +14,7 @@
 
 ## 一、这是什么
 
-交互外壳 `src/tui_textual.py`（Textual）是 QLH 的统一终端面，覆盖 **9 个屏幕**：聊天、状态、模型、分布式、节点、队列、日志、设备、设置——与旧标准库管理 TUI 的 8 屏能力面对齐，并新增「模型」屏。分布式与容量数据取自集群只读端点（`/cluster/resources`、`/cluster/layers`、`/cluster/pipeline-capacity` 等），适用于无浏览器环境（SSH、服务器、树莓派等），支持 Windows 10+ / Linux / macOS。
+交互外壳 `src/tui_textual.py`（Textual）是 QLH 的统一终端面，覆盖 **9 个功能屏 + 1 个调试兜底屏**：聊天、状态、模型、分布式、节点、队列、日志、设备、设置、调试。功能屏直接提供领域操作；调试屏只用于尚未形成专用交互的 JSON 合同。分布式与容量数据取自集群只读端点（`/cluster/resources`、`/cluster/layers`、`/cluster/pipeline-capacity` 等），适用于无浏览器环境（SSH、服务器、树莓派等），支持 Windows 10+ / Linux / macOS。
 
 页面通过 HTTP 与后端 API 交互（默认 `http://127.0.0.1:8000/api`）；本机统一入口会在当前进程内按需启动后端并等待健康检查，远程地址只探测目标后端。交互模式默认使用 **Textual 外壳**（`src/tui_textual.py`，2026-09-17 起）：启动屏把 **Koakuma 大标题与启动条放在一起**（标题灰蓝 `#8fa8c4`，条在标题正下方），冷启动阶段以「**少女祈祷中：<阶段>**」实时反馈（检查本地后端 → 加载后端组件 → 启动 API 服务 → 等待健康检查），就绪后自动进入主界面。后端控制台日志不会穿透 TUI，仍保留在 `logs/` 及日志屏中。
 
@@ -33,11 +33,41 @@
 ```bash
 qlh chat --host http://127.0.0.1:8000
 qlh chat --route distributed_preferred --thinking
+qlh chat --host http://100.100.52.106:8000 --log-token TOKEN
 koakuma                      # 等价于 qlh
 koakuma chat --route distributed_preferred
 qlh nodes                            # 只读单命令（不启动后端）
 qlh models
 ```
+
+### 功能屏操作
+
+功能屏是 TUI 的产品交互，不要求用户先认识后端路由。所有写操作都在提交前显示目标和影响范围，并经确认框执行。
+
+| 屏幕 | 可直接完成的操作 |
+| --- | --- |
+| 模型 | 浏览注册表；L/U 加载/卸载；D 创建下载任务；V 搜索仓库；F 执行本地资产预检；I 登记资产；X 注销登记 |
+| 分布式 | T 切换分布式推理；M 设置最大节点；J 填写主节点地址并连接；查看容量、层段和重分片状态 |
+| 节点 | I 查看邀请信息；J 连接主节点；B 生成一次性入群请求码；K 消费主节点授权；X 注销选中节点；查看成员、角色、状态和 RTT |
+| 队列 | P 暂停/恢复；S 切换 MLFQ/FIFO；C 清空排队任务 |
+| 日志 | F 按级别/名称/节点/请求筛选；S 查看文件与缓冲区统计；E 导出压缩包；X 清理日志文件 |
+| 设备 | G 按画像和评分自动配置；H 选择 GPU；查看 CPU、内存、磁盘、GPU 和档位建议 |
+| 设置 | W 读取当前设置并编辑完整 JSON 后写回用户设置 |
+
+模型下载任务、模型搜索和日志导出在后台线程执行，避免阻塞终端；远程日志操作使用 `--log-token` 传递 `X-QLH-Log-Token`。
+
+入群请求码生成和授权消费已在节点屏接入。主节点签发授权仍必须经过后端 Auth App/TOTP 控制面；控制面未配置时后端会拒绝签发，TUI 不会伪造 `auth_verified`。
+
+### 调试兜底（非功能验收）
+
+主界面左侧的「调试」屏从运行中后端的 `/openapi.json` 动态读取路由，不依赖一份手工维护的路由副本。进入后会按方法、领域和模式列出全部操作；当前 `src/api_server.py` 的 OpenAPI 快照为 152 个操作，实际数量以目标后端返回为准。
+
+- `A`：重新读取 OpenAPI 路由表。
+- 选择一行后可编辑路径、查询参数 JSON 和请求体 JSON；路径中的 `{参数}` 必须先替换。
+- `X`：执行选中操作。GET/HEAD 直接查询，POST/PUT/PATCH/DELETE 必须经过确认。
+- `/chat/stream` 和 `/chat/upload` 标为“专用界面”，避免用普通 JSON 请求破坏 SSE 或 multipart 契约；应分别从聊天页或对应专用流程进入。
+
+调试屏适合验证新后端接口或临时 JSON 合同，不替代功能屏，也不计入功能覆盖率。若某个稳定业务流程只能从调试屏完成，应登记为 TUI 功能缺口，而不是把它视为已完成。远程后端不支持 `/openapi.json` 时，调试列表会显示不可用，但功能屏仍可继续使用。
 
 ## 三、全局 `bjtu` 命令（兼容）
 
@@ -84,10 +114,10 @@ bjtu --host 100.x.x.x status        # 对远程主节点执行单命令
 bjtu models --json                  # 机读输出（便于脚本消费）
 ```
 
-> 单命令模式与交互模式的区别：交互模式负责"启动后端 + 进入 TUI"；单命令模式只做"处理"，后端必须已在运行（可用 `bjtu` 交互模式或 `start_tui.bat` 先启动）。命令名为**只读子集**（status/models/nodes/queue/device/logs/help），与旧 TUI 的 35 条命令注册表**不再等价**：写操作请在交互外壳（`qlh`/`koakuma`）或 API 侧完成——外壳当前**已接**：模型加载/卸载（模型屏 `L`/`U`，或 `/model load|unload`）、队列暂停/恢复/策略/清空（队列屏 `P`/`S`/`C`，或 `/queue …`）、会话管理（`/new`、`/resume`、`/rename`、`/sessions`、`/delete-session`、`/reset`）；破坏性与长耗时操作都会先弹确认框。关机、注销节点等仍未接入。
+> 单命令模式与交互模式的区别：交互模式负责"启动后端 + 进入 TUI"；单命令模式只做"处理"，后端必须已在运行（可用 `bjtu` 交互模式或 `start_tui.bat` 先启动）。命令名为**只读子集**（status/models/nodes/queue/device/logs/help），与旧 TUI 的 35 条命令注册表**不再等价**：写操作应优先使用功能屏或聊天页，只有尚未形成专用交互的研发/运维接口才使用调试屏/API；当前功能屏已接入模型资产、集群、节点、日志、设备和用户设置操作，破坏性与长耗时操作都会先弹确认框。
 > ⚠️ 命令必须是**第一个参数**（`bjtu status --port 9000`）；选项在前（`bjtu --port 9000 status`）会被当作交互模式（可能启动后端）。
 
-`bjtu tui` 的后端生命周期行为与 `start_tui.bat` / `start_tui.sh` 相同：探测 `8000` 端口（`QLH_BACKEND_PORT` 可覆盖）→ 未运行则启动后端 → 等待 `/api/health` 就绪 → 进入 TUI；退出 TUI 后后端继续运行。`bjtu ui` 则在相同检查完成后打开普通界面。
+`bjtu tui` 的后端生命周期行为与 `start_tui.bat` / `start_tui.sh` 相同：探测 `8000` 端口（`QLH_BACKEND_PORT` 可覆盖）→ 未运行则启动后端 → 等待 `/api/health` 可响应 → TUI 进入后等待 `/api/ready` 的运行时组件就绪 → 进入完整交互；模型无需预加载。退出 TUI 后后端继续运行。`bjtu ui` 则在相同检查完成后打开普通界面。
 
 ### `bjtu chat`（终端对话页）
 
@@ -111,7 +141,7 @@ start_tui.bat
 
 1. 检测 `8000` 端口是否已有后端在运行（`QLH_BACKEND_PORT` 可覆盖，见 §四）。
 2. 未运行则**新开一个"QLH 后端 API"窗口**启动 `python -m uvicorn src.api_server:app --host 0.0.0.0 --port 8000`（若存在 `.venv` 会自动激活）。
-3. 轮询 `/api/health` 直至就绪（上限 120 秒）。
+3. 轮询 `/api/health` 直到 API 可响应（上限 120 秒）；TUI 内再轮询 `/api/ready`，运行时组件完成后开放模型、节点和资源数据刷新。
 4. 在当前窗口进入 TUI，原样透传命令行参数。
 
 退出 TUI 的方式与后端命运：
@@ -196,7 +226,8 @@ python src/tui_commands.py models --json                        # 机读输出
 - **契约测试**：`cd gateway && npm run test:tui`（44 用例：38 端点调用点 + 5 项细节 + 错误契约）。
 - **7 屏 × 2 角色走查**：`scripts/tui_walkthrough.py`（驱动旧 `tui_admin.py --plain`）**已随归档移入 `_to_delete/`（2026-09-17）**；其历史用法为 `--host <网关> --port <端口> --mode master|client`，配套桩 `scripts/dev_stubs.py`（scheduler-svc :8020 + inference-svc :8010，`--client-mode` 模拟从节点身份）与 `src/legacy_control.py`（:8040，`/logs/*`）——**两个桩与网关均已随微服务叫停删除（2026-09-14）**，走查以其历史记录为准。
 - 2026-08-03 复核：`tui-contract` 44/44、master/client 双角色走查全部 PASS，`tui_admin.py` 自 TUI 适配完成后零改动。（该文件已于 2026-09-17 归档）
-- 2026-09-17 归档：交互面切到 Textual 外壳（9 屏，含新「模型」屏、设备/设置补全），单命令面抽出只读薄层 `src/tui_commands.py`；回归 `pytest -k "tui or qlh or cold_start"` 93 passed / 1 skipped。
+- 2026-09-17 归档：交互面切到 Textual 外壳（9 个功能屏 + 1 个调试兜底，含新「模型」屏、设备/设置补全），单命令面抽出只读薄层 `src/tui_commands.py`；回归 `pytest -k "tui or qlh or cold_start"` 93 passed / 1 skipped。
+- 2026-09-18：新增「端点」工作台，从 `/openapi.json` 动态发现后端操作；主后端当前 152 个 OpenAPI 操作均可在工作台中查询或按 JSON 合同尝试执行，流式聊天/上传保留专用界面闸门；TUI 定向回归 57 passed。
 
 ---
 

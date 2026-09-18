@@ -409,8 +409,12 @@ def get_model_file_status(model: ModelConfig) -> dict:
 def is_cuda_available() -> bool:
     """检测 CUDA 是否可用（server-side 门控）。"""
     try:
-        import torch
-        return torch.cuda.is_available()
+        from config import INFERENCE_ENGINE
+        from torch_runtime import cuda_available
+
+        if str(INFERENCE_ENGINE or "llama_cpp").lower() in {"llama_cpp", "gguf", "island"}:
+            return False
+        return cuda_available(load=True)
     except ImportError:
         return False
 

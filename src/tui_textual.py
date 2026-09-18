@@ -38,9 +38,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import threading
+import time
+import urllib.parse
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -53,6 +57,7 @@ from textual.widgets import (
     Footer,
     Header,
     Input,
+    Button,
     Label,
     ListItem,
     ListView,
@@ -102,17 +107,23 @@ BAR_MARQUEE = 9
 BAR_BLOCK = "█"
 BAR_EMPTY = "░"
 
+# The backend's distributed read projections can legitimately wait for a
+# remote node.  Keep the fast default for health/core reads, but don't turn a
+# slow cluster projection into a false "unreachable" state after five seconds.
+PAGE_READ_TIMEOUT = 15.0
+
 #: 侧栏导航页表：(key, 页名, 一句话说明)
 PAGES: List[Tuple[str, str, str]] = [
     ("chat", "聊天", "SSE 流式对话 · /help 查看命令"),
     ("status", "状态", "运行概览 · /health /status /models"),
     ("models", "模型", "注册表 · L 加载光标行 · U 卸载当前 · /models"),
-    ("cluster", "分布式", "集群资源合计 · /cluster/resources"),
-    ("nodes", "节点", "成员与角色 · /cluster/nodes"),
+    ("cluster", "分布式", "配置 · 容量 · 层段 · /cluster/*"),
+    ("nodes", "节点", "成员 · 入群 · 邀请 · 连接 · /cluster/nodes"),
     ("queue", "队列", "MLFQ 三级 · P 暂停/恢复 · S 策略 · C 清空排队"),
-    ("logs", "日志", "聚合日志（末尾 200 行）· /cluster/nodes/log-aggregate"),
-    ("device", "设备", "本机设备画像与 GPU · /device/profile"),
+    ("logs", "日志", "筛选 · 统计 · 导出 · /logs/*"),
+    ("device", "设备", "画像 · 自动配置 · GPU · /device/*"),
     ("settings", "设置", "会话参数与依赖边界"),
+    ("api", "调试", "未接线功能的 API 兜底 · OpenAPI"),
 ]
 
 CSS = """
@@ -164,6 +175,12 @@ Screen { background: $surface; }
 #status-pane, #queue-pane, #logs-pane { height: auto; color: $text-muted; }
 #device-pane, #settings-pane { height: auto; }
 #gpu-table { height: auto; max-height: 14; }
+
+/* ---------------------------------------------------------- 调试兜底 */
+#api-table { height: 1fr; }
+#api-detail { height: auto; min-height: 3; color: $text-muted; padding: 0 1; }
+#api-path, #api-params, #api-body { height: 3; margin: 0 0 1 0; }
+#api-result { height: 10; min-height: 5; border: round $primary 20%; padding: 0 1; overflow-y: auto; }
 
 /* ---------------------------------------------------------------- 聊天 */
 /* 对话文本用 Static + 缓冲渲染：Textual 8 的 RichLog.write() 不支持 end=，
@@ -307,6 +324,64 @@ class ConfirmScreen(ModalScreen[bool]):
 
     def action_cancel(self) -> None:
         self.dismiss(False)
+
+
+class ActionFormScreen(ModalScreen[Dict[str, str] | None]):
+    """小型表单弹窗：把高频 API 操作变成可发现的终端交互。"""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "取消", show=False),
+    ]
+
+    CSS = """
+    ActionFormScreen { align: center middle; }
+    #action-form-box {
+        width: 82; max-width: 94%; height: auto; max-height: 90%;
+        border: thick $primary; background: $surface; padding: 1 2;
+    }
+    #action-form-title { height: auto; text-style: bold; color: $accent; }
+    #action-form-body { height: auto; margin: 1 0; color: $text-muted; }
+    .form-label { height: 1; color: $text-muted; }
+    .form-input { margin-bottom: 1; }
+    #action-form-buttons { height: 3; align: right middle; }
+    #action-form-buttons Button { margin-left: 1; }
+    """
+
+    def __init__(self, title: str, body: str,
+                 fields: List[Tuple[str, str, str]],
+                 *, confirm_label: str = "执行") -> None:
+        super().__init__()
+        self.form_title = title
+        self.form_body = body
+        self.fields = fields
+        self.confirm_label = confirm_label
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="action-form-box"):
+            yield Static(self.form_title, id="action-form-title")
+            yield Static(self.form_body, id="action-form-body")
+            for field_id, label, default in self.fields:
+                yield Label(label, classes="form-label")
+                yield Input(value=default, id=f"form-{field_id}", classes="form-input")
+            with Horizontal(id="action-form-buttons"):
+                yield Button(self.confirm_label, variant="primary", id="form-submit")
+                yield Button("取消", variant="default", id="form-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "form-submit":
+            self.action_submit()
+        elif event.button.id == "form-cancel":
+            self.action_cancel()
+
+    def action_submit(self) -> None:
+        values = {
+            field_id: self.query_one(f"#form-{field_id}", Input).value
+            for field_id, _label, _default in self.fields
+        }
+        self.dismiss(values)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class ChatPane(Vertical):
@@ -699,15 +774,30 @@ class ChatPane(Vertical):
 
 
 class MainScreen(Screen):
-    """主界面：左侧导航（黄金比例分栏）+ 右侧内容区（9 屏）。"""
+    """主界面：左侧导航（黄金比例分栏）+ 右侧内容区（9 个功能屏 + 调试兜底）。"""
 
     BINDINGS = [
-        Binding("r", "reload", "刷新"),
+        Binding("r", "refresh", "刷新"),
         Binding("l", "load_model", "加载模型"),
         Binding("u", "unload_model", "卸载模型"),
+        Binding("d", "model_download", "下载模型"),
+        Binding("f", "model_preflight", "模型预检"),
+        Binding("i", "model_register", "登记模型"),
+        Binding("v", "model_search", "搜索模型"),
         Binding("p", "queue_toggle_pause", "暂停/恢复"),
         Binding("s", "queue_cycle_strategy", "调度策略"),
         Binding("c", "queue_clear", "清空排队"),
+        Binding("t", "cluster_toggle", "分布式开关"),
+        Binding("m", "cluster_max_nodes", "最大节点"),
+        Binding("j", "cluster_connect", "连接主节点"),
+        Binding("b", "cluster_join_request", "生成入群请求"),
+        Binding("k", "cluster_join_consume", "消费入群授权"),
+        Binding("g", "device_auto_config", "设备配置"),
+        Binding("h", "device_select_gpu", "选择 GPU"),
+        Binding("e", "logs_export", "导出日志"),
+        Binding("w", "settings_write", "写入设置"),
+        Binding("a", "api_refresh", "更新端点"),
+        Binding("x", "api_execute", "执行端点"),
         Binding("]", "next_page", "下一屏"),
         Binding("[", "prev_page", "上一屏"),
         Binding("q", "quit_app", "退出"),
@@ -717,8 +807,14 @@ class MainScreen(Screen):
     #: 每屏可用键提示（让"这屏能做什么"可见；与 BINDINGS 保持一致）
     PAGE_KEYS = {
         "chat": "/help 看命令",
-        "models": "L 加载 · U 卸载",
+        "models": "L 加载 · U 卸载 · D 下载 · C 取消下载 · F 预检 · I 登记",
+        "cluster": "T 分布式 · M 最大节点 · R 刷新容量",
+        "nodes": "I 邀请 · J 连接 · B 请求码 · K 消费授权 · X 注销",
         "queue": "P 暂停/恢复 · S 策略 · C 清空排队",
+        "logs": "F 筛选 · S 统计 · E 导出 · X 清理",
+        "device": "G 自动配置 · H 选择 GPU",
+        "settings": "W 写入用户设置",
+        "api": "A 更新端点 · X 执行选中端点",
     }
 
     def __init__(self) -> None:
@@ -734,6 +830,26 @@ class MainScreen(Screen):
         #: 最近一次写操作的结果文本（操作没有回显窗口，故常驻侧栏摘要）
         self.op_status = ""
         self.cuda_available: Optional[bool] = None
+        self.model_aux: Dict[str, Any] = {}
+        self.cluster_aux: Dict[str, Any] = {}
+        self.node_aux: Dict[str, Any] = {}
+        self.log_filters: Dict[str, Any] = {}
+        self.log_stats: Dict[str, Any] = {}
+        #: OpenAPI 动态调试兜底；功能屏不把稳定业务流程退化成裸端点。
+        self.api_operations: Dict[str, Dict[str, Any]] = {}
+        self.api_selected_key = ""
+        #: Refresh state is deliberately kept in the screen controller.  A
+        #: screen switch must never fan out into a new refresh storm.
+        self.backend_available: Optional[bool] = None
+        self.runtime_ready: Optional[bool] = None
+        self._core_inflight = False
+        self._initial_page_data_started = False
+        self._pages_inflight = False
+        self._device_inflight = False
+        self._model_aux_inflight = False
+        self._cluster_aux_inflight = False
+        self._api_catalog_inflight = False
+        self._refresh_state_lock = threading.Lock()
 
     # ------------------------------------------------------------ 版式
 
@@ -759,14 +875,17 @@ class MainScreen(Screen):
                 with Vertical(id="page-models", classes="page"):
                     yield Static("模型 · 注册表与当前加载", classes="page-title")
                     yield Static(PAGES[2][2], classes="page-hint")
+                    yield Static("加载中…", id="models-pane")
                     yield DataTable(id="models-table")
                 with Vertical(id="page-cluster", classes="page"):
                     yield Static("分布式 · 集群资源", classes="page-title")
                     yield Static(PAGES[3][2], classes="page-hint")
+                    yield Static("加载中…", id="cluster-pane")
                     yield DataTable(id="resources-table")
                 with Vertical(id="page-nodes", classes="page"):
                     yield Static("节点 · 成员与角色", classes="page-title")
                     yield Static(PAGES[4][2], classes="page-hint")
+                    yield Static("选择节点后可执行邀请、连接和注销。", id="nodes-pane")
                     yield DataTable(id="nodes-table")
                 with Vertical(id="page-queue", classes="page"):
                     yield Static("队列 · MLFQ 三级调度", classes="page-title")
@@ -789,6 +908,15 @@ class MainScreen(Screen):
                     yield Static(PAGES[8][2], classes="page-hint")
                     with VerticalScroll(classes="scroll-panel"):
                         yield Static("", id="settings-pane")
+                with Vertical(id="page-api", classes="page"):
+                    yield Static("调试 · 未接线端点", classes="page-title")
+                    yield Static(PAGES[9][2], classes="page-hint")
+                    yield DataTable(id="api-table")
+                    yield Static("选择端点后可编辑路径、查询参数和 JSON 请求体。GET 直接执行；写操作会确认。", id="api-detail")
+                    yield Input(placeholder="路径，例如 /cluster/config", id="api-path")
+                    yield Input(placeholder='查询参数 JSON，例如 {"limit": 20}', id="api-params")
+                    yield Input(placeholder='请求体 JSON，例如 {"enabled": true}', id="api-body")
+                    yield RichLog(id="api-result", markup=False, wrap=True)
         yield Footer()
 
     # ------------------------------------------------------------ 切屏
@@ -807,11 +935,14 @@ class MainScreen(Screen):
         keys = [item[0] for item in PAGES]
         if key not in keys:
             return
+        current_key = PAGES[self.page_index][0]
         self.page_index = keys.index(key)
         try:
             self.query_one("#content", ContentSwitcher).current = f"page-{key}"
         except Exception:  # noqa: BLE001 - 切屏期间节点可能未挂载
             pass
+        if key != current_key:
+            self.refresh_page_data(key)
 
     def action_next_page(self) -> None:
         self.set_page((self.page_index + 1) % len(PAGES))
@@ -835,7 +966,7 @@ class MainScreen(Screen):
             "[b $accent]Koakuma[/] · QLH 分布式边缘推理 · Textual 外壳\n"
             + kv("后端地址", self.app.api.base_url)
             + "\n"
-            + kv("界面", "9 屏（左栏切换 / [ ] 上下屏 / r 刷新 / q 退出）")
+            + kv("界面", "9 个功能屏 + 调试兜底（左栏切换 / [ ] 上下屏 / r 刷新 / q 退出）")
             + "\n"
             + kv("依赖边界", "外壳需 Textual（requirements-tui.txt，Edge 同装）；")
             + "\n"
@@ -851,7 +982,7 @@ class MainScreen(Screen):
             + kv("port", api.port) + "\n"
             + kv("完整地址", api.base_url) + "\n"
             + kv("请求超时", f"{api.timeout:.0f} 秒") + "\n"
-            + kv("自动刷新", f"{self.app.interval:.0f} 秒（状态/模型/分布式/节点/队列/设备）") + "\n"
+            + kv("自动刷新", f"{self.app.interval:.0f} 秒（核心状态/模型注册表/资源）") + "\n"
             + kv("日志 Token", "已设置" if api.log_token else "未设置（聚合日志可能需要 --log-token）") + "\n"
             + kv("路由偏好", self.app.routing_preference) + "\n"
             + kv("thinking", "on" if self.app.show_thinking else "off") + "\n"
@@ -871,13 +1002,16 @@ class MainScreen(Screen):
         self.query_one("#queue-table", DataTable).add_columns("队列", "深度", "上限(tokens)", "任务")
         self.query_one("#gpu-table", DataTable).add_columns(
             "", "名称", "类型", "CUDA", "显存GB", "驱动")
+        self.query_one("#api-table", DataTable).add_columns(
+            "方法", "路径", "领域", "模式", "说明")
+        self.query_one("#models-pane", Static).update("加载中…")
+        self.query_one("#cluster-pane", Static).update("加载中…")
         self.query_one("#settings-pane", Static).update(self.settings_text())
         self.refresh_topbar()
+        # Only core state is refreshed periodically.  Expensive/optional
+        # projections are loaded after the health check and then on demand.
         self.action_reload()
-        self.load_pages()
-        self.load_device()
         self.set_interval(self.app.interval, self.action_reload)
-        self.set_interval(self.app.interval, self.load_pages)
         self.set_interval(self.app.interval, self.refresh_topbar)
 
     def refresh_topbar(self) -> None:
@@ -906,35 +1040,123 @@ class MainScreen(Screen):
 
     # ------------------------------------------------------------ 只读数据
 
+    def action_refresh(self) -> None:
+        """刷新核心状态，并刷新当前屏的按需数据。"""
+        self.action_reload(refresh_page=True)
+
     @work(thread=True, exclusive=True, group="main")
-    def action_reload(self) -> None:
+    def action_reload(self, refresh_page: bool = False) -> None:
+        with self._refresh_state_lock:
+            if self._core_inflight:
+                return
+            self._core_inflight = True
         # 端点/字段以 2026-09-17 实测的后端真实结构为准：
         #   /status → model_name / model_loaded / active_model_id / engine / run_mode / node_*
         #   /models → {models: [...], active_model_id}（19 个内置模型）
-        health = self.fetch_json(API_PATHS["health"])
-        status = self.fetch_json(API_PATHS["system_status"])
-        registry = self.fetch_json(API_PATHS["models_list"])
-        resources = self.fetch_json(API_PATHS["cluster_resources"])
-        self.app.call_from_thread(self.apply_data, health, status, registry, resources)
-
-    def fetch_json(self, path: str) -> Dict[str, Any]:
         try:
-            value = self.app.api.get(path if path.startswith("/") else "/" + path)
+            health = self.fetch_json(API_PATHS["health"])
+            if "_error" in health:
+                # A failed health probe is authoritative for this refresh cycle.
+                # Do not spend another 15 seconds failing every optional endpoint.
+                error = {"_error": health["_error"]}
+                self.app.call_from_thread(
+                    self.apply_data, health, error, error, error, refresh_page)
+                return
+            readiness = self.fetch_json(API_PATHS["readiness"])
+            # Older remote nodes do not expose /ready. Preserve their previous
+            # behavior while treating errors from the current endpoint as a
+            # real runtime gate.
+            if readiness.get("_status") == 404:
+                readiness = {"ready": True, "status": "legacy"}
+            elif "_error" in readiness:
+                self.app.call_from_thread(
+                    self.apply_data, health, {}, {}, {}, refresh_page, readiness)
+                return
+            if readiness.get("ready") is False:
+                self.app.call_from_thread(
+                    self.apply_data, health, {}, {}, {}, refresh_page, readiness)
+                return
+            status = self.fetch_json(API_PATHS["system_status"])
+            registry = self.fetch_json(API_PATHS["models_list"])
+            resources = self.fetch_json(API_PATHS["cluster_resources"])
+            self.app.call_from_thread(
+                self.apply_data, health, status, registry, resources, refresh_page,
+                readiness)
+        finally:
+            with self._refresh_state_lock:
+                self._core_inflight = False
+
+    def fetch_json(self, path: str, *, timeout: Optional[float] = None) -> Dict[str, Any]:
+        try:
+            normalized = path if path.startswith("/") else "/" + path
+            if timeout is not None and isinstance(self.app.api, ApiClient):
+                value = self.app.api.get(normalized, timeout=timeout)
+            else:
+                value = self.app.api.get(normalized)
             return value if isinstance(value, dict) else {"value": value}
         except ApiError as exc:
-            return {"_error": str(exc)}
+            return {"_error": str(exc), "_status": exc.status}
 
     def apply_data(self, health: Dict[str, Any], status: Dict[str, Any],
-                   registry: Dict[str, Any], resources: Dict[str, Any]) -> None:
-        self.fill_status(health, status, registry)
+                   registry: Dict[str, Any], resources: Dict[str, Any],
+                   refresh_page: bool = False,
+                   readiness: Optional[Dict[str, Any]] = None) -> None:
+        self.backend_available = "_error" not in health
+        self.runtime_ready = (
+            False
+            if isinstance(readiness, dict) and "_error" in readiness
+            else (
+                bool(readiness["ready"])
+                if isinstance(readiness, dict) and "ready" in readiness
+                else self.backend_available
+            )
+        )
+        self.fill_status(health, status, registry, readiness)
+        if self.runtime_ready is False:
+            self.refresh_topbar()
+            return
         self.fill_models(registry, status)
         self.fill_resources(resources)
         self.refresh_topbar()
+        if not self.backend_available:
+            return
+        if not self._initial_page_data_started:
+            self._initial_page_data_started = True
+            self.load_pages()
+            self.load_device()
+        if refresh_page:
+            self.refresh_page_data(PAGES[self.page_index][0], force=True)
+
+    def refresh_page_data(self, key: str, *, force: bool = False) -> None:
+        """Load only the data owned by the selected screen.
+
+        This is intentionally a dispatcher rather than a timer per screen.
+        Highlight/selection events can arrive twice during a terminal redraw,
+        so each worker also has an in-flight guard.
+        """
+        if self.backend_available is not True or self.runtime_ready is not True:
+            return
+        if key in {"nodes", "queue", "logs"}:
+            if force or not self._pages_inflight:
+                self.load_pages()
+        elif key == "models":
+            if force or not self.model_aux:
+                self.load_model_aux()
+        elif key == "cluster":
+            if force or not self.cluster_aux:
+                self.load_cluster_aux()
+        elif key == "device":
+            if force or not self._device_inflight:
+                self.load_device()
+        elif key == "api":
+            if force or not self.api_operations:
+                self.load_api_catalog()
 
     # ------------------------------------------------------------ 状态页
 
     def fill_status(self, health: Dict[str, Any], status: Dict[str, Any],
-                    registry: Dict[str, Any]) -> None:
+                    registry: Dict[str, Any],
+                    readiness: Optional[Dict[str, Any]] = None) -> None:
         pane = self.query_one("#status-pane", Static)
         table = self.query_one("#status-table", DataTable)
         table.clear()
@@ -945,6 +1167,24 @@ class MainScreen(Screen):
             table.add_row("后端地址", self.app.api.base_url)
             table.add_row("连接状态", "[red]不可达[/]")
             table.add_row("提示", "确认后端在运行（qlh 会自动拉起本机后端）")
+            return
+
+        if isinstance(readiness, dict) and (
+            readiness.get("ready") is False or "_error" in readiness
+        ):
+            self.health_text = "[green]API ok[/]"
+            self.model_text = "[yellow]初始化中[/]"
+            status_text = str(readiness.get("status") or "probe-unavailable")
+            pane.update(f"[green]API 已响应[/]  ·  [yellow]运行时初始化中[/]  ·  {status_text}")
+            table.add_row("后端地址", self.app.api.base_url)
+            table.add_row("健康", str(health.get("status") or "ok"))
+            table.add_row("运行时", f"[yellow]{status_text}[/]")
+            components = readiness.get("components") or {}
+            for name in ("local_store", "scheduler", "device_profile"):
+                state = "ready" if components.get(name) else "starting"
+                table.add_row(name, state)
+            if readiness.get("error"):
+                table.add_row("错误", str(readiness["error"]))
             return
 
         self.health_text = "[green]ok[/]"
@@ -1011,6 +1251,265 @@ class MainScreen(Screen):
                 key=model_id,  # 写操作按 row key 取模型，不依赖行序
             )
 
+    @work(thread=True, exclusive=True, group="modelaux")
+    def load_model_aux(self) -> None:
+        """补齐模型屏的资产、预设和异步下载任务，不把它们退化为 JSON 调试。"""
+        with self._refresh_state_lock:
+            if (self._model_aux_inflight
+                    or self.backend_available is not True
+                    or self.runtime_ready is not True):
+                return
+            self._model_aux_inflight = True
+        payload: Dict[str, Any] = {}
+        try:
+            for name, path in (
+                ("assets", "/models/local-assets"),
+                ("presets", "/models/presets"),
+                ("downloads", "/models/downloads"),
+            ):
+                payload[name] = self.fetch_json(path, timeout=PAGE_READ_TIMEOUT)
+            self.app.call_from_thread(self.fill_model_aux, payload)
+        finally:
+            with self._refresh_state_lock:
+                self._model_aux_inflight = False
+
+    def fill_model_aux(self, payload: Dict[str, Any]) -> None:
+        self.model_aux = payload
+        pane = self.query_one("#models-pane", Static)
+        assets = payload.get("assets") or {}
+        presets = payload.get("presets") or {}
+        downloads = payload.get("downloads") or {}
+        asset_items = []
+        if isinstance(assets, dict):
+            asset_items = assets.get("models") or assets.get("assets") or []
+        preset_items = presets.get("presets") if isinstance(presets, dict) else []
+        download_items = downloads.get("jobs") if isinstance(downloads, dict) else []
+        if not isinstance(asset_items, list):
+            asset_items = []
+        if not isinstance(preset_items, list):
+            preset_items = []
+        if not isinstance(download_items, list):
+            download_items = []
+        errors = [str(value.get("_error")) for value in payload.values()
+                  if isinstance(value, dict) and value.get("_error")]
+        jobs = []
+        for job in download_items[:5]:
+            if isinstance(job, dict):
+                jobs.append(f"{job.get('job_id') or job.get('id') or 'job'}:{job.get('status', '—')}")
+        text = (
+            f"资产 {len(asset_items)} · 下载预设 {len(preset_items)} · 下载任务 {len(download_items)}"
+            f"  · L 加载 U 卸载 D 下载 F 预检 I 登记"
+        )
+        if jobs:
+            text += "\n最近任务：" + "  ".join(jobs)
+        if errors:
+            text += "\n[yellow]部分模型辅助接口不可用：[/]" + "；".join(errors)
+        pane.update(text)
+
+    # ------------------------------------------------------------ 模型资产操作
+
+    def open_form(self, title: str, body: str,
+                  fields: List[Tuple[str, str, str]],
+                  callback: Callable[[Dict[str, str]], None],
+                  *, confirm_label: str = "执行") -> None:
+        def _done(values: Optional[Dict[str, str]]) -> None:
+            if values is not None:
+                callback(values)
+        self.app.push_screen(ActionFormScreen(title, body, fields,
+                                              confirm_label=confirm_label), _done)
+
+    def action_model_download(self) -> None:
+        if PAGES[self.page_index][0] != "models":
+            return
+        self.open_form(
+            "下载模型",
+            "优先填写预设 ID；也可直接填写来源和目标。下载任务会进入后台队列。",
+            [
+                ("preset_id", "预设 ID（可选）", ""),
+                ("source", "HF/ModelScope 来源或本地目录", ""),
+                ("target", "目标目录（可选）", ""),
+                ("model_id", "模型 ID（可选）", ""),
+                ("quant", "量化（可选，如 Q4_K_M）", ""),
+                ("gguf_path", "显式 GGUF 路径（可选）", ""),
+                ("allow_cpu", "允许 CPU：true/false", "true"),
+            ],
+            self.submit_model_download,
+        )
+
+    def action_model_search(self) -> None:
+        if PAGES[self.page_index][0] != "models":
+            return
+        self.open_form(
+            "搜索模型仓库",
+            "搜索结果只展示仓库元数据；下载前仍需检查格式、摘要、架构和设备预算。",
+            [
+                ("q", "关键词", ""),
+                ("source", "来源：all/huggingface/modelscope", "all"),
+                ("page", "页码", "1"),
+                ("limit", "条数", "20"),
+            ],
+            self.submit_model_search,
+            confirm_label="搜索",
+        )
+
+    def submit_model_search(self, values: Dict[str, str]) -> None:
+        query = values.get("q", "").strip()
+        if not query:
+            self.write_status("[red]请输入搜索关键词[/]")
+            return
+        try:
+            page = max(1, int(values.get("page", "1")))
+            limit = max(1, min(50, int(values.get("limit", "20"))))
+        except ValueError:
+            self.write_status("[red]页码和条数必须是整数[/]")
+            return
+        self.run_model_search(query, values.get("source", "all").strip() or "all", page, limit)
+
+    @work(thread=True, exclusive=True, group="modelaux")
+    def run_model_search(self, query: str, source: str, page: int, limit: int) -> None:
+        try:
+            result = self.app.api.get(
+                "/models/search", params={"q": query, "source": source, "page": page, "limit": limit})
+            self.app.call_from_thread(self.show_model_search, result)
+        except ApiError as exc:
+            self.app.call_from_thread(self.write_status, f"[red]模型搜索失败[/]：{exc}")
+
+    def show_model_search(self, result: Any) -> None:
+        pane = self.query_one("#models-pane", Static)
+        if not isinstance(result, dict):
+            pane.update(str(result))
+            return
+        items = result.get("models") or result.get("results") or result.get("items") or []
+        lines = [f"搜索结果 {len(items)} 条（V 重新搜索）"]
+        for item in items[:8]:
+            if isinstance(item, dict):
+                lines.append(f"{item.get('id') or item.get('model_id') or item.get('name', '—')} · "
+                             f"{item.get('source') or item.get('downloads') or '—'}")
+        pane.update("\n".join(lines))
+
+    def action_model_cancel_download(self) -> None:
+        if PAGES[self.page_index][0] != "models":
+            return
+        downloads = self.model_aux.get("downloads") or {}
+        items = downloads.get("jobs") if isinstance(downloads, dict) else []
+        first_job = items[0] if isinstance(items, list) and items and isinstance(items[0], dict) else {}
+        default_id = str(first_job.get("job_id") or first_job.get("id") or "")
+        self.open_form(
+            "取消模型下载",
+            "只能取消仍在排队的任务；执行中的任务由后端返回当前状态。",
+            [("job_id", "下载任务 ID", default_id)],
+            self.submit_model_cancel_download,
+            confirm_label="取消下载",
+        )
+
+    def submit_model_cancel_download(self, values: Dict[str, str]) -> None:
+        job_id = values.get("job_id", "").strip()
+        if not job_id:
+            self.write_status("[red]必须填写下载任务 ID[/]")
+            return
+        path = "/models/downloads/%s" % urllib.parse.quote(job_id, safe="")
+        self.app.confirm(
+            "取消模型下载",
+            f"将请求取消下载任务 {job_id}。已开始执行的任务可能只能返回当前状态。",
+            lambda: self.run_json_operation(
+                "DELETE", path, None, success="下载任务取消请求已发送",
+                refresh=(self.load_model_aux,)),
+            confirm_label="取消",
+        )
+
+    def submit_model_download(self, values: Dict[str, str]) -> None:
+        body = {key: value.strip() for key, value in values.items() if value.strip()}
+        if "allow_cpu" in body:
+            body["allow_cpu"] = body["allow_cpu"].lower() not in {"0", "false", "no", "否"}
+        self.app.confirm(
+            "创建模型下载任务",
+            json.dumps(body, ensure_ascii=False),
+            lambda: self.run_json_operation(
+                "POST", "/models/downloads", body,
+                success="下载任务已创建", refresh=(self.load_model_aux,)),
+            confirm_label="下载",
+        )
+
+    def action_model_preflight(self) -> None:
+        if PAGES[self.page_index][0] == "logs":
+            self.action_logs_filter()
+            return
+        if PAGES[self.page_index][0] != "models":
+            return
+        model_id = self.selected_model_id(self.query_one("#models-table", DataTable))
+        if not model_id:
+            self.write_status("[yellow]请先选择模型[/]")
+            return
+        path = "/models/local-assets/%s/preflight" % urllib.parse.quote(model_id, safe="")
+        self.run_json_operation("POST", path, None, success="模型预检完成",
+                                refresh=(self.load_model_aux,))
+
+    def action_model_unregister(self) -> None:
+        if PAGES[self.page_index][0] != "models":
+            return
+        model_id = self.selected_model_id(self.query_one("#models-table", DataTable))
+        if not model_id:
+            self.write_status("[yellow]请先选择模型[/]")
+            return
+        path = "/models/registry/%s" % urllib.parse.quote(model_id, safe="")
+        self.app.confirm(
+            "取消登记模型",
+            f"只删除注册表项，不删除本地模型文件：{model_id}\n此操作不可撤销。",
+            lambda: self.run_json_operation(
+                "DELETE", path, None, success="模型注册表项已删除",
+                refresh=(self.action_reload, self.load_model_aux)),
+            confirm_label="删除",
+        )
+
+    def action_model_register(self) -> None:
+        if PAGES[self.page_index][0] == "nodes":
+            self.action_node_invite()
+            return
+        if PAGES[self.page_index][0] != "models":
+            return
+        self.open_form(
+            "登记模型资产",
+            "登记会写入主仓模型注册表；模型文件仍需由本地资产或下载任务提供。",
+            [
+                ("model_id", "模型 ID", ""),
+                ("name", "显示名称", ""),
+                ("model_type", "类型：gguf/safetensors/both", "gguf"),
+                ("gguf_path", "GGUF 路径", ""),
+                ("huggingface_id", "HuggingFace ID（可选）", ""),
+                ("description", "说明（可选）", ""),
+            ],
+            self.submit_model_register,
+        )
+
+    def submit_model_register(self, values: Dict[str, str]) -> None:
+        body = {key: value.strip() for key, value in values.items() if value.strip()}
+        self.app.confirm(
+            "登记模型资产",
+            json.dumps(body, ensure_ascii=False),
+            lambda: self.run_json_operation(
+                "POST", "/models/registry", body,
+                success="模型已登记", refresh=(self.action_reload, self.load_model_aux)),
+            confirm_label="登记",
+        )
+
+    @work(thread=True, exclusive=True, group="modelctl")
+    def run_json_operation(self, method: str, path: str, body: Any = None, *,
+                           success: str = "操作完成", refresh: Tuple[Callable[[], Any], ...] = (),
+                           with_log_token: bool = False) -> None:
+        try:
+            result = self.app.api.request(
+                method, path, body=body, with_log_token=with_log_token, timeout=180.0)
+            self.app.call_from_thread(self.finish_json_operation, success, result)
+            for fn in refresh:
+                self.app.call_from_thread(fn)
+        except ApiError as exc:
+            self.app.call_from_thread(self.finish_json_operation, "操作失败：" + str(exc), {})
+
+    def finish_json_operation(self, text: str, result: Any) -> None:
+        self.write_status(f"[green]{text}[/]") if not text.startswith("操作失败") else self.write_status(f"[red]{text}[/]")
+        if isinstance(result, dict) and result:
+            self.op_status = text
+
     # ------------------------------------------------------------ 分布式页
 
     def fill_resources(self, resources: Dict[str, Any]) -> None:
@@ -1058,15 +1557,258 @@ class MainScreen(Screen):
                 f"{totals.get('vram_total_gb', '—')} / {totals.get('vram_free_gb', '—')} GB",
             )
 
+    @work(thread=True, exclusive=True, group="clusteraux")
+    def load_cluster_aux(self) -> None:
+        with self._refresh_state_lock:
+            if (self._cluster_aux_inflight
+                    or self.backend_available is not True
+                    or self.runtime_ready is not True):
+                return
+            self._cluster_aux_inflight = True
+        payload: Dict[str, Any] = {}
+        try:
+            for name, path in (
+                ("config", "/cluster/config"),
+                ("role", "/cluster/my-role"),
+                ("distributed", "/cluster/config/distributed-inference"),
+                ("capacity", "/cluster/pipeline-capacity"),
+                ("reshard", "/cluster/pipeline-reshard"),
+                ("layers", "/cluster/layers"),
+            ):
+                payload[name] = self.fetch_json(path, timeout=PAGE_READ_TIMEOUT)
+            self.app.call_from_thread(self.fill_cluster_aux, payload)
+        finally:
+            with self._refresh_state_lock:
+                self._cluster_aux_inflight = False
+
+    def fill_cluster_aux(self, payload: Dict[str, Any]) -> None:
+        self.cluster_aux = payload
+        pane = self.query_one("#cluster-pane", Static)
+        config = payload.get("config") or {}
+        distributed = payload.get("distributed") or {}
+        role = payload.get("role") or {}
+        capacity = payload.get("capacity") or {}
+        if not isinstance(capacity, dict):
+            capacity = {}
+        enabled = distributed.get("enabled") if isinstance(distributed, dict) else None
+        if enabled is None and isinstance(config, dict):
+            enabled = config.get("distributed_inference_enabled")
+        parts = [
+            f"角色 {role.get('role') or role.get('node_role') or '—'}",
+            f"分布式 {'开启' if enabled else '关闭' if enabled is not None else '未知'}",
+            f"容量 {capacity.get('status') or capacity.get('total_layers') or '已刷新'}",
+            "T 开关 · M 最大节点 · J 连接主节点 · R 刷新",
+        ]
+        if isinstance(payload.get("reshard"), dict) and payload["reshard"].get("_error"):
+            parts.append("[yellow]重分片数据不可用[/]")
+        pane.update(" · ".join(str(part) for part in parts))
+
+    def action_cluster_toggle(self) -> None:
+        if PAGES[self.page_index][0] != "cluster":
+            return
+        distributed = self.cluster_aux.get("distributed") or {}
+        current = distributed.get("enabled") if isinstance(distributed, dict) else None
+        if current is None:
+            self.write_status("[yellow]分布式配置尚未加载，请先刷新[/]")
+            return
+        target = not bool(current)
+        self.app.confirm(
+            "切换分布式推理",
+            f"当前状态：{'开启' if current else '关闭'} → {'开启' if target else '关闭'}\n"
+            "新请求将按该配置参与调度，正在执行的任务不强行迁移。",
+            lambda: self.run_json_operation(
+                "PUT", "/cluster/config/distributed-inference", {"enabled": target},
+                success="分布式配置已更新", refresh=(self.load_cluster_aux, self.action_reload)),
+            confirm_label="切换",
+        )
+
+    def action_cluster_max_nodes(self) -> None:
+        if PAGES[self.page_index][0] != "cluster":
+            return
+        current = ((self.cluster_aux.get("config") or {}).get("max_nodes")
+                   if isinstance(self.cluster_aux.get("config"), dict) else "")
+        self.open_form(
+            "调整最大节点数",
+            "只修改集群容量上限，不会预创建节点。",
+            [("max_nodes", "最大节点数（1-64）", str(current or "3"))],
+            self.submit_max_nodes,
+        )
+
+    def submit_max_nodes(self, values: Dict[str, str]) -> None:
+        try:
+            number = max(1, min(64, int(values.get("max_nodes", ""))))
+        except ValueError:
+            self.write_status("[red]最大节点数必须是 1-64 的整数[/]")
+            return
+        self.app.confirm(
+            "更新最大节点数", f"将集群最大节点数设为 {number}。",
+            lambda: self.run_json_operation(
+                "PUT", "/cluster/config/max-nodes", {"max_nodes": number},
+                success="最大节点数已更新", refresh=(self.load_cluster_aux, self.load_pages)),
+            confirm_label="更新",
+        )
+
+    def action_cluster_connect(self) -> None:
+        if PAGES[self.page_index][0] not in {"cluster", "nodes"}:
+            return
+        self.open_form(
+            "连接主节点",
+            "从节点填写主节点地址；切换角色是持久性操作，默认不自动切换。",
+            [
+                ("master_host", "主节点地址", ""),
+                ("master_port", "端口", "8888"),
+                ("switch_to_client", "切换为从节点：true/false", "false"),
+            ],
+            self.submit_cluster_connect,
+        )
+
+    def submit_cluster_connect(self, values: Dict[str, str]) -> None:
+        try:
+            port = int(values.get("master_port", "8888"))
+        except ValueError:
+            self.write_status("[red]端口必须是整数[/]")
+            return
+        body = {
+            "master_host": values.get("master_host", "").strip(),
+            "master_port": port,
+            "switch_to_client": values.get("switch_to_client", "false").lower() in {"1", "true", "yes", "是"},
+        }
+        if not body["master_host"]:
+            self.write_status("[red]必须填写主节点地址[/]")
+            return
+        self.app.confirm(
+            "连接主节点", f"{body['master_host']}:{port}\n切换为从节点：{body['switch_to_client']}",
+            lambda: self.run_json_operation(
+                "POST", "/cluster/connect", body, success="主节点连接请求已发送",
+                refresh=(self.load_cluster_aux, self.load_pages)),
+            confirm_label="连接",
+        )
+
+    def action_cluster_join_request(self) -> None:
+        if PAGES[self.page_index][0] != "nodes":
+            return
+        self.open_form(
+            "生成入群请求码",
+            "在待加入节点生成一次性请求码；主节点仍需通过 Auth App/TOTP 审批后签发授权。",
+            [
+                ("master_endpoint", "主节点地址（host:port）", ""),
+                ("target_node_id", "目标节点 ID（可选）", ""),
+                ("cluster_id", "集群 ID（可选）", "qlh-default"),
+                ("capabilities", "能力标签（逗号分隔）", "presence,task"),
+                ("request_ttl_seconds", "请求有效期（60-3600 秒）", "600"),
+            ],
+            self.submit_cluster_join_request,
+            confirm_label="生成",
+        )
+
+    def submit_cluster_join_request(self, values: Dict[str, str]) -> None:
+        endpoint = values.get("master_endpoint", "").strip()
+        if not endpoint:
+            self.write_status("[red]必须填写主节点地址[/]")
+            return
+        try:
+            ttl = max(60, min(3600, int(values.get("request_ttl_seconds", "600"))))
+        except ValueError:
+            self.write_status("[red]请求有效期必须是整数[/]")
+            return
+        capabilities = [item.strip() for item in values.get("capabilities", "").split(",") if item.strip()]
+        body: Dict[str, Any] = {
+            "master_endpoint": endpoint,
+            "cluster_id": values.get("cluster_id", "").strip(),
+            "capabilities": capabilities or ["presence", "task"],
+            "request_ttl_seconds": ttl,
+        }
+        target_node_id = values.get("target_node_id", "").strip()
+        if target_node_id:
+            body["target_node_id"] = target_node_id
+        self.run_cluster_join_request(body)
+
+    @work(thread=True, exclusive=True, group="nodectl")
+    def run_cluster_join_request(self, body: Dict[str, Any]) -> None:
+        try:
+            result = self.app.api.request("POST", "/cluster/join/request", body=body)
+            self.app.call_from_thread(self.show_cluster_join_request, result)
+        except ApiError as exc:
+            self.app.call_from_thread(self.write_status, f"[red]生成入群请求失败[/]：{exc}")
+
+    def show_cluster_join_request(self, result: Any) -> None:
+        self.node_aux["join_request"] = result
+        code = result.get("request_code") if isinstance(result, dict) else None
+        pane = self.query_one("#nodes-pane", Static)
+        if code:
+            pane.update(
+                "入群请求码（交给主节点 Auth App/TOTP 审批流程）：\n"
+                + str(code)
+                + "\n\nK 消费主节点签发的 grant_code。")
+            self.write_status("[green]入群请求码已生成[/]")
+        else:
+            pane.update("入群请求响应：" + json.dumps(result, ensure_ascii=False, separators=(", ", ": ")))
+            self.write_status("[yellow]后端未返回 request_code[/]")
+
+    def action_cluster_join_consume(self) -> None:
+        if PAGES[self.page_index][0] != "nodes":
+            return
+        self.open_form(
+            "消费入群授权",
+            "消费一次性 grant_code；成功后本节点会切换为从节点并连接主节点。",
+            [("grant_code", "一次性授权码", "")],
+            self.submit_cluster_join_consume,
+            confirm_label="消费授权",
+        )
+
+    def submit_cluster_join_consume(self, values: Dict[str, str]) -> None:
+        grant_code = values.get("grant_code", "").strip()
+        if not grant_code:
+            self.write_status("[red]必须填写 grant_code[/]")
+            return
+        self.app.confirm(
+            "消费入群授权",
+            "成功后当前节点将切换为从节点并连接授权中的主节点；一次性授权不可重复使用。",
+            lambda: self.run_json_operation(
+                "POST", "/cluster/join/consume", {"grant_code": grant_code},
+                success="入群授权消费请求已发送", refresh=(self.load_pages, self.load_cluster_aux)),
+            confirm_label="消费",
+        )
+
     # ------------------------------------------------------------ 运维面（节点/队列/日志）
 
     @work(thread=True, exclusive=True, group="pages")
     def load_pages(self) -> None:
-        """拉取节点/队列/日志三屏的只读数据（失败只显示错误，不伪造内容）。"""
-        nodes = self.fetch_json(API_PATHS["cluster_nodes"])
-        queue = self.fetch_json(API_PATHS["cluster_queue"])
-        logs = self.fetch_json(API_PATHS["cluster_log_aggregate"])
-        self.app.call_from_thread(self.apply_pages, nodes, queue, logs)
+        """拉取节点、队列、聚合日志和日志筛选数据。"""
+        with self._refresh_state_lock:
+            if (self._pages_inflight
+                    or self.backend_available is not True
+                    or self.runtime_ready is not True):
+                return
+            self._pages_inflight = True
+        try:
+            nodes = self.fetch_json(API_PATHS["cluster_nodes"], timeout=PAGE_READ_TIMEOUT)
+            queue = self.fetch_json(API_PATHS["cluster_queue"], timeout=PAGE_READ_TIMEOUT)
+            logs = self.fetch_json(API_PATHS["cluster_log_aggregate"], timeout=PAGE_READ_TIMEOUT)
+            recent = self.fetch_json_params(
+                "/logs/recent", self.log_filters, with_log_token=True,
+                timeout=PAGE_READ_TIMEOUT)
+            stats = self.fetch_json_params(
+                "/logs/stats", {}, with_log_token=True, timeout=PAGE_READ_TIMEOUT)
+            logs["_recent"] = recent
+            logs["_stats"] = stats
+            self.app.call_from_thread(self.apply_pages, nodes, queue, logs)
+        finally:
+            with self._refresh_state_lock:
+                self._pages_inflight = False
+
+    def fetch_json_params(self, path: str, params: Dict[str, Any], *,
+                          with_log_token: bool = False,
+                          timeout: Optional[float] = None) -> Dict[str, Any]:
+        try:
+            if timeout is not None and isinstance(self.app.api, ApiClient):
+                value = self.app.api.get(
+                    path, params=params, with_log_token=with_log_token, timeout=timeout)
+            else:
+                value = self.app.api.get(path, params=params, with_log_token=with_log_token)
+            return value if isinstance(value, dict) else {"value": value}
+        except ApiError as exc:
+            return {"_error": str(exc)}
 
     def apply_pages(self, nodes: Dict[str, Any], queue: Dict[str, Any],
                     logs: Dict[str, Any]) -> None:
@@ -1093,14 +1835,66 @@ class MainScreen(Screen):
             state = str(node.get("state") or ("online" if node.get("is_available") else "—"))
             colored = {"online": "[green]在线[/]", "offline": "[red]离线[/]"}.get(state, state)
             rtt = node.get("avg_rtt_ms")
+            node_id = str(node.get("node_id") or "—")
             table.add_row(
-                str(node.get("node_id") or "—"),
+                node_id,
                 str(node.get("role") or "—"),
                 str(node.get("node_type") or "—"),
                 colored,
                 str(node.get("address") or "—"),
                 f"{rtt:.0f} ms" if isinstance(rtt, (int, float)) else "—",
+                key=node_id,
             )
+        pane = self.query_one("#nodes-pane", Static)
+        pane.update(
+            f"节点 {len(items)} · 在线 {sum(1 for item in items if isinstance(item, dict) and str(item.get('state', '')).lower() == 'online')}"
+            " · I 邀请 · J 连接 · B 请求码 · K 消费授权 · X 注销")
+
+    def selected_node_id(self) -> str:
+        table = self.query_one("#nodes-table", DataTable)
+        if table.row_count == 0:
+            return ""
+        try:
+            row_key, _column_key = table.coordinate_to_cell_key(table.cursor_coordinate)
+            return str(row_key.value or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def action_node_invite(self) -> None:
+        if PAGES[self.page_index][0] != "nodes":
+            return
+        self.run_node_invite()
+
+    @work(thread=True, exclusive=True, group="nodectl")
+    def run_node_invite(self) -> None:
+        try:
+            invite = self.app.api.get("/cluster/invite")
+        except ApiError as exc:
+            self.app.call_from_thread(self.write_status, f"[red]获取邀请信息失败[/]：{exc}")
+            return
+        self.app.call_from_thread(self.show_node_invite, invite)
+
+    def show_node_invite(self, invite: Any) -> None:
+        self.node_aux["invite"] = invite
+        self.query_one("#nodes-pane", Static).update(
+            "邀请信息：" + json.dumps(invite, ensure_ascii=False, separators=(", ", ": ")))
+        self.write_status("[green]邀请信息已显示[/]")
+
+    def action_node_deregister(self) -> None:
+        if PAGES[self.page_index][0] != "nodes":
+            return
+        node_id = self.selected_node_id()
+        if not node_id or node_id == "—":
+            self.write_status("[yellow]请先选择节点[/]")
+            return
+        path = "/cluster/nodes/%s/deregister" % urllib.parse.quote(node_id, safe="")
+        self.app.confirm(
+            "注销节点",
+            f"将请求注销节点 {node_id}。在线节点可能被后端拒绝，操作不可撤销。",
+            lambda: self.run_json_operation(
+                "POST", path, None, success="节点注销请求已发送", refresh=(self.load_pages, self.load_cluster_aux)),
+            confirm_label="注销",
+        )
 
     def fill_queue(self, queue: Dict[str, Any]) -> None:
         """``/cluster/queue`` → MLFQ：``q0/q1/q2`` + ``*_depth`` + ``completed_count``。
@@ -1166,22 +1960,117 @@ class MainScreen(Screen):
             lines.extend(_log_lines(item, "worker"))
         shown = lines[-200:]
         self.log_line_count = len(shown)
+        recent = logs.get("_recent") or {}
+        recent_count = recent.get("count") if isinstance(recent, dict) else None
+        stats = logs.get("_stats") or {}
+        stats_note = ""
+        if isinstance(stats, dict) and not stats.get("_error"):
+            stats_note = f"  · 文件 {stats.get('files_count', '—')} 个"
+        filter_note = f"  · 筛选 {self.log_filters}" if self.log_filters else ""
         pane.update(f"共 {len(lines)} 行（显示末尾 {len(shown)}）"
                     f"  ·  local + {len(worker_items)} worker"
                     f"  ·  total_workers={logs.get('total_workers', 0)}"
-                    f"  ·  limit={logs.get('limit', '—')}")
+                    f"  ·  limit={logs.get('limit', '—')}"
+                    f"  · recent={recent_count if recent_count is not None else '—'}"
+                    f"{stats_note}{filter_note}"
+                    "\nF 筛选 · S 统计 · E 导出 · X 清理日志")
         if not shown:
             view.write("（后端未返回日志行）")
             return
         for line in shown:
             view.write(line)
 
+    def action_logs_filter(self) -> None:
+        if PAGES[self.page_index][0] != "logs":
+            return
+        self.open_form(
+            "筛选最近日志",
+            "空字段表示不筛选；筛选只影响 /logs/recent，不隐藏聚合日志。",
+            [
+                ("level", "最低级别（DEBUG/INFO/WARNING/ERROR）", str(self.log_filters.get("level", ""))),
+                ("name", "logger 名称包含", str(self.log_filters.get("name", ""))),
+                ("node_id", "节点 ID", str(self.log_filters.get("node_id", ""))),
+                ("request_id", "请求 ID", str(self.log_filters.get("request_id", ""))),
+                ("limit", "返回条数（1-1000）", str(self.log_filters.get("limit", "200"))),
+            ],
+            self.submit_log_filter,
+        )
+
+    def submit_log_filter(self, values: Dict[str, str]) -> None:
+        filters = {key: value.strip() for key, value in values.items() if value.strip()}
+        if "limit" in filters:
+            try:
+                filters["limit"] = max(1, min(1000, int(filters["limit"])))
+            except ValueError:
+                self.write_status("[red]日志条数必须是整数[/]")
+                return
+        self.log_filters = filters
+        self.load_pages()
+        self.write_status("[green]日志筛选已更新[/]")
+
+    def action_logs_stats(self) -> None:
+        if PAGES[self.page_index][0] != "logs":
+            return
+        self.run_logs_stats()
+
+    @work(thread=True, exclusive=True, group="logctl")
+    def run_logs_stats(self) -> None:
+        try:
+            stats = self.app.api.get("/logs/stats", with_log_token=True)
+        except ApiError as exc:
+            self.app.call_from_thread(self.write_status, f"[red]读取日志统计失败[/]：{exc}")
+            return
+        self.app.call_from_thread(self.show_logs_stats, stats)
+
+    def show_logs_stats(self, stats: Any) -> None:
+        self.log_stats = stats if isinstance(stats, dict) else {}
+        self.query_one("#logs-pane", Static).update(
+            "日志统计：" + json.dumps(self.log_stats, ensure_ascii=False, separators=(", ", ": "))
+            + "\nF 筛选 · S 统计 · E 导出 · X 清理日志")
+        self.write_status("[green]日志统计已刷新[/]")
+
+    @work(thread=True, exclusive=True, group="logctl")
+    def run_logs_export(self) -> None:
+        target = Path("logs") / f"qlh-logs-export-{int(time.time())}.zip"
+        try:
+            saved = self.app.api.download("/logs/export", target, with_log_token=True)
+            self.app.call_from_thread(self.write_status, f"[green]日志已导出[/]：{saved}")
+        except ApiError as exc:
+            self.app.call_from_thread(self.write_status, f"[red]日志导出失败[/]：{exc}")
+
+    def action_logs_export(self) -> None:
+        if PAGES[self.page_index][0] != "logs":
+            return
+        self.run_logs_export()
+
+    def action_logs_clear(self) -> None:
+        if PAGES[self.page_index][0] != "logs":
+            return
+        self.app.confirm(
+            "清理日志文件",
+            "将删除后端日志目录中的 .log 文件，内存日志缓冲不受影响。此操作不可撤销。",
+            lambda: self.run_json_operation(
+                "DELETE", "/logs", None, success="日志文件已清理", refresh=(self.load_pages,),
+                with_log_token=True),
+            confirm_label="删除",
+        )
+
     # ------------------------------------------------------------ 设备页
 
     @work(thread=True, exclusive=True, group="device")
     def load_device(self) -> None:
-        profile = self.fetch_json(API_PATHS["device_profile"])
-        self.app.call_from_thread(self.fill_device, profile)
+        with self._refresh_state_lock:
+            if (self._device_inflight
+                    or self.backend_available is not True
+                    or self.runtime_ready is not True):
+                return
+            self._device_inflight = True
+        try:
+            profile = self.fetch_json(API_PATHS["device_profile"], timeout=PAGE_READ_TIMEOUT)
+            self.app.call_from_thread(self.fill_device, profile)
+        finally:
+            with self._refresh_state_lock:
+                self._device_inflight = False
 
     def fill_device(self, profile: Dict[str, Any]) -> None:
         pane = self.query_one("#device-pane", Static)
@@ -1238,6 +2127,84 @@ class MainScreen(Screen):
                 str(gpu.get("vram_total_gb", "—")),
                 str(gpu.get("driver_version") or "—"),
             )
+
+    def action_device_auto_config(self) -> None:
+        if PAGES[self.page_index][0] != "device":
+            return
+        self.app.confirm(
+            "应用设备自动配置",
+            "后端将根据设备画像和评分选择推理档位，并可能重建 KV 缓存。",
+            lambda: self.run_json_operation(
+                "POST", "/device/auto-configure", None, success="设备自动配置已应用",
+                refresh=(self.load_device, self.action_reload)),
+            confirm_label="应用",
+        )
+
+    def action_device_select_gpu(self) -> None:
+        if PAGES[self.page_index][0] != "device":
+            return
+        self.open_form(
+            "选择 GPU",
+            "选择后需要重新加载模型才会对推理生效。",
+            [("gpu_index", "GPU 序号", "0")],
+            self.submit_gpu_selection,
+        )
+
+    def submit_gpu_selection(self, values: Dict[str, str]) -> None:
+        try:
+            index = int(values.get("gpu_index", ""))
+        except ValueError:
+            self.write_status("[red]GPU 序号必须是整数[/]")
+            return
+        self.app.confirm(
+            "切换 GPU", f"将选择 GPU #{index}，当前模型若已加载需要重新加载。",
+            lambda: self.run_json_operation(
+                "POST", "/device/select-gpu", {"gpu_index": index}, success="GPU 已切换",
+                refresh=(self.load_device, self.action_reload)),
+            confirm_label="切换",
+        )
+
+    def action_settings_write(self) -> None:
+        if PAGES[self.page_index][0] != "settings":
+            return
+        self.run_settings_read()
+
+    @work(thread=True, exclusive=True, group="settings")
+    def run_settings_read(self) -> None:
+        try:
+            current = self.app.api.get("/user/settings")
+        except ApiError as exc:
+            self.app.call_from_thread(self.write_status, f"[red]读取用户设置失败[/]：{exc}")
+            current = {}
+        settings = current.get("settings", {}) if isinstance(current, dict) else {}
+        self.app.call_from_thread(self.open_settings_form, settings)
+
+    def open_settings_form(self, settings: Any) -> None:
+        if not isinstance(settings, dict):
+            settings = {}
+        self.open_form(
+            "写入用户设置",
+            "请输入完整 JSON 对象；空对象会清空用户自定义设置。",
+            [("settings", "设置 JSON", json.dumps(settings, ensure_ascii=False))],
+            self.submit_settings,
+        )
+
+    def submit_settings(self, values: Dict[str, str]) -> None:
+        try:
+            settings = json.loads(values.get("settings", "{}") or "{}")
+        except json.JSONDecodeError as exc:
+            self.write_status(f"[red]设置 JSON 无效[/]：{exc.msg}")
+            return
+        if not isinstance(settings, dict):
+            self.write_status("[red]设置必须是 JSON 对象[/]")
+            return
+        self.app.confirm(
+            "写入用户设置", json.dumps(settings, ensure_ascii=False),
+            lambda: self.run_json_operation(
+                "PUT", "/user/settings", {"settings": settings}, success="用户设置已保存",
+                refresh=()),
+            confirm_label="保存",
+        )
 
     # ------------------------------------------------------------ 写操作
 
@@ -1366,6 +2333,9 @@ class MainScreen(Screen):
 
     def action_queue_cycle_strategy(self) -> None:
         """队列屏 S：mlfq ↔ fifo（影响新请求的排队行为，故先确认）。"""
+        if PAGES[self.page_index][0] == "logs":
+            self.action_logs_stats()
+            return
         if PAGES[self.page_index][0] != "queue":
             self.write_status("[yellow]请先切到「队列」屏[/]")
             return
@@ -1384,6 +2354,9 @@ class MainScreen(Screen):
 
     def action_queue_clear(self) -> None:
         """队列屏 C：清空排队任务（列出将清空的内容后再确认）。"""
+        if PAGES[self.page_index][0] == "models":
+            self.action_model_cancel_download()
+            return
         if PAGES[self.page_index][0] != "queue":
             self.write_status("[yellow]请先切到「队列」屏[/]")
             return
@@ -1428,6 +2401,212 @@ class MainScreen(Screen):
         except (ApiError, ValueError) as exc:
             text = f"[red]队列 {action} 失败[/]：{exc}"
         self.app.call_from_thread(self.finish_light_action, text)
+
+    # ------------------------------------------------------------ OpenAPI 调试兜底
+
+    @work(thread=True, exclusive=True, group="api")
+    def load_api_catalog(self) -> None:
+        """从运行中后端读取 OpenAPI，避免 TUI 与路由表再次漂移。"""
+        with self._refresh_state_lock:
+            if (self._api_catalog_inflight
+                    or self.backend_available is not True
+                    or self.runtime_ready is not True):
+                return
+            self._api_catalog_inflight = True
+        try:
+            if isinstance(self.app.api, ApiClient):
+                schema = self.app.api.get_openapi(timeout=PAGE_READ_TIMEOUT)
+            else:
+                schema = self.app.api.get_openapi()
+            operations: Dict[str, Dict[str, Any]] = {}
+            for openapi_path, methods in (schema.get("paths") or {}).items():
+                if not isinstance(methods, dict):
+                    continue
+                for method, operation in methods.items():
+                    method = str(method).upper()
+                    if method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}:
+                        continue
+                    if not isinstance(operation, dict):
+                        operation = {}
+                    path = str(openapi_path)
+                    if path.startswith("/api"):
+                        path = path[4:] or "/"
+                    key = f"{method} {openapi_path}"
+                    parts = [part for part in path.split("/") if part]
+                    domain = parts[0] if parts else "root"
+                    if path.startswith("/chat/stream") or path.startswith("/chat/upload"):
+                        mode = "专用界面"
+                    elif method == "GET" or method == "HEAD":
+                        mode = "查询"
+                    else:
+                        mode = "JSON 操作"
+                    operations[key] = {
+                        "key": key,
+                        "method": method,
+                        "openapi_path": str(openapi_path),
+                        "path": path,
+                        "domain": domain,
+                        "mode": mode,
+                        "summary": str(operation.get("summary") or operation.get("description") or ""),
+                        "operation_id": str(operation.get("operationId") or ""),
+                        "operation": operation,
+                    }
+            self.app.call_from_thread(self.fill_api_catalog, operations, "")
+        except Exception as exc:  # noqa: BLE001 - 端点清单不可用时仍保留主界面
+            self.app.call_from_thread(self.fill_api_catalog, {}, str(exc))
+        finally:
+            with self._refresh_state_lock:
+                self._api_catalog_inflight = False
+
+    def fill_api_catalog(self, operations: Dict[str, Dict[str, Any]], error: str = "") -> None:
+        self.api_operations = operations
+        table = self.query_one("#api-table", DataTable)
+        table.clear()
+        self.api_selected_key = ""
+        if error:
+            table.add_row("—", "[red]OpenAPI 不可用[/]", "", "", error)
+            self.query_one("#api-detail", Static).update(
+                "[red]无法读取端点清单[/]：" + error + "\n确认后端支持 /openapi.json，或先刷新。")
+            return
+        for key, item in sorted(operations.items(), key=lambda pair: pair[0]):
+            summary = item["summary"].replace("\n", " ").strip()
+            if len(summary) > 48:
+                summary = summary[:45] + "..."
+            table.add_row(
+                item["method"], item["path"], item["domain"], item["mode"], summary,
+                key=key,
+            )
+        if operations:
+            first = next(iter(sorted(operations)))
+            self.select_api_operation(first)
+            self.query_one("#api-result", RichLog).write(
+                f"已发现 {len(operations)} 个后端端点。GET 可查询，JSON 操作执行前需确认。")
+            self.op_status = f"端点 {len(operations)}"
+        else:
+            self.query_one("#api-detail", Static).update("[yellow]后端未返回业务端点。[/]")
+        self.refresh_topbar()
+
+    def _api_row_key(self, event: Any) -> str:
+        value = getattr(getattr(event, "row_key", None), "value", None)
+        return str(value or "")
+
+    def on_data_table_row_highlighted(self, event: Any) -> None:
+        table = getattr(event, "data_table", None)
+        if getattr(table, "id", None) != "api-table":
+            return
+        key = self._api_row_key(event)
+        if key in self.api_operations:
+            self.select_api_operation(key)
+
+    def on_data_table_row_selected(self, event: Any) -> None:
+        self.on_data_table_row_highlighted(event)
+
+    def select_api_operation(self, key: str) -> None:
+        item = self.api_operations.get(key)
+        if not item:
+            return
+        self.api_selected_key = key
+        operation = item.get("operation") or {}
+        params = operation.get("parameters") or []
+        query_names = [str(param.get("name")) for param in params
+                       if isinstance(param, dict) and param.get("in") == "query"]
+        body = ""
+        if item["method"] not in {"GET", "HEAD"}:
+            body = "{}"
+        detail = (
+            f"[b]{item['method']}[/] {item['path']}  ·  {item['domain']}  ·  {item['mode']}\n"
+            f"operationId={item['operation_id'] or '—'}"
+            + (f"  ·  query: {', '.join(query_names)}" if query_names else "")
+            + ("\n该端点由聊天页专用流式处理，请返回聊天页。"
+               if item["mode"] == "专用界面" else "")
+        )
+        self.query_one("#api-detail", Static).update(detail)
+        self.query_one("#api-path", Input).value = item["path"]
+        self.query_one("#api-params", Input).value = ""
+        self.query_one("#api-body", Input).value = body
+
+    def action_api_refresh(self) -> None:
+        if PAGES[self.page_index][0] != "api":
+            self.write_status("[yellow]请先切到「端点」屏[/]")
+            return
+        self.load_api_catalog()
+
+    def action_api_execute(self) -> None:
+        if PAGES[self.page_index][0] == "models":
+            self.action_model_unregister()
+            return
+        if PAGES[self.page_index][0] == "nodes":
+            self.action_node_deregister()
+            return
+        if PAGES[self.page_index][0] == "logs":
+            self.action_logs_clear()
+            return
+        if PAGES[self.page_index][0] != "api":
+            self.write_status("[yellow]请先切到「端点」屏[/]")
+            return
+        item = self.api_operations.get(self.api_selected_key)
+        if not item:
+            self.write_status("[yellow]请先选择端点[/]")
+            return
+        if item["mode"] == "专用界面":
+            self.write_status("[yellow]该端点由聊天页专用协议处理，请从聊天页操作[/]")
+            return
+        path = self.query_one("#api-path", Input).value.strip()
+        if not path or "{" in path or "}" in path:
+            self.write_status("[yellow]请先把路径中的 {参数} 替换为实际值[/]")
+            return
+        try:
+            params = self._parse_api_json(self.query_one("#api-params", Input).value, "查询参数")
+            body = self._parse_api_json(self.query_one("#api-body", Input).value, "请求体")
+        except ValueError as exc:
+            self.write_status(f"[red]{exc}[/]")
+            return
+        method = item["method"]
+        action = lambda: self.run_api_operation(method, path, params, body)
+        if method not in {"GET", "HEAD"}:
+            self.app.confirm(
+                "执行端点",
+                f"{method} {path}\n请求体：{json.dumps(body, ensure_ascii=False)}\n\n"
+                "这是后端写操作，确认后才会发送。",
+                action,
+                confirm_label="执行",
+            )
+        else:
+            action()
+
+    @staticmethod
+    def _parse_api_json(value: str, label: str) -> Any:
+        text = (value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{label}不是有效 JSON：{exc.msg}") from exc
+        if label == "查询参数" and not isinstance(parsed, dict):
+            raise ValueError("查询参数必须是 JSON 对象")
+        return parsed
+
+    @work(thread=True, exclusive=True, group="api")
+    def run_api_operation(self, method: str, path: str, params: Any, body: Any) -> None:
+        try:
+            result = self.app.api.request(
+                method, path, body=None if method in {"GET", "HEAD"} else body,
+                params=params, with_log_token=True, timeout=180.0 if method not in {"GET", "HEAD"} else None)
+            self.app.call_from_thread(self.show_api_result, method, path, result, "")
+        except ApiError as exc:
+            self.app.call_from_thread(self.show_api_result, method, path, {}, str(exc))
+
+    def show_api_result(self, method: str, path: str, result: Any, error: str) -> None:
+        view = self.query_one("#api-result", RichLog)
+        view.clear()
+        if error:
+            view.write(f"{method} {path}\n错误：{error}")
+            self.op_status = "端点失败"
+        else:
+            view.write(f"{method} {path}\n" + json.dumps(result, ensure_ascii=False, indent=2, default=str))
+            self.op_status = "端点完成"
+        self.update_sidebar(PAGES[self.page_index])
 
     # ------------------------------------------------------------ 动作
 
@@ -1508,12 +2687,12 @@ class KoakumaApp(App):
 
 def run(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, *, interval: float = 5.0,
         routing_preference: str = "auto", show_thinking: bool = False,
-        supervisor: Any = None) -> int:
+        supervisor: Any = None, log_token: str = "") -> int:
     """启动 Textual 外壳（供 qlh.py 调用）。
 
     ``supervisor`` 非空时，本机后端冷启动在**启动屏内**完成（LOGO + 启动条同屏）。
     """
-    api = ApiClient(host=host, port=port)
+    api = ApiClient(host=host, port=port, log_token=log_token)
     KoakumaApp(api, interval=interval, routing_preference=routing_preference,
                show_thinking=show_thinking, supervisor=supervisor).run()
     return 0
@@ -1526,13 +2705,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--interval", type=float, default=5.0)
     parser.add_argument("--route", default="auto")
     parser.add_argument("--thinking", action="store_true")
+    parser.add_argument("--log-token", default="", help="remote log API token")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     return run(args.host, args.port, interval=args.interval,
-               routing_preference=args.route, show_thinking=args.thinking)
+               routing_preference=args.route, show_thinking=args.thinking,
+               log_token=args.log_token)
 
 
 if __name__ == "__main__":

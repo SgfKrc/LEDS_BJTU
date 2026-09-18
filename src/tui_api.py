@@ -16,6 +16,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 try:  # 同目录导入（python src/xxx.py）
@@ -56,14 +57,13 @@ class ApiClient:
 
     # ------------------------------------------------------------ 底层请求
 
-    def request(self, method: str, path: str, body=None, params=None,
-                with_log_token: bool = False, timeout: Optional[float] = None):
-        """``timeout`` 为 None 时用实例超时；模型加载等长操作按需放宽。"""
-        url = self.base_url + "/api" + path
+    def _request_url(self, method: str, url: str, body=None, params=None,
+                     with_log_token: bool = False, timeout: Optional[float] = None):
+        """执行一个已拼好的 URL 请求，供 API 面和根路径文档共用。"""
         if params:
             qs = urllib.parse.urlencode({k: v for k, v in params.items() if v not in (None, "")})
             if qs:
-                url = url + "?" + qs
+                url = url + ("&" if "?" in url else "?") + qs
         data = None
         headers = {"Accept": "application/json"}
         if body is not None:
@@ -103,8 +103,59 @@ class ApiClient:
         except ValueError:
             return {"detail": text}
 
-    def get(self, path, params=None, with_log_token: bool = False):
-        return self.request("GET", path, params=params, with_log_token=with_log_token)
+    def request(self, method: str, path: str, body=None, params=None,
+                with_log_token: bool = False, timeout: Optional[float] = None):
+        """``timeout`` 为 None 时用实例超时；模型加载等长操作按需放宽。"""
+        normalized = path if path.startswith("/") else "/" + path
+        if normalized.startswith("/api/"):
+            normalized = normalized[4:]
+        return self._request_url(
+            method, self.base_url + "/api" + normalized, body=body, params=params,
+            with_log_token=with_log_token, timeout=timeout)
+
+    def request_root(self, method: str, path: str, body=None, params=None,
+                     timeout: Optional[float] = None):
+        """访问后端根路径，主要用于 ``/openapi.json`` 等非业务 API。"""
+        normalized = path if path.startswith("/") else "/" + path
+        return self._request_url(
+            method, self.base_url + normalized, body=body, params=params,
+            timeout=timeout)
+
+    def get_openapi(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """读取运行中后端的实际 OpenAPI 路由表。"""
+        value = self.request_root("GET", "/openapi.json", timeout=timeout)
+        return value if isinstance(value, dict) else {}
+
+    def download(self, path: str, target: Path, *, with_log_token: bool = False,
+                 timeout: Optional[float] = 60.0) -> Path:
+        """下载二进制端点响应到本地文件（日志导出/模型文件等）。"""
+        normalized = path if path.startswith("/") else "/" + path
+        if normalized.startswith("/api/"):
+            normalized = normalized[4:]
+        url = self.base_url + "/api" + normalized
+        headers = {"Accept": "*/*"}
+        if with_log_token and self.log_token:
+            headers["X-QLH-Log-Token"] = self.log_token
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read()
+        except urllib.error.HTTPError as exc:
+            raise ApiError("HTTP %d: %s" % (exc.code, exc.reason), status=exc.code) from exc
+        except (urllib.error.URLError, OSError) as exc:
+            raise ApiError("无法下载 %s：%s" % (url, exc)) from exc
+        target = Path(target)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        except OSError as exc:
+            raise ApiError("无法保存下载文件 %s：%s" % (target, exc)) from exc
+        return target
+
+    def get(self, path, params=None, with_log_token: bool = False,
+            timeout: Optional[float] = None):
+        return self.request("GET", path, params=params,
+                           with_log_token=with_log_token, timeout=timeout)
 
     def post(self, path, body=None, params=None):
         return self.request("POST", path, body=body, params=params)

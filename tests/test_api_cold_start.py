@@ -3,6 +3,7 @@ from pathlib import Path
 import subprocess
 import sys
 import textwrap
+import threading
 import types
 import asyncio
 import pytest
@@ -191,6 +192,61 @@ def test_paged_kv_cache_import_keeps_torch_out_of_default_gguf_process():
     )
     assert completed.returncode == 0, completed.stderr or completed.stdout
     assert "PAGED_IMPORT_OK" in completed.stdout
+
+
+def test_default_gguf_api_import_and_bootstrap_queries_do_not_load_torch():
+    """The installed Torch wheel must stay cold on the default llama.cpp path."""
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["QLH_INFERENCE_ENGINE"] = "llama_cpp"
+    env["PYTHONPATH"] = os.pathsep.join(
+        item for item in (str(repo_root / "src"), env.get("PYTHONPATH", "")) if item
+    )
+    probe = (
+        "import asyncio, sys; "
+        "import api_server; "
+        "assert 'torch' not in sys.modules; "
+        "asyncio.run(api_server.health()); "
+        "asyncio.run(api_server.get_status()); "
+        "asyncio.run(api_server.list_available_models()); "
+        "assert 'torch' not in sys.modules; "
+        "print('DEFAULT_GGUF_BOOTSTRAP_OK')"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+    assert "DEFAULT_GGUF_BOOTSTRAP_OK" in completed.stdout
+
+
+def test_health_is_available_while_runtime_startup_is_still_running(monkeypatch):
+    """Liveness must not wait for the full local runtime startup sequence."""
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_startup():
+        started.set()
+        release.wait(timeout=5)
+
+    monkeypatch.setattr(api_server, "_startup_device_detection", blocked_startup)
+    try:
+        with TestClient(api_server.app) as client:
+            assert started.wait(timeout=1), "runtime startup thread did not start"
+            health = client.get("/api/health")
+            readiness = client.get("/api/ready")
+            assert health.status_code == 200
+            assert health.json()["status"] == "ok"
+            assert readiness.status_code == 200
+            assert readiness.json()["ready"] is False
+            assert readiness.json()["process_ready"] is True
+            release.set()
+    finally:
+        release.set()
 
 
 def test_reserved_pipeline_worker_does_not_auto_load_full_model(monkeypatch):

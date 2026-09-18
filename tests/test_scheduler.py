@@ -6683,6 +6683,70 @@ def test_tcp_bind_failure_keeps_master_local_pipeline_available(monkeypatch):
         sched.stop()
 
 
+def test_distributed_start_defers_network_identity(monkeypatch):
+    """A slow network probe must not block the local scheduler start."""
+    import config as cfg
+    import transport_port
+    import scheduler as scheduler_mod
+
+    monkeypatch.setattr(scheduler_mod, "RUN_MODE", "distributed", raising=False)
+    monkeypatch.setattr(scheduler_mod, "NODE_ROLE", "master", raising=False)
+    monkeypatch.setattr(cfg, "NODE_ROLE", "master", raising=False)
+
+    class FakeServer:
+        _running = True
+        host = "0.0.0.0"
+        port = 8888
+
+        def start(self, **kwargs):
+            return None
+
+        def stop(self):
+            self._running = False
+
+        def get_client_ids(self):
+            return []
+
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+
+    def slow_lan_probe():
+        probe_started.set()
+        release_probe.wait(timeout=5)
+        return "100.64.0.10"
+
+    monkeypatch.setattr(transport_port, "create_server", lambda *args: FakeServer())
+    monkeypatch.setattr(transport_port, "detect_lan_ip", slow_lan_probe)
+    monkeypatch.setattr(transport_port, "get_mac_addresses", lambda: ["001122334455"])
+
+    sched = Scheduler()
+    monkeypatch.setattr(sched, "init_nodes", lambda: None)
+    monkeypatch.setattr(sched, "deactivate_spare_master_on_startup", lambda: None)
+    monkeypatch.setattr(sched, "can_join_existing_master", lambda: False)
+
+    start_done = threading.Event()
+    errors = []
+
+    def run_start():
+        try:
+            sched.start(host="0.0.0.0", port=8888)
+        except BaseException as exc:  # pragma: no cover - diagnostic path
+            errors.append(exc)
+        finally:
+            start_done.set()
+
+    starter = threading.Thread(target=run_start, daemon=True)
+    starter.start()
+    try:
+        assert start_done.wait(timeout=5), "scheduler start waited for network identity"
+        assert not errors
+        assert probe_started.wait(timeout=1), "deferred network probe did not start"
+    finally:
+        release_probe.set()
+        starter.join(timeout=2)
+        sched.stop()
+
+
 def test_distributed_toggle_is_process_owned():
     """运行时分布式开关应立即生效。"""
     sched = Scheduler()

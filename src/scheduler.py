@@ -103,11 +103,10 @@ class _TaskWorkerActiveAttempt:
     lease_expired: bool = False
     cancel_reason: str = ""
 
-# PyTorch 可用性检查（分布式推理按需导入，避免 llama.cpp 模式下硬依赖）
-try:
-    import torch  # pyright: ignore[reportMissingImports]
-except ImportError:
-    torch = None  # type: ignore[assignment]
+# PyTorch is optional. Keep it out of the llama.cpp control-plane import path.
+from torch_runtime import LazyTorch, require_torch, torch_available
+
+torch = LazyTorch()
 
 from config import (
     RUN_MODE, HEARTBEAT_INTERVAL,
@@ -137,8 +136,7 @@ _LAYER_ASSIGNMENT_CACHE_VERSION = 3
 
 def _sample_pipeline_token_id(logits, temperature: float, top_p: float) -> int:
     """Sample one token with the same zero-temperature semantics as local inference."""
-    if torch is None:
-        raise RuntimeError("PyTorch 不可用，无法执行流水线采样")
+    torch_module = require_torch()
     if logits is None or logits.ndim != 3 or logits.shape[0] != 1:
         shape = getattr(logits, "shape", None)
         raise ValueError(f"流水线 logits 形状无效: {shape}")
@@ -148,28 +146,28 @@ def _sample_pipeline_token_id(logits, temperature: float, top_p: float) -> int:
     # which can create infinities and poison the CUDA context in multinomial.
     next_logits = logits[:, -1, :].float()
     if float(temperature) <= 0:
-        return int(torch.argmax(next_logits, dim=-1).item())
+        return int(torch_module.argmax(next_logits, dim=-1).item())
 
     scaled_logits = next_logits / max(float(temperature), 1e-5)
-    if not bool(torch.isfinite(scaled_logits).all().item()):
+    if not bool(torch_module.isfinite(scaled_logits).all().item()):
         raise RuntimeError("流水线 logits 包含 NaN/Inf，拒绝执行采样")
-    probs = torch.softmax(scaled_logits, dim=-1)
-    if not bool(torch.isfinite(probs).all().item()):
+    probs = torch_module.softmax(scaled_logits, dim=-1)
+    if not bool(torch_module.isfinite(probs).all().item()):
         raise RuntimeError("流水线采样概率包含 NaN/Inf")
 
-    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+    sorted_probs, sorted_indices = torch_module.sort(probs, descending=True, dim=-1)
     nucleus = min(1.0, max(0.0, float(top_p)))
-    cumsum = torch.cumsum(sorted_probs, dim=-1)
+    cumsum = torch_module.cumsum(sorted_probs, dim=-1)
     cutoff = cumsum > nucleus
     cutoff[..., 1:] = cutoff[..., :-1].clone()
     cutoff[..., 0] = False
     filtered_probs = sorted_probs.masked_fill(cutoff, 0.0)
     probability_sum = filtered_probs.sum(dim=-1, keepdim=True)
-    if (not bool(torch.isfinite(probability_sum).all().item())
+    if (not bool(torch_module.isfinite(probability_sum).all().item())
             or bool((probability_sum <= 0).any().item())):
         raise RuntimeError("流水线采样概率无有效候选 token")
     filtered_probs = filtered_probs / probability_sum
-    sampled_rank = torch.multinomial(filtered_probs, 1)
+    sampled_rank = torch_module.multinomial(filtered_probs, 1)
     return int(sorted_indices.gather(-1, sampled_rank)[0, 0].item())
 
 
@@ -1053,6 +1051,8 @@ class Scheduler:
         self._running = False
         # 启动期后台发现线程必须能被 stop() 立即唤醒，避免停止后仍发起连接。
         self._startup_cancel_event = threading.Event()
+        self._network_identity_thread: Optional[threading.Thread] = None
+        self._network_identity_lock = threading.Lock()
         self.on_task_complete: Optional[Callable] = None
 
         # TCP 服务端（分布式模式下启动）。回调线程通过
@@ -1293,7 +1293,7 @@ class Scheduler:
         self._master_identity_reason: str = ""
 
         if RUN_MODE == "distributed":
-            from transport_port import create_server, detect_lan_ip, get_mac_addresses
+            from transport_port import create_server
 
             # 绑定到 0.0.0.0 接受所有接口连接（而非占位符 192.168.x.x）
             bind_host = host or "0.0.0.0"
@@ -1323,12 +1323,12 @@ class Scheduler:
 
             # 检测实际局域网 IP 和 MAC 地址
             if NODE_ROLE == "master":
-                self._lan_ip = detect_lan_ip()
-                self._mac_addresses = get_mac_addresses()
+                # Network address and MAC identity are populated by the
+                # post-startup worker below.
                 logger.info(f"调度器已启动（分布式模式），监听 {bind_host}:{actual_port}，局域网 IP: {self._lan_ip}，MAC: {self._mac_addresses}")
 
                 # 验证主节点身份（MAC 匹配）
-                self._verify_master_identity()
+                self._master_identity_reason = "startup_deferred"
 
                 # ★ MAC 不匹配时的处理策略
                 if self._master_identity_reason == "mac_mismatch":
@@ -1393,6 +1393,9 @@ class Scheduler:
         else:
             logger.info("调度器已启动（单机模式）")
 
+        if RUN_MODE == "distributed" and NODE_ROLE == "master":
+            self._start_deferred_network_identity()
+
         # 启动流水线请求队列（仅主节点，FIFO 串行）
         if self._effective_role() == "master":
             self.pipeline_queue.start(process_fn=self._process_queued_pipeline_task)
@@ -1401,12 +1404,77 @@ class Scheduler:
         # 已经是 client 的节点由上面的 auto-connect 唯一路径处理；这里只处理
         # 尚未确认身份、可能需要从 provisional master 切换的节点。
         if (self._effective_role() == "master"
+                and self._master_identity_reason != "startup_deferred"
                 and self.can_join_existing_master()):
             threading.Thread(
                 target=self._auto_join_tailnet_master_on_startup,
                 name="tailnet-master-discovery",
                 daemon=True,
             ).start()
+
+    def _start_deferred_network_identity(self) -> None:
+        """Schedule network address, identity, and discovery work after start."""
+        with self._network_identity_lock:
+            thread = self._network_identity_thread
+            if thread is not None and thread.is_alive():
+                return
+            self._network_identity_thread = threading.Thread(
+                target=self._initialize_network_identity,
+                name="network-identity-startup",
+                daemon=True,
+            )
+            self._network_identity_thread.start()
+
+    def _initialize_network_identity(self) -> None:
+        """Complete distributed identity without delaying local service start."""
+        if self._startup_cancel_event.is_set() or not self._running:
+            return
+        try:
+            from transport_port import detect_lan_ip, get_mac_addresses
+
+            self._lan_ip = detect_lan_ip()
+            self._mac_addresses = get_mac_addresses()
+            if self._startup_cancel_event.is_set() or not self._running:
+                return
+
+            if self._effective_role() != "master":
+                return
+            self._verify_master_identity()
+            if self._master_identity_reason == "mac_mismatch":
+                discovery = self.discover_master()
+                if discovery.get("found"):
+                    logger.warning(
+                        "master identity mismatch; switching to discovered master "
+                        "%s:%s",
+                        discovery["master_host"], discovery["master_port"],
+                    )
+                    threading.Thread(
+                        target=self._auto_switch_to_client,
+                        args=(discovery["master_host"], discovery["master_port"]),
+                        name="auto-switch-client",
+                        daemon=True,
+                    ).start()
+                else:
+                    logger.error(
+                        "master identity mismatch; no confirmed master discovered",
+                    )
+            elif self._tcp_server and self._tcp_server._running:
+                if "master" in self.nodes:
+                    self.nodes["master"].address = (
+                        f"{self._lan_ip}:{self._tcp_server.port}"
+                    )
+
+            if (self._master_identity_reason != "mac_mismatch"
+                    and self._effective_role() == "master"
+                    and self.can_join_existing_master()):
+                threading.Thread(
+                    target=self._auto_join_tailnet_master_on_startup,
+                    name="tailnet-master-discovery",
+                    daemon=True,
+                ).start()
+        except Exception as exc:
+            self._master_identity_reason = "network_probe_failed"
+            logger.warning("deferred network identity initialization failed: %s", exc)
 
     def stop(self) -> None:
         """停止调度器"""
@@ -5783,7 +5851,7 @@ class Scheduler:
     def _task_worker_capabilities(self) -> dict:
         """Build an honest PC Full Worker snapshot without loading a model."""
         engines = []
-        if torch is not None:
+        if torch_available():
             engines.append("pytorch")
         try:
             if importlib.util.find_spec("llama_cpp") is not None:
@@ -11087,6 +11155,7 @@ class Scheduler:
             4. 序列化输出（hidden_states 或 logits，不含 KV cache）
             5. 发送 LAYER_RESULT 回主节点
         """
+        require_torch()
         from transport_port import MessageType, serialize_tensor
 
         data = msg.get("data", {})
@@ -12579,6 +12648,7 @@ class Scheduler:
         Returns:
             {"response": str, "thinking": str, "metrics": dict, ...}
         """
+        require_torch()
         import uuid
         from transport_port import MessageType, deserialize_tensor, serialize_tensor
 

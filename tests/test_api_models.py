@@ -340,7 +340,9 @@ def test_local_assets_endpoint_returns_discovery_inventory(monkeypatch):
         "assets": [{"model_id": "qwen3-4b"}],
         "summary": {"total": 1, "total_bytes": 1},
     }
-    monkeypatch.setattr(local_model_assets, "discover_local_model_assets", lambda: expected)
+    monkeypatch.setattr(
+        local_model_assets, "discover_local_model_assets", lambda **_kwargs: expected
+    )
 
     assert asyncio.run(api_server.list_local_model_assets()) == expected
 

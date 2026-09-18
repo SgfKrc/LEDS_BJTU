@@ -55,6 +55,16 @@ class TestApiResponseKeys:
         body = res.json()
         assert set(body.keys()) == {"status", "timestamp"}
 
+    def test_readiness_is_separate_from_health(self, client):
+        health = client.get("/api/health")
+        readiness = client.get("/api/ready")
+        assert set(health.json().keys()) == {"status", "timestamp"}
+        body = readiness.json()
+        assert {"process_ready", "ready", "status", "components"} <= set(body)
+        assert set(body["components"]) == {
+            "local_store", "scheduler", "device_profile",
+        }
+
     def test_auth_capability_is_explicit_when_running_direct_api(self, client, monkeypatch):
         """The standalone API must not make Account fail with a 404 probe."""
         # Keep the direct-mode contract independent from a developer's local

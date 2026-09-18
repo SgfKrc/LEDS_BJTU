@@ -92,6 +92,18 @@ def test_chat_url_enters_unified_tui_without_remote_autostart(monkeypatch):
     ]
 
 
+def test_chat_log_token_reaches_unified_tui(monkeypatch):
+    seen = {}
+
+    def fake_shell(args):
+        seen["args"] = args
+        return 0
+
+    monkeypatch.setattr(qlh, "_run_textual_shell", fake_shell)
+    assert qlh.main(["chat", "--log-token", "secret"]) == 0
+    assert seen["args"] == ["--auto-start", "--screen", "chat", "--log-token", "secret"]
+
+
 def test_chat_help_is_local(capsys):
     assert qlh.main(["chat", "--help"]) == 0
     output = capsys.readouterr().out
@@ -110,3 +122,13 @@ def test_koakuma_is_an_alias_of_qlh():
     assert "qlh.py" in sh, "koakuma.sh 必须调用 qlh.py"
     assert "%*" in bat, "koakuma.bat 必须原样透传参数"
     assert '"$@"' in sh, "koakuma.sh 必须原样透传参数"
+
+
+def test_windows_launchers_are_ascii_only():
+    """cmd 层不应依赖当前代码页；中文文案留给 Python/Textual。"""
+    from pathlib import Path
+
+    root = Path(qlh.__file__).resolve().parent
+    for name in ("qlh.bat", "koakuma.bat", "start_tui.bat", "bjtu.bat", "start_backend.bat"):
+        content = (root / name).read_text(encoding="utf-8")
+        assert all(ord(char) < 128 for char in content), name

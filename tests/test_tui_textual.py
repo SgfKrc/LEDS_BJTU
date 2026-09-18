@@ -3,7 +3,7 @@
 要点：
 * ``tui_api``（协议层）是纯标准库，**没有** textual 也必须能 import 并正确报错；
 * Textual 外壳在**后端不可用**时也必须能安全启动（只显示错误，不崩）；
-* 九屏（聊天/状态/模型/分布式/节点/队列/日志/设备/设置）侧栏导航与外层 Splash→Main 切换必须存在；
+* 十屏（聊天/状态/模型/分布式/节点/队列/日志/设备/设置/端点）侧栏导航与外层 Splash→Main 切换必须存在；
 * 各屏按后端**真实字段**渲染（回归 2026-09-17 的接线错位），聊天后端错误必须可见。
 
 缺 textual 时整个模块跳过（Edge 之外的极简环境仍可跑其余测试）。
@@ -73,14 +73,14 @@ def test_shell_boots_then_switches_to_main():
             sidebar = app.screen.query_one("#sidebar")
             content = app.screen.query_one("#content", ContentSwitcher)
             items = list(app.screen.query("#nav ListItem"))
-            assert len(items) == 9, (
-                "侧栏应有 聊天/状态/模型/分布式/节点/队列/日志/设备/设置 九项")
+            assert len(items) == 10, (
+                "侧栏应有 聊天/状态/模型/分布式/节点/队列/日志/设备/设置/端点 十项")
             assert [item.id for item in items] == [
                 "nav-chat", "nav-status", "nav-models", "nav-cluster", "nav-nodes",
-                "nav-queue", "nav-logs", "nav-device", "nav-settings"]
+                "nav-queue", "nav-logs", "nav-device", "nav-settings", "nav-api"]
             for widget_id in ("#nodes-table", "#queue-table", "#logs-log",
                               "#device-pane", "#gpu-table", "#settings-pane",
-                              "#status-table", "#topbar"):
+                              "#status-table", "#api-table", "#api-result", "#topbar"):
                 assert app.screen.query_one(widget_id) is not None, widget_id
             settings = str(app.screen.query_one("#settings-pane", Static).render())
             assert "会话设置" in settings and "依赖边界" in settings, "设置屏应含会话参数与关于信息"
@@ -203,9 +203,27 @@ class _StubApi:
     port = 8000
     timeout = 5.0
     log_token = ""
+    def __init__(self):
+        self.calls = []
 
     def get(self, path, **kwargs):
         return LIVE_SHAPES.get(path, {})
+
+    def get_openapi(self):
+        return {
+            "paths": {
+                "/api/health": {"get": {"summary": "健康检查", "operationId": "health"}},
+                "/api/models/load": {"post": {"summary": "加载模型", "operationId": "load_model"}},
+                "/api/chat/stream": {"post": {"summary": "流式聊天", "operationId": "chat_stream"}},
+                "/api/sessions/{session_id}": {
+                    "get": {"summary": "会话详情", "operationId": "session_detail"},
+                },
+            }
+        }
+
+    def request(self, method, path, **kwargs):
+        self.calls.append((method, path, kwargs))
+        return {"ok": True, "method": method, "path": path}
 
 
 def test_live_backend_shapes_render_every_page():
@@ -243,6 +261,110 @@ def test_live_backend_shapes_render_every_page():
             status = " ".join(f"{row[0]}={row[1]}" for row in _rows(screen, "#status-table"))
             assert "运行模式=distributed" in status, status
             assert "Qwen-1.8B-Chat（未加载）" in status, status
+
+    _run(_main())
+
+
+def test_health_failure_short_circuits_optional_refreshes():
+    """健康探测失败时不能继续堆叠状态、节点、日志和设备请求。"""
+    from tui_api import ApiError
+    from tui_textual import KoakumaApp
+
+    class _UnavailableApi(_StubApi):
+        def get(self, path, **kwargs):
+            self.calls.append(path)
+            if path == "/health":
+                raise ApiError("fixture backend unavailable")
+            return super().get(path, **kwargs)
+
+    async def _main():
+        api = _UnavailableApi()
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.1), interval=30)
+        app.api = api
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.show_main()
+            await pilot.pause(0.5)
+            assert api.calls == ["/health"], api.calls
+            assert app.screen.health_text == "[red]不可达[/]"
+
+    _run(_main())
+
+
+def test_runtime_readiness_failure_short_circuits_optional_refreshes():
+    """A live API must not fan out while its runtime components are starting."""
+    from tui_textual import KoakumaApp
+
+    class _StartingApi(_StubApi):
+        def get(self, path, **kwargs):
+            self.calls.append(path)
+            if path == "/ready":
+                return {
+                    "process_ready": True,
+                    "ready": False,
+                    "status": "starting",
+                    "components": {
+                        "local_store": True,
+                        "scheduler": False,
+                        "device_profile": False,
+                    },
+                }
+            return super().get(path, **kwargs)
+
+    async def _main():
+        api = _StartingApi()
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.1), interval=30)
+        app.api = api
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.show_main()
+            await pilot.pause(0.5)
+            assert api.calls == ["/health", "/ready"], api.calls
+            assert "初始化中" in app.screen.model_text
+
+    _run(_main())
+
+
+def test_endpoint_workbench_discovers_and_executes_get():
+    """端点页跟随 OpenAPI，GET 可执行，路径模板不能被误发。"""
+    from textual.widgets import Input
+
+    from tui_textual import KoakumaApp
+
+    async def _main():
+        stub = _StubApi()
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.5))
+        app.api = stub
+        async with app.run_test(size=(140, 48)) as pilot:
+            app.show_main()
+            await pilot.pause(1.0)
+            screen = app.screen
+            screen.switch_page("api")
+            await pilot.pause(0.5)
+            assert len(screen.api_operations) == 4
+            assert "GET /api/health" in screen.api_operations
+            assert screen.query_one("#api-path", Input).value == "/health"
+
+            screen.api_selected_key = "GET /api/health"
+            screen.query_one("#api-path", Input).value = "/health"
+            screen.action_api_execute()
+            deadline = time.time() + 3
+            while time.time() < deadline and not stub.calls:
+                await pilot.pause(0.1)
+            assert stub.calls and stub.calls[-1][0:2] == ("GET", "/health")
+
+            screen.api_selected_key = "POST /api/models/load"
+            screen.select_api_operation(screen.api_selected_key)
+            screen.action_api_execute()
+            await pilot.pause(0.2)
+            assert app.screen.__class__.__name__ == "ConfirmScreen"
+            await pilot.press("n")
+            await pilot.pause(0.1)
+            assert len(stub.calls) == 1, "写操作必须先经过确认屏"
+
+            screen.api_selected_key = "GET /api/sessions/{session_id}"
+            screen.select_api_operation(screen.api_selected_key)
+            screen.action_api_execute()
+            await pilot.pause(0.2)
+            assert len(stub.calls) == 1, "未替换的路径参数不应发送请求"
 
     _run(_main())
 

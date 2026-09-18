@@ -289,6 +289,70 @@ def test_models_screen_unload_confirms_and_posts():
     _run(_main())
 
 
+def test_domain_screens_route_functional_operations_to_real_paths():
+    """领域屏操作走专用合同；调试页不是模型/集群/日志功能的替代品。"""
+    async def _main():
+        app, api = _make_app()
+        async with app.run_test(size=(130, 42)) as pilot:
+            screen = await _enter_main(pilot, app)
+
+            screen.switch_page("models")
+            await pilot.pause()
+            screen.submit_model_download({
+                "preset_id": "qwen-0.5b",
+                "source": "huggingface",
+                "allow_cpu": "true",
+            })
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press("y")
+            assert await _wait_for(pilot, lambda: api.find("/models/downloads", "POST") is not None)
+            assert api.find("/models/downloads", "POST")["body"] == {
+                "preset_id": "qwen-0.5b", "source": "huggingface", "allow_cpu": True,
+            }
+
+            screen.model_aux = {"downloads": {"jobs": [{"job_id": "job/1"}]}}
+            screen.submit_model_cancel_download({"job_id": "job/1"})
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press("y")
+            assert await _wait_for(
+                pilot, lambda: api.find("/models/downloads/job%2F1", "DELETE") is not None)
+
+            screen.switch_page("cluster")
+            screen.cluster_aux = {"distributed": {"enabled": False}}
+            screen.action_cluster_toggle()
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press("y")
+            assert await _wait_for(
+                pilot, lambda: api.find("/cluster/config/distributed-inference", "PUT") is not None)
+            assert api.find("/cluster/config/distributed-inference", "PUT")["body"] == {"enabled": True}
+
+            screen.switch_page("nodes")
+            api.responses["/cluster/join/request"] = {"request_code": "qlhjoinreq1.fixture"}
+            screen.submit_cluster_join_request({
+                "master_endpoint": "100.100.52.106:8888",
+                "cluster_id": "qlh-default",
+                "capabilities": "presence,task",
+                "request_ttl_seconds": "600",
+            })
+            assert await _wait_for(pilot, lambda: api.find("/cluster/join/request", "POST") is not None)
+            assert api.find("/cluster/join/request", "POST")["body"]["master_endpoint"] == "100.100.52.106:8888"
+
+            screen.submit_cluster_join_consume({"grant_code": "qlhjoin1.fixture"})
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press("y")
+            assert await _wait_for(pilot, lambda: api.find("/cluster/join/consume", "POST") is not None)
+
+            screen.switch_page("logs")
+            screen.action_logs_stats()
+            assert await _wait_for(pilot, lambda: api.find("/logs/stats", "GET") is not None)
+
+    _run(_main())
+
+
 def test_quant_prefers_int4_over_fp16():
     """量化优先级：注册表给了 int4 就用 int4（后端默认量化，显存最省）。
 
