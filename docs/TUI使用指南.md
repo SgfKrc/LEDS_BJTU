@@ -84,7 +84,7 @@ bjtu --host 100.x.x.x status        # 对远程主节点执行单命令
 bjtu models --json                  # 机读输出（便于脚本消费）
 ```
 
-> 单命令模式与交互模式的区别：交互模式负责"启动后端 + 进入 TUI"；单命令模式只做"处理"，后端必须已在运行（可用 `bjtu` 交互模式或 `start_tui.bat` 先启动）。命令名为**只读子集**（status/models/nodes/queue/device/logs/help），与旧 TUI 的 35 条命令注册表**不再等价**：写操作（关机、切模型、队列暂停/清理、注销节点等）请在交互外壳（`qlh`/`koakuma`）或 API 侧完成。
+> 单命令模式与交互模式的区别：交互模式负责"启动后端 + 进入 TUI"；单命令模式只做"处理"，后端必须已在运行（可用 `bjtu` 交互模式或 `start_tui.bat` 先启动）。命令名为**只读子集**（status/models/nodes/queue/device/logs/help），与旧 TUI 的 35 条命令注册表**不再等价**：写操作请在交互外壳（`qlh`/`koakuma`）或 API 侧完成——外壳当前**已接**：模型加载/卸载（模型屏 `L`/`U`，或 `/model load|unload`）、队列暂停/恢复/策略/清空（队列屏 `P`/`S`/`C`，或 `/queue …`）、会话管理（`/new`、`/resume`、`/rename`、`/sessions`、`/delete-session`、`/reset`）；破坏性与长耗时操作都会先弹确认框。关机、注销节点等仍未接入。
 > ⚠️ 命令必须是**第一个参数**（`bjtu status --port 9000`）；选项在前（`bjtu --port 9000 status`）会被当作交互模式（可能启动后端）。
 
 `bjtu tui` 的后端生命周期行为与 `start_tui.bat` / `start_tui.sh` 相同：探测 `8000` 端口（`QLH_BACKEND_PORT` 可覆盖）→ 未运行则启动后端 → 等待 `/api/health` 就绪 → 进入 TUI；退出 TUI 后后端继续运行。`bjtu ui` 则在相同检查完成后打开普通界面。

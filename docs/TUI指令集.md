@@ -8,7 +8,7 @@
 >
 > 适用范围（**历史**）：`src/tui_admin.py` 的 `/` 命令系统（35 条）参考——命令、别名、参数、选项、退出语义与契约测试。**该实现已于 2026-09-17 归档到 `_to_delete/`**（连同 `COMMANDS` 注册表与 `tests/test_tui_commands.py`），本文档仅作历史记录保留。
 >
-> **现行替代**：交互外壳 `src/tui_textual.py`（Textual，9 屏：聊天/状态/模型/分布式/节点/队列/日志/设备/设置；聊天内 `/help`、`/route`、`/thinking`、`/clear`、`/cancel`、`/quit`）；单命令面 `src/tui_commands.py`（只读：`status`/`models`/`nodes`/`queue`/`device`/`logs`/`help`）。见 [TUI 使用指南](TUI使用指南.md)。
+> **现行替代**：交互外壳 `src/tui_textual.py`（Textual，9 屏：聊天/状态/模型/分布式/节点/队列/日志/设备/设置；聊天内命令由 `src/tui_shared.py` 的 `COMMAND_SPECS` 生成（`/help` 与实现同源）：`/help`、`/model`、`/queue`、`/new`、`/resume`、`/rename`、`/sessions`、`/delete-session`、`/reset`、`/route`、`/thinking`、`/cancel`、`/clear`、`/quit`；写操作另有屏内按键：模型屏 `L` 加载 / `U` 卸载，队列屏 `P` 暂停-恢复 / `S` 策略 / `C` 清空排队，全部先经确认框）；单命令面 `src/tui_commands.py`（只读：`status`/`models`/`nodes`/`queue`/`device`/`logs`/`help`）。见 [TUI 使用指南](TUI使用指南.md)。
 >
 > 关联文档：[TUI 使用指南](TUI使用指南.md)（启动/参数/排障）· [TUI 适配实施计划](TUI适配实施计划.md)（历史 7 屏网关契约）· [微服务架构改造计划](微服务架构改造计划.md)
 
@@ -135,7 +135,7 @@
 
 - **命令系统单元测试**：`tests/test_tui_commands.py` 与聊天/CLI/启动测试覆盖当前 35 条命令及统一入口；本轮定向回归 **173 passed**。新增/修改命令必须同步源码 `COMMANDS`、测试与本文档。
 - **8 屏走查**：既有 7 个管理屏继续沿用 `scripts/tui_walkthrough.py`；聊天屏与统一入口由 `tests/test_tui_chat_screen.py`、`tests/test_qlh_cli.py` 和 backend supervisor 测试覆盖。
-- **契约来源**：`src/tui_admin.py` `COMMANDS` 注册表（1946 行起）是命令的唯一事实来源；`/help` 与 `bjtu --help` 输出由 `_build_command_help_lines()` 自动生成，与本文档总表一致。
+- **契约来源**：交互外壳的命令**唯一事实来源**是 `src/tui_shared.py` 的 `COMMAND_SPECS`（`/help` 由它生成，未实现的命令不登记——曾出现过 `/image*` 写着却不能用）。`src/tui_admin.py` 已归档到 `_to_delete/`，故本文档第二节的 35 条总表是**已归档旧 TUI 的历史参考**，不代表现行能力。
 
 ---
 

@@ -46,7 +46,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import Screen
+from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     ContentSwitcher,
     DataTable,
@@ -69,10 +69,22 @@ from tui_api import (  # noqa: E402
     DEFAULT_PORT,
     ApiClient,
     ApiError,
+    activate_session,
     cancel_generation,
+    clear_backend_history,
+    clear_queue,
+    create_session,
+    delete_session,
     iter_chat_payloads,
+    list_sessions,
+    load_model,
+    pause_queue,
+    rename_session,
+    resume_queue,
+    set_queue_strategy,
+    unload_model,
 )
-from tui_shared import API_PATHS, format_metrics  # noqa: E402
+from tui_shared import API_PATHS, COMMAND_SPECS, format_metrics  # noqa: E402
 
 LOGO = (
     "  ██╗  ██╗ ██████╗  █████╗ ██╗  ██╗██╗   ██╗███╗   ███╗ █████╗ \n"
@@ -94,10 +106,10 @@ BAR_EMPTY = "░"
 PAGES: List[Tuple[str, str, str]] = [
     ("chat", "聊天", "SSE 流式对话 · /help 查看命令"),
     ("status", "状态", "运行概览 · /health /status /models"),
-    ("models", "模型", "模型注册表（19 个内置）· /models"),
+    ("models", "模型", "注册表 · L 加载光标行 · U 卸载当前 · /models"),
     ("cluster", "分布式", "集群资源合计 · /cluster/resources"),
     ("nodes", "节点", "成员与角色 · /cluster/nodes"),
-    ("queue", "队列", "MLFQ 三级队列 · /cluster/queue"),
+    ("queue", "队列", "MLFQ 三级 · P 暂停/恢复 · S 策略 · C 清空排队"),
     ("logs", "日志", "聚合日志（末尾 200 行）· /cluster/nodes/log-aggregate"),
     ("device", "设备", "本机设备画像与 GPU · /device/profile"),
     ("settings", "设置", "会话参数与依赖边界"),
@@ -254,6 +266,49 @@ class SplashScreen(Screen):
         self.app.show_main()
 
 
+class ConfirmScreen(ModalScreen[bool]):
+    """写操作前的模态确认。
+
+    项目偏好：**涉及删除/破坏的操作必须先列出将影响的内容**（dry-run 精神），
+    所以 ``body`` 必须写清"将要删/改什么"，不能只问一句"确定吗"。
+    """
+
+    BINDINGS = [
+        Binding("y,enter", "confirm", "确认", show=False),
+        Binding("n,escape", "cancel", "取消", show=False),
+    ]
+
+    CSS = """
+    ConfirmScreen { align: center middle; }
+    #confirm-box {
+        width: 70; max-width: 92%; height: auto;
+        border: thick $warning; background: $surface; padding: 1 2;
+    }
+    #confirm-title { height: auto; text-style: bold; color: $warning; }
+    #confirm-body { height: auto; margin: 1 0; }
+    #confirm-keys { height: auto; color: $text-muted; }
+    """
+
+    def __init__(self, title: str, body: str, *, confirm_label: str = "确认") -> None:
+        super().__init__()
+        self.confirm_title = title
+        self.confirm_body = body
+        self.confirm_label = confirm_label
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-box"):
+            yield Static(self.confirm_title, id="confirm-title")
+            yield Static(self.confirm_body, id="confirm-body")
+            yield Static(f"[b]y[/] / [b]{self.confirm_label}[/] 执行    [b]n[/] / Esc 取消",
+                         id="confirm-keys")
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 class ChatPane(Vertical):
     """聊天页：SSE 流式输出（等价旧 ChatScreen 的事件处理）。"""
 
@@ -305,14 +360,7 @@ class ChatPane(Vertical):
             return
         event.input.value = ""
         if text in {"/help", "/?"}:
-            self.write_line(
-                "[b]可用命令[/]\n"
-                "  [b]/help[/]                    显示本帮助\n"
-                "  [b]/route[/] auto|local|distributed|required   路由偏好\n"
-                "  [b]/thinking[/] on|off         是否展示思考流\n"
-                "  [b]/clear[/]                   清空当前会话显示\n"
-                "  [b]/cancel[/]                  取消正在生成的请求\n"
-                "  [b]/quit[/]                    退出外壳（后端保持运行）")
+            self.write_line(self.help_markup())
             return
         if text == "/quit":
             self.app.exit()
@@ -348,6 +396,30 @@ class ChatPane(Vertical):
             else:
                 self.query_one("#chat-status", Static).update("当前没有正在生成的请求")
             return
+        if text.startswith("/model"):
+            self.cmd_model(text)
+            return
+        if text.startswith("/queue"):
+            self.cmd_queue(text)
+            return
+        if text == "/sessions":
+            self.cmd_sessions()
+            return
+        if text.startswith("/new"):
+            self.cmd_new(text)
+            return
+        if text.startswith("/resume"):
+            self.cmd_resume(text)
+            return
+        if text.startswith("/rename"):
+            self.cmd_rename(text)
+            return
+        if text == "/delete-session":
+            self.cmd_delete_session()
+            return
+        if text == "/reset":
+            self.cmd_reset()
+            return
         if text.startswith("/"):
             self.query_one("#chat-status", Static).update(f"[red]未知命令: {text}")
             return
@@ -355,6 +427,215 @@ class ChatPane(Vertical):
         self.write_line(f"[b $accent]你[/] {text}")
         self.write_line("[dim]assistant[/] ")
         self.stream_reply(text)
+
+    # ------------------------------------------------------------ 命令（模型/队列/会话）
+
+    def help_markup(self) -> str:
+        """由 ``COMMAND_SPECS`` 生成帮助（与实现同源，不会"写着却不能用"）。"""
+        lines = ["[b]可用命令[/]"]
+        for spec in COMMAND_SPECS:
+            usage = spec["name"] + (f" {spec['args']}" if spec["args"] else "")
+            lines.append(f"  [b]{usage}[/]  {spec['desc']}")
+        lines.append("  [dim]写操作都会先弹确认框；模型/队列也可在对应屏用按键操作[/]")
+        return "\n".join(lines)
+
+    def status_line(self, text: str) -> None:
+        self.query_one("#chat-status", Static).update(text)
+
+    def cmd_model(self, text: str) -> None:
+        parts = text.split()
+        usage = "用法: /model load <model_id> [engine] [quant] | /model unload"
+        if len(parts) >= 2 and parts[1].lower() == "unload":
+            self.app.confirm(
+                "卸载模型",
+                "将释放后端当前本地模型：正在生成/排队的请求会失败，"
+                "对话上下文与 KV 缓存一并清空。",
+                lambda: self.model_call("unload", "", "", ""),
+                confirm_label="卸载")
+            return
+        if len(parts) < 3 or parts[1].lower() != "load":
+            self.status_line(usage)
+            return
+        model_id = parts[2]
+        engine = parts[3] if len(parts) > 3 else "llama_cpp"
+        quant = parts[4] if len(parts) > 4 else "int4"
+        self.app.confirm(
+            "加载模型",
+            f"将要加载：[b]{model_id}[/]\n引擎 [b]{engine}[/] · 量化 [b]{quant}[/]\n"
+            "耗时约 5-20 秒；期间会先卸载当前模型，失败由后端自动回滚。",
+            lambda: self.model_call("load", model_id, engine, quant),
+            confirm_label="加载")
+
+    @work(thread=True, exclusive=True, group="modelctl")
+    def model_call(self, kind: str, model_id: str, engine: str, quant: str) -> None:
+        app = self.app
+        label = "加载" if kind == "load" else "卸载"
+        self.app.call_from_thread(self.status_line, f"正在{label}模型（5-20 秒）…")
+        try:
+            if kind == "load":
+                load_model(app.api, model_id, engine=engine, quant_type=quant)
+                text = f"[green]模型已加载[/] {model_id}"
+            else:
+                unload_model(app.api)
+                text = "[green]模型已卸载[/]"
+        except ApiError as exc:
+            text = f"[red]模型{label}失败[/]：{exc}"
+        self.app.call_from_thread(self.write_line, text)
+        self.app.call_from_thread(self.status_line, text)
+
+    def cmd_queue(self, text: str) -> None:
+        parts = text.split()
+        usage = "用法: /queue pause | resume | strategy <fifo|mlfq> | clear"
+        if len(parts) == 2 and parts[1].lower() in {"pause", "resume"}:
+            self.queue_call(parts[1].lower())
+            return
+        if len(parts) == 3 and parts[1].lower() == "strategy" \
+                and parts[2].lower() in {"fifo", "mlfq"}:
+            self.queue_call("strategy", parts[2].lower())
+            return
+        if len(parts) == 2 and parts[1].lower() == "clear":
+            self.app.confirm(
+                "清空排队任务",
+                "将清空后端**排队中**的任务（执行中的不受影响）。此操作不可撤销。",
+                lambda: self.queue_call("clear"),
+                confirm_label="清空")
+            return
+        self.status_line(usage)
+
+    @work(thread=True, exclusive=True, group="queuectl")
+    def queue_call(self, action: str, value: str = "") -> None:
+        app = self.app
+        self.app.call_from_thread(self.status_line, f"队列操作 {action} …")
+        try:
+            if action == "pause":
+                pause_queue(app.api)
+            elif action == "resume":
+                resume_queue(app.api)
+            elif action == "strategy":
+                set_queue_strategy(app.api, value)
+            elif action == "clear":
+                clear_queue(app.api)
+            else:
+                raise ValueError(f"未知队列动作: {action}")
+            text = f"[green]队列 {action} 完成[/]" + (f" → {value}" if value else "")
+        except (ApiError, ValueError) as exc:
+            text = f"[red]队列 {action} 失败[/]：{exc}"
+        self.app.call_from_thread(self.write_line, text)
+        self.app.call_from_thread(self.status_line, text)
+
+    def cmd_sessions(self) -> None:
+        self.session_call("list", "")
+
+    def cmd_new(self, text: str) -> None:
+        self.session_call("new", text[len("/new"):].strip())
+
+    def cmd_resume(self, text: str) -> None:
+        session_id = text[len("/resume"):].strip()
+        if not session_id:
+            self.status_line("用法: /resume <session_id>（先 /sessions 查看）")
+            return
+        self.session_call("resume", session_id)
+
+    def cmd_rename(self, text: str) -> None:
+        title = text[len("/rename"):].strip()
+        if not title:
+            self.status_line("用法: /rename <新标题>")
+            return
+        self.session_call("rename", title)
+
+    def cmd_delete_session(self) -> None:
+        session_id = getattr(self.app, "session_id", None)
+        if not session_id:
+            self.status_line("当前没有会话（先 /new 或 /resume）")
+            return
+        self.app.confirm(
+            "删除会话",
+            f"将删除会话 [b]{session_id}[/] **及其全部对话消息**（数据库 + 内存）。\n"
+            "此操作不可撤销。",
+            lambda: self.session_call("delete", session_id),
+            confirm_label="删除")
+
+    def cmd_reset(self) -> None:
+        self.app.confirm(
+            "清空后端会话历史",
+            "将清空后端当前会话的对话历史与 KV 缓存（本地显示一并清空）。\n"
+            "会话本身保留；此操作不可撤销。",
+            lambda: self.session_call("reset", ""),
+            confirm_label="清空")
+
+    def render_history(self, messages: Any) -> str:
+        """把后端会话历史渲染为对话文本（兼容 role/sender 与 content/message 两种命名）。"""
+        if not isinstance(messages, list):
+            return "[dim]（该会话没有历史消息）[/]"
+        lines = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or message.get("sender") or "?")
+            label = {"user": "[b $accent]你[/]",
+                     "assistant": "[dim]assistant[/]"}.get(role, role)
+            content = message.get("content") or message.get("message") or ""
+            lines.append(f"{label} {content}")
+        return "\n".join(lines) or "[dim]（该会话没有历史消息）[/]"
+
+    @work(thread=True, exclusive=True, group="sessions")
+    def session_call(self, action: str, value: str) -> None:
+        """会话管理（新建/恢复/重命名/删除/清空后端历史）——全部在 worker 线程里跑。"""
+        app = self.app
+        clear_local = False
+        self.app.call_from_thread(self.status_line, f"会话操作 {action} …")
+        try:
+            if action == "list":
+                items = list_sessions(app.api)
+                if not items:
+                    self.app.call_from_thread(
+                        self.status_line, "（后端没有会话；用 /new 创建一个）")
+                    return
+                lines = ["[b]最近会话[/]（用 /resume <id> 恢复）"]
+                for item in items[:10]:
+                    sid = item.get("session_id") or item.get("id") or "—"
+                    title = item.get("title") or "(未命名)"
+                    count = item.get("message_count")
+                    lines.append(f"  [b]{sid}[/]  {title}"
+                                 + (f" · {count} 条" if count is not None else ""))
+                self.app.call_from_thread(self.write_line, "\n".join(lines))
+                self.app.call_from_thread(self.status_line, f"共 {len(items)} 个会话")
+                return
+            if action == "new":
+                result = create_session(app.api, value or None)
+                session_id = str(result.get("session_id") or result.get("id") or "") or None
+                app.session_id = session_id
+                text = f"[green]已新建会话[/] {session_id or ''}".strip()
+                clear_local = True
+            elif action == "resume":
+                result = activate_session(app.api, value)
+                app.session_id = value
+                messages = result.get("messages") or result.get("history") or []
+                self.app.call_from_thread(self.replace_transcript, self.render_history(messages))
+                text = f"[green]已恢复会话[/] {value}（{len(messages)} 条消息）"
+            elif action == "rename":
+                if not app.session_id:
+                    raise ValueError("当前没有会话")
+                rename_session(app.api, app.session_id, value)
+                text = f"[green]已重命名[/] → {value}"
+            elif action == "delete":
+                delete_session(app.api, value)
+                if app.session_id == value:
+                    app.session_id = None
+                text = f"[green]已删除会话[/] {value}"
+                clear_local = True
+            elif action == "reset":
+                clear_backend_history(app.api)
+                text = "[green]后端会话历史已清空[/]"
+                clear_local = True
+            else:
+                raise ValueError(f"未知会话动作: {action}")
+        except (ApiError, ValueError) as exc:
+            text = f"[red]会话 {action} 失败[/]：{exc}"
+        if clear_local:
+            self.app.call_from_thread(self.clear_chat)
+        self.app.call_from_thread(self.write_line, text)
+        self.app.call_from_thread(self.status_line, text)
 
     @work(thread=True, exclusive=True, group="chat")
     def stream_reply(self, message: str) -> None:
@@ -422,11 +703,23 @@ class MainScreen(Screen):
 
     BINDINGS = [
         Binding("r", "reload", "刷新"),
+        Binding("l", "load_model", "加载模型"),
+        Binding("u", "unload_model", "卸载模型"),
+        Binding("p", "queue_toggle_pause", "暂停/恢复"),
+        Binding("s", "queue_cycle_strategy", "调度策略"),
+        Binding("c", "queue_clear", "清空排队"),
         Binding("]", "next_page", "下一屏"),
         Binding("[", "prev_page", "上一屏"),
         Binding("q", "quit_app", "退出"),
         Binding("ctrl+c", "quit_app", "退出", show=False),
     ]
+
+    #: 每屏可用键提示（让"这屏能做什么"可见；与 BINDINGS 保持一致）
+    PAGE_KEYS = {
+        "chat": "/help 看命令",
+        "models": "L 加载 · U 卸载",
+        "queue": "P 暂停/恢复 · S 策略 · C 清空排队",
+    }
 
     def __init__(self) -> None:
         super().__init__()
@@ -434,6 +727,13 @@ class MainScreen(Screen):
         self.health_text = "…"
         self.model_text = "…"
         self.log_line_count = 0
+        #: ``/models`` 原始项（模型屏写操作需要 engine/quant/可用性）
+        self.model_rows: Dict[str, Dict[str, Any]] = {}
+        #: ``/cluster/queue`` 最近一次结果（队列屏写操作需要 paused/strategy/深度）
+        self.queue_state: Dict[str, Any] = {}
+        #: 最近一次写操作的结果文本（操作没有回显窗口，故常驻侧栏摘要）
+        self.op_status = ""
+        self.cuda_available: Optional[bool] = None
 
     # ------------------------------------------------------------ 版式
 
@@ -582,9 +882,11 @@ class MainScreen(Screen):
 
     def refresh_topbar(self) -> None:
         page = PAGES[self.page_index]
+        keys = self.PAGE_KEYS.get(page[0])
+        hint = f"   [dim]·[/]   [dim]{keys}[/]" if keys else ""
         self.query_one("#topbar", Static).update(
             f"[dim]后端[/] {self.app.api.base_url}"
-            f"   [dim]·[/]   [dim]当前[/] {page[1]}"
+            f"   [dim]·[/]   [dim]当前[/] {page[1]}{hint}"
             f"   [dim]·[/]   [dim]r 刷新 · [ ] 上下屏 · q 退出[/]")
         self.update_sidebar(page)
 
@@ -597,7 +899,8 @@ class MainScreen(Screen):
                 f"{api.host}:{api.port}\n"
                 f"[dim]健康[/] {self.health_text}\n"
                 f"[dim]模型[/] {self.model_text}\n"
-                f"[dim]刷新[/] {self.app.interval:.0f}s   [dim]当前[/] {page[1]}")
+                f"[dim]刷新[/] {self.app.interval:.0f}s   [dim]当前[/] {page[1]}"
+                + (f"\n[dim]最近[/] {self.op_status}" if self.op_status else ""))
         except Exception:  # noqa: BLE001 - 挂载期间可能尚未就绪
             pass
 
@@ -680,6 +983,7 @@ class MainScreen(Screen):
         """
         table = self.query_one("#models-table", DataTable)
         table.clear()
+        self.model_rows = {}
         if "_error" in registry:
             table.add_row("", "[red]后端不可用[/]", "", "", "", registry["_error"])
             return
@@ -696,6 +1000,7 @@ class MainScreen(Screen):
                 state = f"[yellow]不可用[/] {item.get('unavailable_reason') or ''}".strip()
             else:
                 state = "[green]可用[/]"
+            self.model_rows[model_id] = item
             table.add_row(
                 "[green]◆[/]" if model_id == active else "",
                 model_id,
@@ -703,6 +1008,7 @@ class MainScreen(Screen):
                 _join(item.get("available_formats")),
                 str(item.get("preferred_engine") or "—"),
                 state,
+                key=model_id,  # 写操作按 row key 取模型，不依赖行序
             )
 
     # ------------------------------------------------------------ 分布式页
@@ -804,6 +1110,7 @@ class MainScreen(Screen):
         pane = self.query_one("#queue-pane", Static)
         table = self.query_one("#queue-table", DataTable)
         table.clear()
+        self.queue_state = queue if "_error" not in queue else {}
         if "_error" in queue:
             pane.update(f"[red]队列不可用[/]  ·  {queue['_error']}")
             return
@@ -915,6 +1222,8 @@ class MainScreen(Screen):
 
         gpus = profile.get("gpus") or []
         selected = profile.get("selected_gpu_index", 0)
+        self.cuda_available = any(
+            bool(gpu.get("cuda_available")) for gpu in gpus if isinstance(gpu, dict))
         if not gpus:
             table.add_row("", "[dim]（未检测到 GPU）[/]", "", "", "", "")
             return
@@ -929,6 +1238,196 @@ class MainScreen(Screen):
                 str(gpu.get("vram_total_gb", "—")),
                 str(gpu.get("driver_version") or "—"),
             )
+
+    # ------------------------------------------------------------ 写操作
+
+    def write_status(self, text: str) -> None:
+        """写操作没有独立回显窗口，结果常驻侧栏摘要（避免"点了没反应"）。"""
+        self.op_status = text
+        self.refresh_topbar()
+
+    def finish_write_action(self, text: str) -> None:
+        """写操作收尾：回显 + 重新拉取受影响的数据。"""
+        self.write_status(text)
+        self.action_reload()
+        self.load_pages()
+
+    def finish_light_action(self, text: str) -> None:
+        self.write_status(text)
+        self.load_pages()
+
+    def selected_model_id(self, table: DataTable) -> str:
+        """取光标行的 row key（``fill_models`` 以 model_id 作 key，不依赖行序）。"""
+        if table.row_count == 0:
+            return ""
+        try:
+            row_key, _column_key = table.coordinate_to_cell_key(table.cursor_coordinate)
+        except Exception:  # noqa: BLE001 - 空表或坐标越界
+            return ""
+        return str(row_key.value or "")
+
+    def model_load_args(self, info: Dict[str, Any]) -> Tuple[str, str]:
+        """由注册表项推出 (engine, quant_type)——不猜参数，缺省即后端默认。
+
+        量化**优先 int4**（与后端 ``LoadModelRequest`` 默认值一致，显存占用最低）；
+        注册表未给 int4 时才退到其列表首项。
+        """
+        engine = str(info.get("preferred_engine") or "llama_cpp")
+        quant_types = info.get("quant_types") or info.get("quantizations") or []
+        if isinstance(quant_types, dict):
+            quant_types = list(quant_types.keys())
+        elif isinstance(quant_types, str):
+            quant_types = [quant_types]
+        choices = [str(item) for item in quant_types]
+        if "int4" in choices:
+            quant = "int4"
+        else:
+            quant = choices[0] if choices else "int4"
+        return engine, quant
+
+    def action_load_model(self) -> None:
+        """模型屏 L：加载光标行的模型（先确认，再走 worker，避免阻塞 UI）。"""
+        if PAGES[self.page_index][0] != "models":
+            self.write_status("[yellow]请先切到「模型」屏（侧栏或 [ ] 键）[/]")
+            return
+        table = self.query_one("#models-table", DataTable)
+        model_id = self.selected_model_id(table)
+        if not model_id:
+            self.write_status("[yellow]模型屏没有可加载的行[/]")
+            return
+        info = self.model_rows.get(model_id) or {}
+        if info.get("is_available") is False:
+            reason = info.get("unavailable_reason") or "后端未说明原因"
+            self.write_status(f"[yellow]{model_id} 不可用[/]：{reason}")
+            return
+        engine, quant = self.model_load_args(info)
+        name = str(info.get("name") or model_id)
+        note = ""
+        if engine in {"pytorch", "island"} and self.cuda_available is False:
+            note = "\n[yellow]提示[/]：本机 CUDA 不可用，PyTorch/孤岛引擎会走 CPU（很慢）。"
+        self.app.confirm(
+            "加载模型",
+            f"将要加载：[b]{model_id}[/]（{name}）\n"
+            f"引擎 [b]{engine}[/] · 量化 [b]{quant}[/]\n"
+            "耗时约 5-20 秒；期间会**先卸载当前模型**，失败由后端自动回滚。"
+            f"{note}",
+            lambda: self.run_model_action("load", model_id, engine, quant),
+            confirm_label="加载",
+        )
+
+    def action_unload_model(self) -> None:
+        """模型屏 U：卸载当前模型（破坏性：会中断正在生成的请求）。"""
+        if PAGES[self.page_index][0] != "models":
+            self.write_status("[yellow]请先切到「模型」屏（侧栏或 [ ] 键）[/]")
+            return
+        active = self.model_text.replace("[yellow]", "").replace("[/]", "")
+        self.app.confirm(
+            "卸载模型",
+            f"将**释放**当前本地模型：{active or '（当前未加载）'}\n"
+            "影响：正在生成/排队的请求会失败；KV 缓存与对话上下文一并清空。\n"
+            "之后需要重新「加载模型」才能对话。",
+            lambda: self.run_model_action("unload", "", "", ""),
+            confirm_label="卸载",
+        )
+
+    @work(thread=True, exclusive=True, group="modelctl")
+    def run_model_action(self, kind: str, model_id: str, engine: str, quant: str) -> None:
+        """模型控制走独立 worker 组：加载 5-20 秒，不能阻塞 UI 也不与只读刷新互斥。"""
+        app = self.app
+        if kind == "load":
+            self.app.call_from_thread(self.set_busy, f"正在加载 {model_id}（5-20 秒）…")
+            try:
+                result = load_model(app.api, model_id, engine=engine, quant_type=quant)
+                detail = result.get("message") or result.get("detail") or ""
+                text = f"[green]模型已加载[/] {model_id} {detail}".strip()
+            except ApiError as exc:
+                text = f"[red]模型加载失败[/]：{exc}"
+        else:
+            self.app.call_from_thread(self.set_busy, "正在卸载模型…")
+            try:
+                unload_model(app.api)
+                text = "[green]模型已卸载[/]"
+            except ApiError as exc:
+                text = f"[red]模型卸载失败[/]：{exc}"
+        self.app.call_from_thread(self.finish_write_action, text)
+
+    def set_busy(self, text: str) -> None:
+        self.write_status(f"[yellow]…[/] {text}")
+
+    def action_queue_toggle_pause(self) -> None:
+        """队列屏 P：暂停/恢复接受新请求（可逆，无需确认）。"""
+        if PAGES[self.page_index][0] != "queue":
+            self.write_status("[yellow]请先切到「队列」屏[/]")
+            return
+        if not self.queue_state:
+            self.write_status("[yellow]队列数据不可用，无法操作[/]")
+            return
+        self.run_queue_action("resume" if self.queue_state.get("paused") else "pause")
+
+    def action_queue_cycle_strategy(self) -> None:
+        """队列屏 S：mlfq ↔ fifo（影响新请求的排队行为，故先确认）。"""
+        if PAGES[self.page_index][0] != "queue":
+            self.write_status("[yellow]请先切到「队列」屏[/]")
+            return
+        if not self.queue_state:
+            self.write_status("[yellow]队列数据不可用，无法操作[/]")
+            return
+        current = str(self.queue_state.get("strategy") or "mlfq").lower()
+        target = "fifo" if current == "mlfq" else "mlfq"
+        self.app.confirm(
+            "切换调度策略",
+            f"当前 [b]{current}[/] → [b]{target}[/]\n"
+            "影响：新入队请求的优先级与老化（aging）行为；执行中的任务不受影响。",
+            lambda: self.run_queue_action("strategy", target),
+            confirm_label="切换",
+        )
+
+    def action_queue_clear(self) -> None:
+        """队列屏 C：清空排队任务（列出将清空的内容后再确认）。"""
+        if PAGES[self.page_index][0] != "queue":
+            self.write_status("[yellow]请先切到「队列」屏[/]")
+            return
+        if not self.queue_state:
+            self.write_status("[yellow]队列数据不可用，无法操作[/]")
+            return
+        pending = self.queue_state.get("queue_size", "—")
+        listing = []
+        for level in ("q0", "q1", "q2"):
+            tasks = self.queue_state.get(level) or []
+            if not tasks:
+                continue
+            names = ", ".join(
+                str(task.get("task_id") or task.get("id") or "task")
+                for task in tasks[:5] if isinstance(task, dict))
+            listing.append(f"  {level.upper()}（{len(tasks)}）：{names}")
+        self.app.confirm(
+            "清空排队任务",
+            f"将清空**排队中**的任务（queue_size={pending}），执行中的任务**不受影响**：\n"
+            + ("\n".join(listing) if listing else "  （三级队列当前为空）")
+            + "\n此操作不可撤销。",
+            lambda: self.run_queue_action("clear"),
+            confirm_label="清空",
+        )
+
+    @work(thread=True, exclusive=True, group="queuectl")
+    def run_queue_action(self, action: str, value: str = "") -> None:
+        app = self.app
+        self.app.call_from_thread(self.set_busy, f"队列操作 {action} …")
+        try:
+            if action == "pause":
+                pause_queue(app.api)
+            elif action == "resume":
+                resume_queue(app.api)
+            elif action == "strategy":
+                set_queue_strategy(app.api, value)
+            elif action == "clear":
+                clear_queue(app.api)
+            else:
+                raise ValueError(f"未知队列动作: {action}")
+            text = f"[green]队列 {action} 完成[/]" + (f" → {value}" if value else "")
+        except (ApiError, ValueError) as exc:
+            text = f"[red]队列 {action} 失败[/]：{exc}"
+        self.app.call_from_thread(self.finish_light_action, text)
 
     # ------------------------------------------------------------ 动作
 
@@ -990,6 +1489,15 @@ class KoakumaApp(App):
         if isinstance(screen, SplashScreen):
             screen.wait_for_backend = False
             screen.set_status(f"[red]后端启动失败[/]：{message}（按任意键进入界面查看状态）")
+
+    def confirm(self, title: str, body: str, on_confirm, *,
+                confirm_label: str = "确认") -> None:
+        """弹出模态确认；用户确认后才执行 ``on_confirm()``（写操作的统一闸门）。"""
+        def _done(approved: Optional[bool]) -> None:
+            if approved:
+                on_confirm()
+
+        self.push_screen(ConfirmScreen(title, body, confirm_label=confirm_label), _done)
 
     def show_main(self) -> None:
         """从启动屏切到主界面（重复调用安全）。"""

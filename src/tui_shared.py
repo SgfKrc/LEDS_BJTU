@@ -54,6 +54,19 @@ API_PATHS = {
     "health": "/health",
     "system_status": "/status",
     "models_list": "/models",
+
+    # ---- 写操作面（用户 2026-09-17 裁决：模型控制 + 会话管理 + 队列控制）----
+    # 权限：后端 model_api_access.require_model_api_source() 对 **loopback 默认放行**，
+    # 故本机 TUI 可直接调用；从节点远程控制主节点需显式 QLH_MODEL_API_TRUSTED_CIDRS。
+    "models_load": "/models/load",          # POST {engine, quant_type, use_compile, model_id}
+    "models_unload": "/models/unload",      # POST（无请求体）
+    "chat_clear": "/chat/clear",            # POST 清空后端当前会话历史 + KV 缓存
+    "session_detail": "/sessions/{session_id}",            # PUT 重命名 / DELETE 删除
+    "session_activate": "/sessions/{session_id}/activate",  # POST 恢复会话
+    "cluster_queue_pause": "/cluster/queue/pause",          # POST（仅主节点）
+    "cluster_queue_resume": "/cluster/queue/resume",        # POST（仅主节点）
+    "cluster_queue_strategy": "/cluster/queue/strategy",    # POST {strategy: fifo|mlfq}
+    "cluster_queue_clear": "/cluster/queue/clear",          # POST（仅主节点）
 }
 
 # ============================================================
@@ -210,20 +223,24 @@ def parse_session_line(session: Dict[str, Any]) -> str:
 # T9 命令注册表（/help 与校验共用）
 # ============================================================
 
+#: 命令注册表 —— **只登记已实现的命令**（ChatPane.on_input_submitted 分支与之一一对应）；
+#: 未实现的旧规范条目（/image、/images、/image-clear）已移除，避免 /help "写着却不能用"。
 COMMAND_SPECS: List[Dict[str, str]] = [
-    {"name": "/new", "args": "", "desc": "创建并切换新会话"},
-    {"name": "/resume", "args": "<session_id>", "desc": "恢复历史会话"},
+    {"name": "/new", "args": "[title]", "desc": "新建并切换会话（POST /sessions）"},
+    {"name": "/resume", "args": "<session_id>", "desc": "恢复历史会话并渲染其消息"},
     {"name": "/rename", "args": "<title>", "desc": "重命名当前会话"},
-    {"name": "/delete-session", "args": "", "desc": "删除当前会话"},
+    {"name": "/sessions", "args": "", "desc": "列出最近会话"},
+    {"name": "/delete-session", "args": "", "desc": "删除当前会话及其全部消息（需确认）"},
+    {"name": "/reset", "args": "", "desc": "清空后端会话历史与 KV 缓存（需确认）"},
+    {"name": "/model", "args": "load <id> [engine] [quant] | unload",
+     "desc": "加载/卸载模型（需确认；仅 loopback 后端可调用）"},
+    {"name": "/queue", "args": "pause | resume | strategy <fifo|mlfq> | clear",
+     "desc": "队列控制（clear 需确认）"},
     {"name": "/route", "args": "auto|local|distributed|required",
      "desc": "设置请求级路由偏好"},
-    {"name": "/image", "args": "<path>", "desc": "添加本地 PNG/JPEG/WebP 图片"},
-    {"name": "/images", "args": "", "desc": "查看待发送图片"},
-    {"name": "/image-clear", "args": "", "desc": "移除待发送图片"},
-    {"name": "/cancel", "args": "", "desc": "取消当前生成"},
-    {"name": "/clear", "args": "", "desc": "清空当前会话（需确认）"},
     {"name": "/thinking", "args": "on|off", "desc": "思考内容展示"},
-    {"name": "/sessions", "args": "", "desc": "列出最近会话"},
+    {"name": "/cancel", "args": "", "desc": "取消当前生成"},
+    {"name": "/clear", "args": "", "desc": "清空本地显示（不动后端；清后端用 /reset）"},
     {"name": "/help", "args": "", "desc": "显示本帮助"},
     {"name": "/quit", "args": "", "desc": "退出聊天页"},
 ]

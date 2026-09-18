@@ -16,7 +16,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 try:  # 同目录导入（python src/xxx.py）
     from tui_sse import SSEDecoder, decode_json_event
@@ -57,7 +57,8 @@ class ApiClient:
     # ------------------------------------------------------------ 底层请求
 
     def request(self, method: str, path: str, body=None, params=None,
-                with_log_token: bool = False):
+                with_log_token: bool = False, timeout: Optional[float] = None):
+        """``timeout`` 为 None 时用实例超时；模型加载等长操作按需放宽。"""
         url = self.base_url + "/api" + path
         if params:
             qs = urllib.parse.urlencode({k: v for k, v in params.items() if v not in (None, "")})
@@ -71,8 +72,9 @@ class ApiClient:
         if with_log_token and self.log_token:
             headers["X-QLH-Log-Token"] = self.log_token
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        effective_timeout = self.timeout if timeout is None else float(timeout)
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=effective_timeout) as resp:
                 text = resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as e:
             detail = ""
@@ -88,10 +90,10 @@ class ApiClient:
         except urllib.error.URLError as e:
             reason = getattr(e, "reason", e)
             if isinstance(reason, (TimeoutError, OSError)) and "timed out" in str(reason):
-                raise ApiError("请求超时（>%.0fs）: %s" % (self.timeout, url))
+                raise ApiError("请求超时（>%.0fs）: %s" % (effective_timeout, url))
             raise ApiError("无法连接后端 %s（%s）。%s" % (self.base_url, reason, BACKEND_HINT))
         except TimeoutError:
-            raise ApiError("请求超时（>%.0fs）: %s" % (self.timeout, url))
+            raise ApiError("请求超时（>%.0fs）: %s" % (effective_timeout, url))
         except OSError as e:
             raise ApiError("网络错误 %s: %s。%s" % (self.base_url, e, BACKEND_HINT))
         if not text:
@@ -110,12 +112,129 @@ class ApiClient:
     def put(self, path, body=None):
         return self.request("PUT", path, body=body)
 
+    def delete(self, path, body=None, params=None, timeout: Optional[float] = None):
+        return self.request("DELETE", path, body=body, params=params, timeout=timeout)
+
 
 def cancel_generation(api: ApiClient, generation_id: str) -> None:
     """取消某次生成；``generation_id`` 含 ``/`` 时必须 safe="" 编码。"""
     path = API_PATHS["chat_cancel"].format(
         generation_id=urllib.parse.quote(generation_id, safe=""))
     api.post(path)
+
+
+# ============================================================
+# 写操作：模型控制 / 会话管理 / 队列控制
+# ============================================================
+# 权限边界：后端 ``model_api_access.require_model_api_source()`` 对 loopback 默认放行
+# （``is_model_api_source_trusted`` → 127.0.0.1 直接 True），因此**本机 TUI 可直接调用**；
+# 从节点远程控制主节点需要主节点显式配置 ``QLH_MODEL_API_TRUSTED_CIDRS``。
+
+#: 模型加载/卸载耗时约 5-20 秒（后端 /models/load 注释），故放宽超时
+MODEL_CONTROL_TIMEOUT = 180.0
+
+QUEUE_STRATEGIES = ("mlfq", "fifo")
+
+
+def _as_dict(value: Any) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {"value": value}
+
+
+def _quoted(**values: Any) -> Dict[str, str]:
+    """路径参数必须 safe="" 编码（session_id 可能含 "/"）。"""
+    return {key: urllib.parse.quote(str(value), safe="") for key, value in values.items()}
+
+
+def load_model(api: ApiClient, model_id: Optional[str] = None, *, engine: str = "llama_cpp",
+               quant_type: str = "int4", use_compile: bool = False) -> Dict[str, Any]:
+    """加载/切换模型（POST ``/api/models/load``）。
+
+    后端内部走 ``switch_model``，因此**失败会自动回滚**到上一个模型；耗时 5-20 秒，
+    期间先卸载旧模型。注意 ``/api/models/switch`` 仅 CUDA 可用（非 CUDA 返回 403），
+    故统一走本接口。
+    """
+    body: Dict[str, Any] = {
+        "engine": engine,
+        "quant_type": quant_type,
+        "use_compile": bool(use_compile),
+    }
+    if model_id:
+        body["model_id"] = model_id
+    return _as_dict(api.request("POST", API_PATHS["models_load"], body=body,
+                               timeout=MODEL_CONTROL_TIMEOUT))
+
+
+def unload_model(api: ApiClient) -> Dict[str, Any]:
+    """显式释放本地 LLM（POST ``/api/models/unload``）。"""
+    return _as_dict(api.request("POST", API_PATHS["models_unload"],
+                               timeout=MODEL_CONTROL_TIMEOUT))
+
+
+def clear_backend_history(api: ApiClient) -> Dict[str, Any]:
+    """清空后端当前会话的历史与 KV 缓存（POST ``/api/chat/clear``）。"""
+    return _as_dict(api.post(API_PATHS["chat_clear"]))
+
+
+# ------------------------------------------------------------ 会话管理
+
+def list_sessions(api: ApiClient) -> List[Dict[str, Any]]:
+    """``GET /api/sessions`` → 会话 dict 列表（兼容裸列表与 ``{sessions: [...]}``）。"""
+    value = api.get(API_PATHS["sessions"])
+    if isinstance(value, list):
+        items = value
+    elif isinstance(value, dict):
+        items = value.get("sessions") or value.get("items") or []
+    else:
+        items = []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def create_session(api: ApiClient, title: Optional[str] = None) -> Dict[str, Any]:
+    """新建并激活会话（POST ``/api/sessions``）。"""
+    body = {"title": title} if title else {}
+    return _as_dict(api.post(API_PATHS["sessions"], body=body))
+
+
+def activate_session(api: ApiClient, session_id: str) -> Dict[str, Any]:
+    """切换到指定会话并取回历史（POST ``/sessions/{id}/activate``）。"""
+    path = API_PATHS["session_activate"].format(**_quoted(session_id=session_id))
+    return _as_dict(api.post(path))
+
+
+def rename_session(api: ApiClient, session_id: str, title: str) -> Dict[str, Any]:
+    """重命名会话（PUT ``/sessions/{id}``）。"""
+    path = API_PATHS["session_detail"].format(**_quoted(session_id=session_id))
+    return _as_dict(api.put(path, {"title": title}))
+
+
+def delete_session(api: ApiClient, session_id: str) -> Dict[str, Any]:
+    """删除会话及其全部对话消息（DELETE ``/sessions/{id}``）——破坏性，调用方须先确认。"""
+    path = API_PATHS["session_detail"].format(**_quoted(session_id=session_id))
+    return _as_dict(api.delete(path))
+
+
+# ------------------------------------------------------------ 队列控制
+
+def pause_queue(api: ApiClient) -> Dict[str, Any]:
+    """暂停接受新请求（POST ``/cluster/queue/pause``，仅主节点）。"""
+    return _as_dict(api.post(API_PATHS["cluster_queue_pause"]))
+
+
+def resume_queue(api: ApiClient) -> Dict[str, Any]:
+    """恢复接受新请求（POST ``/cluster/queue/resume``，仅主节点）。"""
+    return _as_dict(api.post(API_PATHS["cluster_queue_resume"]))
+
+
+def set_queue_strategy(api: ApiClient, strategy: str) -> Dict[str, Any]:
+    """切换调度策略（POST ``/cluster/queue/strategy``）。"""
+    if strategy not in QUEUE_STRATEGIES:
+        raise ValueError("调度策略只能是 %s" % " | ".join(QUEUE_STRATEGIES))
+    return _as_dict(api.post(API_PATHS["cluster_queue_strategy"], {"strategy": strategy}))
+
+
+def clear_queue(api: ApiClient) -> Dict[str, Any]:
+    """清空排队任务（POST ``/cluster/queue/clear``）——不影响执行中的任务，仍须确认。"""
+    return _as_dict(api.post(API_PATHS["cluster_queue_clear"]))
 
 
 def iter_chat_payloads(
