@@ -468,7 +468,10 @@ class Gemma4PipelineAdapter:
             raise Gemma4AdapterError("Gemma 4 requires the native Cache representation")
         try:
             return DynamicCache(config=self.text_config)
-        except TypeError:
+        except (TypeError, AttributeError):
+            # ⚠️ transformers 5.x 的 DynamicCache.__init__ 会调用 config.get_text_config()，
+            #    而测试里的假 config 常是 SimpleNamespace（无该方法）⇒ 必须一并兜住，
+            #    否则会把「config 不够完整」误报成适配器失败（实测 5.17 下就是这里红的）。
             return DynamicCache()
 
     def cache_sequence_length(self, cache: Any) -> int:

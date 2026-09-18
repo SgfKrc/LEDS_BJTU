@@ -441,31 +441,56 @@ def test_mask_island_url_strips_credentials():
 # ================================================================
 
 def _import_model_module():
-    """容器内 torch stub 无 torch.nn / 无 transformers，注入最小桩后导入。"""
+    """容器内 torch stub 无 torch.nn / 无 transformers，注入最小桩后导入。
+
+    ⚠️ 这里注入的是**进程级全局**（`sys.modules` 与 `torch.nn` 属性），因此必须在
+    finally 里复原 —— 否则会污染同进程的后续测试。实测：若本用例先跑，它把
+    `sys.modules["transformers"]` 换成 stub 且不还原，后续
+    `test_inference_service_protocol::test_build_app_client_role_gates_chat` 就会在
+    「假 transformers（没有 DisjunctiveConstraint）」上失败（与 transformers 版本无关，
+    属既存的测试卫生问题，5.x 只是让它更容易暴露）。
+    """
     import torch
 
-    if "torch.nn" not in sys.modules:
-        nn_stub = types.ModuleType("torch.nn")
+    had_torch_nn_module = "torch.nn" in sys.modules
+    saved_torch_nn = getattr(torch, "nn", None)
+    had_transformers = "transformers" in sys.modules
+    try:
+        if not had_torch_nn_module:
+            nn_stub = types.ModuleType("torch.nn")
 
-        class _Module:  # noqa: N801 - 与 torch.nn.Module 同名
-            pass
+            class _Module:  # noqa: N801 - 与 torch.nn.Module 同名
+                pass
 
-        nn_stub.Module = _Module
-        nn_stub.ModuleList = list
-        sys.modules["torch.nn"] = nn_stub
-        torch.nn = nn_stub
+            nn_stub.Module = _Module
+            nn_stub.ModuleList = list
+            sys.modules["torch.nn"] = nn_stub
+            torch.nn = nn_stub
 
-    if "transformers" not in sys.modules:
-        tf_stub = types.ModuleType("transformers")
-        for name in (
-            "AutoConfig", "AutoModelForCausalLM",
-            "AutoTokenizer", "BitsAndBytesConfig",
-        ):
-            setattr(tf_stub, name, type(name, (), {}))
-        sys.modules["transformers"] = tf_stub
+        if not had_transformers:
+            tf_stub = types.ModuleType("transformers")
+            for name in (
+                "AutoConfig", "AutoModelForCausalLM",
+                "AutoTokenizer", "BitsAndBytesConfig",
+            ):
+                setattr(tf_stub, name, type(name, (), {}))
+            sys.modules["transformers"] = tf_stub
 
-    import model_module
-    return model_module
+        import model_module
+        return model_module
+    finally:
+        # 复原注入的桩（只还原**本次**注入的那些）
+        if not had_transformers:
+            sys.modules.pop("transformers", None)
+            # ⚠️ model_module 是在**假 transformers**下导入的 ⇒ 它把桩类绑定进了自己的命名空间。
+            #    若不一并移除，后续测试（例如 test_inference_service_protocol 经
+            #    inference_svc_main → model_module）会拿到这个「桩版 model_module」，
+            #    从而在看起来像「transformers 缺符号」的地方失败。
+            sys.modules.pop("model_module", None)
+        if not had_torch_nn_module:
+            sys.modules.pop("torch.nn", None)
+            if saved_torch_nn is not None:
+                torch.nn = saved_torch_nn
 
 
 def test_select_engine_prefers_island_when_enabled(mock_island_server, monkeypatch):

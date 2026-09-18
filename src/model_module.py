@@ -46,6 +46,17 @@ _configure_huggingface_cache()
 import psutil
 import torch
 import torch.nn as nn
+
+# ★ transformers 5.x 兼容 shim：必须在「导入 transformers 之后、使用它的远程代码加载之前」
+#   执行。原因：transformers 5.x 的 dynamic_module_utils.check_imports 在加载任何 remote code
+#   （如 Qwen-1.8B 的 modeling_qwen.py）时会逐个 import 它声明的依赖，而
+#   transformers_stream_generator 顶层引用了 5.x 已移除的 5 个符号，其 ImportError 会被直接抛出
+#   ⇒ 连模型都加载不了。详见 src/transformers5_compat.py。
+import transformers as _transformers  # noqa: F401  (仅为确保 transformers 先于 shim 导入)
+from transformers5_compat import install as _install_transformers5_compat
+
+_install_transformers5_compat()
+
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -131,18 +142,44 @@ def _layer_idx_holders(layer) -> list:
     return [sub for _name, sub in layer.named_children() if hasattr(sub, "layer_idx")]
 
 
+def _is_hybrid_layer_types(layer_types) -> bool:
+    """``layer_types`` 是否表示「混合层型」（A3 / v4-v5 共用的判定）。
+
+    只有出现**既不是 full_attention、也不是 sliding_attention** 的层才算 hybrid
+    —— 例如 Qwen3.5 的 `linear_attention`（需要 recurrent mask，而非 causal mask）。
+
+    ⚠️ 必须排除 sliding_attention，且**不能只判断「有无 layer_types」**：
+    transformers 5.x 给 `Qwen2Config` 也加上了 `layer_types`（值全为 `full_attention`，
+    实测 24/24），若只判断「有无」会把纯 full-attention 模型误判为 hybrid ⇒
+    走进 MRoPE/逐层 mask 分支 ⇒ RoPE 张量维度错乱。
+    """
+    if not layer_types:
+        return False
+    try:
+        return any(
+            str(item) not in ("full_attention", "sliding_attention")
+            for item in layer_types
+        )
+    except TypeError:
+        return False
+
+
 def _new_dynamic_cache(config=None):
     """构造 ``DynamicCache``（A3：跨 transformers 版本兼容）。
 
     新版（实测 5.17）支持 ``DynamicCache(config=...)``，会按 ``config.layer_types`` 建出
     linear/full 混合层 —— hybrid 架构（Qwen3.5）**必须**这样建，否则 ``cache.layers[layer_idx]``
     越界。旧版（4.x）没有该关键字 ⇒ 回退到空构造（对纯 full-attention 的 Qwen2 足够）。
+
+    ⚠️ 5.x 的 `DynamicCache.__init__` 会调用 `config.get_text_config()`，而测试里的假 config
+    常是 `SimpleNamespace`（没有该方法）⇒ 除 `TypeError` 外还要兜住 `AttributeError`，
+    否则会把「config 不够完整」误报成失败（实测 test_gemma4_pipeline_adapter 就是这样红的）。
     """
     from transformers.cache_utils import DynamicCache
 
     try:
         return DynamicCache(config=config)
-    except TypeError:
+    except (TypeError, AttributeError):
         return DynamicCache()
 
 
@@ -2303,11 +2340,8 @@ class ModelManager:
         if cfg is None:
             return False
         text_cfg = getattr(cfg, "text_config", None) or cfg
-        layer_types = getattr(text_cfg, "layer_types", None) or []
-        try:
-            return any(str(item) != "full_attention" for item in layer_types)
-        except TypeError:
-            return False
+        # ★ A3：复用共享判定（排除 sliding_attention；不能只看「有无 layer_types」）
+        return _is_hybrid_layer_types(getattr(text_cfg, "layer_types", None))
 
     def _maybe_apply_compile(self) -> None:
         """按与 ``_load_pytorch`` 相同的条件决定是否启用算子融合。
@@ -3157,9 +3191,15 @@ class ModelManager:
                 #   flash_attention_2 → None（flash 内核自行处理因果掩码）
                 #   sdpa + 纯因果 → None（SDPA is_causal 路径）
                 #   eager / 含填充 → 4D (batch,1,seq,seq) 因果掩码
-                # ★ A3：hybrid 判定（Qwen3.5 等会在 config 里给出 layer_types）。
-                #   刻意放在 try/else 之外 —— 任何分支（含 import 失败回退）下都必须有定义。
-                layer_types = getattr(transformer.config, "layer_types", None)
+                # ★ A3：hybrid 判定。**不能只看「有无 layer_types」** —— transformers 5.x 给
+                #   Qwen2Config 也加上了 layer_types（实测 24/24 全是 full_attention），
+                #   只判断有无会把纯 full-attention 模型误判为 hybrid，进而出错。
+                #   非 hybrid 时显式置 None，使下游的 `if layer_types:` 分支自动走原路径。
+                #   放在 try/else 之外 —— 任何分支（含 import 失败回退）下都必须有定义。
+                _cfg_layer_types = getattr(transformer.config, "layer_types", None)
+                layer_types = (
+                    _cfg_layer_types if _is_hybrid_layer_types(_cfg_layer_types) else None
+                )
                 mask_fallback_error: Optional[Exception] = None
                 mask_parameters = {}
                 try:
