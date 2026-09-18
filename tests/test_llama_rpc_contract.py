@@ -38,3 +38,15 @@ def test_renew_extends_an_active_lease():
     assert renewed.accepted is True
     assert renewed.lease.lease_expires_at > lease.lease_expires_at
     assert renewed.lease.lease_ttl_seconds == 5
+
+
+def test_read_only_fencing_check_rejects_reassigned_lease():
+    book = RpcShardLeaseBook()
+    first = book.assign("shard-0", "rpc-a", "abc", {})
+
+    assert book.check(first.lease_id, first.epoch).reason == "current"
+    second = book.reassign("shard-0", "rpc-b", "abc", {})
+
+    assert book.check(first.lease_id, first.epoch).reason == "stale_lease"
+    assert book.check(second.lease_id, first.epoch).reason == "stale_epoch"
+    assert book.check(second.lease_id, second.epoch).accepted is True

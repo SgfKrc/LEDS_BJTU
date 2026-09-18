@@ -14,7 +14,8 @@ api_server 的运行时反向 import（scheduler.py 中 12 处 `import api_serve
 ModelManager 等价。
 """
 import threading
-from typing import Any, Optional, Protocol
+from dataclasses import dataclass
+from typing import Any, Callable, Optional, Protocol
 
 from koakuma_engine import (
     BackendCapabilities,
@@ -58,6 +59,34 @@ class InferenceHost(Protocol):
     def native_vision_available(self) -> bool: ...
 
     def ensure_full_model(self): ...
+
+    @property
+    def scheduler_callbacks(self) -> Optional["SchedulerCallbacks"]: ...
+
+
+class SchedulerCallbacks(Protocol):
+    """Explicit callbacks required by scheduler control-plane features."""
+
+    active_task_graph_model_identity: Callable[[], Any]
+    execute_task_worker_stage: Callable[[Any, Any], dict]
+    build_model_chat_prompt: Callable[..., str]
+    thinking_system_prompt: str
+    snapshot_recent_logs: Callable[[], tuple[list[dict], int]]
+    filter_recent_logs: Callable[..., list[dict]]
+    format_model_response: Callable[..., tuple[str, Optional[str]]]
+
+
+@dataclass(frozen=True)
+class SchedulerCallbackSet:
+    """Immutable scheduler dependency bundle assembled by the API composition root."""
+
+    active_task_graph_model_identity: Callable[[], Any]
+    execute_task_worker_stage: Callable[[Any, Any], dict]
+    build_model_chat_prompt: Callable[..., str]
+    thinking_system_prompt: str
+    snapshot_recent_logs: Callable[[], tuple[list[dict], int]]
+    filter_recent_logs: Callable[..., list[dict]]
+    format_model_response: Callable[..., tuple[str, Optional[str]]]
 
 
 class _LazyModelManager:
@@ -105,12 +134,11 @@ class _LazyModelManager:
         return repr(instance)
 
 
-# ModelHost 自身持有（不代理给 manager）的属性名（可用 attach 扩展）
+# ModelHost owns these runtime attributes rather than proxying them to a manager.
 _OWN_ATTRS = {
     "_manager", "model_loaded", "generation_config", "current_quant",
-    "full_chat_execution_lock",
+    "full_chat_execution_lock", "scheduler_callbacks",
 }
-_ATTACHED_ATTRS: set[str] = set()
 
 
 class ModelHost:
@@ -136,6 +164,7 @@ class ModelHost:
             "do_sample": True,
         })
         object.__setattr__(self, "full_chat_execution_lock", threading.RLock())
+        object.__setattr__(self, "scheduler_callbacks", None)
 
     @property
     def engine_type(self) -> str:
@@ -182,23 +211,12 @@ class ModelHost:
             island_base_url=island_base_url,
         )
 
-    def attach(self, name: str, value: Any) -> None:
-        """注册自有属性（存于 ModelHost 自身，不走 manager 代理）。
+    def configure_scheduler_callbacks(self, callbacks: SchedulerCallbacks) -> None:
+        """Install the scheduler's complete, typed callback contract atomically."""
 
-        供 api_server 在模块加载完成后挂载需向 scheduler 暴露的回调
-        （如 _execute_task_worker_stage / _active_task_graph_model_identity），
-        避免 scheduler 反向 import api_server（阶段 0.2）。
-        """
-        _OWN_ATTRS.add(name)
-        _ATTACHED_ATTRS.add(name)
-        object.__setattr__(self, name, value)
-
-    def get_attachment(self, name: str) -> Any:
-        """Return an explicitly attached callback without invoking manager proxying."""
-
-        if name not in _ATTACHED_ATTRS:
-            return None
-        return object.__getattribute__(self, "__dict__").get(name)
+        if callbacks is None:
+            raise TypeError("scheduler callbacks are required")
+        object.__setattr__(self, "scheduler_callbacks", callbacks)
 
     def peek_manager(self) -> Any:
         """Return an already-created manager without triggering lazy import."""
@@ -429,7 +447,7 @@ class ModelHost:
 
 
 # 全局单例：api_server 与 scheduler 共享（0.4）
-model_host: InferenceHost = ModelHost()
+model_host = ModelHost()
 
 
 def get_model_host() -> ModelHost:

@@ -4,7 +4,7 @@
   - ModelHost 满足 InferenceHost 协议（鸭子类型：方法签名齐全）
   - ModelHost 属性代理：manager 属性读写转发；自有属性（model_loaded/
     generation_config/full_chat_execution_lock）留在宿主
-  - attach() 回调挂载（api_server 暴露 _execute_task_worker_stage 等）
+  - SchedulerCallbackSet 显式回调注入（api_server 组合根暴露的执行能力）
   - model_host 单例可被 scheduler 默认注入（get_model_host）
 """
 import sys
@@ -18,6 +18,7 @@ import threading
 from model_host import (
     InferenceHost,
     ModelHost,
+    SchedulerCallbackSet,
     get_model_host,
     model_host,
 )
@@ -64,31 +65,47 @@ class TestInferenceHostProtocol:
         assert host.generation_config["max_new_tokens"] == 2048
 
 
-class TestModelHostAttach:
-    """api_server 向 host 挂载回调（消除 scheduler 反向 import）。"""
+def _callback_set(marker="default"):
+    return SchedulerCallbackSet(
+        active_task_graph_model_identity=lambda: marker,
+        execute_task_worker_stage=lambda request, cancel_event: {"marker": marker},
+        build_model_chat_prompt=lambda tokenizer, messages, **kwargs: marker,
+        thinking_system_prompt=f"thinking:{marker}",
+        snapshot_recent_logs=lambda: ([{"marker": marker}], 1),
+        filter_recent_logs=lambda entries, **kwargs: list(entries),
+        format_model_response=lambda text, **kwargs: (text, None),
+    )
 
-    def test_attach_roundtrip(self):
-        host = ModelHost()
 
-        def fake_cb(x):
-            return x + 1
+class TestSchedulerCallbackInjection:
+    """Scheduler callbacks are one explicit, immutable protocol bundle."""
 
-        host.attach("_fake_callback", fake_cb)
-        assert host.get_attachment("_fake_callback")(1) == 2
-
-    def test_attach_overrides_manager_proxy(self):
-        # attach 后属性读取优先取宿主自身
-        host = ModelHost()
-        host.attach("_execute_task_worker_stage", lambda: "attached")
-        assert host.get_attachment("_execute_task_worker_stage")() == "attached"
-
-    def test_attachment_lookup_is_instance_scoped_and_lazy(self):
+    def test_callback_bundle_is_instance_scoped_and_lazy(self):
         attached = ModelHost()
-        attached.attach("_instance_callback", lambda: "attached")
+        callbacks = _callback_set("attached")
+        attached.configure_scheduler_callbacks(callbacks)
         untouched = ModelHost()
 
-        assert untouched.get_attachment("_instance_callback") is None
+        assert attached.scheduler_callbacks is callbacks
+        assert untouched.scheduler_callbacks is None
         assert untouched.runtime_status()["manager_loaded"] is False
+
+    def test_callback_bundle_keyword_order_does_not_change_wiring(self):
+        values = {
+            "active_task_graph_model_identity": lambda: "identity",
+            "execute_task_worker_stage": lambda request, cancel_event: {"ok": True},
+            "build_model_chat_prompt": lambda tokenizer, messages, **kwargs: "prompt",
+            "thinking_system_prompt": "thinking",
+            "snapshot_recent_logs": lambda: ([], 0),
+            "filter_recent_logs": lambda entries, **kwargs: entries,
+            "format_model_response": lambda text, **kwargs: (text, None),
+        }
+        callbacks = SchedulerCallbackSet(**dict(reversed(list(values.items()))))
+
+        assert callbacks.active_task_graph_model_identity() == "identity"
+        assert callbacks.execute_task_worker_stage(None, None) == {"ok": True}
+        assert callbacks.build_model_chat_prompt(None, []) == "prompt"
+        assert callbacks.thinking_system_prompt == "thinking"
 
 
 class TestModelHostSingleton:
@@ -126,10 +143,13 @@ class TestApiServerIntegration:
         import api_server
         assert api_server.model_manager is model_host
 
-    def test_api_server_attach_present(self):
-        import api_server  # noqa: F401 —— 模块加载即执行 attach
-        assert callable(model_host.get_attachment("_execute_task_worker_stage"))
-        assert callable(model_host.get_attachment("_active_task_graph_model_identity"))
+    def test_api_server_configures_explicit_scheduler_callbacks(self):
+        import api_server
+
+        callbacks = api_server.scheduler.inference_callbacks
+        assert callbacks is model_host.scheduler_callbacks
+        assert callable(callbacks.execute_task_worker_stage)
+        assert callable(callbacks.active_task_graph_model_identity)
 
     def test_no_reverse_import(self):
         # 阶段 0.5 验收项：scheduler 不再 import api_server

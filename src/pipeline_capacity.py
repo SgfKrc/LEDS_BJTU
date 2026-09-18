@@ -182,6 +182,7 @@ def solve_pipeline_capacity(
         "schema_version": CAPACITY_PLAN_SCHEMA_VERSION,
         "model_id": str(descriptor.get("model_id", "") or ""),
         "model_type": str(descriptor.get("model_type", "") or ""),
+        "model_sha256": str(descriptor.get("model_sha256", "") or ""),
         "total_layers": total_layers,
         "raw_model_bytes": raw_model_bytes,
         "safety_margin": safety_margin,

@@ -248,3 +248,29 @@ def plan_rpc_split(
         profile=profile,
         reason="cpu_rpc_conservative_cap" if profile.execution_device == "CPU" else "profile_capacity_cap",
     )
+
+
+def plan_to_tensor_split(
+    decision: RpcSplitDecision,
+    *,
+    total_layers: int | None = None,
+) -> list[float] | None:
+    """把 planner 的层段决策翻译成 llama.cpp 的 ``tensor_split``。
+
+    ``plan_rpc_split`` 回答的是"多少层交给远端 worker"（``rpc_layers``），而 llama.cpp 的
+    ``tensor_split`` 是**各 device 的占比**，顺序与 ``devices`` 一致。引擎侧（见
+    ``LlamaCppEngine.load_model(rpc_split=...)``）约定 ``devices = [本机 CPU, RPC0, ...]``，
+    因此转换就是：:
+
+        [ (total - rpc_layers) / total , rpc_layers / total ]
+
+    返回 ``None`` 表示**不把层放到远端**（未获准或 ``rpc_layers == 0``），调用方据此走
+    纯本机路径，而不是给出一份"全 0 远端"的假分片。
+    """
+    total = int(total_layers if total_layers is not None else decision.total_layers)
+    if total <= 0:
+        raise ValueError("total_layers must be positive")
+    remote = max(0, min(int(decision.rpc_layers), total))
+    if not decision.admitted or remote == 0:
+        return None
+    return [(total - remote) / total, remote / total]

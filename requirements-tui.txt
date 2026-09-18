@@ -1,0 +1,8 @@
+# QLH 交互 TUI 依赖（2026-09-18）。
+#
+# `src/tui_textual.py` 是当前主仓交互入口；旧自绘 ANSI TUI 已归档到
+# `_to_delete/`，因此 Textual 不再是可选增强，也不会自动回退到旧外壳。
+# 只读单命令/CI 仍走 `src/tui_commands.py`，不需要安装本文件。
+#
+# 安装：python -m pip install -r requirements-tui.txt
+textual>=8,<9

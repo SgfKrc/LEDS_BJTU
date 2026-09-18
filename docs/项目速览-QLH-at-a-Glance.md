@@ -78,7 +78,7 @@ huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf Qwen-1_8B-Chat
 
 ```bash
 python src/api_server.py               # 后端 http://localhost:8000
-python -m src.tui_admin --plain --host http://127.0.0.1:8000 # 主线 TUI
+python qlh.py                         # 主线 TUI（Textual 外壳，9 个功能屏 + 1 个调试兜底）
 # 或终端版：./start_tui.sh（Windows: start_tui.bat，自动带后端）
 python -c "import src.api_server"                                   # 后端可导入
 .venv-test\Scripts\python.exe -m pytest tests/ -q --collect-only    # 测试环境就绪
@@ -91,7 +91,7 @@ python -c "import src.api_server"                                   # 后端可�
 - **主线计划**：[主线开发计划：分布式推理与边缘优化](主线开发计划-分布式推理与边缘优化-2026-09-14.md) · **支线计划**：支线开发计划：外置迁移与 Koakumix · [总体下一步计划](总体下一步计划.md)（历史总排期）
 - **新人入门**：[项目技术说明](项目技术说明.md) → [整体架构](整体架构.md) → [模块接口说明](模块接口说明.md)
 - **子项目**：[harness 方案](../harness_workbench/docs/小模型轻量推理harness工作台调研与方案.md) · [qlh-docagent](https://github.com/SgfKrc/qlh-docagent) · [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge) · 联网工具调研
-- **实验与判题**：[DS3 替代 R1 专项](DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) · [亚1B 专项](亚1B小模型专项实验计划.md) · [测试与评判标准](测试与评判标准.md)
+- **实验与判题**：[DS3 替代 R1 专项](archive/DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) · [亚1B 专项](archive/亚1B小模型专项实验计划.md) · [测试与评判标准](测试与评判标准.md)
 
 ## 工程文化
 

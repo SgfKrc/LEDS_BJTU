@@ -34,6 +34,26 @@ def test_pipeline_capacity_endpoint_returns_scheduler_plan(monkeypatch):
     assert response.json() == expected
 
 
+def test_pipeline_reshard_endpoint_returns_scheduler_projection(monkeypatch):
+    expected = {
+        "status": "staged",
+        "epoch": 3,
+        "active_contract_sha256": "a" * 64,
+        "staged": [],
+        "last_decision": {"reason_code": "pipeline_reshard_assets_required"},
+    }
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "get_pipeline_reshard_status",
+        lambda: dict(expected),
+    )
+
+    response = TestClient(api_server.app).get("/api/cluster/pipeline-reshard")
+
+    assert response.status_code == 200
+    assert response.json() == expected
+
+
 def test_pipeline_assignment_file_supports_http_range(monkeypatch, tmp_path):
     model_file = tmp_path / "model.safetensors"
     model_file.write_bytes(b"0123456789")
@@ -320,7 +340,9 @@ def test_local_assets_endpoint_returns_discovery_inventory(monkeypatch):
         "assets": [{"model_id": "qwen3-4b"}],
         "summary": {"total": 1, "total_bytes": 1},
     }
-    monkeypatch.setattr(local_model_assets, "discover_local_model_assets", lambda: expected)
+    monkeypatch.setattr(
+        local_model_assets, "discover_local_model_assets", lambda **_kwargs: expected
+    )
 
     assert asyncio.run(api_server.list_local_model_assets()) == expected
 

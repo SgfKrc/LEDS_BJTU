@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 import ntpath
+import os
 import socket
 import subprocess
 import sys
@@ -28,7 +29,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.llama_rpc_contract import RpcShardLeaseBook
-from src.llama_rpc_planner import RpcNodeProfile, RpcSplitDecision, plan_rpc_split
+from src.llama_rpc_planner import (
+    RpcNodeProfile,
+    RpcSplitDecision,
+    plan_rpc_split,
+    plan_to_tensor_split,
+)
 
 from scripts.llama_rpc_sim import (
     DEFAULT_RUNTIME,
@@ -69,6 +75,9 @@ class PcRpcPlan:
     ssh_tunnel: bool = False
     total_layers: int = 25
     auto_split: bool = True
+    #: 关闭权重 repack（llama.cpp 的 -nr/--no-repack）。跨路径数值对齐用：本机 CPU 的
+    #: CPU_REPACK 与 RPC 路径（权重在远端 buffer，无法 repack）浮点结果不同，见文档 §11/§13。
+    no_repack: bool = False
 
     @property
     def target(self) -> str:
@@ -92,7 +101,7 @@ class PcRpcPlan:
     def host_command(self) -> list[str]:
         rpc_host = "127.0.0.1" if self.ssh_tunnel else self.remote_host
         selected_gpu_layers = self.gpu_layers if self.gpu_layers is not None else 0
-        return [
+        command = [
             str(self.runtime_dir / "llama-server.exe"),
             "--model",
             str(self.model),
@@ -117,6 +126,10 @@ class PcRpcPlan:
             "--log-verbosity",
             "4",
         ]
+        if self.no_repack:
+            # 跨路径数值对齐：关闭 CPU_REPACK（与 Python 引擎的 align_numerics 等价）
+            command.append("--no-repack")
+        return command
 
 
 def build_plan(
@@ -139,6 +152,7 @@ def build_plan(
     ssh_tunnel: bool = False,
     total_layers: int = 25,
     auto_split: bool | None = None,
+    no_repack: bool = False,
 ) -> PcRpcPlan:
     if auto_split is None:
         auto_split = gpu_layers is None
@@ -161,6 +175,7 @@ def build_plan(
         ssh_tunnel=ssh_tunnel,
         total_layers=max(0, int(total_layers)),
         auto_split=bool(auto_split),
+        no_repack=bool(no_repack),
     )
 
 
@@ -202,6 +217,33 @@ def _remote_hash(plan: PcRpcPlan) -> str:
         if len(value) == 64 and all(char in "0123456789ABCDEF" for char in value):
             return value
     raise RuntimeError("remote model hash was not returned")
+
+
+def _local_profile() -> dict[str, Any]:
+    """单机自环（``--engine-local-worker``）用的本机节点画像，字段与 DeviceProfiler 同形。
+
+    走 SSH 的 ``_remote_profile`` 在自环场景里没有意义（对端就是本机），这里直接采集本机；
+    ``psutil`` 缺失时退化为保守常量。
+    """
+    cores = os.cpu_count() or 4
+    total_gb, avail_gb = 16.0, 8.0
+    try:
+        import psutil  # 可选依赖
+
+        memory = psutil.virtual_memory()
+        total_gb = memory.total / 2 ** 30
+        avail_gb = memory.available / 2 ** 30
+    except Exception:  # noqa: BLE001 - 画像缺失不应阻断自环
+        pass
+    return {
+        "node_id": socket.gethostname(),
+        "source": "local-self-loop",
+        "cpu_cores": cores,
+        "cpu_freq_mhz": 2000,
+        "cpu_load_percent": 5,
+        "ram_total_gb": round(total_gb, 1),
+        "ram_available_gb": round(avail_gb, 1),
+    }
 
 
 def _remote_profile(plan: PcRpcPlan) -> dict[str, Any]:
@@ -340,6 +382,32 @@ class RemoteAssetSyncPlan:
             "prepare_script": self.prepare_script,
             "commit_script": self.commit_script,
         }
+
+    def as_pipeline_artifact_availability(
+        self, node_id: str, total_layers: int, *, sync_status: str,
+    ) -> Any:
+        """Expose a verified full-GGUF sync result to the reshard contract.
+
+        The caller may use this only after ``sync_remote_model`` reports
+        ``already_current`` or ``applied``.  The source file is a whole-model
+        GGUF, so it covers every decoder layer in the declared topology.
+        """
+        if sync_status not in {"already_current", "applied"}:
+            raise ValueError(
+                "pipeline artifact availability requires a successful sync result",
+            )
+        from src.pipeline_reshard import PipelineArtifactAvailability
+
+        return PipelineArtifactAvailability(
+            node_id=node_id,
+            model_sha256=self.source_sha256,
+            artifact_kind="gguf",
+            layer_range=(0, int(total_layers)),
+            artifact_sha256=self.source_sha256,
+            verified=True,
+            has_embedding=True,
+            has_lm_head=True,
+        )
 
 
 def _validate_remote_asset_path(remote_path: str) -> str:
@@ -748,7 +816,127 @@ def plan_report(
     }
 
 
-def run_probe(plan: PcRpcPlan, *, check_fallback: bool = True) -> dict[str, Any]:
+ENGINE_SMOKE = ROOT / "scripts" / "llama_rpc_engine_smoke.py"
+
+
+def _run_engine_python(
+    plan: PcRpcPlan,
+    decision: RpcSplitDecision,
+    *,
+    python_exe: str,
+    local_worker: bool,
+    run_id: str,
+    timeout: float | None = None,
+    align_numerics: bool = False,
+) -> dict[str, Any]:
+    """用 ``LlamaCppEngine`` 作为执行端（替代 ``llama-server.exe --rpc``）。
+
+    复用本脚本已有的远端 worker / SSH tunnel 生命周期，把 endpoint 与**planner 的层段决策
+    换算出的 tensor_split** 交给引擎；所有实际加载与生成都在 ``llama_rpc_engine_smoke.py``
+    里完成（需要带 GGML_RPC 的解释器，因此走子进程）。
+    """
+    split = plan_to_tensor_split(decision)
+    result: dict[str, Any] = {
+        "executor": "LlamaCppEngine(rpc device injection)",
+        "python": python_exe,
+        "local_worker": local_worker,
+        "decision": {
+            "rpc_layers": decision.rpc_layers,
+            "local_layers": decision.local_layers,
+            "total_layers": decision.total_layers,
+            "reason": decision.reason,
+        },
+        "tensor_split": split,
+        "endpoint": None,
+    }
+    if not Path(python_exe).is_file():
+        result.update({"ok": False, "error": f"engine interpreter not found: {python_exe}"})
+        return result
+    if split is None:
+        result.update({"ok": False, "error": "planner 未把任何层分给远端（rpc_layers=0）"})
+        return result
+
+    remote: RemoteWorkerHandle | None = None
+    tunnel: SshTunnelHandle | None = None
+    with tempfile.TemporaryDirectory(prefix="qlh-pc-rpc-engine-") as temp_dir:
+        temp = Path(temp_dir)
+        report_path = temp / "engine-report.json"
+        try:
+            if local_worker:
+                # 不依赖 SSH：worker 由引擎在本机起（单机自环验证）
+                endpoint = None
+                result["endpoint"] = f"127.0.0.1:{plan.rpc_port} (engine-managed)"
+            else:
+                remote = _start_remote_worker(plan, run_id, temp)
+                if plan.ssh_tunnel:
+                    tunnel = _start_ssh_tunnel(plan, run_id, temp)
+                host = "127.0.0.1" if plan.ssh_tunnel else plan.remote_host
+                endpoint = f"{host}:{plan.rpc_port}"
+                result["endpoint"] = endpoint
+                result["remote_worker"] = {"pid": remote.pid, "stderr": str(remote.stderr_path)}
+
+            command = [
+                python_exe,
+                str(ENGINE_SMOKE),
+                "--model", str(plan.model),
+                "--port", str(plan.rpc_port),
+                "--threads", str(plan.remote_threads),
+                "--n-predict", str(plan.max_tokens),
+                "--split", ",".join(f"{value:.6f}" for value in split),
+                "--report-json", str(report_path),
+            ]
+            if endpoint is None:
+                # worker 必须与**被注入的那个 llama.dll** 协议一致：优先用 b_rpc 那份
+                # （与 RPC 版 llama-cpp-python 同源码树编），否则回退 runtime_dir 里的官方构建
+                candidate = ROOT / "runtime/llama-cpp/b_rpc/ggml-rpc-server.exe"
+                worker_exe = candidate if candidate.is_file() else plan.runtime_dir / "ggml-rpc-server.exe"
+                result["worker_exe"] = str(worker_exe)
+                command += ["--worker-exe", str(worker_exe)]
+            else:
+                command += ["--rpc-servers", endpoint]
+            if align_numerics:
+                # 与 CLI 路径的 --no-repack 等价：关闭 CPU_REPACK，跨路径逐比特一致
+                command.append("--align-numerics")
+
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout or max(120.0, plan.timeout_seconds),
+            )
+            result["command"] = _command_display(command)
+            result["returncode"] = completed.returncode
+            result["stdout_tail"] = (completed.stdout or "")[-4000:]
+            result["stderr_tail"] = (completed.stderr or "")[-2000:]
+            if report_path.is_file():
+                result["engine_report"] = json.loads(report_path.read_text(encoding="utf-8"))
+            result["ok"] = bool(
+                completed.returncode == 0
+                and result.get("engine_report", {}).get("ok")
+            )
+            if not result["ok"]:
+                result["error"] = "engine 路径未完成（见 stdout/stderr tail）"
+        except subprocess.TimeoutExpired as exc:
+            result.update({"ok": False, "error": f"engine 路径超时: {exc}"})
+        finally:
+            if remote is not None:
+                try:
+                    _stop_remote_worker(plan, remote)
+                except Exception as exc:  # noqa: BLE001 - 清理不应掩盖主结果
+                    result.setdefault("cleanup_warnings", []).append(f"remote worker: {exc}")
+            if tunnel is not None:
+                try:
+                    _stop_ssh_tunnel(tunnel)
+                except Exception as exc:  # noqa: BLE001
+                    result.setdefault("cleanup_warnings", []).append(f"ssh tunnel: {exc}")
+    return result
+
+
+def run_probe(plan: PcRpcPlan, *, check_fallback: bool = True, engine: str = "cli",
+              engine_python: str | None = None, engine_local_worker: bool = False,
+              align_numerics: bool = False) -> dict[str, Any]:
     if not plan.model.is_file():
         raise FileNotFoundError(f"local model not found: {plan.model}")
     for name in ("llama-server.exe", "ggml-rpc-server.exe"):
@@ -756,7 +944,14 @@ def run_probe(plan: PcRpcPlan, *, check_fallback: bool = True) -> dict[str, Any]
             raise FileNotFoundError(f"local runtime asset not found: {plan.runtime_dir / name}")
 
     local_hash = _local_hash(plan.model)
-    remote_hash = _remote_hash(plan)
+    self_loop = engine == "python" and engine_local_worker
+    if self_loop:
+        # 单机自环：worker 由引擎在本机起，跳过一切 SSH 采集
+        remote_hash = local_hash
+        remote_profile = _local_profile()
+    else:
+        remote_hash = _remote_hash(plan)
+        remote_profile = None
     requested_plan = plan
     report = plan_report(plan)
     report.update(
@@ -764,17 +959,19 @@ def run_probe(plan: PcRpcPlan, *, check_fallback: bool = True) -> dict[str, Any]
             "local_model_sha256": local_hash,
             "remote_model_sha256": remote_hash,
             "model_identity_match": local_hash == remote_hash,
+            "self_loop": self_loop,
         }
     )
     if local_hash != remote_hash:
         report["status"] = "model_identity_mismatch"
         return report
 
-    try:
-        remote_profile = _remote_profile(plan)
-    except RuntimeError as exc:
-        report.update({"status": "split_profile_unavailable", "split_profile_error": str(exc)})
-        return report
+    if not self_loop:
+        try:
+            remote_profile = _remote_profile(plan)
+        except RuntimeError as exc:
+            report.update({"status": "split_profile_unavailable", "split_profile_error": str(exc)})
+            return report
     decision = _split_decision(plan, remote_profile)
     report = plan_report(
         requested_plan,
@@ -787,6 +984,7 @@ def run_probe(plan: PcRpcPlan, *, check_fallback: bool = True) -> dict[str, Any]
             "remote_model_sha256": remote_hash,
             "model_identity_match": True,
             "remote_device_profile": remote_profile,
+            "self_loop": self_loop,
         }
     )
     if requested_plan.auto_split and not decision.admitted:
@@ -797,7 +995,7 @@ def run_probe(plan: PcRpcPlan, *, check_fallback: bool = True) -> dict[str, Any]
     lease_book = RpcShardLeaseBook()
     remote_lease = lease_book.assign(
         "llama-rpc-offload",
-        plan.target,
+        "local-self-loop" if self_loop else plan.target,
         local_hash,
         {"backend": "RPC0", "gpu_layers": plan.gpu_layers, "total_layers": plan.total_layers},
         lease_seconds=max(30.0, plan.timeout_seconds + 60.0),
@@ -817,6 +1015,22 @@ def run_probe(plan: PcRpcPlan, *, check_fallback: bool = True) -> dict[str, Any]
     }
 
     run_id = f"{int(time.time())}-{plan.rpc_port}"
+
+    if engine == "python":
+        # 执行端换成 LlamaCppEngine：复用上面的 decision 与 lease 记录
+        report["engine"] = "python"
+        report["engine_result"] = _run_engine_python(
+            plan,
+            decision,
+            python_exe=engine_python or str(ROOT / ".venv-llama-rpc/Scripts/python.exe"),
+            local_worker=engine_local_worker,
+            run_id=run_id,
+            timeout=plan.timeout_seconds,
+            align_numerics=align_numerics,
+        )
+        report["status"] = "passed" if report["engine_result"].get("ok") else "engine_failed"
+        return report
+
     remote: RemoteWorkerHandle | None = None
     tunnel: SshTunnelHandle | None = None
     host: subprocess.Popen[str] | None = None
@@ -1059,6 +1273,28 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="bind the remote worker to loopback and forward RPC over an SSH local port",
     )
     parser.add_argument("--no-fallback", action="store_true")
+    parser.add_argument(
+        "--engine",
+        choices=("cli", "python"),
+        default="cli",
+        help="执行端：cli=llama-server.exe --rpc（原路径）；python=LlamaCppEngine 注入 RPC device",
+    )
+    parser.add_argument(
+        "--engine-python",
+        default=str(ROOT / ".venv-llama-rpc/Scripts/python.exe"),
+        help="--engine python 用的解释器（需带 GGML_RPC 的 llama-cpp-python）",
+    )
+    parser.add_argument(
+        "--engine-local-worker",
+        action="store_true",
+        help="--engine python 时由引擎在本机起 worker（不依赖 SSH，用于单机自环）",
+    )
+    parser.add_argument(
+        "--align-numerics",
+        action="store_true",
+        help="关闭权重 repack（CPU_REPACK）：cli 模式加 --no-repack，python 模式注入 "
+             "use_extra_bufts=False，使本机与 RPC 路径逐比特一致（见文档 §11/§13）",
+    )
     parser.add_argument("--report", type=Path)
     parser.add_argument("--json", action="store_true")
     return parser.parse_args(argv)
@@ -1084,6 +1320,7 @@ def main(argv: list[str] | None = None) -> int:
         remote_threads=args.remote_threads,
         ssh_tunnel=args.ssh_tunnel,
         total_layers=args.total_layers,
+        no_repack=args.align_numerics,
     )
     try:
         if args.sync_remote_model or args.apply_remote_model_sync:
@@ -1094,7 +1331,14 @@ def main(argv: list[str] | None = None) -> int:
                 transfer_timeout_seconds=args.asset_sync_timeout_seconds,
             )
         else:
-            report = plan_report(plan) if not args.run else run_probe(plan, check_fallback=not args.no_fallback)
+            report = plan_report(plan) if not args.run else run_probe(
+                plan,
+                check_fallback=not args.no_fallback,
+                engine=args.engine,
+                engine_python=args.engine_python,
+                engine_local_worker=args.engine_local_worker,
+                align_numerics=args.align_numerics,
+            )
     except (FileNotFoundError, OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
         report = {"status": "invalid", "error": str(exc)}
     encoded = json.dumps(report, ensure_ascii=False, indent=2)

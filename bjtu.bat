@@ -1,10 +1,12 @@
 @echo off
 chcp 65001 >nul
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
 rem ============================================================
 rem  QLH global bjtu command (Windows)
 rem
-rem  Usage: bjtu [launcher|ui|tui|chat|tui_admin.py args...]
-rem         bjtu --help       查看 TUI 命令集与启动参数（不启动后端）
+rem  Usage: bjtu [launcher|ui|tui|chat|tui_commands.py args...]
+rem         bjtu --help       print TUI commands and options (no backend)
 rem
 rem  One-click launch: start backend (if not running), wait until
 rem  /api/health is ready, then enter TUI. Backend keeps running
@@ -29,12 +31,12 @@ if not exist "src\api_server.py" (
     exit /b 1
 )
 
-rem ---- help: 仅打印命令集与参数帮助，不启动后端 ----
+rem ---- help: print commands and options; do not start backend ----
 if /i "%~1"=="--help" goto :help
 if /i "%~1"=="-h" goto :help
 
-rem ---- chat: T9 简化聊天页（可选依赖 Textual/httpx）----
-rem ---- 归一化别名：--chat / -chat / -c 等价于 chat ----
+rem ---- chat: T9 terminal chat page (optional Textual/httpx) ----
+rem ---- aliases --chat / -chat / -c are normalized to chat ----
 if /i "%~1"=="--chat" goto :chat
 if /i "%~1"=="-chat" goto :chat
 if /i "%~1"=="-c" goto :chat
@@ -71,8 +73,8 @@ if /i "%~1"=="--help" goto :help
 if /i "%~1"=="-h" goto :help
 if /i "%~1"=="chat" (
     if not exist "%~dp0QLH-TUI-Chat\QLH-TUI-Chat.exe" (
-        echo [ERROR] 当前安装不完整：缺少 QLH-TUI-Chat\QLH-TUI-Chat.exe。
-        echo         请运行 bjtu verify --level deep，或使用受信任安装包修复安装。
+        echo [ERROR] Installation is incomplete: QLH-TUI-Chat\QLH-TUI-Chat.exe is missing.
+        echo         Run bjtu verify --level deep or repair with a trusted installer.
         exit /b 2
     )
     "%~dp0QLH-TUI-Chat\QLH-TUI-Chat.exe" %2 %3 %4 %5 %6
@@ -121,7 +123,7 @@ exit /b %errorlevel%
 
 :legacy_packaged_launcher
 if /i "%~1"=="update" (
-    echo [ERROR] 独立 QLH Launcher 尚未安装，无法使用 bjtu update。
+    echo [ERROR] Standalone QLH Launcher is not installed; bjtu update is unavailable.
     exit /b 2
 )
 if /i "%~1"=="verify" (
@@ -129,31 +131,31 @@ if /i "%~1"=="verify" (
         "tools\QLH-Install-Manifest.exe" verify --root "%CD%" %2 %3 %4 %5 %6
         exit /b %errorlevel%
     )
-    echo [ERROR] 安装完整性校验器缺失；请覆盖安装匹配版本的主应用包。
+    echo [ERROR] Install integrity verifier is missing; reinstall the matching application package.
     exit /b 2
 )
 if /i "%~1"=="diagnose" (
-    echo [ERROR] 独立 QLH Launcher 尚未安装，无法使用 bjtu diagnose。
+    echo [ERROR] Standalone QLH Launcher is not installed; bjtu diagnose is unavailable.
     exit /b 2
 )
 if /i "%~1"=="repair" (
-    echo [ERROR] 独立 QLH Launcher 尚未安装，无法使用 bjtu repair。
+    echo [ERROR] Standalone QLH Launcher is not installed; bjtu repair is unavailable.
     exit /b 2
 )
 if /i "%~1"=="data-status" (
-    echo [ERROR] 独立 QLH Launcher 尚未安装，无法使用 bjtu data-status。
+    echo [ERROR] Standalone QLH Launcher is not installed; bjtu data-status is unavailable.
     exit /b 2
 )
 if /i "%~1"=="retain-data" (
-    echo [ERROR] 独立 QLH Launcher 尚未安装，无法使用 bjtu retain-data。
+    echo [ERROR] Standalone QLH Launcher is not installed; bjtu retain-data is unavailable.
     exit /b 2
 )
 if /i "%~1"=="reassociate-data" (
-    echo [ERROR] 独立 QLH Launcher 尚未安装，无法使用 bjtu reassociate-data。
+    echo [ERROR] Standalone QLH Launcher is not installed; bjtu reassociate-data is unavailable.
     exit /b 2
 )
 if /i "%~1"=="reinstall" (
-    echo [ERROR] 独立 QLH Launcher 尚未安装，无法使用 bjtu reinstall。
+    echo [ERROR] Standalone QLH Launcher is not installed; bjtu reinstall is unavailable.
     exit /b 2
 )
 if /i "%~1"=="version" (
@@ -177,10 +179,10 @@ set "PYTHON_CMD=python"
 if exist "%QLH_SHELL_ROOT%\.venv-tui\Scripts\python.exe" set "PYTHON_CMD=%QLH_SHELL_ROOT%\.venv-tui\Scripts\python.exe"
 %PYTHON_CMD% -c "import textual, httpx" >nul 2>nul
 if not %errorlevel%==0 (
-    echo [T9] 聊天页缺少可选依赖 Textual/httpx。
-    echo      安装: python "%QLH_SHELL_ROOT%\scripts\setup_tui_env.py"
-    echo      或:   pip install -r "%QLH_SHELL_ROOT%\requirements-tui.txt"
-    echo      管理 TUI（bjtu / start_tui.bat）不受影响。
+    echo [T9] Optional Textual/httpx dependencies are missing for chat.
+    echo      Install: python "%QLH_SHELL_ROOT%\scripts\setup_tui_env.py"
+    echo      Or:      pip install -r "%QLH_SHELL_ROOT%\requirements-tui.txt"
+    echo      The management TUI (bjtu / start_tui.bat) is unaffected.
     exit /b 2
 )
 set PYTHONIOENCODING=utf-8
@@ -227,20 +229,20 @@ if not exist "version.txt" echo launcher/app version is managed by the installed
 exit /b 0
 
 :help
-echo QLH BJTU 统一入口:
-echo   bjtu launcher   启动选择页（普通界面 / TUI）
-echo   bjtu ui         直接启动普通 Web/原生界面
-echo   bjtu tui        启动后端并进入 TUI 管理界面
-echo   bjtu chat       进入终端对话页（安装包内置）
-echo   bjtu update     检查更新源中的匹配安装包
-echo   bjtu version    显示当前应用版本
-echo   bjtu verify [--level quick^|full^|deep] [--json]  校验已安装程序文件
-echo   bjtu diagnose [--json]  输出只读故障诊断与人工处理建议
-echo   bjtu repair [--json]    修复当前版本中损坏的签名程序文件
-echo   bjtu retain-data --yes  保留用户数据并准备卸载
-echo   bjtu reassociate-data --yes  将保留数据重新关联到当前安装
-echo   bjtu reinstall --yes    保留数据并下载已验签安装包
-echo   bjtu status     执行 TUI 单命令（不自动启动后端）
+echo QLH BJTU unified entry:
+echo   bjtu launcher   open the launcher (regular UI / TUI)
+echo   bjtu ui         start the regular Web/native UI
+echo   bjtu tui        start the backend and enter the management TUI
+echo   bjtu chat       enter the terminal chat page (packaged builds)
+echo   bjtu update     check the update source
+echo   bjtu version    show the application version
+echo   bjtu verify [--level quick^|full^|deep] [--json]  verify installed files
+echo   bjtu diagnose [--json]  print read-only diagnostics
+echo   bjtu repair [--json]    repair signed application files
+echo   bjtu retain-data --yes  retain user data before uninstall
+echo   bjtu reassociate-data --yes  re-associate retained data
+echo   bjtu reinstall --yes    retain data and download a verified package
+echo   bjtu status     run a TUI read-only command (no backend start)
 echo.
 set "PYTHON_CMD=python"
 where python >nul 2>nul
@@ -248,5 +250,5 @@ if not %errorlevel%==0 (
     set "PYTHON_CMD=py -3"
 )
 set PYTHONIOENCODING=utf-8
-%PYTHON_CMD% src\tui_admin.py --help
+%PYTHON_CMD% src\tui_commands.py help
 exit /b %errorlevel%

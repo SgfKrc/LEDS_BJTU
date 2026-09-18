@@ -24,7 +24,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-# 加载 api_server 以执行 model_host.attach(...)（阶段 0.2：scheduler 回调挂载）
+# 加载 API composition root，以配置 SchedulerCallbackSet。
 import api_server  # noqa: F401,E402
 
 from transformers import Qwen2Config, Qwen2ForCausalLM

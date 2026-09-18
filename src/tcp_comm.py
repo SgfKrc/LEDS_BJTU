@@ -1048,7 +1048,8 @@ class TCPServer:
         self.on_registration_confirmed: Optional[Callable] = None
 
     def start(self, on_message: Callable = None,
-              on_disconnect: Callable = None) -> None:
+              on_disconnect: Callable = None,
+              on_registration_confirmed: Callable = None) -> None:
         """
         启动 TCP 服务端，开始监听。
 
@@ -1057,9 +1058,17 @@ class TCPServer:
                         签名: (client_id: str, msg: dict, raw: bytes) -> None
             on_disconnect: 客户端断连时的回调函数
                           签名: (client_id: str) -> None
+            on_registration_confirmed: REGISTER ACK 写入后调用的回调函数
+                                       签名: (client_id: str) -> None
+
+        回调均在 TCP 接收/心跳 I/O 线程同步执行。TCPServer 只持有显式
+        注册的函数，不持有或反射控制面 owner；回调内部的控制面锁由
+        调用方负责，TCPServer 不在持有 _clients_lock 时调用这些函数。
         """
         self.on_message = on_message
         self.on_disconnect = on_disconnect
+        if on_registration_confirmed is not None:
+            self.on_registration_confirmed = on_registration_confirmed
         self._socks = self._create_listen_sockets(self.host, self.port)
         self.sock = self._socks[0] if self._socks else None
         if self.port == 0 and self.sock is not None:
@@ -1332,20 +1341,10 @@ class TCPServer:
                     # 心跳：回显客户端时间戳并回复 ACK
                     self._handle_heartbeat(client_id, msg)
 
-                # 回调上层（scheduler）
+                # 回调上层。TCPServer 只执行显式注册的事件，不反射回调
+                # owner，也不改写控制面对象的任何属性。
                 if self.on_message:
                     try:
-                        # Keep the scheduler that handles this callback bound
-                        # to the TCPServer which actually accepted the socket.
-                        # Windows runtime re-exec can otherwise leave the API
-                        # status path observing a sibling server instance.
-                        callback_owner = getattr(self.on_message, "__self__", None)
-                        if (callback_owner is not None
-                                and getattr(callback_owner, "_tcp_server", None) is not self):
-                            logger.warning(
-                                "repairing scheduler TCP server binding during registration"
-                            )
-                            callback_owner._tcp_server = self
                         self.on_message(client_id, msg)
                     except Exception as e:
                         logger.error(f"消息回调异常: {e}", exc_info=True)

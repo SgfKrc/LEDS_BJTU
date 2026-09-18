@@ -120,6 +120,25 @@ class RpcShardLeaseBook:
         self._leases[renewed.lease_id] = renewed
         return LeaseDecision(True, "renewed", renewed)
 
+    def check(self, lease_id: str, epoch: int) -> LeaseDecision:
+        """Read-only fencing check for a long-lived topology transition."""
+        lease = self._leases.get(lease_id)
+        if lease is None:
+            return LeaseDecision(False, "unknown_lease")
+        current = self._current.get(lease.shard_id)
+        if current is None or current.lease_id != lease_id:
+            return LeaseDecision(False, "stale_lease", current or lease)
+        if current.epoch != epoch:
+            return LeaseDecision(False, "stale_epoch", current)
+        if current.status != "active":
+            return LeaseDecision(False, f"lease_{current.status}", current)
+        if current.lease_expires_at <= time.time():
+            expired = replace(current, status="expired")
+            self._current[expired.shard_id] = expired
+            self._leases[expired.lease_id] = expired
+            return LeaseDecision(False, "lease_expired", expired)
+        return LeaseDecision(True, "current", current)
+
     def commit(
         self,
         lease_id: str,

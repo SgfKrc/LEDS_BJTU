@@ -176,7 +176,12 @@ def _runtime_profile(model_id: str, config: dict[str, Any]) -> tuple[str, str]:
     )
 
 
-def _manifest_asset(directory: Path, root: Path) -> dict[str, Any] | None:
+def _manifest_asset(
+    directory: Path,
+    root: Path,
+    *,
+    verify_hashes: bool = True,
+) -> dict[str, Any] | None:
     manifest_path = _manifest_path(directory)
     if manifest_path is None:
         return None
@@ -234,8 +239,10 @@ def _manifest_asset(directory: Path, root: Path) -> dict[str, Any] | None:
                 hashes_seen = True
                 if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash):
                     return None
-                if _sha256_file(candidate) != expected_hash.lower():
+                if verify_hashes and _sha256_file(candidate) != expected_hash.lower():
                     return None
+                if not verify_hashes:
+                    hashes_complete = False
         except OSError:
             complete = False
         except (TypeError, ValueError):
@@ -352,13 +359,20 @@ def _merge_assets(parts: list[dict[str, Any]], app_root: Path) -> dict[str, Any]
     }
 
 
-def discover_local_model_assets(models_root: str | os.PathLike[str] | None = None) -> dict[str, Any]:
+def discover_local_model_assets(
+    models_root: str | os.PathLike[str] | None = None,
+    *,
+    verify_hashes: bool = True,
+) -> dict[str, Any]:
     """Return a stable, read-only inventory of local LLM assets.
 
     Only immediate directories below ``models/`` are considered.  This avoids
     treating cache or arbitrary nested files as installable model packages.
     A malformed manifest, a missing listed weight, or a non-LLM config is
-    ignored rather than being exposed as a selectable model.
+    ignored rather than being exposed as a selectable model.  Callers that
+    only need a responsive inventory may set ``verify_hashes=False``; the
+    result is explicitly marked ``manifest_unverified`` and preflight keeps
+    the default full-hash verification before any runtime use.
     """
     app_root = _app_root()
     root = Path(models_root).resolve() if models_root else app_root / "models"
@@ -372,7 +386,7 @@ def discover_local_model_assets(models_root: str | os.PathLike[str] | None = Non
         directories = []
     for directory in directories:
         if _manifest_path(directory) is not None:
-            parts.append(_manifest_asset(directory, root))
+            parts.append(_manifest_asset(directory, root, verify_hashes=verify_hashes))
         else:
             parts.append(_filesystem_asset(directory, root))
     parts = [part for part in parts if part is not None]

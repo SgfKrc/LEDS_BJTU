@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import pytest
-# 加载 api_server 以执行 model_host.attach(...)（阶段 0.2：scheduler 回调挂载）
+# 加载 API composition root，以配置 SchedulerCallbackSet。
 import api_server  # noqa: F401,E402
 import node_runtime as node_runtime_mod
 from scheduler import Scheduler, PipelineQueue, NodeInfo, NodeState, NodeRole
@@ -310,6 +310,52 @@ class TestComputeLayerAssignment:
         assert sum(item["layers_count"] for item in plan["assignments"]) == 4
         assert "master" in plan["control_only_nodes"]
         assert plan["transaction_phase"] == "planned"
+        layout = plan["pipeline_layout"]
+        assert layout["model_sha256"] == "a" * 64
+        assert layout["nodes"][0]["layer_range"][0] == 0
+        assert layout["nodes"][-1]["layer_range"][1] == 4
+        assert sum(
+            item["layer_range"][1] - item["layer_range"][0]
+            for item in layout["nodes"]
+        ) == 4
+
+    def test_aggregate_resource_view_combines_online_nodes_without_addresses(self, sched):
+        sched._role_override = "master"
+        sched.nodes = {
+            "master": NodeInfo(
+                node_id="master", role="master", state=NodeState.ONLINE,
+                address="127.0.0.1:8888",
+                device_info={
+                    "cpu": {"physical_cores": 8, "logical_cores": 16},
+                    "ram": {"total_gb": 32, "available_gb": 12},
+                    "gpu": {
+                        "cuda_available": True, "vram_total_gb": 8,
+                        "vram_free_gb": 6,
+                    },
+                },
+            ),
+            "edge": NodeInfo(
+                node_id="edge", role="client", state=NodeState.ONLINE,
+                address="100.64.0.2:8888",
+                device_info={
+                    "cpu": {"physical_cores": 4, "logical_cores": 8},
+                    "ram": {"total_gb": 16, "available_gb": 10},
+                },
+            ),
+            "offline": NodeInfo(
+                node_id="offline", role="client", state=NodeState.OFFLINE,
+                device_info={"ram": {"total_gb": 128, "available_gb": 128}},
+            ),
+        }
+
+        view = sched.get_aggregate_resource_view()
+
+        assert view["is_distributed"] is True
+        assert view["remote_available_count"] == 1
+        assert view["totals"]["logical_cores"] == 24
+        assert view["totals"]["ram_available_gb"] == 22
+        assert "127.0.0.1" not in json.dumps(view)
+        assert "100.64.0.2" not in json.dumps(view)
 
     def test_capacity_plan_rejects_profile_without_free_memory_evidence(
             self, sched):
@@ -540,6 +586,7 @@ class TestComputeLayerAssignment:
     def test_capacity_transaction_aborts_when_worker_disconnects(
             self, sched, monkeypatch):
         aborts = []
+        reshard_attempts = []
         sched._pipeline_load_transaction = {
             "config_id": "cfg-drop",
             "phase": "preparing",
@@ -554,6 +601,10 @@ class TestComputeLayerAssignment:
             sched, "_fail_pending_pipeline_results_for_node", lambda *_args: None,
         )
         monkeypatch.setattr(sched, "deregister_node", lambda _node_id: False)
+        monkeypatch.setattr(
+            sched, "_stage_pipeline_reshard_after_disconnect",
+            lambda node_id: reshard_attempts.append(node_id) or None,
+        )
 
         sched._on_tcp_disconnect("worker-drop")
 
@@ -562,6 +613,52 @@ class TestComputeLayerAssignment:
             "pipeline_worker_disconnected",
             "worker worker-drop disconnected during transaction",
         )]
+        assert reshard_attempts == ["worker-drop"]
+
+    def test_disconnect_reshard_uses_only_connected_survivors(
+            self, sched, monkeypatch):
+        captured = {}
+
+        class _Node:
+            node_id = "worker-a"
+
+        class _Decision:
+            def to_dict(self):
+                return {"status": "staged", "accepted": True, "reason_code": ""}
+
+        class _Coordinator:
+            layout = type("Layout", (), {"nodes": [_Node()]})()
+
+            def snapshot(self):
+                return {"staged": [{"failed_node_ids": ["worker-old"]}]}
+
+            def stage_failure(self, failed, **kwargs):
+                captured["failed"] = failed
+                captured.update(kwargs)
+                return _Decision()
+
+        sched._role_override = "master"
+        sched._pipeline_reshard_coordinator = _Coordinator()
+        sched._tcp_server = type("Server", (), {
+            "get_client_ids": lambda self: ["worker-b", "task-full"],
+        })()
+        sched._host = type("Host", (), {
+            "get_pipeline_descriptor": lambda self: {"model_sha256": "a" * 64},
+        })()
+        monkeypatch.setattr(
+            sched, "_get_pipeline_capacity_nodes",
+            lambda ids: captured.setdefault("eligible", set(ids)) or [],
+        )
+        monkeypatch.setattr(
+            sched, "_task_worker_full_model_ids", lambda: {"task-full"},
+        )
+        monkeypatch.setattr(sched, "_pipeline_node_metadata", lambda: {})
+
+        report = sched._stage_pipeline_reshard_after_disconnect("worker-a")
+
+        assert report["status"] == "staged"
+        assert captured["failed"] == {"worker-a", "worker-old"}
+        assert captured["eligible"] == {"master", "worker-b"}
 
     def test_versioned_ready_ack_is_fenced_by_generation(self, sched):
         """迟到的同 config ACK 不能跨 generation 激活容量计划。"""
@@ -3010,6 +3107,70 @@ class TestPipelineQueueIntegration:
         assert "queue_size" in q
         assert "running" in q
         assert "current_task" in q
+
+    def test_two_tcp_servers_dispatch_without_callback_cross_talk(self, sched):
+        """并发 server 事件应各自读取显式 source，不能静默串台。"""
+        import socket
+
+        from tcp_comm import MessageType, TCPServer, build_message
+
+        servers = [
+            TCPServer(host="127.0.0.1", port=0),
+            TCPServer(host="127.0.0.1", port=0),
+        ]
+        default_server = object()
+        sched._tcp_server = default_server
+        barrier = threading.Barrier(2)
+        seen = []
+        seen_lock = threading.Lock()
+        socket_pairs = [socket.socketpair(), socket.socketpair()]
+        threads = []
+
+        def observe(label):
+            barrier.wait(timeout=2)
+            with seen_lock:
+                seen.append((label, sched._tcp_server))
+
+        for index, (server, (server_sock, _client_sock)) in enumerate(
+                zip(servers, socket_pairs)):
+            server.on_message = sched._bind_tcp_server_callback(
+                server,
+                lambda _client_id, _message, label=index: observe(label),
+            )
+            server._running = True
+            threads.append(threading.Thread(
+                target=server._handle_client,
+                args=(
+                    server_sock,
+                    ("127.0.0.1", 54400 + index),
+                    f"pending_{index}",
+                ),
+                daemon=True,
+            ))
+
+        try:
+            for thread in threads:
+                thread.start()
+            for index, (_server_sock, client_sock) in enumerate(socket_pairs):
+                client_sock.sendall(build_message(
+                    MessageType.STATUS_RES, {"server": index},
+                ))
+            for thread in threads:
+                thread.join(timeout=2)
+
+            assert sorted(seen, key=lambda item: item[0]) == [
+                (0, servers[0]), (1, servers[1]),
+            ]
+            assert sched._tcp_server is default_server
+        finally:
+            for server in servers:
+                server._running = False
+            for _server_sock, client_sock in socket_pairs:
+                client_sock.close()
+            for thread in threads:
+                thread.join(timeout=2)
+            for server in servers:
+                server.stop()
 
     def test_process_queued_task_delegates(self, sched):
         """_process_queued_pipeline_task 应调用 run_pipeline（绕过排队检查）"""
@@ -6494,7 +6655,8 @@ def test_tcp_bind_failure_keeps_master_local_pipeline_available(monkeypatch):
             self.host = host
             self.port = port
 
-        def start(self, on_message=None, on_disconnect=None):
+        def start(self, on_message=None, on_disconnect=None,
+                  on_registration_confirmed=None):
             raise OSError("address already in use")
 
     sched = Scheduler()
@@ -6518,6 +6680,70 @@ def test_tcp_bind_failure_keeps_master_local_pipeline_available(monkeypatch):
         assert status["tcp_server"] is None
         assert status["pipeline_queue"]["running"] is True
     finally:
+        sched.stop()
+
+
+def test_distributed_start_defers_network_identity(monkeypatch):
+    """A slow network probe must not block the local scheduler start."""
+    import config as cfg
+    import transport_port
+    import scheduler as scheduler_mod
+
+    monkeypatch.setattr(scheduler_mod, "RUN_MODE", "distributed", raising=False)
+    monkeypatch.setattr(scheduler_mod, "NODE_ROLE", "master", raising=False)
+    monkeypatch.setattr(cfg, "NODE_ROLE", "master", raising=False)
+
+    class FakeServer:
+        _running = True
+        host = "0.0.0.0"
+        port = 8888
+
+        def start(self, **kwargs):
+            return None
+
+        def stop(self):
+            self._running = False
+
+        def get_client_ids(self):
+            return []
+
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+
+    def slow_lan_probe():
+        probe_started.set()
+        release_probe.wait(timeout=5)
+        return "100.64.0.10"
+
+    monkeypatch.setattr(transport_port, "create_server", lambda *args: FakeServer())
+    monkeypatch.setattr(transport_port, "detect_lan_ip", slow_lan_probe)
+    monkeypatch.setattr(transport_port, "get_mac_addresses", lambda: ["001122334455"])
+
+    sched = Scheduler()
+    monkeypatch.setattr(sched, "init_nodes", lambda: None)
+    monkeypatch.setattr(sched, "deactivate_spare_master_on_startup", lambda: None)
+    monkeypatch.setattr(sched, "can_join_existing_master", lambda: False)
+
+    start_done = threading.Event()
+    errors = []
+
+    def run_start():
+        try:
+            sched.start(host="0.0.0.0", port=8888)
+        except BaseException as exc:  # pragma: no cover - diagnostic path
+            errors.append(exc)
+        finally:
+            start_done.set()
+
+    starter = threading.Thread(target=run_start, daemon=True)
+    starter.start()
+    try:
+        assert start_done.wait(timeout=5), "scheduler start waited for network identity"
+        assert not errors
+        assert probe_started.wait(timeout=1), "deferred network probe did not start"
+    finally:
+        release_probe.set()
+        starter.join(timeout=2)
         sched.stop()
 
 

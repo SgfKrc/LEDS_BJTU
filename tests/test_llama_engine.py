@@ -418,3 +418,69 @@ def test_gemma4_native_asset_lock_rejects_tampering(tmp_path):
         assert "does not match" in str(exc)
     else:
         raise AssertionError("tampered Gemma asset should be rejected")
+
+
+def test_load_gemma4_native_rejects_n_gpu_layers_via_kwargs():
+    """n_gpu_layers 由 gpu_layers/require_gpu_layers 预算门管理，
+    不得经 **llama_kwargs 绕开（否则预算门形同虚设）。"""
+    engine = LlamaCppEngine()
+    try:
+        engine.load_gemma4_native(gpu_layers=0, n_gpu_layers=99)
+    except ValueError as exc:
+        assert "gpu_layers" in str(exc)
+    else:
+        raise AssertionError("应拒绝经 **llama_kwargs 传入 n_gpu_layers")
+
+
+def test_load_gemma4_native_forwards_llama_kwargs(monkeypatch, tmp_path):
+    """**llama_kwargs 应落到最终 Llama() 的加载参数里。
+
+    这是「主仓缺口」的修复点：load_gemma4_native 此前只透传 n_gpu_layers，
+    使得 tensor_split / use_mmap / use_mlock / kv_overrides 等容量与放置相关的
+    参数无法经该路径使用。
+    """
+    captured: dict = {}
+
+    # 伪造受管工件 + lock，绕过真实文件校验
+    model = tmp_path / "fake.gguf"
+    mmproj = tmp_path / "fake.mmproj"
+    model.write_bytes(b"gguf")
+    mmproj.write_bytes(b"mmproj")
+    lock_dir = tmp_path / "models" / "gemma4-native"
+    lock_dir.mkdir(parents=True)
+    lock = lock_dir / "gemma4-native.lock.json"
+
+    def entry(path):
+        return {
+            "filename": path.name,
+            "size_bytes": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    lock.write_text(json.dumps({
+        "schema_version": 1,
+        "artifacts": {"main_gguf": entry(model), "mmproj": entry(mmproj)},
+    }), encoding="utf-8")
+
+    monkeypatch.setattr(LlamaCppEngine, "_verify_gemma4_native_assets",
+                        staticmethod(lambda *a, **k: None))
+    monkeypatch.setattr(LlamaCppEngine, "load_model",
+                        lambda self, **kw: captured.update(kw))
+
+    engine = LlamaCppEngine()
+    # 直接以显式路径调用，避开缺省工件解析
+    engine.load_gemma4_native(
+        gguf_path=str(model),
+        mmproj_path=str(mmproj),
+        gpu_layers=4,
+        tensor_split=[0.6, 0.4],
+        use_mmap=False,
+        kv_overrides={"qwen35.block_count": 20},
+    )
+    assert captured.get("tensor_split") == [0.6, 0.4]
+    assert captured.get("use_mmap") is False
+    assert captured.get("kv_overrides") == {"qwen35.block_count": 20}
+    # gpu_layers > 0 时由预算门显式写入 n_gpu_layers
+    assert captured.get("n_gpu_layers") == 4
+    # 显式路径必须优先于缺省工件解析
+    assert captured.get("model_path") == str(model)

@@ -113,6 +113,86 @@ class LlamaCppEngine:
         self._thinking_enabled: bool | None = None
         self._thinking_controlled: bool = False
         self._chat_template_kwargs: Dict[str, Any] = {}
+        # RPC 接入（可选）：session 持有注入的 device 与（可选的）本地 worker，
+        # 必须存活到 unload —— worker 一停，RPC device 上的计算即失败。
+        self._rpc_session = None
+
+    # ================================================================
+    # RPC device 接入（llama.cpp RPC backend）
+    # ================================================================
+
+    @staticmethod
+    def _normalize_rpc_servers(rpc_servers) -> List[str]:
+        """把 ``"host:port,host:port"`` 或列表归一为 endpoint 列表。"""
+        if rpc_servers is None:
+            return []
+        if isinstance(rpc_servers, str):
+            return [part.strip() for part in rpc_servers.split(",") if part.strip()]
+        if isinstance(rpc_servers, (list, tuple)):
+            return [str(part).strip() for part in rpc_servers if str(part).strip()]
+        raise ValueError("rpc_servers must be a 'host:port' string or a list of endpoints")
+
+    @staticmethod
+    def _resolve_rpc_split(rpc_split, n_rpc_devices: int) -> List[float] | None:
+        """把分片比例归一为 ``[本机 CPU, RPC0, RPC1, ...]`` 顺序的层占比列表。
+
+        * ``None`` —— 不分片（全部层交给 RPC device，默认行为）；
+        * 数字 ``x``（或等价的字符串 ``"0.5"``）—— 单 RPC device 时展开为 ``[1-x, x]``；
+        * 字符串 ``"0.5,0.5"`` / 列表 —— 长度必须等于 ``1 + n_rpc_devices``。
+        """
+        if rpc_split is None:
+            return None
+        total = n_rpc_devices + 1
+        if isinstance(rpc_split, str):
+            parts = [part.strip() for part in rpc_split.split(",") if part.strip()]
+            if not parts:
+                raise ValueError("rpc_split 字符串为空")
+            if len(parts) == 1:
+                rpc_split = float(parts[0])      # "0.5" 等价于数字 0.5
+            else:
+                rpc_split = [float(part) for part in parts]
+        if isinstance(rpc_split, (list, tuple)):
+            values = [float(v) for v in rpc_split]
+        elif isinstance(rpc_split, (int, float)) and not isinstance(rpc_split, bool):
+            if n_rpc_devices != 1:
+                raise ValueError("单个比例只适用于恰好 1 个 RPC device")
+            values = [1.0 - float(rpc_split), float(rpc_split)]
+        else:
+            raise ValueError("rpc_split must be a number, a 'a,b' string, or a list")
+        if len(values) != total:
+            raise ValueError(
+                f"rpc_split 需要 {total} 个比例（1 个本机 CPU + {n_rpc_devices} 个 RPC），实得 {len(values)}"
+            )
+        if any(v < 0 for v in values) or sum(values) <= 0:
+            raise ValueError("rpc_split 比例必须非负且总和 > 0")
+        return values
+
+    def _open_rpc_session(self, *, endpoints, worker_exe, worker_port, worker_threads, worker_log):
+        """注册 RPC device（必要时先起本机 worker）；失败即抛，不降级为纯 CPU。"""
+        try:
+            from llama_rpc_device import RpcSession
+        except ImportError:  # 以包形式导入本模块时（src.llama_engine）
+            from .llama_rpc_device import RpcSession
+
+        session = RpcSession.open(
+            endpoints=endpoints,
+            autostart_worker=worker_exe,
+            worker_port=worker_port,
+            worker_threads=worker_threads,
+            worker_log=worker_log,
+        )
+        injected = [f"{dev.name}@{dev.endpoint}" for dev in session.injector.devices]
+        logger.info(f"RPC device 已注入: {injected}")
+        return session
+
+    def _close_rpc_session(self) -> None:
+        session = self._rpc_session
+        self._rpc_session = None
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                logger.debug("RPC session close failed", exc_info=True)
 
     # ================================================================
     # 模型加载
@@ -130,6 +210,13 @@ class LlamaCppEngine:
         embedding: bool = False,
         embedding_dimension: int | None = None,
         embedding_model_id: str | None = None,
+        rpc_servers: str | List[str] | None = None,
+        rpc_worker_exe: str | None = None,
+        rpc_worker_port: int = 50163,
+        rpc_worker_threads: int = 4,
+        rpc_worker_log: str | None = None,
+        rpc_split: float | str | List[float] | None = None,
+        align_numerics: bool = False,
         **kwargs,
     ) -> None:
         """
@@ -140,7 +227,35 @@ class LlamaCppEngine:
             n_ctx: 上下文窗口大小（默认 4096，边缘设备建议 2048）
             n_threads: CPU 推理线程数（默认自动检测：物理核心数）
             chat_format: 对话格式（默认自动检测，Qwen 用 "chatml"）
-            **kwargs: 传递给 llama_cpp.Llama 的额外参数
+            **kwargs: 透传给 `llama_cpp.Llama` 的额外参数。经实测（llama-cpp-python 0.3.35）
+                可用且与本项目的容量/放置相关者：
+
+                * `tensor_split` / `main_gpu` / `split_mode` —— 多设备切分；
+                * `use_mmap` / `use_mlock` —— 页映射与常驻（**注意**：llama.cpp CLI 的
+                  `--load-mode {mmap|none|dio|mlock|mmap+mlock}` 与 `--fit-target`
+                  在 Python 绑定中**不存在**，无法透传；只有 `use_mmap` 这个布尔开关）；
+                * `kv_overrides` —— **运行时覆盖 GGUF 元数据**（如需改 `*.block_count` /
+                  `*.nextn_predict_layers` 等架构 KV，这是唯一通道）；
+                * `numa` / `op_offload` / `flash_attn` / `swa_full` / `type_k` / `type_v`。
+
+                **⚠️ 注意**：llama.cpp CLI 的 `--override-tensor`（按张量指定 buffer type）
+                同样**未在 Python 绑定中暴露**，无法经此通道使用。
+
+            rpc_servers: 已有的 ggml-rpc-server endpoint（`"host:port"` 或列表）。给了即走
+                RPC device，**注入失败会抛错，不会静默退回纯 CPU**。
+            rpc_worker_exe: 本机 `ggml-rpc-server` 路径；给了就由引擎启动/回收该 worker
+                （单机实验用；远端 worker 场景只给 `rpc_servers`）。
+            rpc_worker_port / rpc_worker_threads / rpc_worker_log: 本地 worker 的端口、
+                CPU 线程数与日志路径。
+            rpc_split: **分片（部分层驻留）**。`None`=全部层交给 RPC device（默认）；
+                数字 `x`（单 RPC device）= 展开为 `[1-x, x]`；也可给 `"0.5,0.5"` 或列表，
+                顺序为 `[本机 CPU, RPC0, RPC1, ...]`，长度须等于 `1 + RPC device 数`。
+                例：`rpc_split=0.5` ⇒ 一半层留本机 CPU、一半放远端 RPC。
+            align_numerics: **跨路径数值对齐**。本机 CPU 默认启用 CPU_REPACK（`--repack`），
+                而 RPC 路径的权重落在远端 buffer 里**无法 repack**，于是两条路径的 logits 不同
+                （实测 max|Δ|≈0.98、零均值、不随位置累积）⇒ 长序列会分叉。置 True 会把
+                `use_extra_bufts=False` 注入 `llama_model_params`（llama-cpp-python 未暴露该
+                开关，只能这样设），两条路径随即**逐比特一致**；代价实测为 0（见文档 §15）。
         """
         from config import MAX_SEQ_LEN
 
@@ -209,7 +324,60 @@ class LlamaCppEngine:
 
             load_kwargs.update(kwargs)
 
-            self._model = Llama(**load_kwargs)
+            rpc_endpoints = self._normalize_rpc_servers(rpc_servers)
+            if rpc_endpoints or rpc_worker_exe:
+                # RPC device 决定权重放在哪；显式 devices 时默认全部层交给它们（-1），
+                # 调用方仍可经 n_gpu_layers 覆盖。
+                self._rpc_session = self._open_rpc_session(
+                    endpoints=rpc_endpoints,
+                    worker_exe=rpc_worker_exe,
+                    worker_port=rpc_worker_port,
+                    worker_threads=rpc_worker_threads,
+                    worker_log=rpc_worker_log,
+                )
+                injector = self._rpc_session.injector
+                split = self._resolve_rpc_split(rpc_split, len(injector.devices))
+                load_kwargs.setdefault("n_gpu_layers", -1)
+                # 分片时把本机 CPU 也放进 devices，层按 tensor_split 分配
+                array = injector.device_array(include_cpu=split is not None)
+                # 跨路径数值对齐：本机 CPU 默认启用 CPU_REPACK，而 RPC 路径的权重在远端
+                # buffer 里无法 repack → 两条路径浮点结果不同（§11/§13）。关掉 repack 后
+                # 二者逐比特一致；llama-cpp-python 不暴露该开关，只能在注入点改 params。
+                # （Llama.__init__ 既不接受 devices 也不接受 use_extra_bufts）
+                with injector.patched_llama_loader(
+                    device_array=array,
+                    tensor_split=split,
+                    use_extra_bufts=False if align_numerics else None,
+                ):
+                    self._model = Llama(**load_kwargs)
+                engine_label = "llama.cpp (RPC)"
+                engine_detail = "devices=" + ",".join(
+                    (["CPU"] if split is not None else [])
+                    + [f"{dev.name}@{dev.endpoint}" for dev in injector.devices]
+                ) + f" n_gpu_layers={load_kwargs.get('n_gpu_layers')}"
+                if split is not None:
+                    engine_detail += f" tensor_split={split}"
+                if align_numerics:
+                    engine_detail += " use_extra_bufts=False(repack off)"
+                    logger.info("  数值对齐: use_extra_bufts=False —— 关闭 CPU_REPACK，与 RPC 路径逐比特一致")
+                else:
+                    logger.warning(
+                        "  ⚠ 本机 CPU 默认启用 CPU_REPACK，而 RPC 路径无法 repack，两者浮点结果不同"
+                        "（长序列可能分叉）；需与本机逐字一致请传 align_numerics=True"
+                    )
+            else:
+                # 纯本机路径：跨路径对齐同样要求关闭 CPU_REPACK（RPC 侧天然关闭）
+                if align_numerics:
+                    from llama_rpc_device import patched_model_params
+                    with patched_model_params(use_extra_bufts=False):
+                        self._model = Llama(**load_kwargs)
+                    engine_detail = "use_extra_bufts=False(repack off)"
+                    logger.info("  数值对齐: use_extra_bufts=False —— 关闭 CPU_REPACK")
+                else:
+                    self._model = Llama(**load_kwargs)
+                    engine_detail = ""
+                engine_label = "llama.cpp (CPU)"
+
             self._loaded = True
             self._install_chat_template_controls()
             self._embedding_enabled = embedding
@@ -220,7 +388,7 @@ class LlamaCppEngine:
 
             load_time = time.time() - t0
             logger.info(f"GGUF 模型加载完成 ({load_time:.1f}s)")
-            logger.info(f"  引擎: llama.cpp (CPU)")
+            logger.info(f"  引擎: {engine_label}" + (f" {engine_detail}" if engine_detail else ""))
 
         except ImportError:
             raise ImportError(
@@ -233,6 +401,7 @@ class LlamaCppEngine:
         except Exception as e:
             logger.error(f"GGUF 模型加载失败: {e}")
             self._free_mtmd_context()
+            self._close_rpc_session()
             model = self._model
             self._model = None
             close = getattr(model, "close", None)
@@ -419,13 +588,26 @@ class LlamaCppEngine:
         gpu_layers: int = -1,
         require_gpu_layers: int = 0,
         mtmd_use_gpu: bool = True,
+        **llama_kwargs,
     ) -> Dict[str, Any]:
         """G4.5 便捷加载：gemma4 原生工件（受管目录）+ GPU 预算门 + 互斥规则。
 
         - 缺省工件路径从 models/gemma4-native/gemma4-native.lock.json 读取；
         - gpu_layers=-1 时按显存预算自动估算（部分 offload）；
         - 显存不足（低于 require_gpu_layers 对应预算）时 fail-closed。
+
+        Args:
+            **llama_kwargs: 透传给底层 `llama_cpp.Llama` 的额外加载参数
+                （与 `load_model(**kwargs)` 同一通道）。详见 `load_model` 的说明。
         """
+        # 显式拒绝会与本方法的预算门冲突的参数，避免静默覆盖语义。
+        _conflicting = {"n_gpu_layers"}
+        _bad = sorted(_conflicting & set(llama_kwargs))
+        if _bad:
+            raise ValueError(
+                f"{', '.join(_bad)} 由本方法的 gpu_layers/require_gpu_layers 预算门管理，"
+                "请改用 gpu_layers 形参（不通过 **llama_kwargs 传入）"
+            )
         if isinstance(gpu_layers, bool) or not isinstance(gpu_layers, int):
             raise ValueError("gpu_layers must be an integer")
         if gpu_layers < -1 or gpu_layers > 36:
@@ -472,7 +654,9 @@ class LlamaCppEngine:
         if not gguf_file.is_file() or not mmproj_file.is_file():
             raise FileNotFoundError("gemma4-native 工件缺失：检查 models/gemma4-native/ 与冻结记录")
 
-        load_kwargs: Dict[str, Any] = {}
+        # 额外加载参数（tensor_split / use_mmap / use_mlock / kv_overrides /
+        # split_mode / main_gpu / numa / op_offload 等）先落入，再由预算门决定 n_gpu_layers。
+        load_kwargs: Dict[str, Any] = dict(llama_kwargs)
         if gpu_layers > 0:
             load_kwargs["n_gpu_layers"] = int(gpu_layers)
         elif gpu_layers == -1:
@@ -510,6 +694,7 @@ class LlamaCppEngine:
     def unload(self) -> None:
         """卸载模型，释放内存。"""
         self._free_mtmd_context()
+        # 顺序：先释放模型（其张量还在 RPC device 上），再撤 device/worker
         model = self._model
         self._model = None
         close = getattr(model, "close", None)
@@ -518,6 +703,7 @@ class LlamaCppEngine:
                 close()
             except Exception:
                 logger.debug("GGUF model release failed", exc_info=True)
+        self._close_rpc_session()
         self._loaded = False
         self._embedding_enabled = False
         self._embedding_dimension = None

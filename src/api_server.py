@@ -33,10 +33,12 @@ from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Optional, cast
 
-try:  # PyTorch is optional: the L-tier (GGUF/llama.cpp) setup ships without it.
-    import torch
-except ImportError:  # pragma: no cover - exercised by the L-tier environment
-    torch = None  # type: ignore[assignment]
+# 确保 src 目录在 path 中
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from torch_runtime import LazyTorch, cuda_available, loaded_torch
+
+torch = LazyTorch()
 
 
 def _torch_cuda_available() -> bool:
@@ -46,10 +48,20 @@ def _torch_cuda_available() -> bool:
     (GGUF/llama.cpp, no torch), reporting "no CUDA" rather than raising there.
     """
 
-    return torch is not None and torch.cuda.is_available()
+    should_load = False
+    try:
+        active_engine = str(getattr(model_host, "engine_type", "") or "").lower()
+        if active_engine == "pytorch":
+            should_load = True
+        else:
+            import config as _cfg
 
-# 确保 src 目录在 path 中
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            should_load = str(
+                getattr(_cfg, "INFERENCE_ENGINE", "llama_cpp") or "llama_cpp",
+            ).lower() in {"pytorch", "auto"}
+    except Exception:
+        pass
+    return cuda_available(load=should_load)
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -315,12 +327,23 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     """FastAPI lifespan 上下文管理器（替代废弃的 @app.on_event）"""
+    global _runtime_startup_thread
+    _reset_runtime_readiness()
+    _mark_process_ready()
+    _runtime_startup_done.clear()
+    _runtime_startup_thread = threading.Thread(
+        target=_run_runtime_startup,
+        name="runtime-startup",
+        daemon=True,
+    )
+    _runtime_startup_thread.start()
     try:
-        # ---- startup ----
-        await _startup_device_detection()
+        # The HTTP process can serve liveness/readiness while the slower
+        # runtime components finish initializing in the background.
         yield
     finally:
         # ---- shutdown ----
+        _runtime_startup_done.wait(timeout=30.0)
         await _shutdown_resources()
 
 
@@ -407,7 +430,7 @@ async def http_exception_with_request_id(request: Request, exc: HTTPException):
 
 # 推理宿主单例（阶段 0.2/0.4：api_server 与 scheduler 共享；model_manager 为
 # 兼容名，属性读写代理到内部 ModelManager）
-from model_host import model_host
+from model_host import SchedulerCallbackSet, model_host
 from koakuma_engine import (
     Capability,
     accepted_backend_requests,
@@ -429,6 +452,76 @@ conversation_stats: dict = {                    # 累计对话统计（实际消
 device_profile: Optional[dict] = None           # 设备画像缓存
 _device_profile_ready = threading.Event()
 _device_profile_started = False
+
+# Process liveness and inference-runtime readiness are intentionally separate.
+# A model is not part of this gate: the application must remain usable so the
+# user can inspect/download/select a model after entering the TUI.
+_RUNTIME_COMPONENTS = ("local_store", "scheduler", "device_profile")
+_runtime_readiness_lock = threading.RLock()
+_runtime_readiness: dict[str, Any] = {
+    "process_ready": False,
+    "ready": False,
+    "status": "starting",
+    "components": {name: False for name in _RUNTIME_COMPONENTS},
+    "error": None,
+    "started_at": None,
+    "ready_at": None,
+}
+_runtime_startup_done = threading.Event()
+_runtime_startup_thread: Optional[threading.Thread] = None
+
+
+def _reset_runtime_readiness() -> None:
+    with _runtime_readiness_lock:
+        _runtime_readiness.update(
+            process_ready=False,
+            ready=False,
+            status="starting",
+            components={name: False for name in _RUNTIME_COMPONENTS},
+            error=None,
+            started_at=time.time(),
+            ready_at=None,
+        )
+
+
+def _mark_process_ready() -> None:
+    with _runtime_readiness_lock:
+        _runtime_readiness["process_ready"] = True
+
+
+def _mark_runtime_component(
+    name: str, ready: bool, *, error: Optional[str] = None,
+) -> None:
+    if name not in _RUNTIME_COMPONENTS:
+        return
+    with _runtime_readiness_lock:
+        components = _runtime_readiness["components"]
+        components[name] = bool(ready)
+        if error:
+            _runtime_readiness["error"] = str(error)
+        all_ready = all(components.values())
+        _runtime_readiness["ready"] = all_ready
+        if all_ready:
+            _runtime_readiness["status"] = "ready"
+            _runtime_readiness["error"] = None
+            _runtime_readiness["ready_at"] = time.time()
+        elif error:
+            _runtime_readiness["status"] = "degraded"
+
+
+def _mark_runtime_startup_failure(error: BaseException) -> None:
+    with _runtime_readiness_lock:
+        _runtime_readiness["ready"] = False
+        _runtime_readiness["status"] = "failed"
+        _runtime_readiness["error"] = f"{type(error).__name__}: {error}"
+
+
+def _runtime_readiness_snapshot() -> dict[str, Any]:
+    with _runtime_readiness_lock:
+        return {
+            **_runtime_readiness,
+            "components": dict(_runtime_readiness["components"]),
+        }
 
 # 调度器（单机 / 分布式模式共用）
 scheduler: ClusterScheduler = ClusterScheduler()
@@ -711,16 +804,30 @@ def _run_exclusive_model_change(
 # 启动事件 — 设备检测（通过 lifespan 调用）
 # ============================================================
 
-async def _startup_device_detection():
-    """Start core services immediately and detect slower hardware in background."""
+def _run_runtime_startup() -> None:
+    """Run the slower runtime initialization outside the HTTP event loop."""
+    try:
+        _startup_device_detection()
+    except BaseException as exc:  # keep liveness available and report /ready
+        logger.critical("runtime startup failed: %s", exc, exc_info=True)
+        _mark_runtime_startup_failure(exc)
+    finally:
+        _runtime_startup_done.set()
+
+
+def _startup_device_detection():
+    """Initialize local runtime components and detect slower hardware in background."""
     global device_profile, _device_profile_started
     active_scheduler: ClusterScheduler = globals()["scheduler"]
 
+    _mark_runtime_component("local_store", False)
     try:
         sqlite_path = _local_store.initialize_local_store()
         logger.info("主节点 SQLite 已就绪: %s", sqlite_path)
+        _mark_runtime_component("local_store", True)
     except Exception as exc:
         logger.critical("主节点 SQLite 不可写，拒绝启动: %s", exc)
+        _mark_runtime_component("local_store", False, error=str(exc))
         raise RuntimeError("主节点 SQLite 初始化失败") from exc
 
     def _detect_device_profile() -> None:
@@ -738,9 +845,11 @@ async def _startup_device_detection():
             logger.info(f"   推荐配置: {profiler.recommend_config()['description']}")
             for warning in device_profile.get("warnings", []):
                 logger.warning(f"   {warning}")
+            _mark_runtime_component("device_profile", True)
         except Exception as e:
             logger.error(f"设备检测失败: {e}")
             device_profile = None
+            _mark_runtime_component("device_profile", False, error=str(e))
         finally:
             _device_profile_ready.set()
 
@@ -751,13 +860,19 @@ async def _startup_device_detection():
             name="device-profile",
             daemon=True,
         ).start()
+    elif device_profile is not None:
+        _mark_runtime_component("device_profile", True)
+    elif _device_profile_ready.is_set():
+        _mark_runtime_component("device_profile", False, error="device profile unavailable")
 
     # 初始化调度器（单机模式下不启动 TCP 监听）
     try:
         active_scheduler.start()
         logger.info(f"调度器已初始化: mode={RUN_MODE}")
+        _mark_runtime_component("scheduler", True)
     except Exception as e:
         logger.error(f"调度器初始化失败: {e}")
+        _mark_runtime_component("scheduler", False, error=str(e))
 
     # L5: 启动日志保留策略清理线程
     try:
@@ -1985,6 +2100,12 @@ async def health():
     return {"status": "ok", "timestamp": time.time()}
 
 
+@app.get("/api/ready")
+async def readiness():
+    """Report runtime readiness without making model loading mandatory."""
+    return _runtime_readiness_snapshot()
+
+
 def _rag_public_result(row: dict[str, Any]) -> dict[str, Any]:
     """Return citation-safe fields; never expose stored vector blobs."""
     text = str(row.get("text_content", ""))
@@ -2617,15 +2738,16 @@ async def select_gpu(req: SelectGpuRequest):
 async def get_status():
     """获取系统完整状态（含设备档位）"""
     gpu_info = {}
-    if _torch_cuda_available():
+    torch_module = loaded_torch()
+    if torch_module is not None and _torch_cuda_available():
         gpu_info = {
-            "name": torch.cuda.get_device_name(0),
-            "total_mb": round(torch.cuda.get_device_properties(0).total_memory / (1024**2)),
-            "allocated_mb": round(torch.cuda.memory_allocated() / (1024**2), 1),
-            "reserved_mb": round(torch.cuda.memory_reserved() / (1024**2), 1),
+            "name": torch_module.cuda.get_device_name(0),
+            "total_mb": round(torch_module.cuda.get_device_properties(0).total_memory / (1024**2)),
+            "allocated_mb": round(torch_module.cuda.memory_allocated() / (1024**2), 1),
+            "reserved_mb": round(torch_module.cuda.memory_reserved() / (1024**2), 1),
             "utilization": round(
-                torch.cuda.memory_allocated()
-                / torch.cuda.get_device_properties(0).total_memory
+                torch_module.cuda.memory_allocated()
+                / torch_module.cuda.get_device_properties(0).total_memory
                 * 100,
                 1,
             ),
@@ -6561,7 +6683,15 @@ async def list_local_model_assets(request: Request = None):
     require_model_api_source(request)
     from local_model_assets import discover_local_model_assets
 
-    return discover_local_model_assets()
+    # Inventory may hash multi-GB manifests.  Never run that filesystem work
+    # on FastAPI's event loop: while it runs, even /health and /device/profile
+    # would appear to time out to every client.
+    # Inventory is intentionally metadata-only.  Full SHA-256 verification is
+    # still performed by the explicit preflight endpoint before runtime use;
+    # doing it here would read multi-GB weights on every screen refresh.
+    return await run_in_threadpool(
+        lambda: discover_local_model_assets(verify_hashes=False)
+    )
 
 
 @app.post("/api/models/local-assets/{model_id}/preflight")
@@ -6859,7 +6989,7 @@ async def get_cluster_status():
     包含所有节点状态、TCP 连接信息、当前任务等。
     单机模式下返回 3 个默认节点（均为 online）。
     """
-    return scheduler.get_status()
+    return await run_in_threadpool(scheduler.get_status)
 
 
 @app.get("/api/cluster/nodes")
@@ -6870,7 +7000,7 @@ async def get_cluster_nodes():
     Returns:
         { nodes: [...], count: int, online_count: int }
     """
-    nodes = scheduler.get_nodes()
+    nodes = await run_in_threadpool(scheduler.get_nodes)
     online_count = sum(1 for n in nodes if n["is_available"])
     return {
         "nodes": nodes,
@@ -6878,6 +7008,12 @@ async def get_cluster_nodes():
         "online_count": online_count,
         "offline_count": len(nodes) - online_count,
     }
+
+
+@app.get("/api/cluster/resources")
+async def get_cluster_resources():
+    """Return the read-only aggregate CPU, RAM, and GPU resource view."""
+    return await run_in_threadpool(scheduler.get_aggregate_resource_view)
 
 
 @app.post("/api/cluster/nodes/{node_id}/deregister")
@@ -6930,7 +7066,7 @@ async def get_cluster_config():
 
     包含网络配置、分层配置、模型配置、任务统计、当前节点角色。
     """
-    return scheduler.get_config()
+    return await run_in_threadpool(scheduler.get_config)
 
 
 @app.get("/api/cluster/my-role")
@@ -6942,7 +7078,7 @@ async def get_my_role():
     - master 节点：后台管理 Tab 完全开放
     - client 节点：需在设置中开启"分布式推理优化"后才可见
     """
-    return scheduler.get_my_role()
+    return await run_in_threadpool(scheduler.get_my_role)
 
 
 @app.put("/api/cluster/config/max-nodes")
@@ -7712,7 +7848,7 @@ async def get_layer_assignments():
             "computed_at": timestamp | null,
         }
     """
-    return scheduler.get_layer_assignments()
+    return await run_in_threadpool(scheduler.get_layer_assignments)
 
 
 @app.get("/api/cluster/pipeline-capacity")
@@ -7722,7 +7858,13 @@ async def get_pipeline_capacity_plan():
     The response is a read-only admission/transaction projection. It never
     downloads or materializes model weights.
     """
-    return scheduler.get_pipeline_capacity_plan()
+    return await run_in_threadpool(scheduler.get_pipeline_capacity_plan)
+
+
+@app.get("/api/cluster/pipeline-reshard")
+async def get_pipeline_reshard_status():
+    """Return the address-free, epoch-fenced automatic recovery state."""
+    return await run_in_threadpool(scheduler.get_pipeline_reshard_status)
 
 
 class LayerOverrideItem(BaseModel):
@@ -9890,16 +10032,20 @@ async def delete_log_file(filename: str, request: Request):
 # ============================================================
 
 # ============================================================
-# 阶段 0.2：向 model_host 挂载 scheduler 需要的回调（消除 scheduler
-# 对 api_server 的运行时反向 import）
+# API composition root: construct the scheduler's complete callback contract
+# in one step. Scheduler never imports this module or reads host private attrs.
 # ============================================================
-model_host.attach("_execute_task_worker_stage", _execute_task_worker_stage)
-model_host.attach("_active_task_graph_model_identity", _active_task_graph_model_identity)
-model_host.attach("_build_model_chat_prompt", _build_model_chat_prompt)
-model_host.attach("THINKING_SYSTEM_PROMPT", THINKING_SYSTEM_PROMPT)
-model_host.attach("_snapshot_recent_logs", _snapshot_recent_logs)
-model_host.attach("_filter_recent_logs", _filter_recent_logs)
-model_host.attach("_format_model_response", _format_model_response)
+_scheduler_callbacks = SchedulerCallbackSet(
+    active_task_graph_model_identity=_active_task_graph_model_identity,
+    execute_task_worker_stage=_execute_task_worker_stage,
+    build_model_chat_prompt=_build_model_chat_prompt,
+    thinking_system_prompt=THINKING_SYSTEM_PROMPT,
+    snapshot_recent_logs=_snapshot_recent_logs,
+    filter_recent_logs=_filter_recent_logs,
+    format_model_response=_format_model_response,
+)
+model_host.configure_scheduler_callbacks(_scheduler_callbacks)
+scheduler.configure_callbacks(_scheduler_callbacks)
 
 
 def _api_bind_hosts(host: str) -> list[str]:

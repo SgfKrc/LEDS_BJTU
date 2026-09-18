@@ -5,6 +5,8 @@ __pycache__/
 .venv/
 .venv-test/
 .venv-edge/
+# RPC 版 llama-cpp-python 实验环境（GGML_RPC=ON，见 local_docs/CORE-LLAMA-PC-RPC-01-*.md）
+.venv-llama-rpc/
 venv/
 env/
 
@@ -34,6 +36,9 @@ Thumbs.db
 logs/*.log
 logs/*.err
 logs/*.out
+# logs/ 下的一次性调试脚本与临时产物（保留 .gitkeep 与运行日志本身）
+logs/*.py
+logs/*.json
 logs/sd15/
 packaging/*.log
 src/import_time.log

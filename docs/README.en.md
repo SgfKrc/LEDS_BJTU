@@ -59,13 +59,13 @@ Coverage: **Windows PC + Linux PC + Android**. A device type is not sufficient f
 | ⚙️ **Task-chain Full Worker** | `dual_candidate` DAG, journal, lease-epoch fencing and provider registry remain a temporary full-model fallback; this does not mean the model is sharded and `task_dispatch` stays closed → [task chain plan](archive/任务链下一阶段实施计划.md) |
 | 🗂️ **Local RAG** | Master-node SQLite FTS5 + bounded vector embeddings (local Ollama `nomic-embed-text` / native llama.cpp dual providers), recoverable jobs, capacity budgeting and ANN decision gate (RAG-S0…S5D). The 30-query human quality gate is complete locally; long-running, scale and sqlite-vec benchmarks remain deferred → cluster-join & local RAG plan |
 | 🔑 **Manual cluster join (CLUSTER-JOIN)** | Target node issues a one-time grant; master signs an Ed25519 client-only grant after Auth-App approval (text code + QR, atomic nonce ledger), then the node is demoted to worker; Web/TUI wired → cluster-join plan |
-| 🌐 **Weak-network & Transport v2** | `cluster_transport` provides `legacy_tcp`/`wss_443` capability choice, bounded ACK window, stable failure matrix and circuit breaker; NW3.1 local self-signed WSS loopback gate done; real 443/cert/traffic comparison deferred → [weak-network plan](抗弱网通信协议专项计划.md) |
+| 🌐 **Weak-network & Transport v2** | `cluster_transport` provides `legacy_tcp`/`wss_443` capability choice, bounded ACK window, stable failure matrix and circuit breaker; NW3.1 local self-signed WSS loopback gate done; real 443/cert/traffic comparison deferred → [weak-network plan](archive/抗弱网通信协议专项计划.md) |
 | 🧪 **Experiment quality & document governance** | EX-N3 read-only production gate verifies plan, samples, calibration, performance, quality and human review; historical records pass 3/3. The document-maintenance Agent has local retrieval/semantic quality gates and only produces suggestions, never automatic rewrites |
 | 🧩 **Sub-project: small-model harness workbench** | Toy/self-use workbench for small-model customization (S1-S8 local/offline gates done): context budget & STATE compression, model profiles & capability gate, OpenAI-compatible `/v1`, customization experiment bench (A/B + Pareto), image workbench, SQLite sessions & RAG, long-term memory (RAG+compression+local memory), web search & lightweight MCP, red-team samples; **no main-project imports, only shared model artifacts** → [harness plan](../harness_workbench/docs/小模型轻量推理harness工作台调研与方案.md) |
 | 📡 **Web search & lightweight Fetch** | WEB-TOOL G1-G6 local gates done: offline capability probe, fail-closed Tool Gateway (HTTPS-only/SSRF/DNS+redirect re-check), restricted Fetch/SearXNG adapters, TaskGraph `tool_request` Stage, explicit-`persist` tool cache & API, quality gate & joint audit; `production_network_enabled=false` → research plan |
 | 📝 **Document-maintenance Agent sub-project** | Standalone package (own repo [qlh-docagent](https://github.com/SgfKrc/qlh-docagent), brought in as a submodule): rule-as-data (`RULES.md` + `rules.yaml` driven scanner), rule-change mechanical scanning (delta matrix new/gone/changed + `--max-new/--max-gone` gates), evolution gates (agent rule edits: proposed→preflight→gates→released) with equivalence regression → [plan](../tools/docagent/docs/文档维护Agent工具子项目化与通用化专项计划.md) |
 | 🔌 **Reasonix ↔ Codex bridge sub-project** | Standalone package (own repo [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge), brought in as a submodule): exposes the Reasonix subagent to Codex as stdio MCP tools (`reasonix_run` / `reasonix_resume` / `reasonix_cancel` / `reasonix_rollback` / `reasonix_status`); CLI path and model ref resolve per machine with zero hard-coding (`node src/configure.mjs list/use/codex/verify`); read-only by default, with controlled writes, change evidence, explicit rollback and read/write profile separation landed by `W1/W2/W3` (off by default); audit fixes `AUD-01`–`AUD-08`, bounded runtime budget extension `R2-EXT-01`, task-level checkpoint/resume `E2-EXT-01`, and explicit read-only parallel/cancel reclamation `R3-EXT-01` landed; `G3` has WSL cross-platform evidence and `R4` makes output truncation deterministic → roadmap |
-| 🎯 **Judging-policy fix & DS3 replacing R1** | `loose_contains` + 512 tokens (P5) proven discriminative (Qwen3-4B 1/4 vs 1.8B 0/4); DS3-0324-7B full v2 policy **2/4×3, 8/11×3** (budget 192→512 alone flips 0/4→2/4, confirming the judging-policy problem) → **approved candidate to replace R1** as judging model → [DS3 plan](DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) |
+| 🎯 **Judging-policy fix & DS3 replacing R1** | `loose_contains` + 512 tokens (P5) proven discriminative (Qwen3-4B 1/4 vs 1.8B 0/4); DS3-0324-7B full v2 policy **2/4×3, 8/11×3** (budget 192→512 alone flips 0/4→2/4, confirming the judging-policy problem) → **approved candidate to replace R1** as judging model → [DS3 plan](archive/DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) |
 
 ### Project Design Philosophy
 
@@ -117,7 +117,7 @@ Open the Tailscale admin console at https://login.tailscale.com/admin/machines a
 - Tailscale builds a virtual LAN on top of WireGuard, giving each device a fixed `100.x.x.x` address
 - The Windows packaged launcher automatically checks whether Tailscale is installed and logged in
 
-> The campus network is observed to block UDP, so Tailscale can fall back to relay paths. `NET-DUALSTACK-PREF-01` has completed its local gate: a successful explicit connect persists the selected IPv4/IPv6 endpoint, while startup and reconnect use “preference → original bootstrap → Tailnet” fallback; a short dual-machine IPv6 task is verified. Self-hosted DERP, path observation, backup relays, a WSS data plane direct to the primary node and chunked resume still require real 443/certificate/network acceptance; see the [Anti-Weak-Network Communication Protocol Plan](抗弱网通信协议专项计划.md).
+> The campus network is observed to block UDP, so Tailscale can fall back to relay paths. `NET-DUALSTACK-PREF-01` has completed its local gate: a successful explicit connect persists the selected IPv4/IPv6 endpoint, while startup and reconnect use “preference → original bootstrap → Tailnet” fallback; a short dual-machine IPv6 task is verified. Self-hosted DERP, path observation, backup relays, a WSS data plane direct to the primary node and chunked resume still require real 443/certificate/network acceptance; see the [Anti-Weak-Network Communication Protocol Plan](archive/抗弱网通信协议专项计划.md).
 
 ---
 
@@ -152,9 +152,9 @@ Project root
 │   ├── island_engine.py           # ★ TP island engine (OpenAI-compatible endpoint → single logical node, Route A)
 │   ├── external_provider.py       # ★ External inference provider + data-scope gating (Route B)
 │   ├── speculative.py             # ★ draft-verify speculative decoding (experimental, disabled, Route C)
-│   ├── tui_admin.py               # ★ Cross-platform TUI admin menu (pure stdlib, zero dependencies)
+│   ├── tui_commands.py            # ★ Read-only single-command layer (pure stdlib, zero dependencies)
 │   ├── qlh.py                     # Cross-platform core TUI command entry
-│   ├── tui_chat.py                # ★ T9 chat page (Textual + httpx; bundled in installers, optional in source)
+│   ├── tui_textual.py             # ★ Textual TUI shell (9 screens; chat + read-only ops)
 │   ├── tui_sse.py / tui_shared.py # T9 SSE incremental parser & shared layer
 │   ├── paged_kv_cache.py          # Lightweight paged KV cache (hot memory pages; optional cold disk tier)
 │   ├── tcp_comm.py                # TCP master/worker communication (long-lived conns, heartbeats, framing, tensor serialization)
@@ -582,7 +582,7 @@ Open app → Settings → switch to "Full mode" → Model management → pick di
 python src/api_server.py
 
 # Terminal 2: start the mainline TUI (the product shell is a side line)
-python -m src.tui_admin --plain --host http://127.0.0.1:8000
+python qlh.py                       # Textual shell; starts the backend if needed
 ```
 
 Once the backend is ready:
@@ -638,9 +638,9 @@ start_tui.bat                               # Windows (double-click or command l
 **Manual / advanced usage** (run `python src/api_server.py` first if the backend is not running):
 
 ```bash
-python src/tui_admin.py --host 100.x.x.x    # Manage a remote Tailscale master directly
-python src/tui_admin.py --plain             # Fall back to a plain numbered menu on old terminals/pipes
-python src/tui_admin.py --host 100.x.x.x --log-token xxx   # Remote mode with log token
+python src/tui_commands.py status --host 100.x.x.x                # Query a remote Tailscale master (read-only)
+python src/tui_commands.py models --json                          # Machine-readable read-only output
+python src/tui_commands.py logs --host 100.x.x.x --log-token xxx  # Remote aggregated logs
 bjtu --help                                 # Full command set and startup args (does not start the backend)
 ```
 

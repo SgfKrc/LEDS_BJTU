@@ -1,0 +1,334 @@
+"""QLH 后端的最小 REST / SSE 客户端（**纯标准库**）。
+
+从旧的 ``tui_admin.py`` 抽出的 ``ApiClient``，用途：
+
+* 供 Textual 外壳（``src/tui_textual.py``）与后续的单命令薄层共用一份协议实现；
+* 只依赖标准库（``urllib``/``json``），SSE 解析复用 ``src/tui_sse.py``（同样零依赖），
+  因此**无 UI 依赖的环境**（Edge、CI）也能 import 本模块。
+
+历史：``ApiClient`` 原在 ``tui_admin.py`` 内，随该文件的界面代码一起被视为可归档对象；
+协议层不应与界面同生共死，故独立成模块。
+"""
+
+from __future__ import annotations
+
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional
+
+try:  # 同目录导入（python src/xxx.py）
+    from tui_sse import SSEDecoder, decode_json_event
+    from tui_shared import API_PATHS, build_interactive_request
+except ImportError:  # pragma: no cover - 包导入路径
+    from .tui_sse import SSEDecoder, decode_json_event  # type: ignore
+    from .tui_shared import API_PATHS, build_interactive_request  # type: ignore
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8000
+BACKEND_HINT = "请先启动本机后端（python src/api_server.py），或用 qlh 自动启动。"
+
+
+class ApiError(Exception):
+    """后端返回的错误（含 HTTP 状态码，便于界面区分 4xx/5xx）。"""
+
+    def __init__(self, message: str, status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class ApiClient:
+    """与 FastAPI 后端通信的极简 REST 客户端（纯标准库）。"""
+
+    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
+                 timeout: float = 5.0, log_token: str = "") -> None:
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.log_token = log_token
+
+    @property
+    def base_url(self) -> str:
+        from network_address import build_url
+
+        return build_url("http", self.host, self.port)
+
+    # ------------------------------------------------------------ 底层请求
+
+    def _request_url(self, method: str, url: str, body=None, params=None,
+                     with_log_token: bool = False, timeout: Optional[float] = None):
+        """执行一个已拼好的 URL 请求，供 API 面和根路径文档共用。"""
+        if params:
+            qs = urllib.parse.urlencode({k: v for k, v in params.items() if v not in (None, "")})
+            if qs:
+                url = url + ("&" if "?" in url else "?") + qs
+        data = None
+        headers = {"Accept": "application/json"}
+        if body is not None:
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if with_log_token and self.log_token:
+            headers["X-QLH-Log-Token"] = self.log_token
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        effective_timeout = self.timeout if timeout is None else float(timeout)
+        try:
+            with urllib.request.urlopen(req, timeout=effective_timeout) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                raw = e.read().decode("utf-8", errors="replace")
+                parsed = json.loads(raw) if raw else {}
+                detail = parsed.get("detail", raw) if isinstance(parsed, dict) else raw
+                if isinstance(detail, dict):
+                    detail = detail.get("message") or json.dumps(detail, ensure_ascii=False)
+            except Exception:  # noqa: BLE001 - 响应体不是 JSON 时保留状态码
+                detail = ""
+            raise ApiError("HTTP %d: %s" % (e.code, detail or e.reason), status=e.code)
+        except urllib.error.URLError as e:
+            reason = getattr(e, "reason", e)
+            if isinstance(reason, (TimeoutError, OSError)) and "timed out" in str(reason):
+                raise ApiError("请求超时（>%.0fs）: %s" % (effective_timeout, url))
+            raise ApiError("无法连接后端 %s（%s）。%s" % (self.base_url, reason, BACKEND_HINT))
+        except TimeoutError:
+            raise ApiError("请求超时（>%.0fs）: %s" % (effective_timeout, url))
+        except OSError as e:
+            raise ApiError("网络错误 %s: %s。%s" % (self.base_url, e, BACKEND_HINT))
+        if not text:
+            return {}
+        try:
+            return json.loads(text)
+        except ValueError:
+            return {"detail": text}
+
+    def request(self, method: str, path: str, body=None, params=None,
+                with_log_token: bool = False, timeout: Optional[float] = None):
+        """``timeout`` 为 None 时用实例超时；模型加载等长操作按需放宽。"""
+        normalized = path if path.startswith("/") else "/" + path
+        if normalized.startswith("/api/"):
+            normalized = normalized[4:]
+        return self._request_url(
+            method, self.base_url + "/api" + normalized, body=body, params=params,
+            with_log_token=with_log_token, timeout=timeout)
+
+    def request_root(self, method: str, path: str, body=None, params=None,
+                     timeout: Optional[float] = None):
+        """访问后端根路径，主要用于 ``/openapi.json`` 等非业务 API。"""
+        normalized = path if path.startswith("/") else "/" + path
+        return self._request_url(
+            method, self.base_url + normalized, body=body, params=params,
+            timeout=timeout)
+
+    def get_openapi(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """读取运行中后端的实际 OpenAPI 路由表。"""
+        value = self.request_root("GET", "/openapi.json", timeout=timeout)
+        return value if isinstance(value, dict) else {}
+
+    def download(self, path: str, target: Path, *, with_log_token: bool = False,
+                 timeout: Optional[float] = 60.0) -> Path:
+        """下载二进制端点响应到本地文件（日志导出/模型文件等）。"""
+        normalized = path if path.startswith("/") else "/" + path
+        if normalized.startswith("/api/"):
+            normalized = normalized[4:]
+        url = self.base_url + "/api" + normalized
+        headers = {"Accept": "*/*"}
+        if with_log_token and self.log_token:
+            headers["X-QLH-Log-Token"] = self.log_token
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read()
+        except urllib.error.HTTPError as exc:
+            raise ApiError("HTTP %d: %s" % (exc.code, exc.reason), status=exc.code) from exc
+        except (urllib.error.URLError, OSError) as exc:
+            raise ApiError("无法下载 %s：%s" % (url, exc)) from exc
+        target = Path(target)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        except OSError as exc:
+            raise ApiError("无法保存下载文件 %s：%s" % (target, exc)) from exc
+        return target
+
+    def get(self, path, params=None, with_log_token: bool = False,
+            timeout: Optional[float] = None):
+        return self.request("GET", path, params=params,
+                           with_log_token=with_log_token, timeout=timeout)
+
+    def post(self, path, body=None, params=None):
+        return self.request("POST", path, body=body, params=params)
+
+    def put(self, path, body=None):
+        return self.request("PUT", path, body=body)
+
+    def delete(self, path, body=None, params=None, timeout: Optional[float] = None):
+        return self.request("DELETE", path, body=body, params=params, timeout=timeout)
+
+
+def cancel_generation(api: ApiClient, generation_id: str) -> None:
+    """取消某次生成；``generation_id`` 含 ``/`` 时必须 safe="" 编码。"""
+    path = API_PATHS["chat_cancel"].format(
+        generation_id=urllib.parse.quote(generation_id, safe=""))
+    api.post(path)
+
+
+# ============================================================
+# 写操作：模型控制 / 会话管理 / 队列控制
+# ============================================================
+# 权限边界：后端 ``model_api_access.require_model_api_source()`` 对 loopback 默认放行
+# （``is_model_api_source_trusted`` → 127.0.0.1 直接 True），因此**本机 TUI 可直接调用**；
+# 从节点远程控制主节点需要主节点显式配置 ``QLH_MODEL_API_TRUSTED_CIDRS``。
+
+#: 模型加载/卸载耗时约 5-20 秒（后端 /models/load 注释），故放宽超时
+MODEL_CONTROL_TIMEOUT = 180.0
+
+QUEUE_STRATEGIES = ("mlfq", "fifo")
+
+
+def _as_dict(value: Any) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {"value": value}
+
+
+def _quoted(**values: Any) -> Dict[str, str]:
+    """路径参数必须 safe="" 编码（session_id 可能含 "/"）。"""
+    return {key: urllib.parse.quote(str(value), safe="") for key, value in values.items()}
+
+
+def load_model(api: ApiClient, model_id: Optional[str] = None, *, engine: str = "llama_cpp",
+               quant_type: str = "int4", use_compile: bool = False) -> Dict[str, Any]:
+    """加载/切换模型（POST ``/api/models/load``）。
+
+    后端内部走 ``switch_model``，因此**失败会自动回滚**到上一个模型；耗时 5-20 秒，
+    期间先卸载旧模型。注意 ``/api/models/switch`` 仅 CUDA 可用（非 CUDA 返回 403），
+    故统一走本接口。
+    """
+    body: Dict[str, Any] = {
+        "engine": engine,
+        "quant_type": quant_type,
+        "use_compile": bool(use_compile),
+    }
+    if model_id:
+        body["model_id"] = model_id
+    return _as_dict(api.request("POST", API_PATHS["models_load"], body=body,
+                               timeout=MODEL_CONTROL_TIMEOUT))
+
+
+def unload_model(api: ApiClient) -> Dict[str, Any]:
+    """显式释放本地 LLM（POST ``/api/models/unload``）。"""
+    return _as_dict(api.request("POST", API_PATHS["models_unload"],
+                               timeout=MODEL_CONTROL_TIMEOUT))
+
+
+def clear_backend_history(api: ApiClient) -> Dict[str, Any]:
+    """清空后端当前会话的历史与 KV 缓存（POST ``/api/chat/clear``）。"""
+    return _as_dict(api.post(API_PATHS["chat_clear"]))
+
+
+# ------------------------------------------------------------ 会话管理
+
+def list_sessions(api: ApiClient) -> List[Dict[str, Any]]:
+    """``GET /api/sessions`` → 会话 dict 列表（兼容裸列表与 ``{sessions: [...]}``）。"""
+    value = api.get(API_PATHS["sessions"])
+    if isinstance(value, list):
+        items = value
+    elif isinstance(value, dict):
+        items = value.get("sessions") or value.get("items") or []
+    else:
+        items = []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def create_session(api: ApiClient, title: Optional[str] = None) -> Dict[str, Any]:
+    """新建并激活会话（POST ``/api/sessions``）。"""
+    body = {"title": title} if title else {}
+    return _as_dict(api.post(API_PATHS["sessions"], body=body))
+
+
+def activate_session(api: ApiClient, session_id: str) -> Dict[str, Any]:
+    """切换到指定会话并取回历史（POST ``/sessions/{id}/activate``）。"""
+    path = API_PATHS["session_activate"].format(**_quoted(session_id=session_id))
+    return _as_dict(api.post(path))
+
+
+def rename_session(api: ApiClient, session_id: str, title: str) -> Dict[str, Any]:
+    """重命名会话（PUT ``/sessions/{id}``）。"""
+    path = API_PATHS["session_detail"].format(**_quoted(session_id=session_id))
+    return _as_dict(api.put(path, {"title": title}))
+
+
+def delete_session(api: ApiClient, session_id: str) -> Dict[str, Any]:
+    """删除会话及其全部对话消息（DELETE ``/sessions/{id}``）——破坏性，调用方须先确认。"""
+    path = API_PATHS["session_detail"].format(**_quoted(session_id=session_id))
+    return _as_dict(api.delete(path))
+
+
+# ------------------------------------------------------------ 队列控制
+
+def pause_queue(api: ApiClient) -> Dict[str, Any]:
+    """暂停接受新请求（POST ``/cluster/queue/pause``，仅主节点）。"""
+    return _as_dict(api.post(API_PATHS["cluster_queue_pause"]))
+
+
+def resume_queue(api: ApiClient) -> Dict[str, Any]:
+    """恢复接受新请求（POST ``/cluster/queue/resume``，仅主节点）。"""
+    return _as_dict(api.post(API_PATHS["cluster_queue_resume"]))
+
+
+def set_queue_strategy(api: ApiClient, strategy: str) -> Dict[str, Any]:
+    """切换调度策略（POST ``/cluster/queue/strategy``）。"""
+    if strategy not in QUEUE_STRATEGIES:
+        raise ValueError("调度策略只能是 %s" % " | ".join(QUEUE_STRATEGIES))
+    return _as_dict(api.post(API_PATHS["cluster_queue_strategy"], {"strategy": strategy}))
+
+
+def clear_queue(api: ApiClient) -> Dict[str, Any]:
+    """清空排队任务（POST ``/cluster/queue/clear``）——不影响执行中的任务，仍须确认。"""
+    return _as_dict(api.post(API_PATHS["cluster_queue_clear"]))
+
+
+def iter_chat_payloads(
+    api: ApiClient,
+    message: str,
+    *,
+    session_id: Optional[str] = None,
+    generation_id: Optional[str] = None,
+    routing_preference: str = "auto",
+    show_thinking: bool = False,
+    max_new_tokens: int = 1024,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    read_timeout: float = 60.0,
+) -> Iterator[Dict[str, Any]]:
+    """POST ``/api/chat/stream`` 并逐事件产出 JSON payload（供界面 worker 消费）。
+
+    同步生成器：调用方负责放进线程/worker，避免阻塞 UI 事件循环。
+    """
+    body = build_interactive_request(
+        message,
+        session_id=session_id,
+        generation_id=generation_id,
+        routing_preference=routing_preference,
+        show_thinking=show_thinking,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+    )
+    url = api.base_url + "/api" + API_PATHS["chat_stream"]
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+        method="POST",
+    )
+    decoder = SSEDecoder()
+    with urllib.request.urlopen(req, timeout=read_timeout) as resp:
+        while True:
+            chunk = resp.read(4096)
+            if not chunk:
+                break
+            for event in decoder.feed(chunk):
+                payload = decode_json_event(event)
+                if payload:
+                    yield payload

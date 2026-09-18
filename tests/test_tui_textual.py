@@ -1,0 +1,455 @@
+"""Textual 外壳 + 协议层的 headless 测试。
+
+要点：
+* ``tui_api``（协议层）是纯标准库，**没有** textual 也必须能 import 并正确报错；
+* Textual 外壳在**后端不可用**时也必须能安全启动（只显示错误，不崩）；
+* 十屏（聊天/状态/模型/分布式/节点/队列/日志/设备/设置/端点）侧栏导航与外层 Splash→Main 切换必须存在；
+* 各屏按后端**真实字段**渲染（回归 2026-09-17 的接线错位），聊天后端错误必须可见。
+
+缺 textual 时整个模块跳过（Edge 之外的极简环境仍可跑其余测试）。
+"""
+
+import asyncio
+import os
+import sys
+import time
+
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from tui_api import ApiClient, ApiError  # noqa: E402  - 纯标准库，始终可导入
+
+
+# ------------------------------------------------------------------ 协议层
+
+def test_client_reports_connection_failure_as_api_error():
+    """无后端时必须抛 ApiError（界面据此显示错误，而不是崩栈）。"""
+    api = ApiClient(host="127.0.0.1", port=1, timeout=0.5)
+    with pytest.raises(ApiError):
+        api.get("/health")
+
+
+def test_chat_cancel_path_escapes_slash():
+    """generation_id 含 "/" 时必须被编码，否则会多切一段 URL。"""
+    from tui_api import API_PATHS
+    import urllib.parse
+
+    quoted = urllib.parse.quote("sess/1", safe="")
+    assert quoted == "sess%2F1"
+    assert "{generation_id}" in API_PATHS["chat_cancel"]
+
+
+# ------------------------------------------------------------------ Textual 外壳
+
+pytest.importorskip("textual")
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def test_shell_boots_then_switches_to_main():
+    from textual.widgets import ContentSwitcher, ListView
+
+    from tui_textual import KoakumaApp, MainScreen, SplashScreen
+
+    async def _main():
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.5))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, SplashScreen), "应先显示启动屏"
+            splash = app.screen
+            from textual.widgets import Static
+
+            status = str(splash.query_one("#splash-status", Static).render())
+            assert "少女祈祷中" in status, "启动行应以「少女祈祷中：」开头"
+            bar = str(splash.query_one("#splash-bar", Static).render())
+            assert "█" in bar and "░" in bar, "标题下方应有跑马灯启动条"
+            app.show_main()
+            await pilot.pause()
+            assert isinstance(app.screen, MainScreen), "应切换到主界面"
+            nav = app.screen.query_one("#nav", ListView)
+            sidebar = app.screen.query_one("#sidebar")
+            content = app.screen.query_one("#content", ContentSwitcher)
+            items = list(app.screen.query("#nav ListItem"))
+            assert len(items) == 10, (
+                "侧栏应有 聊天/状态/模型/分布式/节点/队列/日志/设备/设置/端点 十项")
+            assert [item.id for item in items] == [
+                "nav-chat", "nav-status", "nav-models", "nav-cluster", "nav-nodes",
+                "nav-queue", "nav-logs", "nav-device", "nav-settings", "nav-api"]
+            for widget_id in ("#nodes-table", "#queue-table", "#logs-log",
+                              "#device-pane", "#gpu-table", "#settings-pane",
+                              "#status-table", "#api-table", "#api-result", "#topbar"):
+                assert app.screen.query_one(widget_id) is not None, widget_id
+            settings = str(app.screen.query_one("#settings-pane", Static).render())
+            assert "会话设置" in settings and "依赖边界" in settings, "设置屏应含会话参数与关于信息"
+
+            # 版式：左窄右宽，分栏按黄金比例 ≈ 0.382 : 0.618
+            await pilot.pause()
+            total = sidebar.size.width + content.size.width
+            assert 0 < sidebar.size.width < content.size.width, "导航栏应在左且窄于内容区"
+            assert abs(sidebar.size.width / total - 0.382) < 0.03, (
+                f"黄金比例分栏偏离过多: {sidebar.size.width}/{total}")
+
+            # 键位切屏：[ ] 上下屏，侧栏高亮同步
+            assert content.current == "page-chat"
+            await pilot.press("]")
+            await pilot.pause()
+            assert content.current == "page-status", "应切到第二屏"
+            assert nav.index == 1, "侧栏高亮应与内容同步"
+            await pilot.press("[")
+            await pilot.pause()
+            assert content.current == "page-chat", "应切回第一屏"
+
+    _run(_main())
+
+
+def test_shell_survives_backend_absent():
+    """后端不可达时：只读屏显示错误文本，界面照常可用。"""
+    from textual.widgets import Static
+
+    from tui_textual import KoakumaApp
+
+    async def _main():
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.5))
+        async with app.run_test() as pilot:
+            app.show_main()
+            await pilot.pause()
+            pane = app.screen.query_one("#status-pane", Static)
+            rendered = ""
+            deadline = time.time() + 6
+            while time.time() < deadline:
+                await pilot.pause(0.1)
+                rendered = str(pane.render())
+                if "无法连接" in rendered or "后端不可达" in rendered:
+                    break
+            assert "后端不可达" in rendered or "无法连接" in rendered
+
+    _run(_main())
+
+
+#: 后端**真实**返回形状（2026-09-17 实测，保留关键字段名）——用于回归"接线是否对上"。
+#: 早期实现沿用旧 TUI 假设（/models/current、resources.nodes、logs.lines、profile.os、
+#: cpu.model、queue.tasks），真机下表现为"只有一行/不显示"。
+LIVE_SHAPES = {
+    "/health": {"status": "ok"},
+    "/status": {
+        "model_loaded": False, "model_name": "Qwen/Qwen-1.8B-Chat", "active_model_id": None,
+        "engine": "", "run_mode": "distributed", "node_role": "master", "node_id": "master",
+        "max_nodes": 3, "current_quant": "int4", "conversation_turns": 0,
+        "pipeline_prepared": False,
+    },
+    "/models": {
+        "models": [{"model_id": "qwen-1_8b", "name": "Qwen-1.8B-Chat",
+                    "available_formats": ["safetensors", "gguf"],
+                    "preferred_engine": "pytorch", "is_available": True,
+                    "unavailable_reason": ""}],
+        "active_model_id": None,
+    },
+    "/cluster/resources": {
+        "scope": "cluster", "node_count": 1, "available_node_count": 1,
+        "available": {
+            "local": {"node_id": "master", "role": "NodeRole.MASTER", "state": "online",
+                      "available": True,
+                      "cpu": {"physical_cores": 14, "logical_cores": 20},
+                      "ram": {"total_gb": 15.6, "available_gb": 6.5},
+                      "gpu": {"count": 2, "cuda_count": 0, "vram_total_gb": 4.0,
+                              "vram_free_gb": 0.0}},
+            "remote": [],
+        },
+        "totals": {"physical_cores": 14, "logical_cores": 20, "ram_total_gb": 15.6,
+                   "ram_available_gb": 6.5, "gpu_count": 2, "cuda_gpu_count": 0,
+                   "vram_total_gb": 4.0, "vram_free_gb": 0.0},
+    },
+    "/cluster/nodes": {"nodes": [{"node_id": "master", "role": "master", "node_type": "pc",
+                                  "state": "online", "address": "100.90.76.108:8888",
+                                  "hostname": "localhost", "avg_rtt_ms": 0}],
+                       "count": 1, "online_count": 1},
+    "/cluster/queue": {"running": True, "paused": False, "strategy": "mlfq", "queue_size": 0,
+                       "max_size": 100, "q0_depth": 0, "q1_depth": 0, "q2_depth": 0,
+                       "q0": [], "q1": [], "q2": [], "completed_count": 0, "current_task": None,
+                       "aging_params": {"q0_max_tokens": 128, "q1_max_tokens": 512}},
+    "/cluster/nodes/log-aggregate": {"local": {"node_id": "master",
+                                               "logs": ["line-1", "line-2"]},
+                                     "workers": [], "total_workers": 0, "limit": 50},
+    "/device/profile": {
+        "tier": "laptop", "tier_label": "游戏本 / 独显本", "score_total": 23.8,
+        "platform": {"os": "Windows", "os_version": "10.0.19045", "hostname": "DESKTOP-X",
+                     "machine": "AMD64", "architecture": "64bit", "python_version": "3.12.10"},
+        "cpu": {"model_name": "13th Gen Intel(R) Core(TM) i9-13900H",
+                "physical_cores": 14, "logical_cores": 20, "usage_percent": 10.3},
+        "ram": {"total_gb": 15.6, "available_gb": 6.5, "percent_used": 58.7},
+        "disk": {"free_gb": 121.1, "total_gb": 503.1, "path": "G:\\models"},
+        "gpus": [{"name": "RTX 4060", "gpu_type": "discrete", "cuda_available": False,
+                  "vram_total_gb": 4.0, "driver_version": ""}],
+        "warnings": [], "recommendations": [],
+    },
+}
+
+
+def _rows(screen, selector):
+    from textual.widgets import DataTable
+
+    table = screen.query_one(selector, DataTable)
+    return [[str(cell) for cell in table.get_row(key)] for key in table.rows]
+
+
+class _StubApi:
+    """按真实形状应答的假后端（暴露给多个用例复用）。"""
+
+    base_url = "http://stub:8000"
+    host = "127.0.0.1"
+    port = 8000
+    timeout = 5.0
+    log_token = ""
+    def __init__(self):
+        self.calls = []
+
+    def get(self, path, **kwargs):
+        return LIVE_SHAPES.get(path, {})
+
+    def get_openapi(self):
+        return {
+            "paths": {
+                "/api/health": {"get": {"summary": "健康检查", "operationId": "health"}},
+                "/api/models/load": {"post": {"summary": "加载模型", "operationId": "load_model"}},
+                "/api/chat/stream": {"post": {"summary": "流式聊天", "operationId": "chat_stream"}},
+                "/api/sessions/{session_id}": {
+                    "get": {"summary": "会话详情", "operationId": "session_detail"},
+                },
+            }
+        }
+
+    def request(self, method, path, **kwargs):
+        self.calls.append((method, path, kwargs))
+        return {"ok": True, "method": method, "path": path}
+
+
+def test_live_backend_shapes_render_every_page():
+    """回归：各页必须按后端**真实**字段渲染（2026-09-17 实测形状）。"""
+    from textual.widgets import Static
+
+    from tui_textual import KoakumaApp
+
+    async def _main():
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.5), interval=3)
+        app.api = _StubApi()
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.show_main()
+            await pilot.pause(2.0)
+            screen = app.screen
+
+            models = _rows(screen, "#models-table")
+            assert models and models[0][1] == "qwen-1_8b", models
+            assert models[0][3] == "safetensors, gguf", models
+
+            resources = _rows(screen, "#resources-table")
+            assert resources[0][0] == "master" and "14 / 20" in resources[0][2], resources
+            assert "合计" in resources[-1][0], resources
+
+            nodes = _rows(screen, "#nodes-table")
+            assert nodes[0][0] == "master" and "在线" in nodes[0][3], nodes
+
+            queue = _rows(screen, "#queue-table")
+            assert [row[0] for row in queue] == ["[b]Q0[/]", "[b]Q1[/]", "[b]Q2[/]"], queue
+
+            device = str(screen.query_one("#device-pane", Static).render())
+            assert "Windows 10.0.19045" in device and "i9-13900H" in device, device
+            assert screen.log_line_count == 2, screen.log_line_count
+
+            status = " ".join(f"{row[0]}={row[1]}" for row in _rows(screen, "#status-table"))
+            assert "运行模式=distributed" in status, status
+            assert "Qwen-1.8B-Chat（未加载）" in status, status
+
+    _run(_main())
+
+
+def test_health_failure_short_circuits_optional_refreshes():
+    """健康探测失败时不能继续堆叠状态、节点、日志和设备请求。"""
+    from tui_api import ApiError
+    from tui_textual import KoakumaApp
+
+    class _UnavailableApi(_StubApi):
+        def get(self, path, **kwargs):
+            self.calls.append(path)
+            if path == "/health":
+                raise ApiError("fixture backend unavailable")
+            return super().get(path, **kwargs)
+
+    async def _main():
+        api = _UnavailableApi()
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.1), interval=30)
+        app.api = api
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.show_main()
+            await pilot.pause(0.5)
+            assert api.calls == ["/health"], api.calls
+            assert app.screen.health_text == "[red]不可达[/]"
+
+    _run(_main())
+
+
+def test_runtime_readiness_failure_short_circuits_optional_refreshes():
+    """A live API must not fan out while its runtime components are starting."""
+    from tui_textual import KoakumaApp
+
+    class _StartingApi(_StubApi):
+        def get(self, path, **kwargs):
+            self.calls.append(path)
+            if path == "/ready":
+                return {
+                    "process_ready": True,
+                    "ready": False,
+                    "status": "starting",
+                    "components": {
+                        "local_store": True,
+                        "scheduler": False,
+                        "device_profile": False,
+                    },
+                }
+            return super().get(path, **kwargs)
+
+    async def _main():
+        api = _StartingApi()
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.1), interval=30)
+        app.api = api
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.show_main()
+            await pilot.pause(0.5)
+            assert api.calls == ["/health", "/ready"], api.calls
+            assert "初始化中" in app.screen.model_text
+
+    _run(_main())
+
+
+def test_endpoint_workbench_discovers_and_executes_get():
+    """端点页跟随 OpenAPI，GET 可执行，路径模板不能被误发。"""
+    from textual.widgets import Input
+
+    from tui_textual import KoakumaApp
+
+    async def _main():
+        stub = _StubApi()
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.5))
+        app.api = stub
+        async with app.run_test(size=(140, 48)) as pilot:
+            app.show_main()
+            await pilot.pause(1.0)
+            screen = app.screen
+            screen.switch_page("api")
+            await pilot.pause(0.5)
+            assert len(screen.api_operations) == 4
+            assert "GET /api/health" in screen.api_operations
+            assert screen.query_one("#api-path", Input).value == "/health"
+
+            screen.api_selected_key = "GET /api/health"
+            screen.query_one("#api-path", Input).value = "/health"
+            screen.action_api_execute()
+            deadline = time.time() + 3
+            while time.time() < deadline and not stub.calls:
+                await pilot.pause(0.1)
+            assert stub.calls and stub.calls[-1][0:2] == ("GET", "/health")
+
+            screen.api_selected_key = "POST /api/models/load"
+            screen.select_api_operation(screen.api_selected_key)
+            screen.action_api_execute()
+            await pilot.pause(0.2)
+            assert app.screen.__class__.__name__ == "ConfirmScreen"
+            await pilot.press("n")
+            await pilot.pause(0.1)
+            assert len(stub.calls) == 1, "写操作必须先经过确认屏"
+
+            screen.api_selected_key = "GET /api/sessions/{session_id}"
+            screen.select_api_operation(screen.api_selected_key)
+            screen.action_api_execute()
+            await pilot.pause(0.2)
+            assert len(stub.calls) == 1, "未替换的路径参数不应发送请求"
+
+    _run(_main())
+
+
+def test_chat_done_error_is_surfaced(monkeypatch):
+    """回归：``/chat/stream`` 的 ``done.error``（如"模型加载失败"）必须显示出来。
+
+    早先只看 done.response/metrics，会把错误吞掉 → 用户看到"没有回复也没有原因"。
+    """
+    from textual.widgets import Input, Static
+
+    import tui_textual as tt
+
+    def fake_stream(api, message, **kwargs):
+        yield {"start": True, "generation_id": "gen-1"}
+        yield {"done": True, "error": "本地回退模型加载失败: llama-cpp-python 未安装"}
+
+    monkeypatch.setattr(tt, "iter_chat_payloads", fake_stream)
+
+    async def _main():
+        app = tt.KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.5))
+        async with app.run_test() as pilot:
+            app.show_main()
+            await pilot.pause()
+            pane = app.screen.query_one("#chat-pane")
+            box = pane.query_one("#chat-input", Input)
+            box.focus()
+            box.value = "你好"
+            await pilot.press("enter")
+            rendered = ""
+            deadline = time.time() + 6
+            while time.time() < deadline:
+                await pilot.pause(0.1)
+                rendered = str(pane.query_one("#chat-status", Static).render())
+                if "错误" in rendered:
+                    break
+            assert "后端错误" in rendered, rendered
+            assert "llama-cpp-python" in rendered or "模型加载失败" in rendered, rendered
+
+    _run(_main())
+
+
+def test_chat_pane_help_and_unknown_command():
+    from textual.widgets import Input, Static
+
+    from tui_textual import ChatPane, KoakumaApp
+
+    async def _main():
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.5))
+        async with app.run_test() as pilot:
+            app.show_main()
+            await pilot.pause()
+            pane = app.screen.query_one("#chat-pane", ChatPane)
+            box = pane.query_one(Input)
+            box.value = "/help"
+            box.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert "可用命令" in pane.chat_buffer
+            assert pane.query_one("#chat-log", Static) is not None
+            # 未识别命令不应触发网络请求，只提示
+            box.value = "/nonexistent"
+            box.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+
+    _run(_main())
+
+
+def test_route_command_updates_preference():
+    from textual.widgets import Input
+
+    from tui_textual import ChatPane, KoakumaApp
+
+    async def _main():
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.5))
+        async with app.run_test() as pilot:
+            app.show_main()
+            await pilot.pause()
+            pane = app.screen.query_one("#chat-pane", ChatPane)
+            box = pane.query_one(Input)
+            box.value = "/route distributed"
+            box.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.routing_preference == "distributed_preferred"
+
+    _run(_main())

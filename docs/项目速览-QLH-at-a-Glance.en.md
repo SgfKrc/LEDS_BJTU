@@ -78,7 +78,7 @@ Other models (Qwen3-4B, Gemma 4, etc.) see the root README "Post-clone asset che
 
 ```bash
 python src/api_server.py               # backend http://localhost:8000
-python -m src.tui_admin --plain --host http://127.0.0.1:8000 # mainline TUI
+python qlh.py                         # mainline TUI (Textual shell, 9 screens)
 # or the terminal UI: ./start_tui.sh (Windows: start_tui.bat, auto-starts the backend)
 python -c "import src.api_server"                                   # backend importable
 .venv-test\Scripts\python.exe -m pytest tests/ -q --collect-only    # test env ready
@@ -91,7 +91,7 @@ Distributed mode: all nodes sign in with the same Tailscale account → "Connect
 - **Mainline plan**: [Distributed Inference & Edge Optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md) · **Side-line plan**: Externalization & Koakumix · Historical schedule: [总体下一步计划](总体下一步计划.md)
 - **Newcomer**: [项目技术说明](项目技术说明.md) → [整体架构](整体架构.md) → [模块接口说明](模块接口说明.md)
 - **Sub-projects**: [harness plan](../harness_workbench/docs/小模型轻量推理harness工作台调研与方案.md) · [qlh-docagent](https://github.com/SgfKrc/qlh-docagent) · [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge) · web-tool research
-- **Experiments & judging**: [DS3 replaces R1](DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) · [sub-1B plan](亚1B小模型专项实验计划.md) · [tests & criteria](测试与评判标准.md)
+- **Experiments & judging**: [DS3 replaces R1](archive/DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) · [sub-1B plan](archive/亚1B小模型专项实验计划.md) · [tests & criteria](测试与评判标准.md)
 
 *Note: most specialized documents are in Chinese (see the root README index).*
 

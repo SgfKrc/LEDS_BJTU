@@ -164,3 +164,11 @@ class TestApiPaths:
         assert API_PATHS["chat_cancel"].format(
             generation_id="gen_x",
         ) == "/chat/generations/gen_x/cancel"
+
+    def test_cluster_resources_path(self):
+        assert API_PATHS["cluster_resources"] == "/cluster/resources"
+
+    def test_pipeline_observation_paths(self):
+        assert API_PATHS["cluster_layers"] == "/cluster/layers"
+        assert API_PATHS["cluster_pipeline_capacity"] == "/cluster/pipeline-capacity"
+        assert API_PATHS["cluster_pipeline_reshard"] == "/cluster/pipeline-reshard"

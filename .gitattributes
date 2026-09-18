@@ -3,3 +3,10 @@
 packaging/build-launcher.bat text eol=crlf
 # Windows 一键环境配置脚本同样必须 CRLF（否则 cmd 对 UTF-8 REM 行与 && 解析会崩）
 setup_all_envs.bat text eol=crlf
+# submodule 初始化脚本同理（cmd 对 LF-only 的 if/goto 解析会崩）
+scripts/init-submodules.bat text eol=crlf
+# TUI 启动脚本同理
+start_tui.bat text eol=crlf
+# 统一入口的别名薄壳（koakuma = qlh）
+koakuma.bat text eol=crlf
+qlh.bat text eol=crlf

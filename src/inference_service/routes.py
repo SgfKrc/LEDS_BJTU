@@ -532,7 +532,7 @@ async def layers_lm_head(req: LMHeadRequest, request: Request):
 # ----------------------------------------------------------------------
 @router.post("/worker/stage")
 def worker_stage(req: WorkerStageRequest, request: Request):
-    """远程 Stage 执行（scheduler._host._execute_task_worker_stage 的 HTTP 化）。
+    """远程 Stage 执行（SchedulerCallbackSet.execute_task_worker_stage 的 HTTP 化）。
 
     body 为 ProviderStageRequest 的 JSON 序列化（dataclasses.asdict 兼容）；
     cancel 通过 request_id 关联的 generation 取消事件实现。
