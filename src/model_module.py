@@ -100,6 +100,34 @@ def _iter_safetensors_keys(model_path: str) -> List[str]:
     return keys
 
 
+def _is_tied_word_embeddings(config, model_path: Optional[str] = None) -> bool:
+    """判断是否为 tied embeddings（`lm_head` 与 `embed_tokens` 共享权重）。
+
+    ★ B16：tied 模型（Qwen3.5 等）的 safetensors 里**没有** `lm_head.weight`
+    （权重与 `embed_tokens` 共用）⇒ 分层加载做「末节点」（`has_lm_head=True`）时
+    **不能**要求该张量，否则必然报 `分层权重不完整: lm_head.weight`。
+
+    判定顺序（先便宜的、再昂贵的）：
+      1. `config.tie_word_embeddings` 显式为 True/False ⇒ 直接定论；
+      2. 该字段缺失时扫 safetensors 的 key：**没有** `lm_head.weight` 且**有**
+         `embed_tokens.weight` ⇒ 视为 tied（探测失败一律返回 False，保证对既有
+         非 tied 模型**行为完全不变**）。
+    """
+    explicit = getattr(config, "tie_word_embeddings", None)
+    if explicit is not None:
+        return bool(explicit)
+    if not model_path:
+        return False
+    try:
+        keys = _iter_safetensors_keys(model_path)
+    except Exception as exc:  # noqa: BLE001 - 探测失败必须无副作用
+        logger.debug(f"tied embeddings 探测失败（按非 tied 处理）: {exc}")
+        return False
+    has_lm = any(k == "lm_head.weight" or k.endswith(".lm_head.weight") for k in keys)
+    has_embed = any(k.endswith("embed_tokens.weight") for k in keys)
+    return (not has_lm) and has_embed
+
+
 def _detect_qwen_root_prefix(
     model_path: str,
     fallback: Optional[str] = "model.",
@@ -1603,9 +1631,19 @@ class ModelManager:
         ]
         # model.norm is tiny and keeps parameter/device discovery valid on all segments.
         selected_prefixes.append(f"{qwen_root}norm.")
-        if has_embedding:
+        # ★ B16：tied embeddings（Qwen3.5 等）的 safetensors 里**没有** `lm_head.weight`
+        #   （与 embed_tokens 共用）⇒ 末节点不能要求它。此时改为加载 `embed_tokens`，
+        #   并在加载后把 lm_head.weight 重绑成同一 Parameter（共享，无额外内存）。
+        #   注意：**不**把 `lm_head.` 放进 selected_prefixes ⇒ 它也就不在完整性校验范围内
+        #   （校验集 model_prefixes 由 selected_prefixes 派生），因此不会误报 missing。
+        tied_lm_head = bool(has_lm_head) and _is_tied_word_embeddings(config, model_path)
+        if tied_lm_head:
+            logger.info(
+                "  🔗 检测到 tied embeddings：末节点的 lm_head 将复用 embed_tokens 权重"
+            )
+        if has_embedding or tied_lm_head:
             selected_prefixes.append(f"{qwen_root}embed_tokens.")
-        if has_lm_head:
+        if has_lm_head and not tied_lm_head:
             selected_prefixes.append("lm_head.")
 
         # ★ A3：safetensors 的 key 与「模型属性路径」可能差一层 —— 实测 Qwen3.5 的 key 是
@@ -1697,6 +1735,33 @@ class ModelManager:
         if missing:
             raise RuntimeError(
                 f"{architecture} 分层权重不完整: " + ", ".join(missing[:5])
+            )
+
+        # ★ B16：tied 模型的末节点 —— `set_module_tensor_to_device` 会**替换** Parameter
+        #   对象，从而**破坏** `lm_head` 与 `embed_tokens` 的共享（tied）关系
+        #   （`lm_head.weight` 会留在 meta 上）⇒ 这里显式把 `lm_head.weight` 重绑为
+        #   **同一个 Parameter 对象**（共享，不复制内存）。非 tied 时不进入该分支，
+        #   行为与既往完全一致。
+        if tied_lm_head:
+            lm_head = getattr(model, "lm_head", None)
+            embed_weight = None
+            try:
+                text_model, _la, embed_attr = _locate_text_transformer(model)
+                embed_weight = getattr(
+                    getattr(text_model, embed_attr, None), "weight", None
+                )
+            except RuntimeError as exc:
+                logger.debug(f"tied 末节点定位 embed_tokens 失败: {exc}")
+            if lm_head is None or embed_weight is None:
+                raise RuntimeError(
+                    "tied 模型做末节点需要在加载后把 lm_head 绑定到 embed_tokens.weight，"
+                    f"但未能定位（lm_head={type(lm_head).__name__}, "
+                    f"embed_weight={type(embed_weight).__name__}）"
+                )
+            lm_head.weight = embed_weight  # 同一 Parameter 对象 ⇒ tied 共享，零额外内存
+            logger.info(
+                f"  🔗 tied 末节点已就绪：lm_head 与 embed_tokens 共享权重 "
+                f"({tuple(embed_weight.shape)}, {embed_weight.dtype})"
             )
 
         model.eval()
