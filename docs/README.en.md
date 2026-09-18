@@ -1,939 +1,399 @@
-# QLH — Lightweight Distributed Edge LLM Inference
+# QLH
 
-> 状态：**现行**
+QLH is a distributed inference core for heterogeneous edge devices. The mainline is the lightweight GGUF/llama.cpp engine; the repository also owns a PyTorch layered-distribution engine plus a **layer pipeline** (including cross-framework layer relay), and the user-facing entry point is a cross-platform TUI.
+
+> Status: the main-repository baseline is being reorganized (2026-09-18)
 >
-> 更新日期：2026-09-16
+> This README describes only the current boundary of the main repository and its reproducible entry points. Experiment logs, historical implementations and external sub-projects are **not** equivalent to production capability.
+>
+> 中文: [../README.md](../README.md) - this file: docs/README.en.md
 
-> **Language**: [English](README.en.md) · [简体中文](../README.md)
+## What the Main Repository Does
 
-**A llama.cpp-first distributed LLM inference system for heterogeneous edge devices.**
+- Runs or coordinates GGUF inference on Windows/Linux PCs, devices without CUDA, and Android nodes.
+- Lets models too large for a single machine be carried jointly by multiple nodes under a verified layer-segment contract; each node should hold only the model part actually assigned to it.
+- Lets an Edge node complete local inference with <=1B models by default, while retaining the ability to serve as an RPC worker for larger models.
+- Manages three node kinds (**local**, **remote RPC**, **cross-framework**) under one layer-segment contract, and selects the engine by device profile and capability.
+- Controls distributed admission and failure recovery through device profiling, capacity planning, model identity, layer-segment contracts, leases and epoch fencing.
+- Uses a Textual TUI for chat, model assets, nodes, distributed layout, queue, device, logs and settings; only backend operations without a dedicated interaction fall back to the debug page. Read-only single commands use a standard-library thin layer.
 
-Model quantization · Operator fusion · Paged KV cache · Graph-algorithm orchestration · Distributed inference · TUI-first edge operation
+The engine is **dual-track**, and both tracks live in the main repository - this is not a "primary path plus legacy comparison" arrangement:
 
-**v0.1.8.3** (updated 2026-09-16)
+| Track | Engine | Capabilities | Dependency |
+| --- | --- | --- | --- |
+| **L** | llama.cpp / GGUF | Single-machine inference, RPC partial residency, TUI chat, the optimization trio | No torch (Edge default) |
+| **D** | PyTorch / Safetensors | Layer splitting and tensor placement, **inter-layer pipeline**, multi-node layer-segment hosting, the upstream side of cross-framework relay, and the control experiments against llama.cpp | torch |
 
-> 📌 Current mainline: **[Distributed Inference & Edge Optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md)**; side lines: **Externalization & Koakumix**; historical snapshot: **Progress & Next Steps**.
-> This README describes **implemented** capabilities; items marked *PoC* are disabled by default and are not production capabilities — see the dedicated plans for boundaries.
-> Scope: capability overview, quick start and documentation index; the authoritative capability boundary lives in the specialized plans, source code and tests. Specialized documentation is currently in Chinese.
+**The D track is not part of the Edge default dependency set**, but layer splitting, the layer pipeline and cross-framework relay are in practice implemented by the PyTorch stack (`model_module.py`, `tcp_comm.py`, `qwen3_pipeline_*`), so it is not a "comparison-only path". On the same card llama.cpp is faster for a single sequence (about 4.3x), so the default production path remains the L track.
 
----
+## Layer Pipeline and Cross-Framework Layer Relay
 
-## 📋 Project Introduction
+### Unified Node Abstraction
 
-QLH targets heterogeneous edge devices — Windows/Linux desktops, workstations, servers, laptops, Android phones and tablets. The production mainline is GGUF/llama.cpp: an Edge node defaults to local inference with a model at or below 1B parameters, while it can also join as an RPC worker for a larger distributed model. Models that do not fit one machine are held partly by multiple nodes. The main repository also carries a PC-only Relay R compatibility track: cut GGUF plus `embd` injection reached 16/16 same-process L→L behavioral matches. A D→L five-token prefill matched, but both 141-token f16 and f32 runs diverged, so the gate remains closed and real-time cross-process/network behavior is still unverified. The PyTorch/Safetensors layer pipeline remains a PC reference and Relay source; TaskGraph/whole-request dispatch is only a temporary full-model fallback. Web, Android UI, release, toolbox and image generation are external side lines. The production hard gates are cutover/low coupling → llama.cpp single machine → same-machine dual-process RPC → PC hardware → Android hardware; Relay has separate `CORE-RELAY-01` / `CORE-RELAY-XFRAME-01` gates and does not replace RPC.
+The layer pipeline unifies "which layers who holds, with which engine, where, and how large the capacity is" into one abstraction: `(layer_range, engine, location)`. The three node kinds are **isomorphic** and share the same contract and validation:
 
-Coverage: **Windows PC + Linux PC + Android**. A device type is not sufficient for scheduling — eligibility depends on engine, model format, model fingerprint, available memory, accelerator and network topology.
+| `kind` | Meaning | Engine | Transport |
+| --- | --- | --- | --- |
+| `local` | Layer segment inside the local process | llama.cpp / pytorch | in-process |
+| `remote_rpc` | **Borrowed compute** (a `ggml-rpc-server` on Android/PC) | llama.cpp | network (ggml RPC) |
+| `cross_framework` | Layer-segment relay across engines (torch upstream + llama.cpp downstream) | both | in-process or stdio |
 
-### Main Repository Runtime Roles (five boundaries)
+"Borrowing compute" is not a fallback scheme but **one node kind** inside the layer pipeline; all three kinds share one abstraction, so there is no "primary path vs. fallback" opposition.
 
-| Tier | Shape | Target devices | Core capabilities | Excludes / not recommended |
-|------|----------|----------------|-------------------|----------------------------|
-| 1 | **Edge node** | Windows/Linux PCs without NVIDIA, constrained devices, Android | Local llama.cpp + GGUF inference (default <=1B), plus RPC worker participation in larger models and cross-platform TUI | torch, Web UI, release tooling, image generation |
-| 2 | **PC llama.cpp sharding** | PCs/workstations/heterogeneous nodes | llama host + `ggml-rpc-server` worker, targeting partial residency and capacity aggregation | No production RPC claim before G0-G2 gates pass |
-| 3 | **PC Relay R** | PCs that can run llama.cpp; PC Reference P supplies the D→L source | Cut GGUF + hidden/`embd` handoff; L→L behavior is verified | Explicitly off by default; does not replace RPC or enter the Edge default path |
-| 4 | **PC Reference P** | NVIDIA/high-memory PCs | PyTorch + Safetensors layer pipeline for correctness, performance, capacity comparison and D→L Relay source | Not part of Edge install, default routing or release |
-| 5 | **Failure-bypass role** | Any node that remains online | On node failure, route to a full-model node, another shard topology, or a local <=1B model; a scheduling strategy, not a Lite product | No separate Lite package or UI |
+Implementation and endpoints:
 
-### Core Features
+- `src/pipeline_node_contract.py`: the `PipelineNode` contract, mapping from existing artifacts, and fail-closed layout validation;
+- `src/pipeline_capacity.py` capacity solving, `src/pipeline_assignment_manifest.py` assignment manifests;
+- `src/pipeline_reshard.py`: capacity re-solve + artifact readiness gate + atomic epoch commit;
+- `GET /api/cluster/layers`, `GET /api/cluster/pipeline-capacity`, `GET /api/cluster/pipeline-reshard`.
 
-| Feature | Description |
-|------|------|
-| 🧠 **Model-sharding research** | The llama.cpp/GGUF mainline studies partial residency, RPC, leases and fault redistribution; Edge nodes serve <=1B locally and can join larger sharded inference; single-machine and same-machine dual-process gates come first → [mainline plan](主线开发计划-分布式推理与边缘优化-2026-09-14.md) |
-| 🔗 **Relay & PyTorch reference path** | Same-process PC L→L Relay behavior is verified 16/16; the Safetensors layer pipeline remains for PC correctness/performance/capacity comparison and D→L source validation; existing QW1.8B dual-machine evidence does not verify llama.cpp model sharding |
-| 🔄 **Production engine boundary** | llama.cpp + GGUF is the default production/Edge path; PyTorch + bitsandbytes exists only in PC Reference P and is not auto-selected on Edge |
-| 📋 **MLFQ queue** | Three-level feedback queue: short-interaction priority + aging anti-starvation + FIFO compatibility → [scheduling doc](分布式资源调度系统.md) |
-| 🗄️ **Local facts source** | Sessions/settings/model registry on the master-node SQLite (remote PostgreSQL retired); offline-safe |
-| 🧩 **Model-asset governance** | Registry, manifest/SHA verification, source/license handling, Sidecar contracts, deployment simulation and HF direct → user proxy → ModelScope fallback are wired into the local product surface; real large artifacts, CUDA and cross-PC delivery remain to be accepted |
-| 🖼️ **Multi-model & multimodal Sidecars** | Qwen3 PyTorch isolated runtime plus Gemma4 native GGUF/mmproj MTMD and PyTorch Sidecar paths have completed development gates. Artifact availability, memory/VRAM budgets and precise identity contracts still fail closed; heavy models are never auto-admitted on an 8 GB machine |
-| 🌐 **Tailscale & dual stack** | IPv4/IPv6 endpoints, manual cluster join and reconnect fall back as “user preference → bootstrap → Tailnet”; explicit successful connects persist the preference. A short dual-machine IPv6 task is verified; IPv4-only/IPv6-only installers and real WSS/443 remain environment acceptance work |
-| 🔐 **Local Auth-App control plane** | Owner bootstrap, Auth-App string/QR delivery, TOTP, recovery-code rotation, membership and one-time cluster grants have local UI/API gates; OS credential and first-install integration remain deferred |
-| 📦 **Install, update & offline bundle** | Independent Launcher signing/update/rollback, download progress and diagnostics are implemented. The offline bundle provides capacity preflight, SHA/manifest, atomic ZIP, 7z/split output and restore validation; real full bundles, empty-root/Android SAF import and cross-platform install acceptance are deferred |
-| 🎛️ **Control plane** | Node register/deregister, layer overrides, role transfer, spare master, TCP status; operated primarily through TUI |
-| 🖥️ **TUI-first entry** | `qlh chat` for local/cluster inference, model fleet and cluster status; `qlh_edge` provides a minimal HTTP/node surface and does not replace local or distributed inference |
-| **Multimodal input** | Main QLH keeps image upload and Gemma/Qwen image understanding; generation/editing and image assets belong to Koakumix |
-| 📱 **Android edge role (side line)** | Android local inference, RPC worker, SAF and real-device evidence are maintained by the external device project; QLH freezes only task, model and capability contracts, with no separate Lite product |
-| 🏝️ **TP island** *(PoC)* | Out-of-cluster homogeneous GPU tensor-parallel subcluster (vLLM/SGLang/llama.cpp rpc) as one logical node → [guide](archive/TP孤岛接入指南.md) |
-| ☁️ **External provider** *(PoC)* | Route whole requests to OpenAI-compatible endpoints outside the cluster; **data scope defaults to deny** → [guide](archive/外部推理服务Provider接入指南.md) |
-| 🎯 **Speculative decoding** *(experiment)* | Local small draft + external verify; disabled by default, not wired into production decoding → [notes](archive/投机解码外部辅助实施说明.md) |
-| 🧭 **Role asymmetry evidence** *(CACHE-05)* | DeepSeek input/output asymmetry is reference-only; QLH records draft/verify and sub-1B role hypotheses with offline evidence boundaries → [report](非对称分工论证-2026-09-14.md) |
-| ⚙️ **Task-chain Full Worker** | `dual_candidate` DAG, journal, lease-epoch fencing and provider registry remain a temporary full-model fallback; this does not mean the model is sharded and `task_dispatch` stays closed → [task chain plan](archive/任务链下一阶段实施计划.md) |
-| 🗂️ **Local RAG** | Master-node SQLite FTS5 + bounded vector embeddings (local Ollama `nomic-embed-text` / native llama.cpp dual providers), recoverable jobs, capacity budgeting and ANN decision gate (RAG-S0…S5D). The 30-query human quality gate is complete locally; long-running, scale and sqlite-vec benchmarks remain deferred → cluster-join & local RAG plan |
-| 🔑 **Manual cluster join (CLUSTER-JOIN)** | Target node issues a one-time grant; master signs an Ed25519 client-only grant after Auth-App approval (text code + QR, atomic nonce ledger), then the node is demoted to worker; Web/TUI wired → cluster-join plan |
-| 🌐 **Weak-network & Transport v2** | `cluster_transport` provides `legacy_tcp`/`wss_443` capability choice, bounded ACK window, stable failure matrix and circuit breaker; NW3.1 local self-signed WSS loopback gate done; real 443/cert/traffic comparison deferred → [weak-network plan](archive/抗弱网通信协议专项计划.md) |
-| 🧪 **Experiment quality & document governance** | EX-N3 read-only production gate verifies plan, samples, calibration, performance, quality and human review; historical records pass 3/3. The document-maintenance Agent has local retrieval/semantic quality gates and only produces suggestions, never automatic rewrites |
-| 🧩 **Sub-project: small-model harness workbench** | Toy/self-use workbench for small-model customization (S1-S8 local/offline gates done): context budget & STATE compression, model profiles & capability gate, OpenAI-compatible `/v1`, customization experiment bench (A/B + Pareto), image workbench, SQLite sessions & RAG, long-term memory (RAG+compression+local memory), web search & lightweight MCP, red-team samples; **no main-project imports, only shared model artifacts** → [harness plan](../harness_workbench/docs/小模型轻量推理harness工作台调研与方案.md) |
-| 📡 **Web search & lightweight Fetch** | WEB-TOOL G1-G6 local gates done: offline capability probe, fail-closed Tool Gateway (HTTPS-only/SSRF/DNS+redirect re-check), restricted Fetch/SearXNG adapters, TaskGraph `tool_request` Stage, explicit-`persist` tool cache & API, quality gate & joint audit; `production_network_enabled=false` → research plan |
-| 📝 **Document-maintenance Agent sub-project** | Standalone package (own repo [qlh-docagent](https://github.com/SgfKrc/qlh-docagent), brought in as a submodule): rule-as-data (`RULES.md` + `rules.yaml` driven scanner), rule-change mechanical scanning (delta matrix new/gone/changed + `--max-new/--max-gone` gates), evolution gates (agent rule edits: proposed→preflight→gates→released) with equivalence regression → [plan](../tools/docagent/docs/文档维护Agent工具子项目化与通用化专项计划.md) |
-| 🔌 **Reasonix ↔ Codex bridge sub-project** | Standalone package (own repo [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge), brought in as a submodule): exposes the Reasonix subagent to Codex as stdio MCP tools (`reasonix_run` / `reasonix_resume` / `reasonix_cancel` / `reasonix_rollback` / `reasonix_status`); CLI path and model ref resolve per machine with zero hard-coding (`node src/configure.mjs list/use/codex/verify`); read-only by default, with controlled writes, change evidence, explicit rollback and read/write profile separation landed by `W1/W2/W3` (off by default); audit fixes `AUD-01`–`AUD-08`, bounded runtime budget extension `R2-EXT-01`, task-level checkpoint/resume `E2-EXT-01`, and explicit read-only parallel/cancel reclamation `R3-EXT-01` landed; `G3` has WSL cross-platform evidence and `R4` makes output truncation deterministic → roadmap |
-| 🎯 **Judging-policy fix & DS3 replacing R1** | `loose_contains` + 512 tokens (P5) proven discriminative (Qwen3-4B 1/4 vs 1.8B 0/4); DS3-0324-7B full v2 policy **2/4×3, 8/11×3** (budget 192→512 alone flips 0/4→2/4, confirming the judging-policy problem) → **approved candidate to replace R1** as judging model → [DS3 plan](archive/DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) |
+### Cross-Framework Layer Relay (D to L)
 
-### Project Design Philosophy
+The upstream PyTorch layer segment computes up to layer N and hands the hidden states to the downstream layer-cut llama.cpp model to finish. The injection point is llama.cpp's **standard** `llama_batch.embd` field, so the PyPI build of `llama-cpp-python` suffices - **no fork and no recompilation**.
 
-- **Asset sovereignty and local autonomy**: model artifacts, external-compute assets, API keys, sessions, task journals, knowledge bases, authentication material, backups and migration capability belong to the user. The development team supplies code plus import/verification/registration/migration tools, never custody, escrow or reset authority; except for source hosting and releases, no development-team service is a runtime prerequisite. Primary-node `local_only` SQLite, user filesystems, encrypted backups and `.qlhmigrate` implement this boundary.
-- **Engineering discipline, automation and controlled Agent collaboration**: testing, acceptance and maintenance tools, together with their test and quality-gate code, are first-class engineering work built alongside product code. Automation both proves quality and removes repetitive work: one-command isolated environment setup, test channels, automatic simulation/experiments, contract/API scans, fault injection, quality gates, offline asset bundle build/verification/restore, launcher-manifest generation, environment diagnostics and controlled deployment sync turn mechanical work into reproducible flows. Agents only summarize evidence, generate suggestions and run quality checks within explicit data, retrieval and permission scopes; they cannot bypass script gates, human review or authorization to rewrite facts, publish assets or make admission decisions.
-- **Test quality constrains automation quality**: tests are split by risk, dependency and realism into unit, contract, browser/API, race/fault-injection, simulation and physical/dual-machine acceptance, rather than optimized for one aggregate green run. Classifications, channels, fixtures and negative cases are repeatedly audited and revised after environment, race or interface blind spots, reducing the pesticide effect of a static test set repeatedly passing while new defects escape.
-- **Data stays in-cluster**: external inference/image assistance defaults to `deny` scope; offline asset packages and signed manifests keep distribution auditable and rebuildable.
+**Why we do it:**
 
-### Architecture Evolution: From Feature Delivery to User Sovereignty
+1. **It is the twin mechanism of the layer pipeline** - both share "layer splitting + hidden passing". The layer pipeline can **completely avoid loading the whole model** (llama.cpp RPC needs the leader to hold the full GGUF), so this track decides whether "a model too large for one device can be carried by several devices", not single-sequence latency;
+2. **It is the only interface that lets heterogeneous devices join one pipeline** - nodes with different engine capabilities (`local` / `remote_rpc` / `cross_framework`) can only coexist in one layer pipeline through it;
+3. **It is the precondition for customizability** - cut-point assignment, mixed precision, operator substitution and batch overlap all build on "hidden states are transferable between layers";
+4. **There is no direct academic precedent** - Petals is same-framework, KTransformers is operator-level, distributed-llama is TP; on this path we also filed a defect upstream and independently verified the fix (issue #28963).
 
-The original proposal focused on quantization, cache optimization and multi-node pipelines. It did not yet make ownership of data or offline recovery an explicit product constraint. Early engineering retained a PostgreSQL compatibility path. Once offline primary-node operation, cross-device migration and bring-your-own assets became non-negotiable, QLH converged on the local-first boundary below. This is a clarification of the system contract, not a substitution of one remote dependency for another.
+**Cumulative measurements (gen=64, every token identical)**:
 
-| Concern | Earlier engineering path | Current boundary |
-|---------|--------------------------|------------------|
-| State and identity | A PostgreSQL compatibility path existed; the master-node source-of-truth boundary was incomplete | `local_only` by default. Sessions, settings, model registration, task journals, audit records and local users live on the master-node SQLite database; WAL/FULL and idempotent recovery preserve offline operation |
-| Models and file assets | The focus was loading and distribution | Weights remain in user-controlled local filesystems; SQLite keeps only verified references, manifests and digests. Import, offline bundles, download and deployment are bounded by SHA/manifest checks, capacity preflight and atomic publish |
-| Knowledge and credentials | No unified data-sovereignty policy | RAG uses an independent user-owned master-node SQLite store (FTS5 plus bounded vectors); embeddings can come from local Ollama or native llama.cpp. Authentication keys use the OS credential store and recovery codes are hashed; the development team keeps no user copy or reset authority |
-| Migration and recovery | A remote service could become a runtime prerequisite | Encrypted backup, `.qlhmigrate` streaming migration and local restore are the primary path. PostgreSQL remains only as a user-initiated, one-time compatibility export/audit window; remote unavailability must not stop core functions |
+| Configuration | Wall clock | vs. first version |
+| --- | ---: | ---: |
+| Cross-process + full-segment recompute | 182 s | 1.0x |
+| Same-process + full-segment recompute | 167 s | 1.09x |
+| Same-process + both-side KV reuse | 53 s | 3.4x |
+| **Same-process + KV + upstream manual 4 layers** | **21.3 s (about 333 ms/step)** | **8.5x** |
+| Cross-process + KV + 4L + downstream GPU offload | 81 s | 2.2x (IPC-bound) |
+| *Control: native llama.cpp full-model GPU* | *about 0.9 s* | *about 200x* |
 
-> These two principles constrain future work: a new model, RAG source, Auth App flow, cluster-join path or external provider must define asset ownership, data scope, offline recovery and revocation semantics, plus reproducible automated checks, failure boundaries and a human acceptance path. Convenience must not reintroduce development-team custody, and an Agent or a single green run must not substitute for factual evidence.
+**Evidence and boundaries (stated as measured; all from persisted runs)**:
 
-**Use cases**: smart terminals · IoT · edge computing · education & research
+| Item | Result |
+| --- | --- |
+| Correctness | Cross-process, same-process, cross-machine (SSH tunnel) and f32 controls are token-identical; the **upstream manual 4 layers are bit-exact** (max absolute difference = 0) |
+| Time breakdown | **99.3% is actual compute on both sides** (upstream 66.5% + downstream 32.9%); communication, synchronization and batch management total only **0.34%** |
+| Largest single win | The upstream was **idling through 20 layers** (running all 24 but using only the first 4); switching to a manual 4-layer forward made the upstream **10.7x** faster (407.6 -> 38.1 ms/step) |
+| Layer pipeline | The upstream loads only `embed_tokens + L0-3`: **1.47 GB (f16)** vs. 4.55 GB for the full model - **3.1x smaller**, end-to-end 64/64 identical |
+| Falsified | Removing the process boundary (only 8%, and only an artifact of "both sides slow"), reusing `llama_batch` (0.09%), naive upstream layer truncation (numerically broken), `--override-tensor` as a speed-up (actually a capacity knob) |
+| Production readiness | The current best is still **about 20x slower** (gap narrowed from 180x); **production admission stays fail-closed** |
+| Operator environment | Missing operators can be bypassed: WSL2 (Ubuntu-22.04) GPU passthrough and `triton`/fla have been measured working |
+| Current positioning | **Architecture-compatibility track**; off by default, does not replace RPC, does not enter the Edge default route; optimization items are registered in [acceptance list D29](验收清单与资源限制登记.md) |
 
----
+**Corrected conclusion**: the earlier judgement "IPC is the main cost" has been overturned - that was an illusion masked while both sides were slow. **The leverage is in the compute on both sides (cut point, kernel, batching), not in the transport layer.** See [Same-Process Dual-Backend Relay Implementation and Performance](同进程双后端接力实现与性能-2026-09-16.md) sections 12-14.
 
-## 🌐 Tailscale Networking (Important)
+### Cut-Point Sweep Results (P0, measured 2026-09-18)
 
-The distributed inference mode relies on **Tailscale** to interconnect devices across subnets. All nodes participating in inference (PC, Android) are advised to install Tailscale first and join the same network.
+A full sweep over the upstream layer count N (N=0 means **no relay** - llama.cpp runs the whole model; the downstream is the corresponding f16 layer-cut GGUF, CPU / 8 threads):
 
-### Installing Tailscale
+| Upstream layers N | Upstream ms/step | Downstream ms/step | **Total ms/step** | 64-token sequence |
+| ---: | ---: | ---: | ---: | --- |
+| **0 (no relay)** | 1.9 | 184.8 | **186.8** | token-identical to baseline |
+| 4 (current default) | 42.7 | 171.6 | **214.3** | identical |
+| 8 | 77.9 | 145.9 | 223.8 | identical |
+| 12 | 120.8 | 103.8 | 224.6 | identical |
+| 16 | 137.2 | 84.6 | 221.9 | identical |
+| 20 | 182.9 | 66.8 | 249.7 | identical |
 
-**PC** (Windows / macOS / Linux):
+- **Correctness does not vary with the cut point**: the greedy sequence is token-identical at every cut point;
+- **Total time is nearly insensitive to the cut point** (N in {4,8,12,16} spans only 214-225 ms/step, about +/-2.6%), **there is no intermediate valley**; the current default N=4 is already optimal under the constraint that relay must happen;
+- **Not relaying is actually fastest** (186.8 ms/step, 12.9% faster than the default N=4) => on the same machine, single-sequence, relay costs about **+15%** (relative to a pure llama.cpp CPU baseline). This is far milder than "about 20x slower than native llama.cpp GPU" - **that 20x is mostly the CPU/GPU difference, not the cost of the relay mechanism**;
+- An upstream layer (torch/CUDA, 8.8-10.7 ms) is **not** cheaper than a downstream layer (llama.cpp/CPU, 7.7-8.6 ms), so "moving layers to the torch GPU" yields no speed advantage on this machine;
+- **Engineering constraint**: the cut point must be a multiple of `full_attention_interval` (Qwen3.5 = 4), otherwise the layer types of the layer-cut GGUF are misaligned and it fails to load (measured at N=2);
+- **Methodology warning**: isolated measurements detached from the end-to-end chain are not trustworthy (this sweep under-measured the upstream per-step cost by about 5.6x); cut-point conclusions must use the end-to-end basis.
 
-> 🔗 https://tailscale.com/download
+Report: `local_docs/CORE-RELAY-XFRAME-02-sweep-2026-09-18.json`; ticket: [acceptance list D29](验收清单与资源限制登记.md).
 
-After installation, logging in with the same account automatically forms the network.
+**Same-day correction (v2) - the section above (including its table) only holds when the upstream runs on CPU**: `relay_sameproc_4L.py` never calls `.to(device)` after `from_pretrained`, so `dev = tmodel.device` is **cpu**; the isolated script `upstream_layer_cost.py` explicitly does `.to("cuda")`. Measured with the same script and the same basis for the same 4 layers: **cpu 34.9 ms / cuda 8.3 ms** => that 5.6x difference **is explained by the device** (neither by KV shape nor by idle down-clocking - both were disproved by controls: `shape_sensitivity` fixed 47.4 > growing 34.4; `idle_wakeup_and_overlap` idle 8.56 vs continuous 7.53 = 1.14x, with the SM clock steady at 780/3105 MHz throughout).
 
-**Android**:
+After adding `--upstream-device cuda` to relay (with f16 + `--upstream-partial` loading only the first N layers, roughly N/24 x 4.3 GB of VRAM) and re-sweeping:
 
-> 🔗 Search "Tailscale" on Google Play to install, or sideload it from APK Mirror
+| Upstream layers N | CPU upstream total ms/step | **GPU upstream total ms/step** | Gain |
+| ---: | ---: | ---: | ---: |
+| 8 | 223.8 | **169.0** | 1.32x |
+| 12 | 224.6 | **155.0** | 1.45x |
+| 16 | 221.9 | **146.4** | 1.52x |
+| **20** | 249.7 | **129.1** | **1.93x** |
 
-**Verifying the network**:
+- Upstream **GPU about 2.5-4.3 ms/layer**, downstream **CPU llama.cpp about 5.8-8.6 ms/layer** => **push as many layers as possible to the GPU upstream**;
+- **Corrected optimum (measured) N=20 = 129.1 ms/step**, **1.45x faster** than the 186.8 ms/step of **no relay** - **relay shows a clear benefit for the first time**;
+- The 64-token sequence at every cut point remains **token-identical** (including the GPU upstream);
+- So "no relay is fastest / cut points give no benefit" **holds only for a CPU upstream** and must not be extrapolated. In real deployments the downstream is usually a **CUDA-less edge device**, which supports the direction "put layers on the GPU upstream" - and therefore **P1 (adding a GPU to the downstream) has narrow applicability; what is actually worth doing is "GPU-izing the upstream" and P2 overlap**.
 
-Open the Tailscale admin console at https://login.tailscale.com/admin/machines and confirm all nodes are online and have been assigned a `100.x.x.x` address.
+Report: `local_docs/CORE-RELAY-XFRAME-02-p0-corrected-2026-09-18.json` (v2, supersedes v1).
 
-### Why Tailscale?
+### Fair Comparison Against "All-llama + CUDA" + P2 Overlap (measured 2026-09-18)
 
-- Campus/home networks usually do not assign public IPs, so devices cannot reach each other directly
-- Tailscale builds a virtual LAN on top of WireGuard, giving each device a fixed `100.x.x.x` address
-- The Windows packaged launcher automatically checks whether Tailscale is installed and logged in
+**Q: When the cluster has a CUDA node, is all-llama.cpp worse than relay? A: No.**
 
-> The campus network is observed to block UDP, so Tailscale can fall back to relay paths. `NET-DUALSTACK-PREF-01` has completed its local gate: a successful explicit connect persists the selected IPv4/IPv6 endpoint, while startup and reconnect use “preference → original bootstrap → Tailnet” fallback; a short dual-machine IPv6 task is verified. Self-hosted DERP, path observation, backup relays, a WSS data plane direct to the primary node and chunked resume still require real 443/certificate/network acceptance; see the [Anti-Weak-Network Communication Protocol Plan](archive/抗弱网通信协议专项计划.md).
+| Configuration | ms/token | Relative |
+| --- | ---: | ---: |
+| **llama.cpp + CUDA** (build-cuda, `-ngl 24` all layers on GPU, f16, t=8) | **26.6** | 1.0x |
+| Best cross-framework relay (torch GPU upstream N=20 + llama.cpp CPU downstream) | 129.1 | 4.85x slower |
 
----
+The `-ngl` curve is monotonic (ms/token): `0->91.1`, `4->71.0`, `8->60.5`, `12->52.9`, `16->44.2`, `20->34.7`, `24->26.6`. The reference must be the **same build** - even at `-ngl 0` the build-cuda llama-bench is about 2x faster than build-cpu (91.1 vs 194.2 ms/token).
 
-## 🏗️ Project Architecture
+**P2 overlap** (software pipelining: the upstream GPU torch and the downstream CPU llama.cpp advance interleaved, each holding a lock; torch's CUDA calls and ctypes' llama.cpp calls both release the GIL, so they can genuinely run in parallel):
 
-```
-Project root
-├── docs/                          # Project documentation
-│   ├── 项目技术说明.md              # Newcomer entry: KV, fusion, quantization, distributed, scheduling & protocols
-│   ├── 整体架构.md                 # Project overview, device scope, current execution paths
-│   ├── 核心技术原理.md              # Multi-engine, quantization, KV cache & distributed-mode boundaries
-│   ├── 模块接口说明.md              # Current module responsibilities (source code is authoritative for interfaces)
-│   ├── 测试与评判标准.md            # Acceptance criteria for standalone and distributed execution
-│   ├── 文档状态与清理清单.md         # Document status definitions & maintenance rules
-│   ├── 图算法.md                   # Topology-path algorithms for the PyTorch layer pipeline
-│   ├── 分布式资源调度系统.md          # MLFQ three-level feedback queue + graph-algorithm layer orchestration
-│   ├── 分布式推理流水线实施计划.md    # Chain topology, LAYER_FORWARD protocol, KV cache plan
-│   ├── 混合分布式推理体系规划.md      # Inter-layer, task-chain, tensor-parallel & GGUF stage multi-provider system
-│   ├── 三种分布式拆分细化实施方案.md  # Inter-layer pending tests, task chain & tensor-parallel implementation
-│   ├── Android版本远期计划.md       # Android plan evaluation
-│   ├── Android SAF模型存储方案.md   # Android SAF external model directory plan
-│   ├── 总体下一步计划.md             # Historical schedule/index; current priority is in the main/side-line plans
-│   ├── 项目进展与下一步计划.md       # ★ Capability & evidence snapshot
-│   ├── 张量并行外部辅助与混合拆分调研方案.md  # ★ Quantitative argument that in-mesh TP is infeasible + three external routes
-│   ├── TP孤岛接入指南.md            # ★ Route A: island = single logical high-compute node (PoC)
-│   ├── 外部推理服务Provider接入指南.md # ★ Route B: whole-request external routing + data-scope gating (PoC)
-│   └── 投机解码外部辅助实施说明.md   # ★ Route C: draft-verify (experimental, disabled by default)
-├── src/                           # Python source (PC side)
-│   ├── config.py                  # Global configuration (network/model/KV/layering/run-mode/graph thresholds)
-│   ├── model_module.py            # Model loading, quantization, operator fusion, layer split, forward inference
-│   ├── llama_engine.py            # llama.cpp engine wrapper (CPU/iGPU GGUF inference)
-│   ├── island_engine.py           # ★ TP island engine (OpenAI-compatible endpoint → single logical node, Route A)
-│   ├── external_provider.py       # ★ External inference provider + data-scope gating (Route B)
-│   ├── speculative.py             # ★ draft-verify speculative decoding (experimental, disabled, Route C)
-│   ├── tui_commands.py            # ★ Read-only single-command layer (pure stdlib, zero dependencies)
-│   ├── qlh.py                     # Cross-platform core TUI command entry
-│   ├── tui_textual.py             # ★ Textual TUI shell (9 screens; chat + read-only ops)
-│   ├── tui_sse.py / tui_shared.py # T9 SSE incremental parser & shared layer
-│   ├── paged_kv_cache.py          # Lightweight paged KV cache (hot memory pages; optional cold disk tier)
-│   ├── tcp_comm.py                # TCP master/worker communication (long-lived conns, heartbeats, framing, tensor serialization)
-│   ├── scheduler.py               # Task scheduling (node management, layer assignment, pipeline control, request queue)
-│   ├── graph_orchestrator.py      # ★ Graph-algorithm orchestration (max-bandwidth spanning tree + DFS)
-│   ├── device_profiler.py         # Device profiling (CPU/GPU/RAM/network)
-│   ├── api_server.py              # FastAPI server (REST API + WebSocket)
-│   ├── local_store.py             # Primary-node SQLite local storage (one-time legacy JSON import)
-│   ├── model_downloader.py        # Model download guidance (HuggingFace/ModelScope/Baidu Netdisk)
-│   ├── model_host.py              # Model lifecycle host (manager-held, LLM runtime lifecycle)
-│   ├── scheduler_svc_http.py      # scheduler-svc HTTP shell (contract passthrough)
-│   ├── inference_service/         # ★ inference-svc (engine_host/protocol/routes)
-│   └── node_config.py             # Local node configuration (cluster secret/profile, not source-controlled)
-├── schemas/                       # ★ MODEL-FLEET frozen contracts (artifact/pull-job/deployment/profile JSON Schema)
-├── fixtures/                      # Test & walkthrough fixtures (LLM/SSE event streams, model-gate samples)
-├── (sibling) qlh-android/         # Android Edge runtime/client, JNI, Gradle, Android tests/resources
-├── (sibling) qlh-shell/           # CyberGothic Web/Desktop shell, Node tests, optional Textual
-├── (sibling) qlh-release/         # Launcher, PyInstaller/Inno/Linux release and release venvs
-├── (sibling) qlh-toolbox/         # SSH/patch, demo, defense and performance tools
-├── .venv-test/                    # Isolated test env (created by setup_test_env.py; full test runs only — never install into system Python)
-├── requirements/                  # Main and sidecar dependency manifests
-├── requirements-lock/             # Main-repo reproducibility locks
-├── _to_delete/                    # Recoverable migration/archive material; never a runtime dependency
-├── harness_workbench/             # ★ Small-model harness workbench (independent sub-project; no main-project imports)
-│   ├── context_engine/            # Context budget & STATE compression
-│   ├── model_profiles/            # Model profiles and capability gate
-│   ├── rag/                       # Local RAG (chunking/index/rewrite/rerank) and retrieval quality gates
-│   ├── api_layer/                 # OpenAI-compatible /v1 and workbench backend
-│   ├── image_workbench/           # Image workbench
-│   ├── memory/ session/ mcp_server/ research/ adaptation/ eval/  # Memory / sessions / lightweight MCP / experiments & eval
-│   ├── tools/                     # rag_baseline, Tool Gateway, ...
-│   ├── ui_react/                  # Workbench frontend (React + Vite)
-│   └── cli.py / tui.py            # CLI and terminal entry points
-├── tests/                         # Unit/contract/regression tests (full-run baselines are historical; plans hold current evidence)
-├── scripts/                       # Utility scripts
-│   ├── quantize_model.py          # Model preparation & quantization verification
-│   ├── benchmark_all.py           # Full quantization-tier benchmark
-│   ├── benchmark_compile.py       # torch.compile fusion test
-│   ├── convert_to_gguf.py         # Safetensors → GGUF conversion
-│   ├── build_offline_bundle.py    # Offline-bundle preflight, manifest and atomic publish
-│   ├── experiment_quality_production_gate.py # EX-N3 read-only quality audit
-│   └── docagent_*_gate.py         # Document retrieval/semantic quality gates
-├── tools/                         # ★ Submodules and ops tooling
-│   ├── docagent/                  # Submodule (in-house): document-maintenance Agent repo
-│   ├── reasonix-codex-bridge/     # Submodule (in-house): Codex ↔ Reasonix MCP bridge
-│   ├── ssh_sync_*.py              # Worker sync / patch delivery
-│   └── modelscope_download.py     # ModelScope download helper
-├── models/                        # Model files (download yourself)
-│   ├── qwen-1_8b-chat/            # PC: Safetensors format
-│   └── qwen-1_8b-chat-Q4_K_M.gguf # PC: GGUF format (llama.cpp engine)
-├── logs/                          # Runtime logs
-├── requirements.txt               # Python dependency list
-└── README.md                      # This file
-```
+| Mode | ms/token | Throughput |
+| --- | ---: | ---: |
+| serial | 101.11 | 154.5 tok/s |
+| **threaded (overlapped)** | **78.31** | **199.5 tok/s** |
 
-### Submodules and external repositories
+A **1.291x** speed-up, and both sequences are **identical** to the single-sequence baseline; the theoretical ceiling is about 1.79x (taking the larger of upstream 72.3 / downstream 56.8 when fully overlapped), and the measurement reaches about 72% of it.
 
-The main repository pins **three in-house Git submodules**. Android, shell, release, and toolbox code lives in sibling repositories and is not a main-repository startup prerequisite:
+**Conclusion and positioning**: the 1.45x from P0 above is only the local gain of "CPU llama.cpp -> GPU **torch**"; the better move is "CPU llama.cpp -> GPU **llama.cpp**" (`-ngl`). So **cross-framework relay is not a faster inference path** - it is the mechanism for "**layers that can only run under torch**" (hybrid/custom operators) and for "**capacity merging / layer pipeline** (too large for a single machine)", plus an experiment platform. **When the cluster has a CUDA node, the best practice is to use it as a llama.cpp CUDA worker (RPC/sharding), not as a relay upstream**; P2 overlap only recovers part of the loss inside the "relay is unavoidable" scenario (78.3 ms/token is still about 3x slower than 26.6).
 
-| Path | Repository | Kind | Purpose |
-|------|------------|------|---------|
-| `tools/docagent` | [SgfKrc/qlh-docagent](https://github.com/SgfKrc/qlh-docagent) | **In-house** | Rule-as-data scanner, mechanical rule-change scanning (new/gone/changed delta matrix) and evolution gates |
-| `tools/reasonix-codex-bridge` | [SgfKrc/reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge) | **In-house** | stdio MCP bridge that lets Codex drive the read-only Reasonix subagent; CLI path and model ref resolve per machine, `configure verify` self-checks |
-| `../qlh-android/app/src/main/cpp/llama.cpp` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | **External third-party dependency** | Native builds for the Android Edge runtime; pinned revision, not needed on PC or in Python sidecars |
+Report: `local_docs/CORE-RELAY-XFRAME-02-p2-2026-09-18.json`. All of the above is **same-machine** data; the **cross-machine (GPU node + CUDA-less edge node) RPC vs. relay comparison is still unmeasured**.
 
-#### In-house sub-project 1: `qlh-docagent` (document-maintenance Agent)
+### torch.compile and the "Layer Loop" Switches (`USE_COMPILE` / `USE_MONOLITHIC_FORWARD`)
 
-- **What it is**: the repo's document-maintenance toolkit (formerly the `docs/agent_tool` suite) extracted into a general-purpose package where rules are **data** (`RULES.md` + `rules.yaml`), not code.
-- **Capabilities**: rule-driven mechanical scanner; rule-change delta matrix (`new/gone/changed` with `--max-new/--max-gone` gates); evolution gates (`proposed → preflight → gates → released`) with equivalence regression.
-- **Relationship to this repo**: only a gitlink (`tools/docagent`) plus plan docs live here; source and rules evolve in the standalone repository — no source copies in the main repo.
-- **Entry points**: [sub-project plan](../tools/docagent/docs/文档维护Agent工具子项目化与通用化专项计划.md) · [tool design](../tools/docagent/docs/文档维护Agent工具设计.md)
+Getting `torch.compile` gains out of segmented forward takes two switches (both in `src/config.py`, overridable by environment variables):
 
-#### In-house sub-project 2: `reasonix-codex-bridge` (Codex ↔ Reasonix bridge)
+| Switch | Default | Effect |
+| --- | --- | --- |
+| `USE_COMPILE` | `True` | Enables compilation. When compilation is unavailable it **warns and falls back to eager** without blocking startup (this is the path taken on Windows without `triton-windows`). |
+| `USE_MONOLITHIC_FORWARD` | `False` | Additionally compiles the **"layer loop"** (`_LayerLoop`) used by `forward_layers()`; off by default. |
 
-- **What it is**: a stdio MCP service that turns Reasonix (a local multi-model coding agent) into something Codex can call, giving Codex a subagent with its **own model and its own quota**.
-- **Capabilities**: five MCP tools (`reasonix_run` / `status` / `resume` / `rollback` / `cancel`); CLI path and model ref resolve per machine with zero hard-coding (`configure list/use/codex/verify`); controlled writes (`allowWrite` + `allowedPaths` allowlist + clean-tree requirement + git-snapshot rollback); task-level checkpoint resume; redacted JSONL run log.
-- **Relationship to this repo**: only a gitlink (`tools/reasonix-codex-bridge`) plus roadmap/audit docs live here; subagent profiles (`deepseek-worker` / `deepseek-worker-write`) are created by the sub-project's `configure profile` in the global Reasonix directory.
-- **Entry points**: roadmap · audit report · ACP session-recovery plan
+**Why only the layer loop is compiled, not the whole model**: `Qwen2Model.forward()`'s return value passes through `self.norm` (full-model semantics), while a distributed segmented forward must return the **pre-norm** raw hidden when `has_lm_head=False`. So only the loop is wrapped; the pre/post steps stay in `forward_layers()`, which is what keeps the semantics identical to the per-layer version. (The first version compiled the entire `Qwen2Model` segment and got 2.325x, but **applied `self.norm` one extra time** - argmax diverged from decode step 1 - so that number is retired.)
 
+**Measured gains** (`USE_MONOLITHIC_FORWARD=True`; see [Figure 3](figures/cross-frame-relay/fig3-compile-gains.png)):
+
+| Scenario | Per-layer | Compiled layer loop | Speedup | Per-token argmax |
+| --- | ---: | ---: | ---: | --- |
+| Qwen2.5-0.5B, 12 layers (non-hybrid, prefill 64, repeats=5) | 10.269 ms/step | **6.133 ms/step** | **1.674x** | identical |
+| Qwen3.5-2B, 24 layers (hybrid, prefill 32, repeats=3) | 41.058 ms/step | **32.349 ms/step** | **1.269x** | identical |
+
+Hybrid models (Qwen3.5's 18 `linear_attention` + 6 `full_attention` layers) need **a different mask per layer type**; `_LayerLoop` supports this (using a "tuple + per-layer mask index", which also keeps `torch.compile` guards simple). NOTE: the two rows use different setups (model/layers/prefill), so the **speedups are not directly comparable**; hybrid's `linear_attention` (GatedDeltaNet) offers fewer fusion opportunities than pure attention+MLP, so a lower gain is expected.
+
+**Three boundaries you must know**:
+
+1. **compile and eager are not bit-identical**: the hidden difference is exactly **1 ULP of f16** (`0.015625 = 2^-6`); after ruling out every other candidate, the only remaining source is the attention implementation path (`fuse_attention` fusing bmm+softmax back into aten SDPA). **But it must not be described as "compile is worse"** - upstream reports compile has **better** rtol against a **float64** baseline; the correct wording is "**not bit-identical to eager**".
+2. **Scenarios with a "per-token identical" acceptance criterion must not enable compile** (e.g. the cross-framework relay admission criterion).
+3. **Windows needs two things**: `PYTHONUTF8=1` (otherwise torch/inductor decodes internally as GBK, fails, and **silently falls back to eager**) and [`triton-windows`](../requirements-compile.txt) (optional acceleration). Missing either is non-fatal - you just do not get the gain.
+
+Reports: `local_docs/CORE-RELAY-XFRAME-02-a4-layer-loop-2026-09-18.json`, `...-b14-hybrid-layer-loop-2026-09-18.json`, `...-compile-numerics-2026-09-18.json`.
+
+### Top-Level Transparency
+
+The TUI and API top layer only needs to know the **aggregate resources** (GPU/CPU/memory) and "whether it is distributed"; it does not need to know who is local and who is remote. Engine choice is decided by **resources + capability + goal**, not by "torch whenever there is a GPU". Optional policies (privacy, bandwidth) are not implemented yet and are left to a later policy ticket. See [Layer Pipeline Node Kinds and Top-Level Transparency](层流水线节点类型与顶层透明性-可行性确认-2026-09-17.md).
+
+## Current Status
+
+| Capability | Current position |
+| --- | --- |
+| Textual TUI | Wired into the unified `qlh` entry point; chat, 9 feature screens and 1 debug fallback screen share one process and can start the local backend on demand; write operations such as model download/search/preflight/registration, cluster config, node management, log filtering/stats/export, device config and user settings go through a confirmation gate; the old hand-drawn ANSI TUI is archived |
+| Edge <=1B single machine | Model profiling, the GGUF/llama.cpp path and edge preflight exist; torch is not loaded by default |
+| Same-machine two-process RPC | A llama host + `ggml-rpc-server` simulation and contract tests exist; not equivalent to cross-machine production admission |
+| PC RPC | Device scoring, automatic layer planning, lease/disconnect fallback and asset-sync contracts exist; real large-model capacity gains remain fail-closed |
+| Layer-segment contract and auto-reshard | The contract, fail-closed layout validation, capacity re-solve and atomic epoch commit development gate are done; real PC/Android fault injection, long-run and performance acceptance remain |
+| Cross-framework layer relay (D to L) | Correctness verified along multiple paths (cross-process/same-process/cross-machine SSH/f32 all token-identical; upstream manual 4 layers bit-exact); cumulative **8.5x** (21.3 s / 64 steps), the current best is still about **20x slower**, **production admission fail-closed**; optimization ticket D29 |
+| PyTorch D track | The actual implementer of layer splitting / inter-layer pipeline / multi-node layer-segment hosting, doubling as the control experiment; not part of the Edge default dependency |
+| Relay R | L to L, D to L, the f32/sampling matrix and SSH cross-machine evidence have completed correctness verification; no performance advantage, off by default, does not replace RPC |
+| Android | `qlh-android` P0 cross-compilation/JNI is done; P1's on-device run, RPC worker, disconnect, thermal/power and security evidence is not |
+| Model assets | Model files are not in Git; the repository asset list registers Qwen2.5-0.5B, Qwen3-0.6B, MiniCPM4-0.5B, DistilQwen2.5-DS3-0324-7B and others |
+
+Experiments that do not state real device, cross-machine or production acceptance may only be used as development evidence or PoC.
+
+## Main Repository Boundary
+
+| Kept in the main repository | Externalized or not flowing back |
+| --- | --- |
+| llama.cpp/GGUF engine adaptation, RPC/layer-segment contracts, scheduling and failure recovery | Android UI/JNI project: `qlh-android` |
+| FastAPI control plane, model/node/capability contracts | Product shell and frontend: `qlh-shell` |
+| Cross-platform Textual TUI, read-only command thin layer, Edge entry point and quality gates | Release/installer: `qlh-release` |
+| Single-machine, same-machine two-process and PC/Android mainline experiment interfaces | Toolbox: `qlh-toolbox` |
+| **PyTorch D-track engine (layer splitting, layer pipeline) and cross-framework relay implementation** | Image generation, web product UI, mail, operations workbench |
+| Model registration, download verification, device profiling and distributed observability | Koakumix harness custom experiments, image generation and sidecar capability |
+
+The main project keeps no image-generation runtime or assets; image generation belongs solely to Koakumix. Multimodality is not a fixed mainline dependency - the model fleet picks a text or vision model per device capability.
+
+## Directory Layout
+
+| Path | Content |
+| --- | --- |
+| `src/` | QLH main code: control plane, engines, layer-segment/layer-pipeline contracts, TUI (grouped below) |
+| `tests/` | pytest suite (TUI, RPC/layer-segment, scheduling, contracts, doc gates) |
+| `scripts/` | Verification, experiment, environment and documentation tools (`edge_preflight.py`, `android_validation.py`, `llama_rpc_*.py`, `doc_maintenance_audit.py`, ...) |
+| `docs/` | Current documents; historical and migrated content lives in `docs/archive/` |
+| `schemas/` | Cross-process/cross-repo JSON Schema contracts (artifact-manifest, cluster-profile, experiment-record, ...) |
+| `fixtures/` | Test fixtures (including offline chat event replay, used by `qlh chat --fixture`) |
+| `local_docs/` | Local experiment and acceptance raw records; not a public source interface |
+| `runtime/` | Runtime logs and the llama.cpp runtime directory |
+| `qlh.py` / `qlh_edge.py` | Interactive TUI/CLI entry point and Edge entry point |
+| `qlh.bat` / `qlh.sh` / `bjtu.*` / `koakuma.*` | Launchers; `bjtu` and `koakuma` are compatibility aliases, the unified entry point is still `qlh` |
+| `start_tui.*` / `start_backend.bat` / `setup_all_envs.*` | One-click start and multi-environment install scripts |
+| `requirements*.txt` / `pytest.ini` / `pyrightconfig.json` / `reasonix.toml` | Dependency lists and tool configuration |
+| `models/`, `chat_history/`, `dist/`, `build/`, `test-results/`, `logs/`, `_to_delete/` | Local artifacts or archive areas, not in Git (`logs/`, `_to_delete/` are gitignored) |
+
+There are 8 external submodules, all registered in `.gitmodules`:
+
+| Submodule path | Remote |
+| --- | --- |
+| `android/` | `qlh-android` |
+| `frontend_cybergothic/` | `qlh-shell` |
+| `packaging/` | `qlh-release` |
+| `harness_workbench/` | `Koakumix` |
+| `packages/spawnledger/` | `spawnledger` |
+| `tools/docagent/` | `qlh-docagent` |
+| `tools/toolbox/` | `qlh-toolbox` |
+| `tools/reasonix-codex-bridge/` | `reasonix-codex-bridge` |
+
+`src/` grouped by responsibility (for navigation; per-module interfaces are in [Module Interfaces](模块接口说明.md)):
+
+| Group | Representative modules |
+| --- | --- |
+| Control plane and entry points | `api_server.py` (FastAPI control plane), `api_errors.py`, `config.py`, `bootstrap.py`, `model_api_access.py`, `review.py`, `local_store.py` |
+| Scheduling and cluster | `scheduler.py`, `scheduler_svc_http.py`, `cluster_join.py`, `cluster_transport.py`, `edge_cluster.py`, `node_config.py`, `node_runtime.py`, `transport_runtime.py`, `transport_port.py`, `network_address.py`, `network_path.py`, `proxy_config.py`, `wss_loopback.py` |
+| Engines | `llama_engine.py` (L track), `model_module.py` (D track layer splitting), `island_engine.py`, `koakuma_engine.py`, `tcp_comm.py` (torch tensor transport), `inference_client.py`, `inference_svc_main.py`, `inference_service/`, `paged_kv_cache.py`, `external_provider.py`, `speculative*.py` |
+| RPC and layer relay | `llama_rpc_contract.py`, `llama_rpc_device.py`, `llama_rpc_planner.py`, `relay_contract.py`, `relay_planner.py`, `relay_transport.py` |
+| Layer-segment / layer-pipeline contracts | `pipeline_node_contract.py`, `pipeline_capacity.py`, `pipeline_assignment_manifest.py`, `pipeline_model_descriptor.py`, `pipeline_reshard.py`, `cache_unit_layout.py` |
+| Cross-framework / multimodal pipelines | `qwen3_pipeline_*.py`, `qwen3_multimodal_*.py`, `gemma4_pipeline_*.py`, `multimodal.py` |
+| Models and assets | `model_config.py`, `model_host.py`, `model_sync.py`, `model_downloader.py`, `model_download_jobs.py`, `model_search.py`, `model_registry_validation.py`, `model_runtime_contracts.py`, `local_model_assets.py` |
+| Task graph and workflows | `task_graph*.py`, `task_journal.py`, `task_provider.py`, `task_worker_*.py`, `graph_orchestrator.py` |
+| TUI and interaction | `tui_textual.py`, `tui_api.py`, `tui_shared.py`, `tui_sse.py`, `tui_backend.py`, `tui_commands.py` |
+| Retrieval, devices and soak | `rag_store.py`, `rag_embedding.py`, `rag_ann.py`, `rag_quality.py`, `device_profiler.py`, `provider_soak.py` |
+
+## Quick Start
+
+### 1. Get the Code and Submodules
 
 ```bash
+git clone https://github.com/SgfKrc/qlh.git
+cd qlh
 git submodule update --init --recursive
-git clone --recurse-submodules https://github.com/SgfKrc/qlh
-# Optional siblings: qlh-android, qlh-shell, qlh-release, qlh-toolbox
 ```
 
-> Planned: the small-model harness workbench (`harness_workbench/`) still lives inside the main repo; it is a candidate for the same submodule treatment later (in-house), leaving only a gitlink and wiring docs here.
-### PyTorch Layer Pipeline Example (device count is not fixed)
+Submodule remotes are in `.gitmodules`. Common sibling repositories:
 
-```
-User input → Master → TCP → Worker 1 (Client) → TCP → Worker 2 (Client) → Result return
-             Embed + L0-3        L4-14             L15-23 + LM Head
-             The dGPU master participates in the first segment's compute; it no longer only coordinates
-```
+- `https://github.com/SgfKrc/qlh-android.git`
+- `https://github.com/SgfKrc/qlh-shell.git`
+- `https://github.com/SgfKrc/qlh-release.git`
+- `https://github.com/SgfKrc/qlh-toolbox.git`
+- `https://github.com/SgfKrc/qlh-docagent.git`
+- `https://github.com/SgfKrc/reasonix-codex-bridge.git`
+- `https://github.com/SgfKrc/Koakumix.git`
 
-### Android's Two Current Modes
+### 2. Choose a Runtime Environment
 
-```
-┌──────────────────────────────┬──────────────────────────────┐
-│ Local mode (UI: Full mode)   │ Remote mode (UI: Thin mode)   │
-│                              │                              │
-│  Android local llama.cpp     │  Android chat UI             │
-│  GGUF Q4_K_M (~1.16 GB)      │  HTTP → PC master node       │
-│  Offline-capable             │  PC cluster distributed inference │
-└──────────────────────────────┴──────────────────────────────┘
-```
-
-### Software Layering
-
-| Layer | Function | Technology |
-|------|------|------|
-| Application | TUI-first inference and node control; optional product shells are external | Standard-library TUI + versioned HTTP/contracts |
-| Scheduling | Task scheduling, instruction dispatch, state management, request queue | Python threading + graph algorithms |
-| Communication | Long-lived TCP connections, packet de-framing, heartbeats, tensor serialization | Python socket + struct |
-| Inference | Multi-engine: model loading, quantization, fusion, KV cache | PyTorch (CUDA) / llama.cpp (CPU / Android) / island *(PoC)* |
-| External assistance *(PoC)* | Whole-request external routing and data-scope gating, speculative-decoding verification | OpenAI-compatible HTTP (vLLM / SGLang, etc.) |
-| Storage | Conversation persistence, node registration, configuration management | Primary-node SQLite (shared by Python/Node) + Room (Android) |
-| Foundation | Runtime environment | Python / CUDA / bitsandbytes / llama.cpp |
-
----
-
-## 📦 Environment Dependencies
-
-### Core Frameworks
-
-| Dependency | Version Requirement | Notes |
-|------|----------|------|
-| Python | ≥ 3.10 | Dev environment 3.12.10; source verified to parse on 3.10 / 3.11 / 3.12 |
-| PyTorch | ≥ 2.2.0 | CUDA build for discrete GPUs; CPU build for integrated graphics |
-| **transformers** | **≥ 4.45, < 5.0** | ⚠️ Must stay on 4.x! 5.x removed `load_in_4bit`/`load_in_8bit` |
-| accelerate | ≥ 1.0.0 | Model loading acceleration (bitsandbytes dependency) |
-
-### Model Quantization
-
-| Dependency | Version Requirement | Notes |
-|------|----------|------|
-| bitsandbytes | ≥ 0.45.0 | INT4/INT8 quantization (required for discrete GPUs, optional for integrated graphics) |
-
-### CPU / Integrated-GPU Inference Engine
-
-| Dependency | Version Requirement | Notes |
-|------|----------|------|
-| llama-cpp-python | ≥ 0.3.0 | CPU-optimized GGUF inference, 3-5x faster than PyTorch on CPU |
-
-### Image generation boundary
-
-QLH no longer ships an image-generation engine, image-generation API, Diffusers dependencies, or image assets. Image upload and Gemma/Qwen multimodal understanding remain in the main project. Koakumix owns the local image workspace and exposes its own OpenAI-compatible `/v1/images/generations` endpoint.
-
-
-### Web Visualization
-
-| Dependency | Version Requirement | Notes |
-|------|----------|------|
-| fastapi | ≥ 0.110.0 | API backend framework |
-| uvicorn[standard] | ≥ 0.29.0 | ASGI server |
-| pywebview | ≥ 5.0 | Native window for packaged builds (replaces the browser) |
-| python-multipart | ≥ 0.0.12 | File upload support |
-
-### Database
-
-> Remote PostgreSQL has been retired (M1.3, 2026-08-10): production runtime no longer connects to or packages the PG driver; data is carried by the primary node's SQLite. psycopg2 is installed on demand only when needed for historical migration audits.
-
-### Networking (Required for Distributed Mode)
-
-| Dependency | Version Requirement | Notes |
-|------|----------|------|
-| **Tailscale** | Latest | Cross-subnet virtual networking; must be installed on every distributed node |
-
-> 🔗 Download: https://tailscale.com/download
-
-### Tools
-
-| Dependency | Version Requirement | Notes |
-|------|----------|------|
-| tqdm | ≥ 4.65.0 | Progress bars |
-| psutil | ≥ 5.9.0 | System resource monitoring |
-
-### Frontend
-
-| Dependency | Version Requirement | Notes |
-|------|----------|------|
-| Node.js | ≥ 18 | Frontend build |
-| npm | — | Package manager |
-
-### Android Client
-
-| Dependency | Version Requirement | Notes |
-|------|----------|------|
-| Android SDK | API 34+ | Compile target |
-| Gradle | 8.11+ | Wrapper bundled; no separate installation needed |
-| Kotlin | 2.1.0 | Downloaded automatically via Gradle |
-| Java | JDK 17 | Required for compilation |
-
-> The Android client does **not** need Android Studio; a JDK plus the Android SDK command-line tools is enough to build via `gradlew.bat`.
-
-### One-Click Installation
-
-```bash
-# Python dependencies (primary node is self-contained on SQLite; no PostgreSQL needed)
-pip install -r requirements.txt
-
-# Product shell dependencies (optional side line; not needed by mainline)
-# cd ../qlh-shell/frontend_cybergothic && npm ci && cd ../..
-```
-
-### 🚀 One-Click Setup for All Development Environments (recommended after cloning)
-
-The repo contains **the main runtime + Python virtual environments**. Product-shell Node projects are optional migration sources, not mainline prerequisites. The unified entrypoint `scripts/setup_envs.py` (or the root-level `setup_all_envs.bat` / `setup_all_envs.sh`) prepares the mainline environments:
-
-```bash
-# Windows
-setup_all_envs.bat --all
-
-# Linux / macOS
-./setup_all_envs.sh --all
-
-# Or call the script directly (equivalent; also --only / --skip / --check / --snapshot / --list)
-python scripts/setup_envs.py --all
-python scripts/setup_envs.py --check      # verify existing envs only, no install
-python scripts/setup_envs.py --list       # show the environment inventory
-```
-
-> ⚠️ **Platform-specific heavy deps such as torch are NOT installed automatically**: the script filters out `torch/torchvision/torchaudio` and prints the per-environment install commands, so CPU/CUDA wheels never contaminate each other (the two packaging venvs must never be mixed: the iGPU build takes CPU-only torch, the dGPU build defaults to CUDA). Pass `--torch-index-url URL` to bake your chosen source into the hints, e.g. `https://download.pytorch.org/whl/cu126`. Packages that need a source build (e.g. llama-cpp-python) fail loudly without a compiler toolchain — follow the header comments of the corresponding requirements file.
-
-**Environment ↔ dependency file ↔ lock snapshot**: `requirements-lock/*.lock.txt` are generated from the live `pip freeze` via `--snapshot` and pin exact versions for reproducibility (torch-family, editable and local-path installs are not pinned); installation still follows the version windows in the `requirements-*.txt` files.
-
-| Environment | Purpose | Dependency source | lock snapshot |
-|---|---|---|---|
-| **Main** (system Python) | Runtime (transformers/torch inference services) & tool scripts | `requirements.txt` | `requirements-lock/main.lock.txt` |
-| `.venv-test` | The only test environment (all pytest runs) | `requirements-test.txt` | `requirements-lock/test.lock.txt` |
-| `../qlh-shell/.venv-tui` | T9 terminal chat page (textual) | `../qlh-shell/requirements-tui.txt` | `../qlh-shell/requirements-lock/tui.lock.txt` |
-| `.venv-gemma4-native` | Native Gemma 4 MTMD / llama.cpp | `requirements/requirements-gemma4-native.txt` | `requirements-lock/gemma4-native.lock.txt` |
-| `.venv-gemma4-pipeline` | Gemma 4 PyTorch Transformers 5.10.1 sidecar | `requirements/requirements-gemma4-pipeline-sidecar.txt` | `requirements-lock/gemma4-pipeline.lock.txt` |
-| `.venv-qwen3-sidecar` | Qwen3 PyTorch sidecar (incl. pipeline execution deps) | `requirements/requirements-qwen3-sidecar.txt` + `requirements/requirements-qwen3-pipeline-sidecar.txt` | `requirements-lock/qwen3-sidecar.lock.txt` |
-| `../qlh-release/.venv-packaging` | iGPU packaging (CPU torch + PyInstaller) | `../qlh-release/packaging/requirements-cpu.txt` | `../qlh-release/requirements-lock/packaging.lock.txt` |
-| `../qlh-release/.venv-packaging-cuda` | dGPU packaging (CUDA torch) | `../qlh-release/packaging/requirements-cpu.txt` | `../qlh-release/requirements-lock/packaging-cuda.lock.txt` |
-| `../qlh-shell/frontend_cybergothic` | Product shell (side line) | `package-lock.json` (`npm ci`) | — |
-
-> `setup_all_envs.bat` runs `chcp 65001` automatically on Windows; if you run the script directly and the terminal shows mojibake, run `chcp 65001` or `set PYTHONIOENCODING=utf-8`.
-
-### 🔒 Environment Separation (main / test / packaging)
-
-**Hard rule: test dependencies go ONLY into `.venv-test` — never into the system Python (main environment); never copy/sync site-packages between `.venv-test` and the main environment.**
-
-| Environment | Purpose | Dependency source | Forbidden |
-|---|---|---|---|
-| **Main** (system Python) | Runtime (transformers 4.47.1 / torch / inference services) and tool scripts | `requirements.txt` | No pytest-family test deps; no full test runs |
-| **`.venv-test`** | **The only test environment** (all pytest runs) | `scripts/setup_test_env.py` + `requirements-test.txt` | No runtime inference; not a main env substitute |
-| `../qlh-release/.venv-packaging/` | iGPU packaging (CPU torch) | `../qlh-release/packaging/requirements-cpu.txt` | — |
-| `../qlh-release/.venv-packaging-cuda/` | dGPU packaging (CUDA torch) | see qlh-release docs | — |
-| `.venv-gemma4-native/`, `.venv-qwen3-sidecar/` | Isolated sidecar runtimes (native MTMD / Qwen3 sidecar) | their own requirements | — |
-
-**Common commands**:
+The main environment includes torch and suits the D-track PyTorch layer pipeline, cross-framework relay and the full API:
 
 ```powershell
-# Create / verify the test env (--check is a read-only health check)
-python scripts/setup_test_env.py --check
-# Run tests in the test env (channel script has a venv guard that rejects system Python)
-.venv-test\Scripts\python.exe scripts/run_test_channels.py
-# Targeted tests
-.venv-test\Scripts\python.exe -m pytest tests/test_xxx.py -q -n 1
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-> **Incident log (2026-08-14)**: the main env was once polluted with pytest-family packages while `.venv-test` was stripped of pytest (site-packages copied between the two envs), forcing test runs in the main env. Fixed (main env uninstalled test packages; `.venv-test` reinstalled from requirements-test.txt). **Do not bypass the guard via `run_test_channels.py --allow-system-python`** — that flag is only for throwaway CI images.
+The Edge environment installs only GGUF/llama.cpp and control-plane dependencies, without torch, Transformers or bitsandbytes:
 
----
+```powershell
+python -m venv .venv-edge
+.\.venv-edge\Scripts\python.exe -m pip install -r requirements-edge.txt
+.\.venv-edge\Scripts\python.exe scripts/edge_preflight.py --python .venv-edge\Scripts\python.exe --json
+```
 
-## 🧰 After-Clone Asset Checklist
+On Linux/macOS replace `Scripts\python.exe` with `bin/python`. The interactive TUI needs `Textual`; read-only commands, the protocol layer and CI checks do not. `uvicorn/FastAPI` is only needed when the local backend is started automatically - a remote TUI will not start a backend on the remote host.
 
-> Cloning the repo ≠ immediately usable. The list below covers the **offline assets you still need beyond the code** (model weights, submodules, secrets, environment files). Items marked ✅ ship with the repo or come with a normal clone; the rest must be obtained per the tables.
+If you only need the interactive TUI, you can install it on top of a complete environment:
 
-### 0. First Steps After Cloning (one-time environment steps)
+```powershell
+python -m pip install -r requirements-tui.txt
+```
+
+### 3. Start the TUI
 
 ```bash
-# 1. Initialize the main repository's in-house submodules (docagent/reasonix bridge)
-git submodule update --init --recursive
-
-# 2. Install Python dependencies (main environment; online)
-pip install -r requirements.txt
-
-# 3. Product shell dependencies (optional; maintained in qlh-shell)
-# cd ../qlh-shell/frontend_cybergothic && npm ci && cd ../..
-
-# 4. Environment files (not committed; create per node)
-#    The main .env needs at least QLH_CLUSTER_SECRET (distributed secret);
-#    judging/tool keys see §4.1 of docs/文档维护Agent工具设计.md and .env.docagent
-
-# 5. Verify
-python -c "import src.api_server" && python -m pytest tests/ -q --collect-only | tail -1
+python qlh.py chat
+python qlh.py chat --route distributed_preferred --thinking
+python qlh.py chat --fixture fixtures/chat.json
+python qlh.py status
+python qlh.py models
 ```
 
-`llama.cpp` is pinned inside the external `qlh-android` repository at `app/src/main/cpp/llama.cpp`. To keep Android Edge build capability, clone `https://github.com/SgfKrc/qlh-android` beside the main repository and initialize its submodule; PC workers and Python sidecars do not need it. `.venv-gemma4-native` uses `llama-cpp-python` and does not reference the Android source tree.
+When the local backend is not running, `qlh chat` starts it in a daemon thread of the current process and shows the liveness stage on the Textual splash screen. Backend logs are not flushed into the TUI; they go to the existing log file and the logs screen. Single commands such as `status` and `models` do not start the backend automatically; `--fixture` is the offline chat event replay path.
 
-A PC worker without CUDA / discrete GPU must explicitly install CPU PyTorch; never copy the master's CUDA venv:
+Write operations are initiated from the shell: the models screen uses `L` to load / `U` to unload, the queue screen uses `P` pause-resume / `S` policy / `C` clear queued, and the chat screen supports `/model`, `/queue`, `/new`, `/resume`, `/rename`, `/sessions`, `/delete-session`, `/reset`; destructive and long-running operations first show a confirmation box. Model control endpoints are allowed by default on loopback; to control a main node remotely the main node must configure `QLH_MODEL_API_TRUSTED_CIDRS`.
 
-```bash
-python scripts/setup_qwen3_sidecar_env.py --pipeline \
-  --torch-index-url https://download.pytorch.org/whl/cpu
-python scripts/setup_gemma4_pipeline_env.py \
-  --torch-index-url https://download.pytorch.org/whl/cpu
-python scripts/setup_envs.py --check --no-node
+On Windows you can use `qlh.bat` directly; on Linux/macOS use `qlh.sh`. `bjtu`/`koakuma` are compatibility launchers, and the unified repository entry point is still `qlh`.
+
+The TUI's 9 feature screens are the main interaction and acceptance boundary: the models screen covers local assets/presets/download jobs, search, preflight, registration, load and unload; the distributed/nodes screen covers toggles, capacity, max nodes, invite, connect, join-request code/authorization consumption and deregistration; the logs screen covers filtering, statistics, export and clearing; the device screen covers auto-configuration and GPU selection; the settings screen reads and writes user settings. The final "debug" screen reads routes dynamically from `/openapi.json` of the running backend and serves only as a JSON fallback for operations that have no dedicated interaction yet; it does not count as product feature coverage. The current main backend OpenAPI snapshot is 152 operations; the actual number is whatever the target backend returns. Streaming chat and file upload are still handled by the chat page specifically.
+
+## Models and Distribution
+
+Model artifacts, download caches and large GGUF files do not enter Git. The model list and capability profiles are managed by the repository API/TUI, and a model must pass format, digest, architecture, template, thinking, device budget and provenance validation before it can enter the usable list.
+
+Current recommended validation order:
+
+1. Load a single <=1B GGUF locally and verify the template, thinking toggle and streaming output.
+2. Start a host and `ggml-rpc-server` on the same machine and verify partial residency, capacity merging, output comparison and worker disconnect.
+3. On a PC node, complete real RPC, asset sync, lease and failure-recovery acceptance.
+4. When cross-framework or inter-layer pipeline is involved, first re-check the numerical consistency and performance boundary of the D to L relay locally.
+5. Then move on to ARM64/Android worker acceptance.
+
+Do not claim "the model is sharded" based on full-model replication, whole-request parallelism through the task graph, or old two-machine PyTorch results. Small-model bypass on node failure is a scheduling policy, not a separate Lite product.
+
+## Android Validation
+
+The Android project lives in the external submodule `android/`. When the development machine has no real Android device, use layered evidence:
+
+```powershell
+# JVM protocol/state-machine/capability contract tests
+python scripts/android_validation.py
+
+# Also build the fullDebug APK
+python scripts/android_validation.py --assemble
+
+# With an emulator or adb device connected, install and launch the control plane
+python scripts/android_validation.py --assemble --install --launch --serial emulator-5554
+
+# Emit machine-readable evidence
+python scripts/android_validation.py --assemble --json
 ```
 
-At runtime use `execution_device=cpu` (or `auto`, which falls back to CPU when CUDA is absent); capacity gates judge by available RAM, not VRAM. CPU and CUDA environments must be created locally on each node — never copy `.venv-*` across machines.
+An x86_64 emulator can validate the APK, UI, permissions, networking and lifecycle, but cannot prove the `arm64-v8a` JNI RPC worker; an ARM64 AVD/QEMU can only add ARM compatibility and cannot replace real-phone thermal/power, background-reclaim, weak-network and long-run testing. The full Android P1 criteria and the AVD/QEMU/remote-adb plan are in [Android Validation Alternative Paths](Android验证替代路径-2026-09-18.md). The old hand-drawn ANSI TUI has been moved to `_to_delete/`; do not treat it as the current interaction implementation or test entry point.
 
-### 1. Offline Asset Checklist (fetch as needed)
+## Testing
 
-| Asset | Size | Purpose | How to get | Required? |
-|---|---|---|---|---|
-| **Qwen-1.8B-Chat (Safetensors)** | ~3.5 GB | Default sample model: dGPU inference, distributed pipeline | ModelScope `Qwen/Qwen-1.8B-Chat` or HF (see Model Download below) | ⭐ Required (default model) |
-| **Qwen-1.8B-Chat (GGUF Q4_K_M)** | ~1.16 GB | CPU/iGPU standalone, Android local inference | `huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf ...` | ⭐ Required (CPU path) |
-| **Qwen3-4B (GGUF Q4_K_M)** | ~2.5 GB | EX-N3 judging model (v2 accuracy criteria), experiments | managed download (MODEL-TOOLS) / HF `Qwen/Qwen3-4B-GGUF` | experiments |
-| **Gemma 4 12B native binding** (GGUF + mmproj) | ~7.3 GB | image understanding (image-to-text) native path | managed artifact manifest `models/gemma4-native/gemma4-native.lock.json` + download script | multimodal experiments |
-| **nomic-embed-text:latest** (Ollama) | on demand | master-node local RAG embedding provider | `ollama pull nomic-embed-text:latest` | local RAG quality/capacity gates |
-| **Koakumix image assets** | Koakumix-owned | image generation workspace | kept outside the QLH offline bundle; see the Koakumix documentation |
-| **Ollama models** (`gemma4:12b` etc.) | on demand | EX-N3 Gemma judging, external-path verification | `ollama pull gemma4:12b` | judging experiments |
+Use an environment separate from the main one for tests:
 
-### 2. Already in the Repo / No Need to Fetch
-
-| Item | Note |
-|---|---|
-| ✅ Runtime license records | LLM/multimodal runtime licenses stay with their managed assets; Koakumix owns image-generation licenses outside the QLH bundle |
-| ✅ Test fixtures & experiment plans | all of `fixtures/` committed |
-| ✅ Signature origin / serve distribution | code in `../qlh-release/`, no main-repo assets |
-| ⚠️ Release signing keys | `../qlh-release/.signing-keys/` **not in the repo**; held by release owners — a clone can only verify, not sign |
-| ⚠️ `.env` (e.g. QLH_CLUSTER_SECRET) | each node provides its own; not committed |
-| ⚠️ `models/` large files | all gitignored; fetch per the table above, not shipped with the repo |
-
-### 3. Installers (usable without cloning)
-
-Windows CPU/CUDA Setup, Launcher, Android Edge runtime APK and Linux `.deb` are all obtained from the **release channel** (on this project's intranet: run `python packaging/serve.py` from the sibling `qlh-release` repository). Installing does not require cloning the main repo; cloning is mainly for development and acceptance.
-
----
-
-## 🤖 Model Download
-
-> **Default source**: the current control-svc has the Hugging Face official source built in and enabled, and also registers HF mirror and ModelScope endpoint descriptions (the latter two are disabled by default, pending the corresponding adapters / real-network acceptance); source priority, enable/disable and `credential_ref` are supported. Windows tokens are protected by the current user's DPAPI; the model proxy follows `QLH_HTTP_PROXY > user-persisted config > direct connection` and can be set or cleared via the local `/models/network/proxy` API without modifying the system proxy. Gated repositories require registered credentials and explicit license acceptance first; plaintext never enters SQLite/jobs/manifests/responses. See [Special Plan](../../qlh-release/docs/一键模型部署与自治集群远期计划.md) §4.2/§7.1 for the mechanism.
-
-The project's default example model is **Qwen-1.8B-Chat**, and the model registry provides additional Qwen/DeepSeek experimental slots. The following covers only the two formats of the default model and does not imply the system supports only that model:
-
-| Format | Engine | Size | Use Cases |
-|------|------|------|---------|
-| **Safetensors** | PyTorch (CUDA) | ~3.5 GB | Discrete-GPU inference, distributed pipeline |
-| **GGUF Q4_K_M** | llama.cpp (CPU / Android) | ~1.16 GB | Integrated-GPU/CPU, single-machine inference, Android local inference |
-
-### Safetensors Format (PyTorch / Distributed)
-
-**Option 1: ModelScope (recommended, faster in China)**
-
-```bash
-pip install modelscope
-python -c "from modelscope import snapshot_download; snapshot_download('Qwen/Qwen-1.8B-Chat', local_dir='models/qwen-1_8b-chat')"
+```powershell
+python -m venv .venv-test
+.\.venv-test\Scripts\python.exe -m pip install -r requirements-test.txt
+.\.venv-test\Scripts\python.exe -m pytest -q
 ```
 
-**Option 2: Hugging Face**
+Targeted checks for high-risk mainlines:
 
-```bash
-pip install huggingface_hub
-huggingface-cli download Qwen/Qwen-1.8B-Chat --local-dir models/qwen-1_8b-chat
+```powershell
+.\.venv-test\Scripts\python.exe -m pytest -q tests/test_tui_textual.py tests/test_tui_write_ops.py tests/test_tui_shared.py tests/test_tui_sse.py
+.\.venv-test\Scripts\python.exe -m pytest -q tests/test_llama_rpc_planner.py tests/test_llama_rpc_device.py
+.\.venv-test\Scripts\python.exe -m pytest -q tests/test_pipeline_node_contract.py tests/test_pipeline_reshard.py tests/test_pipeline_capacity.py
 ```
 
-**Option 3: Baidu Netdisk**
-
-> 🔗 https://pan.baidu.com/s/1hAAaIN1Og-ZdeEHzxU-o4g?pwd=vtp3 | Extraction code: vtp3
-
-### GGUF Format (llama.cpp / PC CPU Engine)
-
-```bash
-# Download the recommended Q4_K_M (~1.16 GB)
-huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf Qwen-1_8B-Chat-Q4_K_M.gguf --local-dir models/
-```
-
-| Quantization | Size | Notes |
-|------|------|------|
-| Q3_K_M | ~0.94 GB | Experimental tier; for 14B+ capacity validation or small-model pipeline smoke, not recommended for daily small-model use |
-| **Q4_K_M** ⭐ | **~1.16 GB** | **Recommended — best speed/quality balance** |
-| Q5_K_M | ~1.31 GB | Higher quality |
-| Q8_0 | ~1.82 GB | Near-lossless |
-
-### Image generation
-
-The QLH main project does not provide image generation or editing. Use the independent Koakumix `harness_workbench` image workspace and its `/v1/images/generations` endpoint. QLH still supports image input for multimodal chat.
-
-### GGUF Format (Android Local Inference)
-
-In Android local mode (called "Full Mode" in the existing UI), models must be placed in a **user-selected external directory** (SAF `ACTION_OPEN_DOCUMENT_TREE`), **not in app internal storage**, so that models are kept by default when the APK is uninstalled.
-
-**Android model storage locations**:
-
-| Recommended Location | Notes |
-|----------|------|
-| `Download/QLH/models/` | The device's built-in download directory; uninstalling the APK does not delete it |
-| User-chosen external SD card directory | Any directory authorized via SAF |
-
-**How to obtain**:
-
-1. **PC distribution**: start the distribution server on the PC, download from the Android browser, then move the model into the SAF model directory
-
-   ```bash
-   cd packaging
-   python serve.py
-   ```
-
-2. **Direct download**: access Hugging Face from the Android browser or transfer files via USB
-
-3. **Later**: in-app support for downloading directly from the PC primary node into the SAF directory
-
-**Workflow**:
-
-```text
-Open app → Settings → switch to "Full mode" → Model management → pick directory
-  → pick a directory containing .gguf → scan → select model → done
-```
-
-> For the detailed plan, see [Android SAF Model Storage Plan](Android SAF模型存储方案.md)
-
----
-
-## 🚀 Quick Start
-
-### Development Mode (PC)
-
-```bash
-# Terminal 1: start the Python backend (run from the project root)
-python src/api_server.py
-
-# Terminal 2: start the mainline TUI (the product shell is a side line)
-python qlh.py                       # Textual shell; starts the backend if needed
-```
-
-Once the backend is ready:
-
-- **Backend API**: `http://localhost:8000`
-- **Mainline TUI**: terminal conversation, model fleet and cluster control
-- **Product shell**: maintained by the side-line migration plan; it is not a mainline startup prerequisite
-
-> The product shell, pywebview Launcher, packaging specs and Linux `.deb` are side-line migration scope; their clean-machine and upgrade gates do not define mainline TUI or Edge readiness.
-
-### Standalone Mode (PC)
-
-Edit `src/config.py`: set `RUN_MODE = "single"`, then:
-
-```bash
-python src/api_server.py
-```
-
-### Distributed Mode (PC)
-
-> ⚠️ Prerequisite: all participating nodes have Tailscale installed and are logged in with the same account.
-
-**Master node**:
-
-```bash
-python src/api_server.py
-# Enable "distributed inference" in the admin panel and configure the Tailscale network
-```
-
-**Worker node**:
-
-```bash
-python src/api_server.py
-# Enter the master node's Tailscale IP in the admin panel and click "connect to master"
-```
-
-> The system automatically completes: node registration → device profile reporting → layer assignment computation → layered configuration push.
-
-### TUI Admin Menu (terminal, cross-platform)
-
-For environments without a browser (SSH, servers, Raspberry Pi, etc.), a terminal admin menu is available, covering the same functions as the Web admin panel (system overview / node management / distributed & layered inference / request queue / device profile / logs / settings). It is implemented purely with the Python standard library and supports Windows 10+ / Linux / macOS.
-
-**One-click launch** (auto-starts the backend + waits until ready + enters the TUI; the backend keeps running after the TUI exits):
-
-```bash
-bjtu                                        # Global command: works from any terminal (install below)
-./start_tui.sh                              # Linux / macOS (no install needed)
-start_tui.bat                               # Windows (double-click or command line)
-```
-
-**Install the global `bjtu` command** (recommended): the packaged Windows build offers PATH registration in the install wizard (silent flag `/ENVREG=0|1`); the Linux `.deb` always installs `/usr/local/bin/bjtu`, and you can additionally register the `/opt` PATH via `QLH_ENVREG=1` or `qlh-env-register enable`. For a source checkout, add the project root in the GUI environment-variable editor on Windows (avoid `setx` rewriting an overly long PATH); on Linux/macOS you can use `sudo ln -s <project root>/bjtu.sh /usr/local/bin/bjtu`.
-
-**Manual / advanced usage** (run `python src/api_server.py` first if the backend is not running):
-
-```bash
-python src/tui_commands.py status --host 100.x.x.x                # Query a remote Tailscale master (read-only)
-python src/tui_commands.py models --json                          # Machine-readable read-only output
-python src/tui_commands.py logs --host 100.x.x.x --log-token xxx  # Remote aggregated logs
-bjtu --help                                 # Full command set and startup args (does not start the backend)
-```
-
-**TUI command set** (in any screen, type a `/` command and press Enter; ESC cancels; also works in `--plain` mode): common operations such as model / quantization / engine switching, GPU selection, distributed toggle, queue control, logs, settings, and graceful exit are available without entering the menu:
-
-```bash
-/help                     # Command help (inside the TUI)
-/status  /models  /model  # Status & model info
-/switch <model ID> [--quant precision] [--engine engine]   # Switch model (auto-rollback on failure)
-/quant  <int4|int8|fp16|gguf>                    # Quantization switch (reloads current model)
-/engine <auto|llama_cpp|pytorch|island>          # Engine switch (reloads current model)
-/gpu <index>  /device auto                        # GPU selection / device auto-config
-/dist on|off  /queue pause|resume|clear          # Distributed toggle / queue control
-/logs  /host <host> [port]  /interval <seconds>   # Logs / settings
-/quit                     # Exit the TUI (backend keeps running)
-/shutdown                 # Graceful exit: backend cleans up resources, then the TUI exits
-```
-
-See the **[TUI User Guide](TUI使用指南.md)** for the full parameter table, the `QLH_BACKEND_PORT` override, troubleshooting, and the automated walkthrough; the **complete reference of the 27 `/` commands (aliases / parameters / options / exit semantics / menu mapping) is in [TUI Command Set](TUI指令集.md)**; gateway contract and tests are in [TUI Adaptation Implementation Plan](TUI适配实施计划.md) (T1–T8 current · Active; T9.0–T9.5 completed, terminal walkthrough 54/54; T9.6-R2 Windows dev-machine implementation gate and the UP-N6.4W cross-volume retention gate passed; external clean machine / Linux / real-model sessions and the default entry point are still pending).
-
-### External Compute Assistance (three routes, all disabled by default)
-
-Tensor parallelism is not feasible inside this project's heterogeneous Tailscale mesh (48 all-reduces per token; at a 20 ms RTT, synchronization alone costs ≥960 ms/token — see the quantization argument in the [research proposal](张量并行外部辅助与混合拆分调研方案.md), §1). TP therefore stays on fast interconnects **outside** the cluster, leveraged through three routes:
-
-| Route | Form | Switch | Status |
-|------|------|------|------|
-| **A · TP island** | An out-of-cluster homogeneous GPU sub-cluster running TP, presenting itself to the cluster as a **single logical high-compute node** and handling whole-request inference (not participating in layer splitting) | `QLH_ISLAND_ENABLED=1` + `QLH_ISLAND_BASE_URL` | Phase 1 PoC, verified |
-| **B · External inference service** | Whole requests routed by policy to an OpenAI-compatible endpoint outside the cluster; **nothing leaves the cluster by default** | `QLH_EXTERNAL_ENABLED=1` + `QLH_EXTERNAL_DATA_SCOPE` | Phase 1 PoC, verified |
-| **C · Speculative decoding** | A local small model drafts γ tokens and the external large model verifies them in one pass; only token ids cross the slow network | `QLH_SPEC_ENABLED=1` (experimental endpoint returns 404 while disabled by default) | Phase 0–1 exploration, **not wired into the production decoding loop** |
-
-```bash
-# Route A: island side (multi-GPU machine / homogeneous LAN GPU group)
-vllm serve Qwen/Qwen2.5-7B-Instruct --tensor-parallel-size 2 --host 0.0.0.0 --port 8000
-# Gateway side (run QLH, then connect to the master as usual)
-set QLH_ISLAND_ENABLED=1 && set QLH_ISLAND_BASE_URL=http://10.0.0.2:8000
-set QLH_ISLAND_GPU_COUNT=2 && set QLH_ISLAND_VRAM_GB=48 && set QLH_ISLAND_TP_SIZE=2
-python src/api_server.py
-
-# Route B: default opt_in — only requests explicitly marked allow_external may leave the cluster
-set QLH_EXTERNAL_ENABLED=1 && set QLH_EXTERNAL_BASE_URL=https://gpu-box.example.com:8000
-set QLH_EXTERNAL_DATA_SCOPE=opt_in
-curl -X POST localhost:8000/api/chat -H "Content-Type: application/json" \
-     -d "{\"message\":\"...\",\"allow_external\":true,\"prefer_external\":true}"
-```
-
-> ⚠️ **Data boundary**: Routes B / C send user content (including speculative-decoding draft tokens) out of the cluster. The scope levels `deny` / `opt_in` (default) / `allow_all` are a security boundary, not a performance switch; an invalid value fails closed to `deny`. Confirm compliance requirements before enabling.
-
-### Windows Packaging Baseline and Build Scripts (optional side line)
-
-The table below is the historical size baseline for the existing full-package build scripts, not a `PACK-SLIM` release promise. `PACK-SLIM` has completed its local development gate; real PyInstaller builds and first external-runtime bootstrap still await packaging-environment acceptance.
-
-| Version | Installer | Typical size | Use case |
-|------|--------|---------|---------|
-| **iGPU (CPU) edition** | `QLH-Edge-Inference-Setup-vX.X.X.exe` | ~180 MB | CPU / integrated-graphics nodes (worker nodes) |
-| **dGPU (CUDA) edition** | `QLH-Edge-Inference-Setup-vX.X.X-CUDA.exe` | ~1.7 GB | NVIDIA GPU nodes (master node); falls back to CPU automatically when no GPU is present |
-
-**iGPU (CPU) build**:
-
-```bash
-# 0. Run the release workflow from the sibling release repository
-cd ..\qlh-release
-# 1. Create and activate the iGPU venv (first time only)
-python -m venv .venv-packaging
-.venv-packaging\Scripts\activate
-
-# 2. Install dependencies (first time only)
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install -r packaging/requirements-cpu.txt
-pip install pyinstaller
-
-# 3. Build the shell in its sibling repository when a fresh dist is needed
-# cd ..\qlh-shell\frontend_cybergothic && npm ci && npm run build && cd ..\..\qlh-release
-
-# 4. PyInstaller packaging (run from qlh-release)
-pyinstaller packaging/qlh-cpu.spec --noconfirm
-
-# 4. Inno Setup installer compilation
-cd packaging
-"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup.iss
-```
-
-**dGPU (CUDA) build** (requires a separate venv):
-
-```bash
-# 0. Run from the sibling release repository
-cd ..\qlh-release
-# 1. Create and activate the dGPU venv (first time only)
-python -m venv .venv-packaging-cuda
-.venv-packaging-cuda\Scripts\activate
-
-# 2. Install dependencies (first time only; torch first, then shared deps — they don't overwrite each other)
-pip install torch                        # ★ CUDA 12.x (default), NOT the CPU build
-pip install -r packaging/requirements-cpu.txt
-pip install pyinstaller
-
-# 3-5. Same as the iGPU edition, but use qlh-cuda.spec / setup-cuda.iss
-pyinstaller packaging/qlh-cuda.spec --noconfirm
-cd packaging && "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup-cuda.iss
-```
-
-> ⚠️ **Important**: the two versions use **different, separate venvs** (`.venv-packaging/` vs `.venv-packaging-cuda/`).
-> Never mix them — the iGPU venv must install CPU-only torch, and the dGPU venv must install CUDA torch.
-> Installing the wrong one will bloat the iGPU build from 180 MB to 1.8 GB.
->
-> **Image-generation boundary**: CPU/CUDA QLH packages contain no image-generation dependencies, models, or workspace. Install and run that capability only in Koakumix; QLH image input and multimodal understanding remain available.
->
-> After installation, double-click the desktop shortcut to launch — no Python environment configuration needed. On uninstall you will be asked whether to also delete the `models/` directory; model files are kept by default.
->
-> See [qlh-release README](../../qlh-release/README.md) for the detailed packaging workflow.
-
-### Linux `.deb` Packaging Baseline
-
-The Linux build scripts cover Ubuntu 22.04+ / Debian 12+. Versions and sizes below are historical examples, not a substitute for the current release manifest or clean-machine acceptance:
-
-| Version | Package | Typical size | Use case |
-|------|--------|---------|---------|
-| **CPU edition** | `qlh-edge-inference-cpu_<version>_amd64.deb` | ~200 MB (historical) | CPU / integrated-graphics nodes |
-| **CUDA edition** | `qlh-edge-inference-cuda_<version>_amd64.deb` | ~1.8 GB (historical) | NVIDIA GPU nodes |
-
-**Build** (requires an Ubuntu/Debian environment):
-
-```bash
-cd ../qlh-release/packaging/linux
-bash build-deb.sh cpu     # iGPU edition
-bash build-deb.sh cuda    # dGPU edition
-```
-
-**Install**:
-
-```bash
-sudo dpkg -i qlh-edge-inference-cpu_0.1.8.2_amd64.deb
-# Registers the systemd service, desktop entry and /usr/local/bin/qlh-launcher automatically
-```
-
-**Usage**:
-
-```bash
-qlh-launcher --gui        # Standalone graphical launcher (regular UI / TUI / update)
-qlh-launcher app-ui       # Launch the regular UI directly
-qlh-launcher --headless   # Headless mode (API only, good for servers)
-sudo systemctl enable --now qlh-edge-inference  # Enable at boot
-```
-
-> Prerequisites: `python3` (≥ 3.10), `python3-venv`, `python3-tk` (graphical Launcher, recommended), `tailscale` (distributed mode). The package bundles its own venv and does not pollute the system Python.
-
-### Android Client
-
-> Prerequisite: JDK 17 + Android SDK (API 34+) installed, with the SDK path configured in `../qlh-android/local.properties`
->
-> After cloning `qlh-android`, initialize its llama.cpp submodule first (required for the Android Edge native runtime):
-
-```bash
-cd ../qlh-android
-git submodule update --init --recursive
-```
-
-**Build** (no Android Studio required):
-
-```bash
-cd ../qlh-android
-
-# Debug APK (uncompressed, for development)
-./gradlew.bat assembleDebug
-
-# Release APK (R8 shrinking + signing, for distribution)
-./gradlew.bat assembleRelease
-```
-
-Artifacts:
-
-| Artifact | Path | Typical size | Notes |
-|------|------|---------|------|
-| Android Edge Debug | `../qlh-android/app/build/outputs/apk/full/debug/app-full-debug.apk` | ~29 MB | Includes the llama.cpp native backend |
-| Android Edge Release | `../qlh-android/app/build/outputs/apk/full/release/app-full-release.apk` | **~6.7 MB** | R8 + native strip; failure bypass is a runtime policy |
-
-**Install**:
-
-```bash
-adb install ../qlh-android/app/build/outputs/apk/full/release/app-full-release.apk
-```
-
-**Usage**:
-
-1. Launch the app → select "Settings" in the bottom navigation
-2. Local mode: pick a SAF external directory containing `.gguf` files, prefer a <=1B model, and run inference offline
-3. Cluster mode: register as an Edge node for larger-model sharding; use another node, a full-model node, or a local small model only as failure/resource bypass
-
-### Distribution Server
-
-Distribute installers within the same Tailscale network so other devices can download them directly from a browser:
-
-```bash
-cd ../qlh-release
-python serve.py
-# Default port 9090; browse to http://<local Tailscale IP>:9090/
-```
-
-The homepage lists:
-
-- Windows PC installer (.exe)
-- Linux installer (.deb)
-- Android Edge runtime APK
-- PC model archive `models_pc.7z`
-- Android model archive `models_android.7z` (GGUF models only)
-
-> Other devices (including Android phones) can download directly by opening the link in a browser.
-
----
-
-## 📊 Historical Quantization Baselines (not current release or multi-node performance claims)
-
-> These fixed-environment samples describe comparison dimensions only. Real sampling quality, CUDA parity, dual-machine throughput and production routing are governed by the [Acceptance Checklist & Resource Limits](验收清单与资源限制登记.md) and the specialist records.
-
-### CUDA dGPU (PyTorch + bitsandbytes)
-
-> Test environment: NVIDIA RTX GPU + CUDA 12.6 + PyTorch 2.12.0 + Qwen-1.8B-Chat (24 layers)
-
-| Config | GPU VRAM | Inference Speed | Notes |
-|--------|----------|-----------------|-------|
-| FP16 | 3.47 GB | 53.2 tok/s | Baseline control group |
-| FP16 + compile | 3.47 GB | 55.1 tok/s | Operator fusion +3.6% |
-| INT8 | 2.30 GB | 9.8 tok/s | Saves VRAM but large speed loss |
-| **INT4** ⭐ | **1.75 GB** | **28.7 tok/s** | **Recommended for edge devices: VRAM halved** |
-
-### CPU / iGPU (llama.cpp + GGUF)
-
-> Test environment: Intel i5-12400F / AMD R5 5600 + 16GB RAM + Windows 11
-
-| Engine | Quantization | Memory | Inference Speed | Notes |
-|--------|--------------|--------|-----------------|-------|
-| PyTorch CPU | FP16 | ~3.5 GB | ~3 tok/s | No CUDA fallback |
-| llama.cpp | Q4_K_M | ~1.2 GB | **~12 tok/s** | **Recommended for CPU/iGPU** |
-
-> llama.cpp vs PyTorch CPU: memory **-65%**, speed **+300% (3–5x)**
-
-### Android Local Inference (theoretical estimates; not physical-device acceptance results)
-
-| Chip | Tier | Q4_K_M tok/s | Peak RAM |
-|------|------|--------------|----------|
-| Snapdragon 8 Gen 3 | Flagship | 12-18 | 1.8 GB |
-| Snapdragon 8+ Gen 1 | Upper-mid | 8-12 | 1.8 GB |
-| Snapdragon 865 | Mid-range | 5-8 | 1.8 GB |
-
----
-
-## 🧪 Comparative Experiment Matrix (design and future acceptance criteria)
-
-> This is not a table of completed experiment results. EX-N3 has read-only audited historical records; real-model multi-round sampling, CUDA, dual-machine and production-routing evidence remain in the acceptance queue.
-
-| Experiment | Quantization | Operator Fusion | KV Cache | Scheduling Strategy | Deployment Mode |
-|------------|--------------|-----------------|----------|---------------------|-----------------|
-| Baseline | FP16 | None | Traditional KV | — | Single node |
-| Experiment 1 | INT4 | None | Traditional KV | — | Single node |
-| Experiment 2 | INT4 | Fused | Traditional KV | — | Single node |
-| Experiment 3 | INT4 | Fused | Paged KV | — | Single node |
-| Experiment 4 | INT4 | Fused | Paged KV | Simple weighting | Distributed (3 nodes) |
-| Experiment 5 | INT4 | Fused | Paged KV | 🧠 Graph algorithm | Distributed (>5 nodes) |
-
----
-
-## 📊 Core Metrics
-
-- **VRAM usage**: quantization and paged-KV optimization effect
-- **Inference latency / token generation speed**: operator fusion, pipeline latency
-- **Network bandwidth utilization**: graph-algorithm scheduling vs simple weight allocation
-- **CPU load / network latency**: distributed communication overhead
-- **Conversation fluency**: evaluation of quantization accuracy loss
-- **Long-run stability**: reconnection, heartbeat recovery, cache cleanup
-
----
-
-## 👥 Team
-
-| Team | Responsibilities |
-|------|------------------|
-| Model Optimization | Literature review, model quantization, operator fusion, KV-cache optimization |
-| Distributed Architecture | Distributed architecture design, communication protocol development, multi-node scheduling logic |
-| Frontend & Documentation | Web visualization platform, performance monitoring module, documentation and demo materials |
-
-**Advisor**: Gao Bo, Associate Professor (School of Software Engineering, Beijing Jiaotong University)
-
----
-
-## 📚 Documentation Index
-
-Specialized plans are currently in Chinese; start from the **[Mainline Plan](主线开发计划-分布式推理与边缘优化-2026-09-14.md)** and **Side-line Plan**. The [Overall Next-Step Plan](../docs/总体下一步计划.md) is retained as the historical schedule/index, and the Progress & Next Steps page is an evidence snapshot. Full index: [文档索引](../README.md#-文档索引).
-
-> **Translation status**: all sections are translated; the Chinese README remains the source of truth for ongoing changes.
-
-## 📄 License
-
-This project is a 2026 Beijing Jiaotong University Student Innovation and Entrepreneurship Training Program project, released under the [MIT License](../LICENSE) (Copyright (c) 2026 SgfKrc).
-
----
-
-© 2026 SgfKrc (QLH Project, Beijing Jiaotong University) · MIT License
+Real hardware, cross-machine networking, Android ARM64, performance and long-run soak must additionally preserve the raw commands, environment, model digests, topology, output and failure boundaries; a green test run alone does not replace that evidence.
+
+## Documentation Index
+
+- [Mainline Development Plan: Distributed Inference and Edge Optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md)
+- [Overall Architecture](整体架构.md)
+- [Layer-Segment Protocol Proposal (2026-09-17)](层段协议立项-2026-09-17.md)
+- [Layer Pipeline Node Kinds and Top-Level Transparency](层流水线节点类型与顶层透明性-可行性确认-2026-09-17.md)
+- [Same-Process Dual-Backend Relay Implementation and Performance](同进程双后端接力实现与性能-2026-09-16.md)
+- [Engine Single-Sequence and Concurrency Comparison](引擎单序列与并发性能对比-2026-09-16.md)
+- [Distributed Inference Parallelism and Cross-Framework Route Survey](分布式推理并行与跨框架路线调研汇总-2026-09-15.md)
+- [TUI User Guide](TUI使用指南.md)
+- [TUI Feature Screens and Debug Fallback](TUI使用指南.md#调试兜底非功能验收)
+- [TUI Command Set](TUI指令集.md)
+- [Edge Device Simulation Environment Plan](边缘设备模拟环境计划-2026-09-15.md)
+- [Android Validation Alternative Paths](Android验证替代路径-2026-09-18.md)
+- [Baseline Rewrite Plan](基线重写方案-2026-09-16.md)
+- [Module Interfaces](模块接口说明.md)
+- [Testing and Evaluation Criteria](测试与评判标准.md)
+- [Document Status and Cleanup List](文档状态与清理清单.md)
+
+Historical plans and migrated capabilities live in `docs/archive/`; local experiment artifacts and acceptance raw records live in `local_docs/` and are not a public source interface.
+
+## License
+
+The main repository uses the [MIT License](../LICENSE). Each submodule and the upstream `llama.cpp` keep their own license and version lock, unchanged by being referenced here.

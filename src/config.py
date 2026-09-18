@@ -158,6 +158,13 @@ MODEL_PATH = os.path.join(_APP_ROOT, "models", "qwen-1_8b-chat")       # Safeten
 GGUF_MODEL_PATH = os.path.join(_APP_ROOT, "models", "Qwen-1_8B-Chat.Q4_K_M.gguf")  # GGUF 格式
 QUANT_TYPE = "int4"                          # 量化精度: "fp16" | "int8" | "int4"
 USE_COMPILE = True                           # 算子融合（仅 FP16+CUDA 有效；INT4/CPU 自动跳过）
+
+#: A4：让 `forward_layers()` 的**层循环**走 torch.compile 编译版。
+#: 前置（embedding / cache / mask / RoPE）与后置（norm / lm_head）逻辑**保持不变** ⇒ 与逐层版语义一致。
+#: 默认 False ⇒ 既有路径（含分布式层流水线）行为完全不变。
+#: ⚠️ 不要改成「编译整个 Qwen2Model 再用于分段」：它的 forward 会 apply `self.norm`，与分段语义不符
+#:    （实测 B vs A 的逐 token argmax 从 decode 第 1 步就分叉）。
+USE_MONOLITHIC_FORWARD = False
 #: torch.compile 的序列长度上限（2026-09-18 实测）：compile 在短序列有收益，但随生成步数
 #: 变长而劣化 —— gen=24 1.904× → 64 1.372× → **141 步 0.672×（反而慢 1.49×）**，
 #: 根因是 KV 增长使形状反复变化、`torch._dynamo` 的 `recompile_limit` 被 hybrid KV 的

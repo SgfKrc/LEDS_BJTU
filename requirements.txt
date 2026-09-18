@@ -21,7 +21,16 @@ bitsandbytes>=0.45.0             # INT4/INT8 量化（Windows + CUDA 12.x 兼容
 # auto-gptq                      # 可选：离线 GPTQ 量化 (Linux only, Windows 安装困难)
 
 # --- 推理优化 ---
-# torch.compile 已内置于 PyTorch 2.x，无需额外安装
+# torch.compile 已内置于 PyTorch 2.x，无需额外安装。
+# ⚠️ Windows 例外：inductor 需要 triton，而 PyPI 无 Windows 版 triton。
+#    需要 torch.compile 时请另装可选依赖（见 requirements-compile.txt）：
+#        pip install -r requirements-compile.txt
+#    未安装时主仓会自动告警并回退到 eager（不影响启动，见 src/model_module.py 的 _apply_compile）。
+#
+# ⚠️ Windows 上还存在一个与编码相关的坑：非 UTF-8 模式下 torch.compile 会抛
+#    `'gbk' codec can't decode ...`（torch/inductor/triton 内部按 GBK 解码源码）。
+#    本仓的启动脚本（qlh.bat / koakuma.bat / bjtu.bat / start_backend.bat / start_tui.bat）
+#    已统一设置 `PYTHONUTF8=1` 与 `PYTHONIOENCODING=utf-8`；手工起进程时请自行设置。
 
 # --- 网络通信（标准库）---
 # socket, struct, threading, json — Python 内置
@@ -41,3 +50,8 @@ httpx2>=2.5.0,<3.0.0             # Starlette 1.x TestClient 后端
 tqdm>=4.65.0                     # 进度条
 psutil>=5.9.0                    # 系统资源监控（CPU/内存）
 python-dotenv>=1.0.0             # 环境变量加载（从 .env 文件）
+
+# --- 模型工件（GGUF）---
+# scripts/cut_layers.py（离线裁层生成器，为层流水线造下游工件）需要它读写 GGUF；
+# 该脚本与 src/relay_contract.py 的 RelayTrimPlan 合同配套，属主仓工具链的一部分。
+gguf>=0.10.0

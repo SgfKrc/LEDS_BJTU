@@ -1,0 +1,20 @@
+# ============================================================
+# 可选加速依赖：torch.compile（inductor）在 Windows / Linux 上的额外要求
+# ============================================================
+# 安装: pip install -r requirements-compile.txt
+#
+# 为什么单独一份：
+#   - Linux 上 inductor 随 PyTorch 自带，本文件**不需要**；
+#   - Windows 上 PyPI **没有** torch 官方 triton wheel，需要社区构建
+#     `triton-windows`（见下）。把它放进主 requirements.txt 会让所有 Windows
+#     用户都背上一个编译相关依赖，而它是**可选加速**，故拆开。
+#
+# 未安装时的行为：主仓 `src/model_module.py` 的 `_apply_compile()` 会捕获
+# `TritonMissing`，记录告警并回退到 eager —— **不影响启动与正确性**，
+# 只是拿不到 `USE_COMPILE` / `USE_MONOLITHIC_FORWARD` 的加速。
+#
+# 版本对应：triton-windows 的版本号前两位需与 PyTorch 自带的 triton 匹配
+#   （实测 torch 2.13 对应 triton 3.8；用 `triton-windows-3.8.0.post28` 通过）。
+# 若版本不匹配，请按 https://github.com/woct0rdho/triton-windows 的对应表选择。
+
+triton-windows>=3.8,<3.9 ; sys_platform == "win32"
