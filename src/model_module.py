@@ -21,6 +21,7 @@
 """
 
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -55,7 +56,7 @@ from transformers import (
 from config import (
     MODEL_NAME, MODEL_PATH, GGUF_MODEL_PATH,
     COMPILE_RECOMPILE_LIMIT,
-    QUANT_TYPE, USE_COMPILE,
+    QUANT_TYPE, USE_COMPILE, USE_MONOLITHIC_FORWARD,
     DEVICE, TRUST_REMOTE_CODE,
     INFERENCE_ENGINE,
     TOTAL_MODEL_LAYERS, DEFAULT_LAYER_CONFIG,
@@ -65,6 +66,48 @@ from koakuma_engine import backend_capabilities, select_backend
 import model_config as mc
 
 logger = logging.getLogger(__name__)
+
+
+class _LayerLoop(torch.nn.Module):
+    """把「逐层循环」封装成可编译模块（A4：compile 层循环，而非整个 Qwen2Model）。
+
+    为什么只编译层循环：`Qwen2Model.forward()` 的返回值经过 `self.norm`（完整模型语义），
+    而分布式分段前向在 `has_lm_head=False` 时必须返回**未过 norm** 的 raw hidden。
+    这里只包层循环 ⇒ 前置/后置仍由 `forward_layers()` 负责 ⇒ 语义与逐层版一致。
+
+    注意：`torch.compile` 会把 `layer.self_attn.layer_idx` 等属性纳入 guard，
+    因此调用方必须在**编译之前**把这些属性设成最终值（见 `_apply_compile`）。
+    """
+
+    def __init__(self, layers: torch.nn.ModuleList, cache_arg_name: Optional[str]) -> None:
+        super().__init__()
+        self.layers = layers
+        self.cache_arg_name = cache_arg_name
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[tuple] = None,
+        cache_position: Optional[torch.Tensor] = None,
+        use_cache: bool = True,
+        cache: Optional[object] = None,
+    ) -> torch.Tensor:
+        for layer in self.layers:
+            layer_kwargs = {
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "position_embeddings": position_embeddings,
+                "use_cache": use_cache,
+                "cache_position": cache_position,
+            }
+            if self.cache_arg_name is not None and cache is not None:
+                layer_kwargs[self.cache_arg_name] = cache
+            layer_output = layer(hidden_states, **layer_kwargs)
+            # transformers>=5.x: DecoderLayer 直接返回 tensor；4.x: 返回元组
+            hidden_states = layer_output[0] if isinstance(layer_output, tuple) else layer_output
+        return hidden_states
 _IMPORTED_INFERENCE_ENGINE = INFERENCE_ENGINE
 
 
@@ -247,6 +290,8 @@ class ModelManager:
         #: 否则 self.model.model / self.model.transformer 的结构访问会失效
         #: （forward_layers 与 _count_transformer_layers 都依赖它们）。
         self._compiled_transformer: Optional[nn.Module] = None
+        # A4：编译版「层循环」（仅 forward_layers 使用；见 USE_MONOLITHIC_FORWARD）
+        self._compiled_layer_loop: Optional[nn.Module] = None
 
         # llama.cpp 引擎（延迟导入 + 延迟加载）
         self._llama_engine = None   # LlamaCppEngine 实例
@@ -2056,6 +2101,29 @@ class ModelManager:
         try:
             self._compiled_transformer = torch.compile(inner, mode="default")
             logger.info("  ✅ torch.compile 已启用 (mode='default'；解码路径不依赖 CUDA Graphs)")
+
+            # ---- A4：额外编译「层循环」（供 forward_layers 使用）----
+            # 与整模编译的区别：层循环**不含**末端 norm / lm_head ⇒ 与分段前向语义一致。
+            self._compiled_layer_loop = None
+            if USE_MONOLITHIC_FORWARD and hasattr(inner, "layers") and len(inner.layers):
+                first_fwd = inner.layers[0].forward
+                params = inspect.signature(first_fwd).parameters
+                cache_arg_name = (
+                    "past_key_values" if "past_key_values" in params
+                    else "past_key_value" if "past_key_value" in params
+                    else None
+                )
+                # ⚠️ 编译前必须定成最终值：compile 把属性当 guard，若每次调用临时改再恢复
+                #    （原逐层版的补丁方式）会反复触发重编译。分段加载时本地索引才是正确的。
+                for local_idx, layer in enumerate(inner.layers):
+                    layer.self_attn.layer_idx = local_idx
+                self._compiled_layer_loop = torch.compile(
+                    _LayerLoop(inner.layers, cache_arg_name), mode="default"
+                )
+                logger.info(
+                    f"  ✅ A4 层循环已编译（{len(inner.layers)} 层；layer_idx 已永久本地化；"
+                    f"cache 参数名={cache_arg_name}）"
+                )
             # 退出路径配套（2026-09-18 用户裁定）：hybrid + compile 时解释器清理期可能崩溃
             #（`_PyModule_ClearDict` 调用栈）⇒ 登记 atexit，在清理**之前**有序释放编译对象
             # 与 CUDA 缓存，降低「退出码非零」的风险。
@@ -2077,6 +2145,7 @@ class ModelManager:
             atexit.register(_release_compiled)
         except Exception as e:
             self._compiled_transformer = None
+            self._compiled_layer_loop = None
             hint = ""
             if isinstance(e, UnicodeDecodeError) or "codec can't decode" in str(e):
                 hint = (
@@ -2853,14 +2922,19 @@ class ModelManager:
 
             # 保存并覆盖层索引为本地连续编号
             # ★ 先保存原始索引，再在 try 块内补丁，确保 finally 无论何路径都恢复
+            # ★ A4：走编译版层循环时，layer_idx 已在 _apply_compile 里**永久**本地化
+            #   （compile 把属性当 guard，每次临时改再恢复会反复重编译）⇒ 此时不打补丁。
+            _use_compiled_loop = getattr(self, "_compiled_layer_loop", None) is not None
             saved_layer_indices: list = []
-            for local_idx, layer in enumerate(transformer.layers):
-                saved_layer_indices.append(layer.self_attn.layer_idx)
+            if not _use_compiled_loop:
+                for layer in transformer.layers:
+                    saved_layer_indices.append(layer.self_attn.layer_idx)
 
             try:
                 # ---- 补丁 layer_idx 为本地索引（必须在 try 内，确保异常时恢复） ----
-                for local_idx, layer in enumerate(transformer.layers):
-                    layer.self_attn.layer_idx = local_idx
+                if not _use_compiled_loop:
+                    for local_idx, layer in enumerate(transformer.layers):
+                        layer.self_attn.layer_idx = local_idx
 
                 import inspect
                 first_layer_forward = transformer.layers[0].forward if len(transformer.layers) else None
@@ -3015,24 +3089,37 @@ class ModelManager:
                 # ============================================================
                 # DynamicCache 由 SDPA/FlashAttention 在 forward 时原地更新，
                 # 每层的 key/value 按 layer_idx 写入 DynamicCache。
-                for i, layer in enumerate(transformer.layers):
-                    layer_kwargs = {
-                        "attention_mask": causal_mask,
-                        "position_ids": position_ids,
-                        "position_embeddings": position_embeddings,
-                        "use_cache": use_cache,
-                        "cache_position": cache_position,
-                    }
-                    if cache_arg_name is not None:
-                        layer_kwargs[cache_arg_name] = cache
-                    layer_output = layer(hidden_states, **layer_kwargs)
-                    # transformers≥5.x: DecoderLayer 直接返回 tensor
-                    # transformers 4.x: 返回 (hidden_states, present_key_value) 元组
-                    if isinstance(layer_output, tuple):
-                        hidden_states = layer_output[0]
-                    else:
-                        hidden_states = layer_output
-                    del layer_output
+                # ★ A4：可用时走**编译版层循环**（前置/后置逻辑完全不变 ⇒ 语义一致）。
+                layer_loop = getattr(self, "_compiled_layer_loop", None)
+                if layer_loop is not None:
+                    hidden_states = layer_loop(
+                        hidden_states,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        position_embeddings=position_embeddings,
+                        cache_position=cache_position,
+                        use_cache=use_cache,
+                        cache=cache,
+                    )
+                else:
+                    for i, layer in enumerate(transformer.layers):
+                        layer_kwargs = {
+                            "attention_mask": causal_mask,
+                            "position_ids": position_ids,
+                            "position_embeddings": position_embeddings,
+                            "use_cache": use_cache,
+                            "cache_position": cache_position,
+                        }
+                        if cache_arg_name is not None:
+                            layer_kwargs[cache_arg_name] = cache
+                        layer_output = layer(hidden_states, **layer_kwargs)
+                        # transformers≥5.x: DecoderLayer 直接返回 tensor
+                        # transformers 4.x: 返回 (hidden_states, present_key_value) 元组
+                        if isinstance(layer_output, tuple):
+                            hidden_states = layer_output[0]
+                        else:
+                            hidden_states = layer_output
+                        del layer_output
 
                 # ============================================================
                 # Step 7: 最终 Norm + LM Head（末节点）
