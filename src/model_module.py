@@ -67,6 +67,53 @@ import model_config as mc
 
 logger = logging.getLogger(__name__)
 
+#: 匹配 `<root>layers.<i>.` 形式的权重 key（Qwen 系各包装器共用该形态）。
+_LAYER_KEY_RE = re.compile(r"^(?P<root>.*\.)layers\.\d+\.")
+
+
+def _iter_safetensors_keys(model_path: str) -> List[str]:
+    """只读枚举 safetensors 的权重 key（优先 index.json，避免逐个 shard 打开）。"""
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        with open(index_path, "r", encoding="utf-8") as handle:
+            return list(json.load(handle).get("weight_map", {}).keys())
+    from safetensors import safe_open
+
+    keys: List[str] = []
+    for filename in sorted(
+        name for name in os.listdir(model_path) if name.endswith(".safetensors")
+    ):
+        with safe_open(os.path.join(model_path, filename),
+                       framework="pt", device="cpu") as handle:
+            keys.extend(handle.keys())
+    return keys
+
+
+def _detect_qwen_root_prefix(
+    model_path: str,
+    fallback: Optional[str] = "model.",
+) -> Optional[str]:
+    """探测 `<root>layers.<i>.` 的 root（出现次数最多者）。
+
+    用于适配不同 Qwen 系包装器的 key 前缀（如 Qwen3.5 的
+    ``model.language_model.layers.``）。探测失败（含异常）时返回 ``fallback``，
+    因此对既有 Qwen2 系列**行为完全不变**。
+    """
+    try:
+        keys = _iter_safetensors_keys(model_path)
+    except Exception as exc:  # noqa: BLE001 - 探测失败必须无副作用
+        logger.debug(f"层前缀探测失败（回退默认）: {exc}")
+        return fallback
+    counts: Dict[str, int] = {}
+    for key in keys:
+        match = _LAYER_KEY_RE.match(key)
+        if match:
+            root = match.group("root")
+            counts[root] = counts.get(root, 0) + 1
+    if not counts:
+        return fallback
+    return max(counts, key=counts.get)
+
 
 class _LayerLoop(torch.nn.Module):
     """把「逐层循环」封装成可编译模块（A4：compile 层循环，而非整个 Qwen2Model）。
@@ -1405,14 +1452,23 @@ class ModelManager:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+        # ★ A2：层前缀自动探测（探测失败或与默认一致时，行为与既往完全相同）。
+        #   不同 Qwen 系包装器的 key 前缀不同（实测 Qwen3.5 为
+        #   `model.language_model.layers.`），硬编码 `model.layers.` 会静默匹配不到张量。
+        qwen_root = _detect_qwen_root_prefix(model_path)
+        if qwen_root != "model.":
+            logger.info(
+                f"  🔎 探测到层前缀根: {qwen_root}（默认 model.；"
+                f"仅影响本段的 key 过滤，语义不变）"
+            )
         selected_prefixes = [
-            f"model.layers.{index}."
+            f"{qwen_root}layers.{index}."
             for index in range(start_layer, end_layer)
         ]
         # model.norm is tiny and keeps parameter/device discovery valid on all segments.
-        selected_prefixes.append("model.norm.")
+        selected_prefixes.append(f"{qwen_root}norm.")
         if has_embedding:
-            selected_prefixes.append("model.embed_tokens.")
+            selected_prefixes.append(f"{qwen_root}embed_tokens.")
         if has_lm_head:
             selected_prefixes.append("lm_head.")
 
@@ -1421,7 +1477,7 @@ class ModelManager:
             architecture=architecture,
             start_layer=start_layer,
             end_layer=end_layer,
-            layer_prefix="model.layers.",
+            layer_prefix=f"{qwen_root}layers.",
             selected_prefixes=selected_prefixes,
             target_dtype=target_dtype,
         )
