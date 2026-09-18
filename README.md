@@ -5,6 +5,8 @@ QLH 是一个面向异构边缘设备的分布式推理核心：主线是 GGUF/l
 > 状态：主仓基线重整中（2026-09-18）
 >
 > 本 README 只描述主仓当前边界和可复现入口。实验记录、历史实现和外置子项目不等同于主仓生产能力。
+>
+> English: [docs/README.en.md](docs/README.en.md)
 
 ## 主仓做什么
 
@@ -145,6 +147,34 @@ QLH 是一个面向异构边缘设备的分布式推理核心：主线是 GGUF/l
 **结论与定位**：上面 P0 那个 1.45× 只是「CPU llama.cpp → GPU **torch**」的局部收益；更好的做法是「CPU llama.cpp → GPU **llama.cpp**」（`-ngl`）。所以 **跨框架接力不是更快的推理路径**，而是「**只能用 torch 跑的层**」（hybrid/自定义算子）与「**容量合并 / 层流水线**（单机装不下）」的机制，外加实验平台。**集群里有 CUDA 节点时，最佳实践是把它作为 llama.cpp 的 CUDA worker（RPC/分片），而不是接力上游**；P2 交叠只在「不得不接力」的场景内把损失补回一部分（78.3 ms/token 仍慢于 26.6 约 3×）。
 
 报告：`local_docs/CORE-RELAY-XFRAME-02-p2-2026-09-18.json`。⚠️ 以上均为**同机**数据；**跨机（GPU 节点 + 无 CUDA 边缘节点）的 RPC vs 接力对照仍未测**。
+
+### torch.compile 与「层循环」开关（`USE_COMPILE` / `USE_MONOLITHIC_FORWARD`）
+
+分段前向要吃到 `torch.compile` 的收益，靠这两个开关配合（都在 `src/config.py`，可用环境变量覆盖）：
+
+| 开关 | 默认 | 作用 |
+| --- | --- | --- |
+| `USE_COMPILE` | `True` | 启用编译。编译不可用时**告警并回退 eager**，不影响启动（Windows 未装 `triton-windows` 时即走此路径） |
+| `USE_MONOLITHIC_FORWARD` | `False` | 打开后额外编译**「层循环」**（`_LayerLoop`），供 `forward_layers()` 使用；默认关 |
+
+**为什么只编译「层循环」而不编译整个模型**：`Qwen2Model.forward()` 的返回值要经过 `self.norm`（完整模型语义），而分布式分段前向在 `has_lm_head=False` 时必须返回**未过 norm** 的 raw hidden。所以只包住层循环，前置/后置仍由 `forward_layers()` 负责，语义才与逐层版一致。（第一版直接编译整段 `Qwen2Model` 得到 2.325×，但**多算了一次 `self.norm`**，argmax 从 decode 第 1 步就分叉 —— 该数字已废弃。）
+
+**实测收益**（`USE_MONOLITHIC_FORWARD=True`；见[图 3](docs/figures/cross-frame-relay/fig3-compile-gains.png)）：
+
+| 场景 | 逐层 | 编译层循环 | 加速 | 逐 token argmax |
+| --- | ---: | ---: | ---: | --- |
+| Qwen2.5-0.5B 12 层（非 hybrid，prefill 64，repeats=5） | 10.269 ms/步 | **6.133 ms/步** | **1.674×** | 一致 |
+| Qwen3.5-2B 24 层（hybrid，prefill 32，repeats=3） | 41.058 ms/步 | **32.349 ms/步** | **1.269×** | 一致 |
+
+hybrid（Qwen3.5 的 18 层 `linear_attention` + 6 层 `full_attention`）需要**按层类型分别取 mask**，`_LayerLoop` 已支持（用「元组 + 每层的 mask 索引」，便于 `torch.compile` 做 guard）。⚠️ 两组口径不同（模型/层数/prefill），**加速比不可直接比较**；hybrid 的 `linear_attention`（GatedDeltaNet）可融合点比纯 attention+MLP 少，收益偏低属合理。
+
+**⚠️ 三条必须知道的边界**：
+
+1. **compile 与 eager 不是逐位一致**：hidden 差异量级恰为 **f16 的 1 ULP**（`0.015625 = 2^-6`）；逐项排除后唯一剩余来源是 attention 实现通路（`fuse_attention` 把 bmm+softmax 融回 aten SDPA）。**但不能说"compile 更差"** —— 上游对照 **float64** 基线时 compile 版本的 rtol **更好**；正确表述是「**与 eager 非逐位一致**」。
+2. **有「逐 token 一致」验收判据的场景不得开启 compile**（例如跨框架接力的准入判据）。
+3. **Windows 需要两件事**：`PYTHONUTF8=1`（否则 torch/inductor 内部按 GBK 解码失败、**静默回退 eager**）与 [`triton-windows`](requirements-compile.txt)（可选加速）。两者缺一都不会崩，只是拿不到收益。
+
+报告：`local_docs/CORE-RELAY-XFRAME-02-a4-layer-loop-2026-09-18.json`、`…-b14-hybrid-layer-loop-2026-09-18.json`、`…-compile-numerics-2026-09-18.json`。
 
 ### 顶层透明性
 
