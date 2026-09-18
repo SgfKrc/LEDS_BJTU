@@ -20,18 +20,17 @@ EN = ROOT / "docs" / "README.en.md"
 
 # 章节映射（中文 H2 -> 英文 H2）。新增中文章节必须在此登记并同步英文版。
 SECTION_MAP = {
-    "📋 项目简介": "📋 Project Introduction",
-    "🌐 Tailscale 组网（重要）": "🌐 Tailscale Networking (Important)",
-    "🏗️ 项目架构": "🏗️ Project Architecture",
-    "📦 环境依赖": "📦 Environment Dependencies",
-    "🤖 模型下载": "🤖 Model Download",
-    "🚀 快速开始": "🚀 Quick Start",
-    "📊 量化效果": "📊 Quantization Results",
-    "🧪 对照实验组": "🧪 Comparative Experiments",
-    "📊 核心评判指标": "📊 Core Metrics",
-    "👥 团队分工": "👥 Team",
-    "📚 文档索引": "📚 Documentation Index",
-    "📄 许可证": "📄 License",
+    "主仓做什么": "What the Main Repository Does",
+    "层流水线与跨框架逐层接力": "Layer Pipeline and Cross-Framework Layer Relay",
+    "当前状态": "Current Status",
+    "主仓边界": "Main Repository Boundary",
+    "目录结构": "Directory Layout",
+    "快速开始": "Quick Start",
+    "模型与分布式": "Models and Distribution",
+    "Android 验证": "Android Validation",
+    "测试": "Testing",
+    "文档入口": "Documentation Index",
+    "许可证": "License",
 }
 
 
@@ -41,6 +40,15 @@ def h2_titles(path: Path) -> set[str]:
 
 
 def main() -> int:
+    # 报告里含 emoji / 中文，Windows 控制台默认 GBK 会在 print 时抛
+    # UnicodeEncodeError 并掩盖真正的检查结果 —— 这里强制以 UTF-8 写出，
+    # 遇到无法编码的字符用 replace 降级而不是让脚本崩掉。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
+
     errors: list[str] = []
     zh_text = ZH.read_text(encoding="utf-8")
     en_text = EN.read_text(encoding="utf-8")
