@@ -57,3 +57,9 @@ python-dotenv>=1.0.0             # 环境变量加载（从 .env 文件）
 # scripts/cut_layers.py（离线裁层生成器，为层流水线造下游工件）需要它读写 GGUF；
 # 该脚本与 src/relay_contract.py 的 RelayTrimPlan 合同配套，属主仓工具链的一部分。
 gguf>=0.10.0
+
+# --- 图表生成（仅实验文档需要）---
+# build/cross-framework-layer-poc/make_figures.py 直接从 local_docs/CORE-RELAY-XFRAME-02-*.json
+# 生成 docs/figures/cross-frame-relay/ 下的图（图是**提交物**）。除它之外主仓不 import matplotlib。
+# 注：此前它由实验用的 overlay 环境提供，该环境已归档 ⇒ 在此显式声明，避免图表无法再生成。
+matplotlib>=3.8                # 仅 make_figures.py 需要

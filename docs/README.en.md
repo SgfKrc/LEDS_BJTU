@@ -154,10 +154,10 @@ Getting `torch.compile` gains out of segmented forward takes two switches (both 
 
 | Switch | Default | Effect |
 | --- | --- | --- |
-| `USE_COMPILE` | `True` | Enables compilation. When compilation is unavailable it **warns and falls back to eager** without blocking startup (this is the path taken on Windows without `triton-windows`). |
+| `USE_COMPILE` | `True` | Enables compilation. When compilation is unavailable it **warns and falls back to eager** without blocking startup (this is the path taken on Windows without `triton-windows`; **installing it is enough** - native Windows compilation has been verified working since 2026-09-19, so it is no longer a 'dead switch'). |
 | `USE_MONOLITHIC_FORWARD` | `False` | Additionally compiles the **"layer loop"** (`_LayerLoop`) used by `forward_layers()`; off by default. |
 
-**Why only the layer loop is compiled, not the whole model**: `Qwen2Model.forward()`'s return value passes through `self.norm` (full-model semantics), while a distributed segmented forward must return the **pre-norm** raw hidden when `has_lm_head=False`. So only the loop is wrapped; the pre/post steps stay in `forward_layers()`, which is what keeps the semantics identical to the per-layer version. (The first version compiled the entire `Qwen2Model` segment and got 2.325x, but **applied `self.norm` one extra time** - argmax diverged from decode step 1 - so that number is retired.)
+**Why only the layer loop is compiled, not the whole model**: `Qwen2Model.forward()`'s return value passes through `self.norm` (full-model semantics), while a distributed segmented forward must return the **pre-norm** raw hidden when `has_lm_head=False`. So only the loop is wrapped; the pre/post steps stay in `forward_layers()`, which is what keeps the semantics identical to the per-layer version.
 
 **Measured gains** (`USE_MONOLITHIC_FORWARD=True`; see [Figure 3](figures/cross-frame-relay/fig3-compile-gains.png)):
 
@@ -172,7 +172,9 @@ Hybrid models (Qwen3.5's 18 `linear_attention` + 6 `full_attention` layers) need
 
 1. **compile and eager are not bit-identical**: the hidden difference is exactly **1 ULP of f16** (`0.015625 = 2^-6`); after ruling out every other candidate, the only remaining source is the attention implementation path (`fuse_attention` fusing bmm+softmax back into aten SDPA). **But it must not be described as "compile is worse"** - upstream reports compile has **better** rtol against a **float64** baseline; the correct wording is "**not bit-identical to eager**".
 2. **Scenarios with a "per-token identical" acceptance criterion must not enable compile** (e.g. the cross-framework relay admission criterion).
-3. **Windows needs two things**: `PYTHONUTF8=1` (otherwise torch/inductor decodes internally as GBK, fails, and **silently falls back to eager**) and [`triton-windows`](../requirements-compile.txt) (optional acceleration). Missing either is non-fatal - you just do not get the gain.
+3. **Windows needs two things**: `PYTHONUTF8=1` (otherwise torch/inductor decodes internally as GBK, fails, and **silently falls back to eager**) and [`triton-windows`](../requirements-compile.txt) (optional acceleration, declared in `requirements-compile.txt`; **verified working** - PyPI has no official Windows wheel, so use the community build `triton-windows-3.8.0.post28`). Missing either is non-fatal - you just do not get the gain.
+
+Current **serial full-suite** baseline: `2807 passed / 11 skipped / 0 failed` (`-n 0`; xdist concurrency occasionally flakes - judge by the serial run).
 
 Reports: `local_docs/CORE-RELAY-XFRAME-02-a4-layer-loop-2026-09-18.json`, `...-b14-hybrid-layer-loop-2026-09-18.json`, `...-compile-numerics-2026-09-18.json`.
 
@@ -193,6 +195,7 @@ The TUI and API top layer only needs to know the **aggregate resources** (GPU/CP
 | PyTorch D track | The actual implementer of layer splitting / inter-layer pipeline / multi-node layer-segment hosting, doubling as the control experiment; not part of the Edge default dependency |
 | Relay R | L to L, D to L, the f32/sampling matrix and SSH cross-machine evidence have completed correctness verification; no performance advantage, off by default, does not replace RPC |
 | Android | `qlh-android` P0 cross-compilation/JNI is done; P1's on-device run, RPC worker, disconnect, thermal/power and security evidence is not |
+| Runtime | **Main runtime `transformers` 5.17.0** (`huggingface_hub` 1.32 / `tokenizers` 0.23); all PyTorch sidecars (`.venv-qwen3-sidecar` / `.venv-gemma4-pipeline`) unified to 5.17.0; `.venv-test` carries `triton-windows`. Native Windows `torch.compile` **works** |
 | Model assets | Model files are not in Git; the repository asset list registers Qwen2.5-0.5B, Qwen3-0.6B, MiniCPM4-0.5B, DistilQwen2.5-DS3-0324-7B and others |
 
 Experiments that do not state real device, cross-machine or production acceptance may only be used as development evidence or PoC.
@@ -351,7 +354,7 @@ python scripts/android_validation.py --assemble --install --launch --serial emul
 python scripts/android_validation.py --assemble --json
 ```
 
-An x86_64 emulator can validate the APK, UI, permissions, networking and lifecycle, but cannot prove the `arm64-v8a` JNI RPC worker; an ARM64 AVD/QEMU can only add ARM compatibility and cannot replace real-phone thermal/power, background-reclaim, weak-network and long-run testing. The full Android P1 criteria and the AVD/QEMU/remote-adb plan are in [Android Validation Alternative Paths](Android验证替代路径-2026-09-18.md). The old hand-drawn ANSI TUI has been moved to `_to_delete/`; do not treat it as the current interaction implementation or test entry point.
+An x86_64 emulator can validate the APK, UI, permissions, networking and lifecycle, but cannot prove the `arm64-v8a` JNI RPC worker; an ARM64 AVD/QEMU can only add ARM compatibility and cannot replace real-phone thermal/power, background-reclaim, weak-network and long-run testing. The full Android P1 criteria and the AVD/QEMU/remote-adb plan are in [Android Validation Alternative Paths](../android/Android验证替代路径-2026-09-18.md). The old hand-drawn ANSI TUI has been moved to `_to_delete/`; do not treat it as the current interaction implementation or test entry point.
 
 ## Testing
 
@@ -386,7 +389,7 @@ Real hardware, cross-machine networking, Android ARM64, performance and long-run
 - [TUI Feature Screens and Debug Fallback](TUI使用指南.md#调试兜底非功能验收)
 - [TUI Command Set](TUI指令集.md)
 - [Edge Device Simulation Environment Plan](边缘设备模拟环境计划-2026-09-15.md)
-- [Android Validation Alternative Paths](Android验证替代路径-2026-09-18.md)
+- [Android Validation Alternative Paths](../android/Android验证替代路径-2026-09-18.md)
 - [Baseline Rewrite Plan](基线重写方案-2026-09-16.md)
 - [Module Interfaces](模块接口说明.md)
 - [Testing and Evaluation Criteria](测试与评判标准.md)

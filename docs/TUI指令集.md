@@ -10,7 +10,6 @@
 >
 > **现行替代**：交互外壳 `src/tui_textual.py`（Textual，9 个功能屏 + 1 个调试兜底屏：聊天/状态/模型/分布式/节点/队列/日志/设备/设置/调试；聊天内命令由 `src/tui_shared.py` 的 `COMMAND_SPECS` 生成（`/help` 与实现同源）：`/help`、`/model`、`/queue`、`/new`、`/resume`、`/rename`、`/sessions`、`/delete-session`、`/reset`、`/route`、`/thinking`、`/cancel`、`/clear`、`/quit`；模型/集群/节点/日志/设备/设置的稳定写操作由屏内按键提供，全部先经确认框）；单命令面 `src/tui_commands.py`（只读：`status`/`models`/`nodes`/`queue`/`device`/`logs`/`help`）。调试屏不计作产品功能覆盖。见 [TUI 使用指南](TUI使用指南.md)。
 >
-> 关联文档：[TUI 使用指南](TUI使用指南.md)（启动/参数/排障）· [TUI 适配实施计划](TUI适配实施计划.md)（历史 7 屏网关契约）· [微服务架构改造计划](微服务架构改造计划.md)
 
 ---
 

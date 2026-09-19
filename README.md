@@ -154,10 +154,10 @@ QLH 是一个面向异构边缘设备的分布式推理核心：主线是 GGUF/l
 
 | 开关 | 默认 | 作用 |
 | --- | --- | --- |
-| `USE_COMPILE` | `True` | 启用编译。编译不可用时**告警并回退 eager**，不影响启动（Windows 未装 `triton-windows` 时即走此路径） |
+| `USE_COMPILE` | `True` | 启用编译。编译不可用时**告警并回退 eager**，不影响启动（Windows 未装 [`triton-windows`](requirements-compile.txt) 时即走此路径；**装了就可用** —— 2026-09-19 起 Windows 原生已实测编译成功，不再是「死开关」） |
 | `USE_MONOLITHIC_FORWARD` | `False` | 打开后额外编译**「层循环」**（`_LayerLoop`），供 `forward_layers()` 使用；默认关 |
 
-**为什么只编译「层循环」而不编译整个模型**：`Qwen2Model.forward()` 的返回值要经过 `self.norm`（完整模型语义），而分布式分段前向在 `has_lm_head=False` 时必须返回**未过 norm** 的 raw hidden。所以只包住层循环，前置/后置仍由 `forward_layers()` 负责，语义才与逐层版一致。（第一版直接编译整段 `Qwen2Model` 得到 2.325×，但**多算了一次 `self.norm`**，argmax 从 decode 第 1 步就分叉 —— 该数字已废弃。）
+**为什么只编译「层循环」而不编译整个模型**：`Qwen2Model.forward()` 的返回值要经过 `self.norm`（完整模型语义），而分布式分段前向在 `has_lm_head=False` 时必须返回**未过 norm** 的 raw hidden。所以只包住层循环，前置/后置仍由 `forward_layers()` 负责，语义才与逐层版一致。（第一版直接编译整段 `Qwen2Model` 得到 2.325×，但**多算了一次 `self.norm`**，argmax 从 decode 第 1 步就分叉 —— ）
 
 **实测收益**（`USE_MONOLITHIC_FORWARD=True`；见[图 3](docs/figures/cross-frame-relay/fig3-compile-gains.png)）：
 
@@ -172,7 +172,7 @@ hybrid（Qwen3.5 的 18 层 `linear_attention` + 6 层 `full_attention`）需要
 
 1. **compile 与 eager 不是逐位一致**：hidden 差异量级恰为 **f16 的 1 ULP**（`0.015625 = 2^-6`）；逐项排除后唯一剩余来源是 attention 实现通路（`fuse_attention` 把 bmm+softmax 融回 aten SDPA）。**但不能说"compile 更差"** —— 上游对照 **float64** 基线时 compile 版本的 rtol **更好**；正确表述是「**与 eager 非逐位一致**」。
 2. **有「逐 token 一致」验收判据的场景不得开启 compile**（例如跨框架接力的准入判据）。
-3. **Windows 需要两件事**：`PYTHONUTF8=1`（否则 torch/inductor 内部按 GBK 解码失败、**静默回退 eager**）与 [`triton-windows`](requirements-compile.txt)（可选加速）。两者缺一都不会崩，只是拿不到收益。
+3. **Windows 需要两件事**：`PYTHONUTF8=1`（否则 torch/inductor 内部按 GBK 解码失败、**静默回退 eager**）与 [`triton-windows`](requirements-compile.txt)（可选加速，`requirements-compile.txt` 声明；**已实测可用**，官方 PyPI 无 Windows wheel，用社区构建 `triton-windows-3.8.0.post28`）。两者缺一都不会崩，只是拿不到收益。
 
 报告：`local_docs/CORE-RELAY-XFRAME-02-a4-layer-loop-2026-09-18.json`、`…-b14-hybrid-layer-loop-2026-09-18.json`、`…-compile-numerics-2026-09-18.json`。
 
@@ -189,10 +189,11 @@ TUI 与 API 顶层只需知道**聚合资源**（GPU/CPU/内存）和"是否分�
 | 同机双进程 RPC | 已有 llama host + `ggml-rpc-server` 模拟及合同测试；不等同于跨机生产准入 |
 | PC RPC | 有设备评分、自动层数规划、租约/断线回退和资产同步合同；真实大模型容量收益仍保持 fail-closed |
 | 层段合同与自动重分片 | 合同、布局 fail-closed 校验、容量重解与 epoch 原子提交的开发门已完成；真实 PC/Android 故障注入、长时和性能验收待做 |
-| 跨框架逐层接力（D→L） | 正确性多路验证（跨进程/同进程/跨机 SSH/f32 均逐 token 一致；上游手动 4 层 bit-exact）；累计 **8.5×**（21.3 s / 64 步），当前最优仍慢约 **20×**，**生产准入 fail-closed 关闭**；优化票见 D29 |
+| 跨框架逐层接力（D→L） | 正确性多路验证（跨进程/同进程/跨机 SSH/f32 均逐 token 一致；上游手动 4 层 bit-exact）；累计 **8.5×**（21.3 s / 64 步），当前最优仍慢约 **20×**（该 20× 是 **CPU 上游**口径；GPU 上游 N=20 的对应值是 **4.85×** —— 两者参照物不同，不可互相印证，见实验数据汇总 §H），**生产准入 fail-closed 关闭**；优化票见 D29 |
 | PyTorch D 档 | 层拆分/层间流水线/多节点层段承载的实际实现方，兼作对照实验；不进入 Edge 默认依赖 |
 | Relay R | L→L、D→L、f32/采样矩阵和 SSH 跨机证据已完成正确性验证；性能无优势，默认关闭，不替代 RPC |
 | Android | `qlh-android` P0 交叉编译/JNI 已完成；P1 的设备运行、RPC worker、断线、热/电和安全证据未完成 |
+| 运行环境 | **主运行时 `transformers` 5.17.0**（`huggingface_hub` 1.32 / `tokenizers` 0.23）；全部 PyTorch 侧车（`.venv-qwen3-sidecar` / `.venv-gemma4-pipeline`）已统一到 5.17.0；`.venv-test` 含 `triton-windows`（compile 路径可测）。Windows 原生 `torch.compile` **可用** |
 | 模型资产 | 模型文件不入 Git；主仓资产清单支持 Qwen2.5-0.5B、Qwen3-0.6B、MiniCPM4-0.5B、DistilQwen2.5-DS3-0324-7B 等登记模型 |
 
 没有标注真实设备、跨机或生产验收的实验，只能作为开发证据或 PoC 使用。
@@ -351,7 +352,7 @@ python scripts/android_validation.py --assemble --install --launch --serial emul
 python scripts/android_validation.py --assemble --json
 ```
 
-x86_64 模拟器可验证 APK、UI、权限、网络和生命周期，但不能证明 `arm64-v8a` JNI RPC worker；ARM64 AVD/QEMU 只能补 ARM 兼容性，不能替代真实手机的热/电、后台回收、弱网和长时测试。Android P1 的完整判据和 AVD/QEMU/远程 adb 方案见 [Android 验证替代路径](docs/Android验证替代路径-2026-09-18.md)。旧自绘 ANSI TUI 已移入 `_to_delete/`，不要再把它作为当前交互实现或测试入口。
+x86_64 模拟器可验证 APK、UI、权限、网络和生命周期，但不能证明 `arm64-v8a` JNI RPC worker；ARM64 AVD/QEMU 只能补 ARM 兼容性，不能替代真实手机的热/电、后台回收、弱网和长时测试。Android P1 的完整判据和 AVD/QEMU/远程 adb 方案见 [Android 验证替代路径](android/Android验证替代路径-2026-09-18.md)。旧自绘 ANSI TUI 已移入 `_to_delete/`，不要再把它作为当前交互实现或测试入口。
 
 ## 测试
 
@@ -371,6 +372,8 @@ python -m venv .venv-test
 .\.venv-test\Scripts\python.exe -m pytest -q tests/test_pipeline_node_contract.py tests/test_pipeline_reshard.py tests/test_pipeline_capacity.py
 ```
 
+当前**串行全量**基线：`2807 passed / 11 skipped / 0 failed`（`-n 0`；xdist 并发下偶有 flaky，判定请以串行为准）。
+
 真实硬件、跨机网络、Android ARM64、性能和长时 soak 必须另外保存原始命令、环境、模型摘要、拓扑、输出和失败边界，测试绿灯本身不替代这些证据。
 
 ## 文档入口
@@ -386,7 +389,7 @@ python -m venv .venv-test
 - [TUI 功能屏与调试兜底说明](docs/TUI使用指南.md#调试兜底非功能验收)
 - [TUI 指令集](docs/TUI指令集.md)
 - [边缘设备模拟环境计划](docs/边缘设备模拟环境计划-2026-09-15.md)
-- [Android 验证替代路径](docs/Android验证替代路径-2026-09-18.md)
+- [Android 验证替代路径](android/Android验证替代路径-2026-09-18.md)
 - [基线重写方案](docs/基线重写方案-2026-09-16.md)
 - [模块接口说明](docs/模块接口说明.md)
 - [测试与评判标准](docs/测试与评判标准.md)
