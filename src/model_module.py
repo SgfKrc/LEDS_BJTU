@@ -502,6 +502,111 @@ class _LayerRangeLoadTracker:
 _compile_limit_tls = threading.local()
 
 
+def _is_transformers_5_or_newer() -> bool:
+    """当前 `transformers` 主版本是否 ≥5（用于决定是否需要「权重覆盖」守卫）。"""
+    try:
+        import transformers
+        major = str(getattr(transformers, "__version__", "0")).split(".")[0]
+        return int(major) >= 5
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _verify_and_repair_loaded_weights(model, model_path: str) -> Optional[Dict[str, Any]]:
+    """★ A7/B7：transformers 5.x 下 remote-code 模型的「**权重被 `_init_weights` 覆盖**」守卫。
+
+    ## 为什么需要（已实测定位，见 `local_docs/CORE-RELAY-XFRAME-02-a6-and-leak-*.json`）
+    transformers ≥5 把权重初始化从「装载**之前**」搬到了「装载**之后**」，且
+    `_initialize_weights` 的「未初始化」检查只看 **`recurse=False`** 的 params/buffers，
+    而 remote code 的 `_init_weights` 写入用的是**递归** `named_parameters()` ⇒ 两者范围不一致；
+    当某个模块**只直接持有 non-persistent buffer**（`_move_missing_keys_from_meta_to_device`
+    会把它们换成 `torch.empty_like` 的**新对象、丢掉标志**）时，该模块会被**误判为未初始化**。
+    若 remote code 的 `_init_weights` 又按**相对名**匹配（如
+    `modeling_qwen.py` 的 `if name == "c_proj.weight": p.data.normal_(...)`），
+    就会**覆盖已经正确装载的权重** —— 且 **`missing_keys` 仍报 0**（**静默**，最危险的一类）。
+
+    Qwen-1.8B 实测：**24 层 `transformer.h.*.attn.c_proj.weight` 全部中招**
+    （`ok=171 / bad=24`），导致输出错误 + 跨进程非确定；本函数重载后输出与 4.47.1 **逐位一致**。
+
+    ## 做法
+    逐键把 `model.state_dict()` 与 safetensors 原值比对（`torch.equal`），**不符的键就地重载**。
+    只在「5.x + `TRUST_REMOTE_CODE`」时被调用（4.x 无此缺陷，省掉一次全区读取）。
+
+    ## 纪律
+    ① **只修不抛**：任何异常都只记日志（fail-loud），绝不让加载失败；
+    ② **绝不静默**：发现不符必然 `logger.warning`（这正是上游缺陷的可见性补救）；
+    ③ 返回统计字典（供上层日志/报告），无问题或不可用时返回 None。
+    """
+    if not model_path:
+        return None
+    try:
+        import torch
+        from safetensors import safe_open
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("权重守卫：缺少 torch/safetensors，跳过（%s）", exc)
+        return None
+
+    try:
+        state = model.state_dict()
+        index_path = os.path.join(model_path, "model.safetensors.index.json")
+        by_shard: Dict[str, List[str]] = {}
+        if os.path.isfile(index_path):
+            with open(index_path, "r", encoding="utf-8") as handle:
+                weight_map = json.load(handle).get("weight_map", {})
+            for key, shard in weight_map.items():
+                if key in state:
+                    by_shard.setdefault(shard, []).append(key)
+        else:
+            for name in sorted(n for n in os.listdir(model_path) if n.endswith(".safetensors")):
+                by_shard[name] = [k for k in _iter_safetensors_keys(model_path)]
+
+        if not by_shard:
+            logger.debug("权重守卫：%s 无可用 safetensors 索引，跳过", model_path)
+            return None
+
+        checked = repaired = 0
+        mismatched: List[str] = []
+        with torch.no_grad():
+            for shard, keys in by_shard.items():
+                shard_path = os.path.join(model_path, shard)
+                if not os.path.isfile(shard_path):
+                    continue
+                with safe_open(shard_path, framework="pt", device="cpu") as handle:
+                    available = set(handle.keys())
+                    for key in keys:
+                        if key not in available:
+                            continue
+                        target = state.get(key)
+                        if target is None or not hasattr(target, "copy_"):
+                            continue
+                        raw = handle.get_tensor(key)
+                        checked += 1
+                        try:
+                            same = raw.shape == target.shape and bool(
+                                torch.equal(raw.to(target.dtype), target))
+                        except Exception:  # noqa: BLE001
+                            same = False
+                        if not same:
+                            target.copy_(raw.to(target.dtype))
+                            repaired += 1
+                            if len(mismatched) < 12:
+                                mismatched.append(key)
+
+        if repaired:
+            logger.warning(
+                "⚠️ 权重守卫：检测到 %d/%d 个张量的加载结果与 safetensors **不一致**（transformers 5.x 的 "
+                "「初始化覆盖已装载权重」缺陷）⇒ **已从 safetensors 重载修复**：%s%s",
+                repaired, checked, ", ".join(mismatched),
+                " 等" if repaired > len(mismatched) else "",
+            )
+        else:
+            logger.info("权重守卫：已逐键校验 %d 个张量，**全部与 safetensors 一致**", checked)
+        return {"checked": checked, "repaired": repaired, "mismatched_head": mismatched}
+    except Exception as exc:  # noqa: BLE001 - 守卫绝不使加载失败
+        logger.warning("权重守卫执行失败（已忽略，继续使用原加载结果）: %s", exc)
+        return None
+
+
 def _ensure_compile_limits_in_current_thread() -> None:
     """★ A6：把 `recompile_limit`/`cache_size_limit` 在当前线程内**幂等**补设到配置值。
 
@@ -2380,6 +2485,14 @@ class ModelManager:
 
         logger.info(f"加载 PyTorch 模型路径: {path}")
         self.model = AutoModelForCausalLM.from_pretrained(path, **load_kwargs)
+
+        # ★ A7/B7：transformers 5.x 下 remote-code 模型的「权重被 `_init_weights` 覆盖」守卫。
+        #   只在「transformers ≥5 且启用了 remote code」时执行 —— 4.x 无此缺陷（它有
+        #   `set_initialized_submodules()`），因此可省掉一次全区读取（Qwen-1.8B 约 3.5 GB）。
+        self._weight_guard_report = None
+        if TRUST_REMOTE_CODE and _is_transformers_5_or_newer():
+            self._weight_guard_report = _verify_and_repair_loaded_weights(self.model, path)
+
         self.tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=TRUST_REMOTE_CODE)
         self.layer_range = None
         self._layer_load_metrics = None

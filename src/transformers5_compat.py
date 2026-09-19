@@ -103,6 +103,8 @@ def install() -> list[str]:
             setattr(module, name, placeholder)
             added.append(f"{namespace}.{name}")
 
+    added.extend(_install_legacy_model_apis())
+
     if added:
         logger.debug(
             "已为 transformers %s 补回 %d 个已移除符号以兼容 transformers_stream_generator: %s",
@@ -110,4 +112,43 @@ def install() -> list[str]:
             len(added),
             ", ".join(added),
         )
+    return added
+
+
+def _install_legacy_model_apis() -> list[str]:
+    """补回 5.x 移除、但 **remote code 的前向会调用**的 `PreTrainedModel` 老 API。
+
+    ★ A7：`models/qwen-1_8b-chat/modeling_qwen.py:819` 在前向里调用
+    `self.get_head_mask(head_mask, self.config.num_hidden_layers)`（`:896` 随后用
+    `head_mask[i]`），而 `PreTrainedModel.get_head_mask` 在 transformers 5.x **已被移除**
+    ⇒ 不补则**加载能过、前向必崩**（`AttributeError: 'QWenModel' object has no attribute
+    'get_head_mask'`）。
+
+    这里按 **4.x 语义**补回：`head_mask is None` 时返回 **`[None] * num_hidden_layers`**
+    （⚠️ 不是 `None` —— 返回 `None` 会让 remote code 的 `head_mask[i]` 以
+    `'NoneType' object is not subscriptable` 再次失败；B15 实际踩过这一步）。
+    非 `None` 时 **fail-loud**（避免"看似能用、实际静默错算"）：QLH 推理路径从不传 head_mask。
+    """
+    added: list[str] = []
+    try:
+        from transformers.modeling_utils import PreTrainedModel
+    except Exception as exc:  # noqa: BLE001 - 环境相关
+        logger.debug("补回老 API：无法导入 PreTrainedModel（%s）", exc)
+        return added
+
+    if not hasattr(PreTrainedModel, "get_head_mask"):
+        def get_head_mask(  # noqa: D401 - 与上游签名保持一致
+            self, head_mask, num_hidden_layers: int, is_attention_chunked: bool = False
+        ):
+            if head_mask is None:
+                return [None] * int(num_hidden_layers)
+            raise RuntimeError(
+                "QLH 的 5.x 兼容补丁只支持 head_mask=None（推理路径不传 head_mask）；"
+                "transformers 5.x 已移除 `PreTrainedModel.get_head_mask` 与其 "
+                "`_convert_head_mask_to_5d`，需要非 None 时请改用上游新的 mask 方案。"
+            )
+
+        PreTrainedModel.get_head_mask = get_head_mask
+        added.append("PreTrainedModel.get_head_mask")
+
     return added
