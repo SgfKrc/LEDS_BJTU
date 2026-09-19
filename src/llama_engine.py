@@ -1393,6 +1393,62 @@ class LlamaCppEngine:
             info["memory"] = self.get_memory_usage()
         return info
 
+    def forward_layers_to_hidden(self, input_ids, n_past: int = 0):
+        """★ 层接力上游入口（2026-09-19）：只跑**本模型（裁层 GGUF = 前 k 层）**的层，
+        返回**末位 hidden**（`np.float32`，长度 `n_embd`）。
+
+        与 `forward_layers_from_hidden()`（吃 hidden）对称，两者合起来让 **llama 也能当上游**，
+        从而支持「**交换上下游**」：llama 上游 → torch 下游
+        （`model_module.forward_layers(hidden_states=..., apply_lm_head=...)` 原生支持从 hidden 起算）。
+
+        实现走 llama.cpp 的 embeddings 通道：`llama_set_embeddings(ctx, True)` ⇒ decode ⇒
+        `llama_get_embeddings_ith(ctx, -1)`。
+
+        Args:
+            input_ids: token id 序列（list / 1D array）。
+            n_past: KV 里已有的位置数（接力首步传 0）。
+
+        Returns:
+            末位 hidden 的 `np.ndarray`（长度 n_embd），或 `None`（未加载）。
+        """
+        if not self.is_loaded:
+            return None
+        import numpy as np
+        import llama_cpp.llama_cpp as M
+
+        llm = self._model
+        native_model = getattr(getattr(llm, "_model", None), "model", None)
+        native_ctx = getattr(getattr(llm, "_ctx", None), "ctx", None)
+        if native_model is None or native_ctx is None:
+            raise RuntimeError("llama_engine: 取不到原生 llama_model / llama_context")
+
+        toks = [int(t) for t in np.asarray(input_ids).reshape(-1).tolist()]
+        n_tokens = len(toks)
+        if n_tokens == 0:
+            raise ValueError("input_ids 不能为空")
+        n_embd = int(M.llama_model_n_embd(native_model))
+
+        # 开启 embeddings 通道（否则 llama_get_embeddings_ith 返回空指针）
+        M.llama_set_embeddings(native_ctx, True)
+        batch = M.llama_batch_init(n_tokens, 0, 1)
+        try:
+            for i, tid in enumerate(toks):
+                batch.token[i] = tid
+                batch.n_seq_id[i] = 1
+                batch.seq_id[i][0] = 0
+                batch.logits[i] = 0          # 上游不需要 logits，只要 hidden
+                batch.pos[i] = int(n_past) + i
+            batch.n_tokens = n_tokens
+            rc = M.llama_decode(native_ctx, batch)
+            if rc != 0:
+                raise RuntimeError(f"llama_decode 失败 rc={rc}")
+            emb_ptr = M.llama_get_embeddings_ith(native_ctx, n_tokens - 1)
+            if not emb_ptr:
+                raise RuntimeError("llama_get_embeddings_ith 返回空（embeddings 通道未生效？）")
+            return np.ctypeslib.as_array(emb_ptr, shape=(n_embd,)).copy()
+        finally:
+            M.llama_batch_free(batch)
+
     def forward_layers_from_hidden(self, hidden, n_past: int = 0):
         """★ 层接力下游入口（2026-09-19）：把**上游 hidden** 注入 llama.cpp 的 `embd` 通道，
         只跑**本模型（裁层 GGUF）的层**，返回末位 logits。

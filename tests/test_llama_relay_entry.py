@@ -101,3 +101,35 @@ class TestWithRealModel:
         n_embd = int(M.llama_model_n_embd_inp(eng._model._model.model))
         lg = eng.forward_layers_from_hidden(np.zeros(n_embd, dtype=np.float32), n_past=0)
         assert lg is not None and lg.ndim == 1
+
+    def test_upstream_entry_returns_hidden(self):
+        """★ 上游入口（对称）：裁层 GGUF 跑前 k 层 ⇒ 出末位 hidden（长度 n_embd），且同输入逐位一致。"""
+        import numpy as np
+
+        eng = _engine_or_skip()
+        import llama_cpp.llama_cpp as M
+
+        n_embd = int(M.llama_model_n_embd(eng._model._model.model))
+        ids = [100, 200, 300, 400]
+        h1 = eng.forward_layers_to_hidden(ids, n_past=0)
+        assert h1 is not None
+        assert h1.shape == (n_embd,), f"hidden 形状应为 (n_embd,)，实得 {h1.shape}"
+        assert np.isfinite(h1).all()
+
+        # ⚠️ 同 n_past 重跑前须清 KV（reset_kv_cache 是既有 no-op）
+        eng._model._ctx.kv_cache_clear()
+        h2 = eng.forward_layers_to_hidden(ids, n_past=0)
+        assert np.array_equal(h1, h2), "相同输入两次调用结果必须逐位一致"
+
+    def test_upstream_entry_rejects_empty(self):
+        eng = _engine_or_skip()
+        with pytest.raises(ValueError, match="不能为空"):
+            eng.forward_layers_to_hidden([], n_past=0)
+
+    def test_roundtrip_hidden_width_matches_downstream(self):
+        """★ 对称性：上游出的 hidden 宽度 == 下游入口接受的宽度（两端可直连）。"""
+        eng = _engine_or_skip()
+        h = eng.forward_layers_to_hidden([100, 200], n_past=0)
+        eng._model._ctx.kv_cache_clear()
+        lg = eng.forward_layers_from_hidden(h, n_past=0)
+        assert lg is not None, "上游 hidden 应能被下游入口直接接受"

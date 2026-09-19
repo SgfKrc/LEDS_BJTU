@@ -2503,20 +2503,15 @@ class ModelManager:
             # ---- CUDA 路径 ----
             bnb_config = self._get_bnb_config(self.quant_type)
 
-            # 按架构能力选择 attention 实现：不支持 sdpa 的老架构（remote code）用 eager。
-        try:
-            import transformers as _tf
-            _supports = getattr(_tf, "SUPPORTED_ATTENTION_IMPLEMENTATIONS", None)
-            _impls = set(_supports or ())
-            _sdpa_or_eager = "sdpa" if ("sdpa" in _impls or not _impls) else "eager"
-        except Exception:  # noqa: BLE001
-            _sdpa_or_eager = "sdpa"
+            # ★ P6 实测 f16+sdpa 1.665 ms/层最佳，但**并非所有架构都支持**（remote-code 老架构会抛
+            #   ValueError）。这里**直接试**而不是靠常量探测 —— 探测在 5.17 下不经实测不敢依赖。
+            _attn_candidates = ("sdpa", "eager")
             load_kwargs: Dict[str, Any] = dict(
                 device_map="auto",
                 trust_remote_code=TRUST_REMOTE_CODE,
                 # ★ P6 实测 f16+sdpa 1.665 ms/层最佳；`_attn_impl` 由调用方按架构降级决定
                 #   （不支持的架构会用 "eager"，见下方 except 分支）。
-                attn_implementation=_sdpa_or_eager,
+                attn_implementation=_attn_candidates[0],
             )
 
             if bnb_config is not None:
@@ -2528,7 +2523,16 @@ class ModelManager:
         t0 = time.time()
 
         logger.info(f"加载 PyTorch 模型路径: {path}")
-        self.model = AutoModelForCausalLM.from_pretrained(path, **load_kwargs)
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(path, **load_kwargs)
+        except (ValueError, TypeError) as exc:
+            # ⚠️ 老架构（remote code）不支持 sdpa ⇒ 回退 eager 重试一次
+            if load_kwargs.get("attn_implementation") != "eager":
+                logger.warning("⚠️ 该架构不支持 sdpa，回退 eager 重试：%s", str(exc)[:160])
+                load_kwargs = dict(load_kwargs, attn_implementation="eager")
+                self.model = AutoModelForCausalLM.from_pretrained(path, **load_kwargs)
+            else:
+                raise
 
         # ★ A7/B7：transformers 5.x 下 remote-code 模型的「权重被 `_init_weights` 覆盖」守卫。
         #   只在「transformers ≥5 且启用了 remote code」时执行 —— 4.x 无此缺陷（它有
