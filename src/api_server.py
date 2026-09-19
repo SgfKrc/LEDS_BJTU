@@ -2675,18 +2675,25 @@ async def load_model(req: LoadModelRequest, request: Request = None):
 
         # P3修复: 使用 switch_model 获得失败时自动回滚保护
         logger.info(f"加载模型: engine={effective_engine}, quant={quant}, compile={req.use_compile}")
-        result = _run_exclusive_model_change(
-            lambda: model_manager.switch_model(
-                model_id=req.model_id or mc.DEFAULT_MODEL_ID,
-                quant_type=quant,
-                profile=device_profile,
-                engine=effective_engine if effective_engine != "auto" else None,
-                model_path=resolved_model_path,
-                db_experimental_models=_get_registered_experimental_models(),
-            ),
-            prepare=_prepare_model_load,
-            release_worker_reservation=True,
-        )
+
+        # ★ 2026-09-19：模型加载耗时 5-20 s，**必须**挪到线程池执行。
+        #   否则会占住事件循环 ⇒ 期间 `/api/health` 等端点全部无响应
+        #   （用户实测：「加载过程中健康不可达，加载完成后恢复」）。
+        def _do_switch():
+            return _run_exclusive_model_change(
+                lambda: model_manager.switch_model(
+                    model_id=req.model_id or mc.DEFAULT_MODEL_ID,
+                    quant_type=quant,
+                    profile=device_profile,
+                    engine=effective_engine if effective_engine != "auto" else None,
+                    model_path=resolved_model_path,
+                    db_experimental_models=_get_registered_experimental_models(),
+                ),
+                prepare=_prepare_model_load,
+                release_worker_reservation=True,
+            )
+
+        result = await run_in_threadpool(_do_switch)
 
         if result["success"]:
             model_host.model_loaded = True

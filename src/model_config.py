@@ -143,21 +143,27 @@ class ModelConfig:
 # 内置模型注册表
 # ================================================================
 
-DEFAULT_MODEL_ID = "qwen-1_8b"
+# ★ 2026-09-19：默认模型由 `qwen-1_8b` 改为 `qwen3-0.6b`。
+#   原因：Qwen-1.8B 的 remote code（2023 年老架构）与 transformers 5.x **链式不兼容**
+#   （uint8 权重被 `_init_weights` 覆盖 ⇒ 崩溃；缺 `generation_config`；`generate` 依赖
+#   已被移除的 `super().generate`；5.x 生成栈又依赖更多新属性）—— 逐个补属性是无底洞。
+#   同体积新模型已有替代（`qwen3-0.6b` / `qwen2.5-0.5b`）⇒ 该模型**退役**。
+#   ⚠️ 模型文件与其专属代码**保留**（不删），GGUF 路径仍可正常使用。
+DEFAULT_MODEL_ID = "qwen3-0.6b"
 
 BUILTIN_MODELS: list[ModelConfig] = [
     ModelConfig(
         model_id="qwen-1_8b",
-        name="Qwen-1.8B-Chat",
+        name="Qwen-1.8B-Chat（⚠️ 已退役）",
         model_type="both",
         model_path=os.path.join(_APP_ROOT, "models", "qwen-1_8b-chat"),
         gguf_path=os.path.join(_APP_ROOT, "models", "Qwen-1_8B-Chat.Q4_K_M.gguf"),
         recommended_vram_gb=3.5,
         max_context=4096,
-        is_experimental=False,
+        is_experimental=True,
         huggingface_id="Qwen/Qwen-1.8B-Chat",
         quant_types=["fp16", "int8", "int4"],
-        description="默认模型。1.8B 参数，Q4_K_M GGUF (1.16GB) / INT4 Safetensors (1.75GB VRAM)。适合入门级 GPU 和 CPU。",
+        description="⚠️ **已退役**（2026-09-19）：其 remote code 与 transformers 5.x 链式不兼容（详见 `DEFAULT_MODEL_ID` 处注释），不再是默认模型。同体积请改用 qwen3-0.6b / qwen2.5-0.5b。GGUF (Q4_K_M 1.16GB) 路径仍可用；Safetensors+PyTorch 路径在新版 transformers 下不可用。",
         location="bundled",
     ),
     ModelConfig(
@@ -224,7 +230,9 @@ BUILTIN_MODELS: list[ModelConfig] = [
         gguf_path=os.path.join(_APP_ROOT, "models", "qwen3-0.6b-q8_0.gguf"),
         recommended_vram_gb=2.0,
         max_context=40960,
-        is_experimental=True,
+        # ★ 2026-09-19：`qwen-1_8b` 退役后本模型成为**默认**，故不再是 experimental
+        #   （`test_experimental_models_are_hidden_without_cuda` 要求默认模型在无 CUDA 时也可见）。
+        is_experimental=False,
         huggingface_id="Qwen/Qwen3-0.6B",
         quant_types=["fp16", "int8", "int4", "Q8_0"],
         description="亚 1B Qwen3 对照模型。模板声明 enable_thinking 开关，需经 sidecar 和真实推理门。",

@@ -22,6 +22,7 @@
 
 import hashlib
 import inspect
+import contextlib
 import json
 import logging
 import os
@@ -501,6 +502,65 @@ class _LayerRangeLoadTracker:
 #   ⇒ 长序列下过早触发 `recompile_limit` 而放弃编译（与 B1/B2 观测的长序列劣化一致）。
 #   对策：在**每个进入模型访问的线程**里幂等地补设一次（每线程一次，开销可忽略）。
 _compile_limit_tls = threading.local()
+
+
+@contextlib.contextmanager
+def _premark_hf_initialized():
+    """★ BUG 修复（2026-09-19）：`from_pretrained` 期间**禁止** `_init_weights` 覆盖已装载权重。
+
+    ## 症状（用户报障）
+    `qwen-1_8b` + int4 加载 ⇒ `NotImplementedError: "normal_kernel_cuda"
+    not implemented for 'Byte'`（HTTP 500），**崩在 `Loading weights 1%` 处**。
+
+    ## 根因（transformers 5.17 源码 + 实测调用栈）
+    `modeling_utils.py:2379` `self._init_weights(module)` ⇒ `:2401-2402` `smart_apply` ⇒
+    **remote code** `modeling_qwen.py:666 _init_weights` ⇒ `p.data.normal_(...)`，
+    而量化后 `p.data` 是 **`uint8`** ⇒ CUDA 无该 dtype 的 normal 内核 ⇒ 抛异常。
+    触发条件：`:2361` 的「是否已初始化」判定**看不到** remote code 用**递归**
+    `named_parameters()` 写入的标记（`:521-524` 记录的同一 5.x 缺陷），
+    于是把**已装载**的模块误判为未初始化。
+
+    ## 为什么必须「预标记」而不是「事后修」
+    仓库已有的 `_verify_and_repair_loaded_weights`（A7/B7）在**加载完成后**才跑，
+    而本缺陷在**加载过程中**就崩溃 ⇒ 实测 `guard_calls: []`（守卫根本没被调到）。
+    transformers 自己在「加载后修复 missing keys」时也用同一标记（`:4766-4769`）⇒
+    本函数与官方做法**一致**，只是**提前**到加载窗口内。
+
+    ## 安全性
+    量化加载时权重**已从 ckpt 装载**，本就不需要 `_init_weights`；真缺失的键仍会由
+    `missing_keys` 与现有守卫暴露（不会静默留下随机权重）。
+
+    ⚠️ 调用方须**收窄作用域**（仅 transformers≥5 + remote code + 量化）；
+    本函数用 `try/finally` 严格恢复 `PreTrainedModel.initialize_weights`。
+    """
+    try:
+        from transformers import PreTrainedModel
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("预标记：无法 import PreTrainedModel，跳过（%s）", exc)
+        yield
+        return
+
+    original = PreTrainedModel.initialize_weights
+
+    def _patched(self, *args, **kwargs):  # noqa: ANN001
+        # 与 transformers :4766-4769 一致的标记方式
+        for module in self.modules():
+            try:
+                module._is_hf_initialized = True
+            except Exception:  # noqa: BLE001
+                pass
+            for param in module.parameters(recurse=False):
+                try:
+                    param._is_hf_initialized = True
+                except Exception:  # noqa: BLE001
+                    pass
+        return original(self, *args, **kwargs)
+
+    PreTrainedModel.initialize_weights = _patched
+    try:
+        yield
+    finally:
+        PreTrainedModel.initialize_weights = original
 
 
 def _is_transformers_5_or_newer() -> bool:
@@ -2523,25 +2583,105 @@ class ModelManager:
         t0 = time.time()
 
         logger.info(f"加载 PyTorch 模型路径: {path}")
-        try:
-            self.model = AutoModelForCausalLM.from_pretrained(path, **load_kwargs)
-        except (ValueError, TypeError) as exc:
-            # ⚠️ 老架构（remote code）不支持 sdpa ⇒ 回退 eager 重试一次
-            if load_kwargs.get("attn_implementation") != "eager":
-                logger.warning("⚠️ 该架构不支持 sdpa，回退 eager 重试：%s", str(exc)[:160])
-                load_kwargs = dict(load_kwargs, attn_implementation="eager")
+
+        # ★ BUG 修复（2026-09-19）：量化 + remote code + transformers≥5 时，
+        #   加载窗口内**禁止** `_init_weights` 覆盖已装载权重（否则 Qwen-1.8B 会在
+        #   `modeling_qwen.py:_init_weights` 里对 uint8 权重调 `normal_()` 而崩溃）。
+        #   作用域收窄：仅三条件同时成立才打补丁。
+        _needs_premark = (
+            TRUST_REMOTE_CODE
+            and _is_transformers_5_or_newer()
+            and self.quant_type in ("int4", "int8")
+        )
+        if _needs_premark:
+            logger.info("  已启用「预标记已初始化」守卫（量化 + remote code + transformers≥5）")
+
+        premark = _premark_hf_initialized() if _needs_premark else contextlib.nullcontext()
+        with premark:
+            try:
                 self.model = AutoModelForCausalLM.from_pretrained(path, **load_kwargs)
-            else:
-                raise
+            except (ValueError, TypeError) as exc:
+                # ⚠️ 老架构（remote code）不支持 sdpa ⇒ 回退 eager 重试一次
+                if load_kwargs.get("attn_implementation") != "eager":
+                    logger.warning("⚠️ 该架构不支持 sdpa，回退 eager 重试：%s", str(exc)[:160])
+                    load_kwargs = dict(load_kwargs, attn_implementation="eager")
+                    self.model = AutoModelForCausalLM.from_pretrained(path, **load_kwargs)
+                else:
+                    raise
 
         # ★ A7/B7：transformers 5.x 下 remote-code 模型的「权重被 `_init_weights` 覆盖」守卫。
         #   只在「transformers ≥5 且启用了 remote code」时执行 —— 4.x 无此缺陷（它有
         #   `set_initialized_submodules()`），因此可省掉一次全区读取（Qwen-1.8B 约 3.5 GB）。
         self._weight_guard_report = None
+        #: 是否因 transformers 5.x 断裂而把 generate 改绑到 GenerationMixin
+        self._generate_rebound = False
         if TRUST_REMOTE_CODE and _is_transformers_5_or_newer():
             self._weight_guard_report = _verify_and_repair_loaded_weights(self.model, path)
 
         self.tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=TRUST_REMOTE_CODE)
+
+        # ★ BUG 修复（2026-09-19）：**旧版 remote code 模型缺 `generation_config`**。
+        #   `_pytorch_chat()` 调 `self.model.generate(...)`，而 transformers>=5 的 `generate()`
+        #   会读 `self.generation_config`；Qwen-1.8B 的 `QWenLMHeadModel`（继承
+        #   `QWenPreTrainedModel` → `PreTrainedModel`）**从不设置该属性**（实测
+        #   `hasattr(..., "generation_config") is False`）⇒ `AttributeError` ⇒ 聊天即时失败
+        #   （上层表现为「收不到回复 / 超时」）。
+        #   ⇒ **只补不覆盖**：已有该属性的模型完全不受影响。
+        if getattr(self.model, "generation_config", None) is None:
+            try:
+                from transformers import GenerationConfig
+
+                gen_cfg = GenerationConfig.from_model_config(self.model.config)
+                # 尽量补齐特殊 token（`generate()` 的调用点虽显式传了 pad_token_id，
+                # 但其他调用方可能依赖配置里的值）
+                tok = self.tokenizer
+                if getattr(gen_cfg, "pad_token_id", None) is None:
+                    gen_cfg.pad_token_id = getattr(tok, "pad_token_id", None) \
+                        or getattr(tok, "eos_token_id", None)
+                if getattr(gen_cfg, "eos_token_id", None) is None:
+                    gen_cfg.eos_token_id = getattr(tok, "eos_token_id", None)
+                self.model.generation_config = gen_cfg
+                logger.info("  已为 %s 补齐 generation_config（remote code 旧架构缺失）",
+                            type(self.model).__name__)
+            except Exception as exc:  # noqa: BLE001 —— 只补不抛
+                logger.warning("  补齐 generation_config 失败（不影响加载）：%s", str(exc)[:160])
+
+        # ★ BUG 修复（2026-09-19）：**旧 remote code 的 `generate` 与 transformers 5.x 断裂**。
+        #   `QWenLMHeadModel.generate` 内部调 `super().generate(...)`，而 5.x 已把 `generate`
+        #   从 `PreTrainedModel` 挪到 `GenerationMixin` ⇒ `AttributeError: 'super' object has
+        #   no attribute 'generate'`（实测：补齐 generation_config 后紧接着出现）。
+        #   ⇒ 这里**探测**该断裂，命中才把实例的 `generate` 绑到标准 `GenerationMixin.generate`。
+        _gen = getattr(self.model, "generate", None)
+        _broken = _gen is None
+        if not _broken:
+            try:
+                import inspect as _inspect
+
+                src_text = ""
+                try:
+                    src_text = _inspect.getsource(_gen) or ""
+                except Exception:  # noqa: BLE001 —— 拿不到源码不算断裂
+                    src_text = ""
+                # 只有「源码里确实调 super().generate」才认为存在断裂风险
+                _broken = "super().generate" in src_text
+            except Exception:  # noqa: BLE001
+                _broken = False
+        if _broken:
+            try:
+                from transformers.generation import GenerationMixin
+
+                self.model.generate = GenerationMixin.generate.__get__(self.model, type(self.model))
+                self._generate_rebound = True
+                logger.warning(
+                    "  ⚠️ %s.generate 依赖已被 5.x 移除的 super().generate ⇒ "
+                    "已改绑标准 GenerationMixin.generate",
+                    type(self.model).__name__,
+                )
+            except Exception as exc:  # noqa: BLE001 —— 只补不抛
+                logger.warning("  改绑 generate 失败（不影响加载）：%s", str(exc)[:160])
+        else:
+            self._generate_rebound = False
+
         self.layer_range = None
         self._layer_load_metrics = None
         self._layer_has_embedding = True

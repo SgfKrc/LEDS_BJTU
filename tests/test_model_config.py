@@ -58,9 +58,12 @@ def test_deepseek_r1_distill_qwen_slots_are_registered():
 
 
 def test_new_small_and_distilqwen_slots_are_registered():
+    # ★ 2026-09-19：`qwen-1_8b` 退役后 `qwen3-0.6b` 成为**默认**模型 ⇒
+    #   它不再是 experimental（否则 `test_experimental_models_are_hidden_without_cuda`
+    #   会在无 CUDA 时把它隐藏，导致「默认模型不可见」）。这里把它从「全是实验」的
+    #   集合中移出，单独断言。
     expected = {
         "qwen2.5-0.5b": ("Qwen/Qwen2.5-0.5B-Instruct", "models/qwen2.5-0.5b-instruct", "models/qwen2.5-0.5b-instruct-q4_k_m.gguf", 1.5, 32768),
-        "qwen3-0.6b": ("Qwen/Qwen3-0.6B", "models/qwen3-0.6b", "models/qwen3-0.6b-q8_0.gguf", 2.0, 40960),
         "minicpm4-0.5b": ("openbmb/MiniCPM4-0.5B", "models/minicpm4-0.5b", "models/minicpm4-0.5b-q4_k_m.gguf", 1.5, 32768),
         "distilqwen25-ds3-0324-7b": ("alibaba-pai/DistilQwen2.5-DS3-0324-7B", "models/distilqwen25-ds3-0324-7b", "models/distilqwen25-ds3-0324-7b-q4_k_m.gguf", 8.0, 32768),
     }
@@ -74,6 +77,16 @@ def test_new_small_and_distilqwen_slots_are_registered():
         assert cfg.is_experimental is True
         assert os.path.normpath(cfg.model_path).endswith(os.path.normpath(model_suffix))
         assert os.path.normpath(cfg.gguf_path).endswith(os.path.normpath(gguf_suffix))
+
+    # ★ qwen3-0.6b：现在是**默认**模型 ⇒ 必须**不是** experimental（见函数头注释）
+    default_cfg = mc.get_builtin_model("qwen3-0.6b")
+    assert default_cfg is not None
+    assert default_cfg.model_type == "both"
+    assert default_cfg.huggingface_id == "Qwen/Qwen3-0.6B"
+    assert default_cfg.recommended_vram_gb == 2.0
+    assert default_cfg.max_context == 40960
+    assert default_cfg.is_experimental is False, "它已是默认门面模型，不应被标为实验"
+    assert mc.DEFAULT_MODEL_ID == "qwen3-0.6b"
 
 
 def test_experimental_models_are_hidden_without_cuda(monkeypatch):
