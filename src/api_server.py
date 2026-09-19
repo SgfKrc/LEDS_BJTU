@@ -1993,6 +1993,31 @@ def _fallback_followups(history: list[dict], existing: list[str]) -> list[str]:
     return result
 
 
+def _safe_torch_model():
+    """★ 2026-09-19：安全获取底层 **PyTorch 模型**，非 PyTorch 引擎返回 None。
+
+    为什么需要：`model_manager`（`ModelHost`）会把未知属性转发给底层引擎；
+    **llama_cpp 引擎（`LlamaCppEngine`）只有 `_model`，没有 `.model`**
+    ⇒ 直接 `model_manager.model` 会抛
+    `AttributeError: 'LlamaCppEngine' object has no attribute 'model'`
+    （用户实测：加载完成后 `_init_kv_cache()` 即崩，表现为 HTTP 500）。
+
+    判定标准：**只看「取属性是否成功」**——
+      * 取属性抛 `AttributeError`（`ModelHost` 把未知属性转发给 `LlamaCppEngine`）⇒ 返回 None；
+      * 取到 `None`（未加载 / llama.cpp 引擎下 `self.model` 为 None）⇒ 返回 None；
+      * 其余**原样返回**（PyTorch 真模型、乃至测试替身都照旧）。
+
+    ⚠️ 早先版本用 `isinstance(candidate, torch.nn.Module)` 判定，**过严**：会把测试里的
+    **替身模型**也挡掉（`test_local_pytorch_chat_restores_full_model_before_generate` 于是失败）。
+    现在只做「属性可访问性」判断，**PyTorch 路径与替身路径行为完全不变**。
+    """
+    try:
+        candidate = getattr(model_manager, "model", None)
+    except Exception:  # noqa: BLE001 —— 属性转发本身可能抛（AttributeError 等）
+        return None
+    return candidate
+
+
 def _init_kv_cache():
     """初始化分页 KV 缓存（根据设备画像自适应大小）"""
     global kv_cache
@@ -2004,12 +2029,22 @@ def _init_kv_cache():
         kv_cache = None
         return
 
+    # ★ 2026-09-19：**非 PyTorch 引擎直接跳过**。
+    #   本函数是 PyTorch 特性（见上方注释：L-tier 未接入单机解码循环）。
+    #   而 `model_manager` 会把未知属性转发给底层引擎，`LlamaCppEngine` 既无 `.model`
+    #   也无 `.get_device` ⇒ 继续往下会连抛 AttributeError（用户实测的 HTTP 500）。
+    _torch_model = _safe_torch_model()
+    if _torch_model is None:
+        kv_cache = None
+        logger.debug("非 PyTorch 引擎（或无 torch 模型）⇒ 跳过 paged KV 初始化")
+        return
+
     num_heads = 16      # Qwen-1.8B: 16 attention heads
     head_dim = 64       # 隐藏维度 2048 / 16 heads = 128, 但实际是 64 per head for K/V
     # 从模型获取实际的 head_dim
-    if model_manager.model is not None:
+    if _torch_model is not None:
         try:
-            cfg = model_manager.model.config
+            cfg = _torch_model.config
             num_heads = cfg.num_attention_heads
             head_dim = cfg.hidden_size // num_heads
         except Exception:
@@ -4490,7 +4525,7 @@ def _execute_chat_full(
 
         t0 = time.time()
         with torch.no_grad():
-            outputs = model_manager.model.generate(
+            outputs = _safe_torch_model().generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=effective_max,
@@ -4548,7 +4583,7 @@ def _execute_chat_full(
         followups = _generate_followups(
             completed_history,
             tokenizer,
-            model_manager.model,
+            _safe_torch_model(),
             model_manager.get_device(),
             cancel_event,
         )
