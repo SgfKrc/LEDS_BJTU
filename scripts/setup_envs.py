@@ -96,7 +96,7 @@ ENVS: tuple[PyEnv, ...] = (
     ),
     PyEnv(
         name="gemma4-pipeline",
-        description="Gemma 4 PyTorch Transformers 5.10.1 侧车（.venv-gemma4-pipeline）",
+        description="Gemma 4 PyTorch Transformers 5.17.0 侧车（.venv-gemma4-pipeline）",
         venv_dir=".venv-gemma4-pipeline",
         requirements=("requirements/requirements-gemma4-pipeline-sidecar.txt",),
         lock_file="gemma4-pipeline.lock.txt",
@@ -230,7 +230,7 @@ def _torch_hint(env: PyEnv, index_url: str) -> str:
         + (f" --index-url {index_url}" if index_url else ""),
     ]
     if env.name == "gemma4-pipeline":
-        lines.append("    （Transformers 5.10.1 建议 torch>=2.10,<2.14）")
+        lines.append("    （Transformers 5.17.0 建议 torch>=2.10,<2.14）")
     return "\n".join(lines)
 
 

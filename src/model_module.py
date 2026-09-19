@@ -67,6 +67,7 @@ from transformers import (
 from config import (
     MODEL_NAME, MODEL_PATH, GGUF_MODEL_PATH,
     COMPILE_RECOMPILE_LIMIT,
+COMPILE_MIN_PARAMS,
     QUANT_TYPE, USE_COMPILE, USE_MONOLITHIC_FORWARD,
     DEVICE, TRUST_REMOTE_CODE,
     INFERENCE_ENGINE,
@@ -228,6 +229,60 @@ def _new_dynamic_cache(config=None):
         return DynamicCache(config=config)
     except (TypeError, AttributeError):
         return DynamicCache()
+
+
+def _normalize_past_key_values(past_key_values):
+    """★ B9：把「**空的** cache 对象」规范化成 ``None``（视同没有缓存）。
+
+    为什么需要：调用方很容易传一个**尚未写入任何内容**的 cache 对象（例如
+    ``DynamicCache()`` / ``DynamicCache(config=cfg)``）而不是 ``None``。各架构随后会：
+
+      * ``len(past_key_values)`` ⇒ ``0`` ⇒ 报 ``Qwen2 KV cache 层数不匹配: cache=0, local=N``
+        —— **报错信息不指向根因**（看起来像"层数算错了"，实际是"传了空 cache"）；
+      * 或直接 ``cache.layers[layer_idx]`` ⇒ ``IndexError: list index out of range``
+        （hybrid 架构上尤其容易踩）。
+
+    两者是**同一个坑**。这里统一识别「没有任何已写入层的 cache」并视同 ``None``，
+    由 ``forward_layers`` 自建正确形状的 cache。
+
+    ⚠️ 只处理**完全空**的情况；**部分写入**的 cache（如已缓存若干层）原样返回，不做任何改动。
+    """
+    if past_key_values is None:
+        return None
+
+    # (1) cache 对象（DynamicCache-like）：**以「已缓存长度 == 0」为准**。
+    #     ⚠️ 不能只看层容器是否为空：5.x 的 `DynamicCache(config=...)` 会**按 config 预先建出**
+    #     每层的 `DynamicLayer` 占位对象（实测 `layers=[DynamicLayer×4]`、`len(cache)==4`），
+    #     但 `get_seq_length()` 仍是 0 —— 那些占位对象不是 KV，直接 enumerate 会以
+    #     `k, v = item ⇒ ValueError: too many values to unpack` 失败（本票实际踩到）。
+    try:
+        seq_len = None
+        get_seq_length = getattr(past_key_values, "get_seq_length", None)
+        if callable(get_seq_length):
+            try:
+                seq_len = int(get_seq_length())
+            except (TypeError, ValueError):
+                # 部分实现要求传 layer_idx；无参调用失败时不算"空"
+                seq_len = None
+        if seq_len is not None:
+            return None if seq_len == 0 else past_key_values
+    except Exception as exc:  # noqa: BLE001 - 规范化失败不应影响主流程
+        logger.debug(f"空 cache 规范化：读取 get_seq_length 失败（按原样使用）: {exc}")
+
+    # (2) 无 `get_seq_length` 的层容器（空 list/tuple、或全 None 占位）⇒ 没有任何真实 KV。
+    layers = getattr(past_key_values, "layers", None)
+    if isinstance(layers, (list, tuple)) and (
+        len(layers) == 0 or all(x is None for x in layers)
+    ):
+        return None
+
+    # (3) 纯 tuple/list 形式：空、或全 None 占位（B14 在 hybrid 收集侧会留 None 占位）。
+    if isinstance(past_key_values, (tuple, list)) and (
+        len(past_key_values) == 0 or all(x is None for x in past_key_values)
+    ):
+        return None
+
+    return past_key_values
 
 
 def _locate_text_transformer(model) -> tuple:
@@ -438,10 +493,163 @@ class _LayerRangeLoadTracker:
         }
 
 
+# ★ A6：`torch._dynamo.config` 是 **thread-local**（torch ≥2.12；本仓实测 2.13.0 亦然 ——
+#   源码 `torch/utils/_config_module.py:53/:394-395/:812` 明确 "User overrides are thread-local"，
+#   且实测「主线程设 64 ⇒ 新线程读回默认 8」）。
+#   主仓 `_apply_compile()` 在**加载线程**设置 `recompile_limit`/`cache_size_limit`，而推理（尤其经
+#   starlette `run_in_threadpool` 的 API 路径）发生在**worker 线程** ⇒ 设置**读不到**、退回默认 8
+#   ⇒ 长序列下过早触发 `recompile_limit` 而放弃编译（与 B1/B2 观测的长序列劣化一致）。
+#   对策：在**每个进入模型访问的线程**里幂等地补设一次（每线程一次，开销可忽略）。
+_compile_limit_tls = threading.local()
+
+
+def _is_transformers_5_or_newer() -> bool:
+    """当前 `transformers` 主版本是否 ≥5（用于决定是否需要「权重覆盖」守卫）。"""
+    try:
+        import transformers
+        major = str(getattr(transformers, "__version__", "0")).split(".")[0]
+        return int(major) >= 5
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _verify_and_repair_loaded_weights(model, model_path: str) -> Optional[Dict[str, Any]]:
+    """★ A7/B7：transformers 5.x 下 remote-code 模型的「**权重被 `_init_weights` 覆盖**」守卫。
+
+    ## 为什么需要（已实测定位，见 `local_docs/CORE-RELAY-XFRAME-02-a6-and-leak-*.json`）
+    transformers ≥5 把权重初始化从「装载**之前**」搬到了「装载**之后**」，且
+    `_initialize_weights` 的「未初始化」检查只看 **`recurse=False`** 的 params/buffers，
+    而 remote code 的 `_init_weights` 写入用的是**递归** `named_parameters()` ⇒ 两者范围不一致；
+    当某个模块**只直接持有 non-persistent buffer**（`_move_missing_keys_from_meta_to_device`
+    会把它们换成 `torch.empty_like` 的**新对象、丢掉标志**）时，该模块会被**误判为未初始化**。
+    若 remote code 的 `_init_weights` 又按**相对名**匹配（如
+    `modeling_qwen.py` 的 `if name == "c_proj.weight": p.data.normal_(...)`），
+    就会**覆盖已经正确装载的权重** —— 且 **`missing_keys` 仍报 0**（**静默**，最危险的一类）。
+
+    Qwen-1.8B 实测：**24 层 `transformer.h.*.attn.c_proj.weight` 全部中招**
+    （`ok=171 / bad=24`），导致输出错误 + 跨进程非确定；本函数重载后输出与 4.47.1 **逐位一致**。
+
+    ## 做法
+    逐键把 `model.state_dict()` 与 safetensors 原值比对（`torch.equal`），**不符的键就地重载**。
+    只在「5.x + `TRUST_REMOTE_CODE`」时被调用（4.x 无此缺陷，省掉一次全区读取）。
+
+    ## 纪律
+    ① **只修不抛**：任何异常都只记日志（fail-loud），绝不让加载失败；
+    ② **绝不静默**：发现不符必然 `logger.warning`（这正是上游缺陷的可见性补救）；
+    ③ 返回统计字典（供上层日志/报告），无问题或不可用时返回 None。
+    """
+    if not model_path:
+        return None
+    try:
+        import torch
+        from safetensors import safe_open
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("权重守卫：缺少 torch/safetensors，跳过（%s）", exc)
+        return None
+
+    try:
+        state = model.state_dict()
+        index_path = os.path.join(model_path, "model.safetensors.index.json")
+        by_shard: Dict[str, List[str]] = {}
+        if os.path.isfile(index_path):
+            with open(index_path, "r", encoding="utf-8") as handle:
+                weight_map = json.load(handle).get("weight_map", {})
+            for key, shard in weight_map.items():
+                if key in state:
+                    by_shard.setdefault(shard, []).append(key)
+        else:
+            for name in sorted(n for n in os.listdir(model_path) if n.endswith(".safetensors")):
+                by_shard[name] = [k for k in _iter_safetensors_keys(model_path)]
+
+        if not by_shard:
+            logger.debug("权重守卫：%s 无可用 safetensors 索引，跳过", model_path)
+            return None
+
+        checked = repaired = 0
+        mismatched: List[str] = []
+        with torch.no_grad():
+            for shard, keys in by_shard.items():
+                shard_path = os.path.join(model_path, shard)
+                if not os.path.isfile(shard_path):
+                    continue
+                with safe_open(shard_path, framework="pt", device="cpu") as handle:
+                    available = set(handle.keys())
+                    for key in keys:
+                        if key not in available:
+                            continue
+                        target = state.get(key)
+                        if target is None or not hasattr(target, "copy_"):
+                            continue
+                        # ⚠️ **跨设备**：CUDA 上 `model.state_dict()` 的张量在 GPU，而 safetensors
+                        # 读到的是 CPU。必须**显式搬到 target 的设备**再比较/写入 —— 否则
+                        # `torch.equal` 跨设备恒为 False，会把**全部**键误判为「不一致」并做过量重载
+                        # （2026-09-19 实测：CUDA 上曾误报 195/195）。
+                        if getattr(target, "is_meta", False):
+                            # `device_map` 分片可能把某些键留成 meta 占位，无法就地对写 ⇒ 跳过。
+                            continue
+                        raw = handle.get_tensor(key)
+                        checked += 1
+                        try:
+                            src = raw.to(device=target.device, dtype=target.dtype)
+                            same = raw.shape == target.shape and bool(torch.equal(src, target))
+                        except Exception:  # noqa: BLE001
+                            same = False
+                            src = raw
+                        if not same:
+                            target.copy_(src)
+                            repaired += 1
+                            if len(mismatched) < 12:
+                                mismatched.append(key)
+
+        if repaired:
+            logger.warning(
+                "⚠️ 权重守卫：检测到 %d/%d 个张量的加载结果与 safetensors **不一致**（transformers 5.x 的 "
+                "「初始化覆盖已装载权重」缺陷）⇒ **已从 safetensors 重载修复**：%s%s",
+                repaired, checked, ", ".join(mismatched),
+                " 等" if repaired > len(mismatched) else "",
+            )
+        else:
+            logger.info("权重守卫：已逐键校验 %d 个张量，**全部与 safetensors 一致**", checked)
+        return {"checked": checked, "repaired": repaired, "mismatched_head": mismatched}
+    except Exception as exc:  # noqa: BLE001 - 守卫绝不使加载失败
+        logger.warning("权重守卫执行失败（已忽略，继续使用原加载结果）: %s", exc)
+        return None
+
+
+def _ensure_compile_limits_in_current_thread() -> None:
+    """★ A6：把 `recompile_limit`/`cache_size_limit` 在当前线程内**幂等**补设到配置值。
+
+    `torch._dynamo.config` 是 thread-local ⇒ 仅在 `_apply_compile()`（加载线程）里设是不够的。
+    本函数每个线程只真正执行一次；只在「当前值小于配置值」时才写，避免覆盖用户显式调大的值。
+    """
+    if getattr(_compile_limit_tls, "done", False):
+        return
+    if not globals().get("USE_COMPILE"):
+        _compile_limit_tls.done = True
+        return
+    limit = globals().get("COMPILE_RECOMPILE_LIMIT")
+    if not limit:
+        _compile_limit_tls.done = True
+        return
+    try:
+        import torch._dynamo as _dynamo
+        want = int(limit)
+        if int(_dynamo.config.recompile_limit or 0) < want:
+            _dynamo.config.recompile_limit = want
+        current_cache = getattr(_dynamo.config, "cache_size_limit", None)
+        if current_cache is not None and int(current_cache or 0) < want:
+            _dynamo.config.cache_size_limit = want
+        _compile_limit_tls.done = True
+        logger.debug("A6：已在本线程内补设 recompile_limit/cache_size_limit = %s", want)
+    except Exception as exc:  # noqa: BLE001 - 补设失败不应影响前向
+        logger.debug("A6：线程内补设 recompile_limit 失败（忽略）: %s", exc)
+
+
 def _serialized_model_access(method):
     """Serialize model mutation and inference against the manager RLock."""
     @wraps(method)
     def wrapper(self, *args, **kwargs):
+        _ensure_compile_limits_in_current_thread()  # ★ A6
         with self._lock:
             return method(self, *args, **kwargs)
     return wrapper
@@ -451,6 +659,7 @@ def _serialized_model_stream(method):
     """Keep the model lock for the complete lifetime of a stream."""
     @wraps(method)
     def wrapper(self, *args, **kwargs):
+        _ensure_compile_limits_in_current_thread()  # ★ A6
         with self._lock:
             yield from method(self, *args, **kwargs)
     return wrapper
@@ -1669,10 +1878,22 @@ class ModelManager:
         )
 
         with init_empty_weights():
-            model = AutoModelForCausalLM.from_config(
-                config,
-                trust_remote_code=TRUST_REMOTE_CODE,
-            )
+            # ★ P6 实测：f16+sdpa 1.665 ms/层为最佳；此前未显式设置（依赖库默认）。
+            # ⚠️ 但并非所有架构都支持 sdpa（如 remote-code 的 QWenLMHeadModel 会抛
+            #    "does not support ... scaled_dot_product_attention"）⇒ **必须可降级**。
+            try:
+                model = AutoModelForCausalLM.from_config(
+                    config,
+                    trust_remote_code=TRUST_REMOTE_CODE,
+                    attn_implementation="sdpa",
+                )
+            except (ValueError, TypeError) as exc:
+                logger.warning("⚠️ 该架构不支持 sdpa，回退 eager：%s", str(exc)[:160])
+                model = AutoModelForCausalLM.from_config(
+                    config,
+                    trust_remote_code=TRUST_REMOTE_CODE,
+                    attn_implementation="eager",
+                )
         load_tracker.observe()
 
         index_path = os.path.join(model_path, "model.safetensors.index.json")
@@ -1859,10 +2080,22 @@ class ModelManager:
         )
 
         with init_empty_weights():
-            model = AutoModelForCausalLM.from_config(
-                config,
-                trust_remote_code=TRUST_REMOTE_CODE,
-            )
+            # ★ P6 实测：f16+sdpa 1.665 ms/层为最佳；此前未显式设置（依赖库默认）。
+            # ⚠️ 但并非所有架构都支持 sdpa（如 remote-code 的 QWenLMHeadModel 会抛
+            #    "does not support ... scaled_dot_product_attention"）⇒ **必须可降级**。
+            try:
+                model = AutoModelForCausalLM.from_config(
+                    config,
+                    trust_remote_code=TRUST_REMOTE_CODE,
+                    attn_implementation="sdpa",
+                )
+            except (ValueError, TypeError) as exc:
+                logger.warning("⚠️ 该架构不支持 sdpa，回退 eager：%s", str(exc)[:160])
+                model = AutoModelForCausalLM.from_config(
+                    config,
+                    trust_remote_code=TRUST_REMOTE_CODE,
+                    attn_implementation="eager",
+                )
         load_tracker.observe()
 
         index_path = os.path.join(model_path, "model.safetensors.index.json")
@@ -2270,9 +2503,15 @@ class ModelManager:
             # ---- CUDA 路径 ----
             bnb_config = self._get_bnb_config(self.quant_type)
 
+            # ★ P6 实测 f16+sdpa 1.665 ms/层最佳，但**并非所有架构都支持**（remote-code 老架构会抛
+            #   ValueError）。这里**直接试**而不是靠常量探测 —— 探测在 5.17 下不经实测不敢依赖。
+            _attn_candidates = ("sdpa", "eager")
             load_kwargs: Dict[str, Any] = dict(
                 device_map="auto",
                 trust_remote_code=TRUST_REMOTE_CODE,
+                # ★ P6 实测 f16+sdpa 1.665 ms/层最佳；`_attn_impl` 由调用方按架构降级决定
+                #   （不支持的架构会用 "eager"，见下方 except 分支）。
+                attn_implementation=_attn_candidates[0],
             )
 
             if bnb_config is not None:
@@ -2284,7 +2523,24 @@ class ModelManager:
         t0 = time.time()
 
         logger.info(f"加载 PyTorch 模型路径: {path}")
-        self.model = AutoModelForCausalLM.from_pretrained(path, **load_kwargs)
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(path, **load_kwargs)
+        except (ValueError, TypeError) as exc:
+            # ⚠️ 老架构（remote code）不支持 sdpa ⇒ 回退 eager 重试一次
+            if load_kwargs.get("attn_implementation") != "eager":
+                logger.warning("⚠️ 该架构不支持 sdpa，回退 eager 重试：%s", str(exc)[:160])
+                load_kwargs = dict(load_kwargs, attn_implementation="eager")
+                self.model = AutoModelForCausalLM.from_pretrained(path, **load_kwargs)
+            else:
+                raise
+
+        # ★ A7/B7：transformers 5.x 下 remote-code 模型的「权重被 `_init_weights` 覆盖」守卫。
+        #   只在「transformers ≥5 且启用了 remote code」时执行 —— 4.x 无此缺陷（它有
+        #   `set_initialized_submodules()`），因此可省掉一次全区读取（Qwen-1.8B 约 3.5 GB）。
+        self._weight_guard_report = None
+        if TRUST_REMOTE_CODE and _is_transformers_5_or_newer():
+            self._weight_guard_report = _verify_and_repair_loaded_weights(self.model, path)
+
         self.tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=TRUST_REMOTE_CODE)
         self.layer_range = None
         self._layer_load_metrics = None
@@ -2456,6 +2712,29 @@ class ModelManager:
         # ★ A3：复用共享判定（排除 sliding_attention；不能只看「有无 layer_types」）
         return _is_hybrid_layer_types(getattr(text_cfg, "layer_types", None))
 
+    def _estimate_total_params(self) -> float | None:
+        """按 config 估算**整模**参数量（用于 compile 的规模门）。
+
+        为什么不用 `sum(p.numel() for p in self.model.parameters())`：**分层加载只物化本节点
+        的层段**（可能只有 12/24 层），直接求和会把大模型误判成小模型而错误跳过 compile。
+
+        近似式：`layers × (4·h² + 3·h·i)`（attention 约 4 个 h×h 投影 + MLP 三个 h×i 矩阵），
+        忽略 embedding/lm_head 与 hybrid 的 linear_attn 差异 —— 作为**数量级门槛**足够。
+        """
+        try:
+            cfg = getattr(getattr(self.model, "config", None), "text_config", None) or \
+                getattr(self.model, "config", None)
+            if cfg is None:
+                return None
+            layers = int(getattr(cfg, "num_hidden_layers", 0) or 0)
+            h = int(getattr(cfg, "hidden_size", 0) or 0)
+            i = int(getattr(cfg, "intermediate_size", 0) or 0)
+            if layers <= 0 or h <= 0 or i <= 0:
+                return None
+            return float(layers) * (4.0 * h * h + 3.0 * h * i)
+        except Exception:  # noqa: BLE001
+            return None
+
     def _maybe_apply_compile(self) -> None:
         """按与 ``_load_pytorch`` 相同的条件决定是否启用算子融合。
 
@@ -2475,6 +2754,22 @@ class ModelManager:
             logger.warning(
                 f"⚠️ torch.compile 与 {self.quant_type} 量化不兼容（实测慢 13%），已自动跳过。"
                 f"如需融合，请设置 QUANT_TYPE='fp16'。"
+            )
+            return
+        # ★ 规模门（2026-09-19 用户裁定）：编译的收益**只在 ≥1.5B 上稳定为正**。
+        #   ★ 2026-09-19 修正：旧依据（「0.5B/12 层反而慢约 6×」）是**误读** —— 那是把**约 6.45 s 的首次编译**
+        #     摊进了短 gen 的每步。实测（`bench_compile_fresh.py`，主仓 `forward_layers`/12 层/f16）：编译层循环
+        #     **稳态快 2.428×**（4.615 vs 11.204 ms/步），但**盈亏平衡 ≈979 步** ⇒ **门保留（结论对），理由改为
+        #     「小模型每步省得少、摊不平编译开销」**；更贴切的判据是**预期生成长度**。
+        #   （上游 84.2 vs 13.9 ms/step）—— 每层计算太轻时，编译的 guard/Python 开销压过
+        #   kernel 收益；而 2B/24 层同一开关实测 **快 2.698×**（逐 token 一致）。
+        #   1B 以内的小模型即便真能优化也会碰到边际效应 ⇒ 低于阈值直接跳过并告知。
+        approx_params = self._estimate_total_params()
+        if approx_params is not None and approx_params < COMPILE_MIN_PARAMS:
+            logger.warning(
+                "⚠️ 模型规模约 %.2fB < %.1fB ⇒ 自动跳过 torch.compile"
+                "（实测该规模下编译反而慢；见 COMPILE_MIN_PARAMS 注释）",
+                approx_params / 1e9, COMPILE_MIN_PARAMS / 1e9,
             )
             return
         if self._is_hybrid_architecture():
@@ -3130,6 +3425,11 @@ class ModelManager:
             raise ValueError("必须提供 input_ids 或 hidden_states 之一")
         if input_ids is not None and hidden_states is not None:
             raise ValueError("input_ids 和 hidden_states 不能同时提供")
+
+        # ★ B9：把「**空的** cache 对象」规范化成 None。调用方常传 `DynamicCache()`（而不是
+        #   `None`），此时 `len(cache) == 0` ⇒ 会报「KV cache 层数不匹配: cache=0, local=N」，
+        #   或（hybrid）直接 IndexError —— 两者报错都**不指向根因**。视同 None 由本方法自建即可。
+        past_key_values = _normalize_past_key_values(past_key_values)
 
         model_type = str(getattr(self.model.config, "model_type", "") or "").lower()
         if model_type == "qwen":

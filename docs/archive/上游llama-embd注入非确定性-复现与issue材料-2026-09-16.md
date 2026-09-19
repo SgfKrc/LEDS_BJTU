@@ -565,10 +565,50 @@ QLH_NO_POS_FIX=1 $BIN/llama-relay-check.exe H:/qlh_models/Qwen-1_8B-Chat.Q4_K_M.
 - 重跑此前被"非确定性"阻断的 D→L 正式实验，重新给出准入证据；
 - 回复上游：**仅做独立复现确认**，草稿见 `local_docs/给上游的回复草稿-embd-pos越界-2026-09-16.md`。
 
+### 13.8 上游社区状态追踪（2026-09-19 核查）
+
+本节追踪与本仓库 #28963 同源的上游讨论。**四个线程共用同一条根因链**：`llama_batch_allocr::ubatch_add`
+在 M-RoPE 模型 + `embd` 批次时按 `n_pos_per_embd * n_tokens`（典型 = 4×）读 `pos`，而
+`include/llama.h:248` 只承诺 `n_tokens` 项。
+
+| 线程 | 类型 | 状态 | 作者 | 摘要 |
+| --- | --- | --- | --- | --- |
+| **#28441** | issue | **closed** | `ardan-bkennedy` | 现场案例：Kronk(Go) + Qwen2.5-Omni Q8 + Metal，750-token 音频 prefill 间歇性静默损坏。实测 `llama_batch_init(750, 2048, 1)` → `pos` 750 项(3000B)，llama.cpp 读 3000 项(12000B) → **越界 9000B**；改分配 `n_tokens*4` 后 4 次全新进程均相干并到 EOS |
+| **#28902** | issue | **open** | `devYRPauli` | 根因定位：`src/llama-batch.cpp:786-787` 的读越界；**两条路径** —— ① 调用方照文档分配；② `pos == NULL` 时库内 fallback(`llama-batch.cpp:91` `pos.resize(n_tokens)`)同样越界，**调用方无法避免** |
+| **#28910** | **PR** | **open**（`mergeable=True`，未合并） | `shashb27` | **修复路径②**：fallback 尺寸改为 `n_tokens * n_pos_per_embd`，各 section 填同一自增序列；并在 `llama.h` 文档化 embedding 批次的 `pos` 布局。`+39 -3`，3 文件。分支 `fix/28902-mrope-auto-pos-overread` |
+| **#28963** | issue | **open** | **`SgfKrc`（本仓库）** | 我们的原始报告：CPU 后端 `llama_batch.embd` 解码非确定性、token 路径逐位确定。`mitoyosh` 独立复现并定位同一根因；我们随后在 Windows/MSYS2 + Qwen3.5-2B 上独立确认修复有效（141/141，cosine min = 1.000000） |
+
+**交叉独立验证证据**：
+
+| 来源 | 平台 | 方法 | 结果 |
+| --- | --- | --- | --- |
+| `devYRPauli`（#28910 评论） | macOS arm64，`-DLLAMA_SANITIZE_ADDRESS=ON` | 三棵树的对照构建 | master 未改 rc=0(30 tests)；**只加测试 rc=134（ASan heap-buffer-overflow @ `llama-batch.cpp:787`）**；加完整 PR rc=0(31 tests) |
+| `mitoyosh`（#28902 评论） | Apple clang 21 / arm64，ASan，mock-vocab 单元测试 | 无模型参与 | 同样在 `ubatch_add` 报 heap-buffer-overflow（8-byte 区域后越界读） |
+| `mitoyosh`（#28963 评论） | Debian 13 x86-64，CPU build `930e2fa`，`n_threads=1`，flash attn off，Qwen3.5-0.8B BF16 | 同形状探针 | 复现我们的现象（embd 5 次运行 `bitwise_equal=NO`，`max_abs_diff` 1.85–2.4）并给出根因 |
+| **本仓库**（#28963 评论） | Windows 11 x86-64 / MSYS2 UCRT64 g++ 15.2.0 / CPU / Qwen3.5-2B f16（`dimension_sections` 4 项 → `n_pos_per_embd=4`） | 按对方所述调用方修复 | 修复前 argmax **126/141**、cosine 0.85–0.99 → 修复后 **141/141**、**cosine min = 1.000000** |
+
+**⚠️ 修复的覆盖面（关键）**：#28910 **只修路径②（`pos == NULL` 的库内 fallback）**。
+「路径①」（调用方按 `include/llama.h:248` 的文档分配 `n_tokens`）被作者明确留作
+**「maintainer decision」**（API 语义问题）—— 即 **header 承诺的尺寸与实际读取的尺寸不一致**这一点，
+截至 2026-09-19 仍未被上游以代码形式解决。
+
+**对 QLH 的含义**：
+
+1. **本仓库的调用方补丁仍然必要**（§13.2 / §8）：在 M-RoPE 模型上使用 `embd` 批次时，`pos` 必须按
+   `n_pos_per_embd * n_tokens` 提供。§13.4 待办中「若上游在库侧修复，本地补丁即可移除」——
+   **目前只对 `pos == NULL` 的调用方成立；我们走的是显式 `pos`，仍须保留补丁**。
+2. **「同一循环的孪生情形」判断已被上游独立坐实**（§13.1 中我们提出的表述），且同一根因还波及
+   **MTMD 图像 embedding** 与 **Metal 多模态** —— 说明该缺陷的影响面比我们最初报告的 CPU 文本场景更广。
+3. 追踪状态（截至 2026-09-19）：**#28910 尚未有维护者表态**，5 条评论均为 bot 检查 + 贡献者互验。
+
+**数据来源**：GitHub REST API（`api.github.com/repos/ggml-org/llama.cpp/{issues,pulls}/{28441,28902,28910,28963}`
+及其 `/comments`），核查时间 2026-09-19。
+
 ## 变更记录
 
 | 日期 | 变更 |
 | --- | --- |
+| 2026-09-19 | **新增 §13.8 上游社区状态追踪**（核查 `api.github.com`）：确认 **#28963 与 #28441 / #28902 / #28910 共用同一条根因链**（`ubatch_add` 在 M-RoPE + `embd` 批次按 `4×n_tokens` 读 `pos`，而 `llama.h:248` 只承诺 `n_tokens`）。记录 #28441 现场数据（Kronk + Qwen2.5-Omni + Metal，越界 9000B）、#28902 的两条路径、**#28910 PR 当前 `open`/`mergeable`/未合并**，以及四方（`devYRPauli` / `mitoyosh` / `shashb27` / 本仓库）的独立验证证据。**结论修正**：§13.4「若上游库侧修复即可移除本地补丁」**只对 `pos == NULL` 成立** —— #28910 仅修路径②，我们走显式 `pos`，**补丁必须保留**；「路径①」被作者留作 maintainer decision，截至核查日未被代码解决。 |
 | 2026-09-16 | 新建：把 §7.10/§7.11 发现的 `embd` 非确定性整理成可提交的 issue 材料。含环境、最小复现探针（自包含源码）、16 项实验数据、逐层定位（分叉始于第一个 full-attention 层、需要 >1 token）、7 条已排除成因、候选假设、QLH 侧绕开口径、pin 版本与打补丁流程、英文 issue 正文草稿。**根因未坐实，本轮不提供上游修复补丁**；曾尝试的"清零 `inp->tokens`"已回退，工作树干净。 |
 | 2026-09-16 | **补实验 #17/#18（增量注入）**：新增 `relay-incr-probe`（整段注入 vs 逐 token 增量注入对比）→ **增量注入同样逐位不等**（cosine 0.994），"改用更细注入粒度即可复现"的期望**被证伪**；并据此细化定位为"**pos = 0 单 token 确定、pos ≥ 1（有历史状态）单 token 不确定**"。同步更新 §8 绕开口径（可复现性只能靠 argmax / 单进程口径）与提交指引。 |
 | 2026-09-16 | **issue 已提交**：[ggml-org/llama.cpp#28963](https://github.com/ggml-org/llama.cpp/issues/28963)（作者 `SgfKrc`，`open`，0 评论）—— `Misc. bug: CPU backend: llama_batch.embd (embedding input) decoding is non-deterministic`。 |

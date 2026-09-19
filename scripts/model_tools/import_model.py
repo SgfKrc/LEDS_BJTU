@@ -72,7 +72,9 @@ def download_model(repo_or_path: str, target: Path, *, use_modelscope: bool = Fa
             previous = {key: os.environ.get(key) for key in keys}
             try:
                 os.environ.update({key: environment[key] for key in keys})
-                huggingface_hub.snapshot_download(repo_id=repo_or_path, local_dir=str(target), local_dir_use_symlinks=False)
+                # 注：`local_dir_use_symlinks` 在 huggingface_hub **1.x 已被移除**；1.x 会把它 pop 掉
+                # 并给警告（不会 TypeError），且默认行为就是不再使用 symlink ⇒ 直接不传。
+                huggingface_hub.snapshot_download(repo_id=repo_or_path, local_dir=str(target))
             finally:
                 for key, value in previous.items():
                     if value is None:

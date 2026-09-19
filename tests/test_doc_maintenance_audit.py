@@ -326,9 +326,15 @@ def test_real_repo_scan_is_read_only_and_fast():
     assert out["docs"]
     # 只读性：扫描前后 docs/ 工作区状态一致（不产生/清除任何改动）
     assert docs_status() == before, "扫描改变了 docs/ 工作区状态"
-    # 至少一类 warn 命中（对当前仓库必然成立：存在已知遗留模式）
-    all_findings = [f for d in out["docs"] for f in d["findings"]]
-    assert any(f["level"] == "warn" for f in all_findings)
+    # ⚠️ 2026-09-19 更正：原断言是「至少一类 warn 命中（对当前仓库必然成立）」，但该前提
+    #    已被**文档整肃**打破——旧结论不再「保留+划掉」，warn 因此归零。
+    #    ⇒ 这里改为「**允许 0 warn**，但若出现必须是合法 level」，同时用**构造输入**保证
+    #      扫描器**仍能识别 warn**（见本文件里的定向用例），避免这条只读烟雾验证变成空断言。
+    # ⚠️ 2026-09-19 更正：原断言是「至少一类 warn 命中（**对当前仓库必然成立**）」，但该前提已被
+    #    **文档整肃**打破 —— 旧结论不再「保留+划掉」，而是挪入汇总的「已推翻结论」清单，warn 因此归零。
+    #    ⇒ 本**只读烟雾验证**只负责「扫描跑通 + 只读 + 规则指纹稳定」；「扫描器仍能识别 warn」
+    #      由本文件里**构造输入**的定向用例保证（不依赖仓库现状，避免空断言）。
+    assert all(f["level"] for f in [x for d in out["docs"] for x in d["findings"]])
     assert len(out["rules_fingerprint"]) == 64
     assert out["rules"] == {
         "R1": "完成未收口", "R2": "未提交登记", "R3": "状态行滞后",

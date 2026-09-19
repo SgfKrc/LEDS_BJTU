@@ -283,12 +283,25 @@ def execute_request(
         return result
     except Qwen3MultimodalPreflightError as exc:
         result["status"] = "processor_contract_rejected"
-        result["errors"] = [{"code": "processor_contract_rejected", "message": exc.__class__.__name__}]
+        result["errors"] = [{"code": "processor_contract_rejected",
+                             "message": _debug_message(exc)}]
         return result
     except Exception as exc:
         result["status"] = "processor_smoke_failed"
-        result["errors"] = [{"code": "processor_construction_failed", "message": exc.__class__.__name__}]
+        result["errors"] = [{"code": "processor_construction_failed",
+                             "message": _debug_message(exc)}]
         return result
+
+
+def _debug_message(exc: BaseException) -> str:
+    """错误信息：默认只给**类名**（fail-closed，不把内部路径/细节带进控制面响应）。
+
+    设 `QLH_MM_DEBUG=1` 时附带异常文本，便于本地定位 ——
+    例如 5.17 的 `pixel_values` 形状变化会让下游契约拒绝，但只给类名时无从下手。
+    """
+    if os.environ.get("QLH_MM_DEBUG", "").strip() in {"1", "true", "yes"}:
+        return f"{exc.__class__.__name__}: {exc}"
+    return exc.__class__.__name__
 
 
 def main() -> int:

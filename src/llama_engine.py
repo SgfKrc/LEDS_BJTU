@@ -70,6 +70,41 @@ def _merge_stop_sequences(stop: List[str] = None) -> List[str]:
     return merged
 
 
+def _new_llama_with_seq_max(load_kwargs: Dict[str, Any], n_seq_max: Optional[int] = None):
+    """构造 `llama_cpp.Llama`，可选地把 context 的 `n_seq_max` 抬到指定值。
+
+    为什么需要：`llama-cpp-python` 的 `Llama.__init__` **只在 `embedding=True` 时**才设置
+    `context_params.n_seq_max`（源码 :341-346）⇒ 非 embedding 时它保持 llama.cpp 的默认值 1 ⇒
+    **任何 `seq_id > 0` 的 `llama_batch` 都会 `llama_decode rc=-1`**，多序列（批量交叠）无法使用。
+
+    绕法：`Llama.__init__:253` 经**模块级** `llama_cpp.llama_cpp.llama_context_default_params()` 取默认
+    params ⇒ 在建 context **之前**临时替换该函数即可。这里用 `try/finally` 严格恢复，
+    并保持其余 `load_kwargs` 语义完全不变（`n_seq_max=None` 时行为与直接 `Llama(**load_kwargs)` 一致）。
+
+    ⚠️ 若同时走 RPC 路径（`patched_llama_loader`），本函数只包住 `Llama(...)` 构造，
+    与注入器的 patch 是**并列**关系，不改变其顺序语义。
+    """
+    from llama_cpp import Llama
+
+    if n_seq_max is None:
+        return Llama(**load_kwargs)
+
+    import llama_cpp.llama_cpp as _lc
+
+    original_default_params = _lc.llama_context_default_params
+
+    def _patched_default_params():
+        params = original_default_params()
+        params.n_seq_max = max(int(n_seq_max), int(params.n_seq_max))
+        return params
+
+    _lc.llama_context_default_params = _patched_default_params
+    try:
+        return Llama(**load_kwargs)
+    finally:
+        _lc.llama_context_default_params = original_default_params
+
+
 class LlamaCppEngine:
     """
     llama.cpp 推理引擎 — 面向 CPU / 集显环境优化。
@@ -217,6 +252,7 @@ class LlamaCppEngine:
         rpc_worker_log: str | None = None,
         rpc_split: float | str | List[float] | None = None,
         align_numerics: bool = False,
+        n_seq_max: int | None = None,
         **kwargs,
     ) -> None:
         """
@@ -227,7 +263,14 @@ class LlamaCppEngine:
             n_ctx: 上下文窗口大小（默认 4096，边缘设备建议 2048）
             n_threads: CPU 推理线程数（默认自动检测：物理核心数）
             chat_format: 对话格式（默认自动检测，Qwen 用 "chatml"）
-            **kwargs: 透传给 `llama_cpp.Llama` 的额外参数。经实测（llama-cpp-python 0.3.35）
+                align_numerics: 跨路径数值对齐（关闭 CPU_REPACK，使 RPC 与本机 no-repack 逐比特一致）。
+            n_seq_max: ★ 抬升 context 的并行序列上限（**多序列 / 批量交叠**所必需）。
+                默认 None ⇒ 行为与旧版完全一致（llama.cpp 默认 1）。**为什么需要**：
+                `llama-cpp-python` 的 `Llama.__init__` 只在 `embedding=True` 时设置它
+                （源码 :341-346）⇒ 非 embedding 时任何 `seq_id > 0` 的批次都会
+                `llama_decode rc=-1`。本实现经模块级 `llama_context_default_params()`
+                在建 context 前注入，并在 `finally` 恢复（见 `_new_llama_with_seq_max`）。
+        **kwargs: 透传给 `llama_cpp.Llama` 的额外参数。经实测（llama-cpp-python 0.3.35）
                 可用且与本项目的容量/放置相关者：
 
                 * `tensor_split` / `main_gpu` / `split_mode` —— 多设备切分；
@@ -349,7 +392,7 @@ class LlamaCppEngine:
                     tensor_split=split,
                     use_extra_bufts=False if align_numerics else None,
                 ):
-                    self._model = Llama(**load_kwargs)
+                    self._model = _new_llama_with_seq_max(load_kwargs, n_seq_max)
                 engine_label = "llama.cpp (RPC)"
                 engine_detail = "devices=" + ",".join(
                     (["CPU"] if split is not None else [])
@@ -370,11 +413,11 @@ class LlamaCppEngine:
                 if align_numerics:
                     from llama_rpc_device import patched_model_params
                     with patched_model_params(use_extra_bufts=False):
-                        self._model = Llama(**load_kwargs)
+                        self._model = _new_llama_with_seq_max(load_kwargs, n_seq_max)
                     engine_detail = "use_extra_bufts=False(repack off)"
                     logger.info("  数值对齐: use_extra_bufts=False —— 关闭 CPU_REPACK")
                 else:
-                    self._model = Llama(**load_kwargs)
+                    self._model = _new_llama_with_seq_max(load_kwargs, n_seq_max)
                     engine_detail = ""
                 engine_label = "llama.cpp (CPU)"
 
@@ -1392,6 +1435,166 @@ class LlamaCppEngine:
         if self._loaded:
             info["memory"] = self.get_memory_usage()
         return info
+
+    def forward_layers_to_hidden(self, input_ids, n_past: int = 0,
+                                   all_positions: bool = False):
+        """★ 层接力上游入口（2026-09-19）：只跑**本模型（裁层 GGUF = 前 k 层）**的层，
+        返回**末位 hidden**（`np.float32`，长度 `n_embd`）。
+
+        与 `forward_layers_from_hidden()`（吃 hidden）对称，两者合起来让 **llama 也能当上游**，
+        从而支持「**交换上下游**」：llama 上游 → torch 下游
+        （`model_module.forward_layers(hidden_states=..., apply_lm_head=...)` 原生支持从 hidden 起算）。
+
+        实现走 llama.cpp 的 embeddings 通道：`llama_set_embeddings(ctx, True)` ⇒ decode ⇒
+        `llama_get_embeddings_ith(ctx, -1)`。
+
+        Args:
+            input_ids: token id 序列（list / 1D array）。
+            n_past: KV 里已有的位置数（接力首步传 0）。
+            all_positions: True 时返回**每个位置**的 hidden（`[n_tokens, n_embd]`），
+                上游 **prefill 必须**用它（下游要整段）；False（默认）只返回末位。
+
+        Returns:
+            末位 hidden 的 `np.ndarray`（长度 n_embd），或 `None`（未加载）。
+        """
+        if not self.is_loaded:
+            return None
+        import numpy as np
+        import llama_cpp.llama_cpp as M
+
+        llm = self._model
+        native_model = getattr(getattr(llm, "_model", None), "model", None)
+        native_ctx = getattr(getattr(llm, "_ctx", None), "ctx", None)
+        if native_model is None or native_ctx is None:
+            raise RuntimeError("llama_engine: 取不到原生 llama_model / llama_context")
+
+        toks = [int(t) for t in np.asarray(input_ids).reshape(-1).tolist()]
+        n_tokens = len(toks)
+        if n_tokens == 0:
+            raise ValueError("input_ids 不能为空")
+        n_embd = int(M.llama_model_n_embd(native_model))
+
+        # 开启 embeddings 通道（否则 llama_get_embeddings_ith 返回空指针）
+        M.llama_set_embeddings(native_ctx, True)
+        batch = M.llama_batch_init(n_tokens, 0, 1)
+        try:
+            for i, tid in enumerate(toks):
+                batch.token[i] = tid
+                batch.n_seq_id[i] = 1
+                batch.seq_id[i][0] = 0
+                batch.logits[i] = 0          # 上游不需要 logits，只要 hidden
+                batch.pos[i] = int(n_past) + i
+            batch.n_tokens = n_tokens
+            rc = M.llama_decode(native_ctx, batch)
+            if rc != 0:
+                raise RuntimeError(f"llama_decode 失败 rc={rc}")
+            if all_positions:
+                rows = []
+                for i in range(n_tokens):
+                    p = M.llama_get_embeddings_ith(native_ctx, i)
+                    if not p:
+                        raise RuntimeError(
+                            f"llama_get_embeddings_ith({i}) 返回空（embeddings 通道未生效？）")
+                    rows.append(np.ctypeslib.as_array(p, shape=(n_embd,)).copy())
+                return np.stack(rows, axis=0)          # [n_tokens, n_embd]
+            emb_ptr = M.llama_get_embeddings_ith(native_ctx, n_tokens - 1)
+            if not emb_ptr:
+                raise RuntimeError("llama_get_embeddings_ith 返回空（embeddings 通道未生效？）")
+            return np.ctypeslib.as_array(emb_ptr, shape=(n_embd,)).copy()
+        finally:
+            M.llama_batch_free(batch)
+
+    def forward_layers_from_hidden(self, hidden, n_past: int = 0,
+                                   seq_ids: Optional[list] = None,
+                                   positions: Optional[list] = None,
+                                   all_logits: bool = False):
+        """★ 层接力下游入口（2026-09-19）：把**上游 hidden** 注入 llama.cpp 的 `embd` 通道，
+        只跑**本模型（裁层 GGUF）的层**，返回末位 logits。
+
+        为什么需要：QLH 的跨框架层接力（D→L / L→L）此前**只有实验脚本**用裸 `llama_cpp` API
+        实现（`build/cross-framework-layer-poc/relay_mainrepo_upstream.py`），主仓
+        `llama_engine` **没有入口** —— 与 D21 票面「生产接线后置」吻合。本方法把下游接回主仓，
+        使「上下游都走主仓引擎」成立（上游＝`model_module.forward_layers`）。
+
+        Args:
+            hidden: 形状 `[n_tokens, n_embd]`（或 1D）的上游 `hidden_states`；内部转 f32。
+            n_past: 本模型 KV 里已有的位置数（接力首步传 0）。**仅在 `positions` 为 None 时使用。**
+            seq_ids: ★ **多序列（批量交叠）**：长度 `n_tokens` 的序列号列表；None ⇒ 全部为 0（单序列，
+                与旧行为一致）。多条序列须使用**互不相同**的 id。
+            positions: ★ 每个 token 的 KV 位置列表；None ⇒ `[n_past, n_past+1, ...]`（旧行为）。
+                多序列交错推进时必须由调用方显式给出。
+            all_logits: True ⇒ 返回**每个 token** 的 logits（形状 `[n_tokens, n_vocab]`）；
+                False（默认）⇒ 只返回末位（形状 `[n_vocab]`，与旧行为一致）。
+                多序列下需自行按 `seq_ids` 取末位。
+
+        Returns:
+            末位 logits（或全部，见 `all_logits`）的 `np.ndarray`，或 `None`（未加载）。
+
+        ⚠️ **KV 位置由调用方管理**：本方法**直接在 KV 里占 `[n_past, n_past+n_tokens)`**；
+        接力 decode 的常规用法是逐步推进 `n_past`。若要在**同一位置**重跑，先
+        `self._model._ctx.kv_cache_clear()` —— 注意 `reset_kv_cache()` 是既有的 stateless
+        no-op，**不能**用来清这里的 KV；同 `n_past` 重跑会得到 `llama_decode rc=-1`。
+        """
+        if not self.is_loaded:
+            return None
+        import ctypes
+
+        import numpy as np
+        import llama_cpp.llama_cpp as M
+
+        llm = self._model                                    # llama_cpp.Llama
+        # ⚠️ 实测（probe_llama_handles.py）：`llm._model` 是 `LlamaModel` 包装，
+        #    **不能**直接喂给 `llama_*` C 函数（报 ctypes ArgumentError: wrong type）；
+        #    原生 `llama_model_p` 是它的 `.model` 属性。`llm._ctx.ctx` 即原生 context。
+        native_model = getattr(getattr(llm, "_model", None), "model", None)
+        native_ctx = getattr(getattr(llm, "_ctx", None), "ctx", None)
+        if native_model is None or native_ctx is None:
+            raise RuntimeError("llama_engine: 取不到原生 llama_model / llama_context")
+
+        h = np.ascontiguousarray(np.asarray(hidden, dtype=np.float32))
+        if h.ndim == 1:
+            h = h[None, :]
+        n_tokens = int(h.shape[0])
+        n_embd = int(M.llama_model_n_embd_inp(native_model))
+        if h.shape[1] != n_embd:
+            raise ValueError(f"hidden 宽度 {h.shape[1]} != 模型 n_embd {n_embd}")
+
+        # ★ 多序列（批量交叠）：None 时退化为旧的单序列行为，保证向后兼容。
+        if seq_ids is None:
+            seq_list = [0] * n_tokens
+        else:
+            seq_list = [int(s) for s in seq_ids]
+            if len(seq_list) != n_tokens:
+                raise ValueError(f"seq_ids 长度 {len(seq_list)} != n_tokens {n_tokens}")
+        if positions is None:
+            pos_list = [int(n_past) + i for i in range(n_tokens)]
+        else:
+            pos_list = [int(p) for p in positions]
+            if len(pos_list) != n_tokens:
+                raise ValueError(f"positions 长度 {len(pos_list)} != n_tokens {n_tokens}")
+
+        batch = M.llama_batch_init(n_tokens, n_embd, 1)
+        try:
+            for i in range(n_tokens):
+                batch.n_seq_id[i] = 1
+                batch.seq_id[i][0] = seq_list[i]
+                # ★ 每个 token 都可能是「某条序列的末位」⇒ logits 全开（下游只跑少数 token，开销可接受）
+                batch.logits[i] = 1
+                batch.pos[i] = pos_list[i]
+            batch.n_tokens = n_tokens
+            ctypes.memmove(batch.embd, h.ctypes.data, h.nbytes)
+            rc = M.llama_decode(native_ctx, batch)
+            if rc != 0:
+                raise RuntimeError(f"llama_decode 失败 rc={rc}")
+            n_vocab = int(M.llama_vocab_n_tokens(M.llama_model_get_vocab(native_model)))
+            if all_logits:
+                rows = [np.ctypeslib.as_array(M.llama_get_logits_ith(native_ctx, i),
+                                              shape=(n_vocab,)).copy() for i in range(n_tokens)]
+                return np.stack(rows, 0)
+            logits_ptr = M.llama_get_logits_ith(native_ctx, n_tokens - 1)
+            return np.ctypeslib.as_array(logits_ptr, shape=(n_vocab,)).copy()
+        finally:
+            M.llama_batch_free(batch)
 
     def reset_kv_cache(self) -> None:
         """

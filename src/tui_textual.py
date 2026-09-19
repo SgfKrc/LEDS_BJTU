@@ -10,8 +10,8 @@
 
 启动体验（2026-09-17 用户要求）：
 
-* **标题页与启动条合体**：LOGO 下方紧跟一条跑马灯启动条 + 状态行，不再"先纯文本等待、
-  再进 TUI"两段式；
+* **标题页与启动条合体**：LOGO 下方依次显示快速流式副标题、跑马灯启动条和状态行，
+  副标题为 ``Lightweight Edge Distributed Inference System``，不再"先纯文本等待、再进 TUI"两段式；
 * 状态文案统一以 **「少女祈祷中：」** 开头（避免与标题 ``Koakuma`` 重复）；
 * 后端冷启动（``BackendSupervisor.ensure_ready``）在启动屏的 worker 线程里执行，
   阶段文本实时反映到启动条下方。
@@ -102,10 +102,13 @@ LOGO = (
 
 #: 启动行前缀（用户 2026-09-17 指定：不用 "Koakuma:"，避免与标题重复）
 SPLASH_PREFIX = "少女祈祷中："
+SPLASH_SUBTITLE = "Lightweight Edge Distributed Inference System"
 BAR_WIDTH = 30
 BAR_MARQUEE = 9
 BAR_BLOCK = "█"
 BAR_EMPTY = "░"
+SUBTITLE_TICK_SECONDS = 0.025
+SUBTITLE_CHARS_PER_TICK = 3
 
 # The backend's distributed read projections can legitimately wait for a
 # remote node.  Keep the fast default for health/core reads, but don't turn a
@@ -131,6 +134,7 @@ Screen { background: $surface; }
 
 /* ---------------------------------------------------------------- 启动屏 */
 #splash-logo { color: #8fa8c4; text-align: center; padding: 1 0 0 0; }
+#splash-subtitle { color: $text-muted; text-align: center; padding: 0 0 0 0; }
 #splash-bar { color: #6b8aa8; text-align: center; padding: 1 0 0 0; }
 #splash-status { color: $text; text-align: center; padding: 0 0 1 0; }
 #splash-hint { text-align: center; color: $text-disabled; }
@@ -241,19 +245,37 @@ class SplashScreen(Screen):
         self.splash_status = status
         self.wait_for_backend = bool(wait_for_backend)
         self.bar_pos = 0
+        self.subtitle_pos = 0
 
     # ------------------------------------------------------------ 渲染
 
     def compose(self) -> ComposeResult:
         yield Static(LOGO, id="splash-logo")
+        yield Static(self.subtitle_text(), id="splash-subtitle")
         yield Static(self.bar_text(), id="splash-bar")
         yield Static(self.status_line(), id="splash-status")
         yield Static("q / ctrl+c 退出 · 任意键进入", id="splash-hint")
 
     def on_mount(self) -> None:
         self.set_interval(0.09, self.tick_bar)
+        self.set_interval(SUBTITLE_TICK_SECONDS, self.tick_subtitle)
         if not self.wait_for_backend:
             self.set_timer(0.6, self.action_finish)
+
+    def subtitle_text(self) -> str:
+        return SPLASH_SUBTITLE[:self.subtitle_pos]
+
+    def tick_subtitle(self) -> None:
+        if self.subtitle_pos >= len(SPLASH_SUBTITLE):
+            return
+        self.subtitle_pos = min(
+            len(SPLASH_SUBTITLE),
+            self.subtitle_pos + SUBTITLE_CHARS_PER_TICK,
+        )
+        try:
+            self.query_one("#splash-subtitle", Static).update(self.subtitle_text())
+        except Exception:  # noqa: BLE001 - 启动屏可能尚未挂载
+            pass
 
     def bar_text(self) -> str:
         cells = [BAR_EMPTY] * BAR_WIDTH
@@ -458,7 +480,22 @@ class ChatPane(Vertical):
             value = text.split(" ", 1)[1].strip().lower()
             self.app.show_thinking = value in {"on", "1", "true", "yes"}
             self.query_one("#chat-status", Static).update(
-                f"thinking → {'on' if self.app.show_thinking else 'off'}")
+                f"thinking 展示 → {'on' if self.app.show_thinking else 'off'}")
+            return
+        if text.startswith("/reasoning "):
+            value = text.split(" ", 1)[1].strip().lower()
+            if value in {"auto", "default", "none"}:
+                self.app.enable_thinking = None
+            elif value in {"on", "1", "true", "yes"}:
+                self.app.enable_thinking = True
+            elif value in {"off", "0", "false", "no"}:
+                self.app.enable_thinking = False
+            else:
+                self.query_one("#chat-status", Static).update(
+                    "[red]用法: /reasoning on|off|auto")
+                return
+            state = {None: "auto", True: "on", False: "off"}[self.app.enable_thinking]
+            self.query_one("#chat-status", Static).update(f"reasoning → {state}")
             return
         if text == "/cancel":
             generation = getattr(self.app, "generation_id", None)
@@ -727,6 +764,7 @@ class ChatPane(Vertical):
                 generation_id=getattr(app, "generation_id", None),
                 routing_preference=app.routing_preference,
                 show_thinking=app.show_thinking,
+                enable_thinking=app.enable_thinking,
             ):
                 if payload.get("start"):
                     if payload.get("generation_id"):
@@ -986,6 +1024,7 @@ class MainScreen(Screen):
             + kv("日志 Token", "已设置" if api.log_token else "未设置（聚合日志可能需要 --log-token）") + "\n"
             + kv("路由偏好", self.app.routing_preference) + "\n"
             + kv("thinking", "on" if self.app.show_thinking else "off") + "\n"
+            + kv("reasoning", {None: "auto", True: "on", False: "off"}[self.app.enable_thinking]) + "\n"
             + "\n" + self.about_text()
         )
 
@@ -2618,17 +2657,23 @@ class KoakumaApp(App):
     """统一交互入口的 Textual 实现。"""
 
     TITLE = "Koakuma"
-    SUB_TITLE = "QLH 分布式边缘推理"
+    SUB_TITLE = SPLASH_SUBTITLE
     CSS = CSS
 
     def __init__(self, api: ApiClient, *, interval: float = 5.0,
                  routing_preference: str = "auto", show_thinking: bool = False,
+                 enable_thinking: Optional[bool] = None,
                  supervisor: Any = None) -> None:
         super().__init__()
         self.api = api
         self.interval = float(interval)
         self.routing_preference = routing_preference
         self.show_thinking = show_thinking
+        #: ★ 深度思考**开关**（None=auto 沿用模板默认 / True=强制思考 / False=强制不思考）。
+        #:  与 `show_thinking`（仅控制 UI 是否显示）语义不同：本项**改变模型行为** ——
+        #:  False 时引擎会经 chat template 的 `enable_thinking=False` **真正阻止**生成 `<think>`
+        #:  （省算力），而不是靠事后剥离（后者依赖模板含 `<think>` 且能找到 `</think>`）。
+        self.enable_thinking: Optional[bool] = enable_thinking
         #: 传入 BackendSupervisor 即在启动屏内完成冷启动（LOGO + 启动条同屏反馈）
         self.supervisor = supervisor
         self.session_id: Optional[str] = None
@@ -2705,6 +2750,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--interval", type=float, default=5.0)
     parser.add_argument("--route", default="auto")
     parser.add_argument("--thinking", action="store_true")
+    parser.add_argument(
+        "--reasoning", choices=["on", "off", "auto"], default="auto",
+        help="深度思考开关（改变模型行为）：on/off/auto（默认沿用模型模板）",
+    )
     parser.add_argument("--log-token", default="", help="remote log API token")
     return parser.parse_args(argv)
 
@@ -2713,6 +2762,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     return run(args.host, args.port, interval=args.interval,
                routing_preference=args.route, show_thinking=args.thinking,
+               enable_thinking={"on": True, "off": False, "auto": None}.get(args.reasoning),
                log_token=args.log_token)
 
 

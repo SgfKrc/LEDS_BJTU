@@ -16,7 +16,7 @@
 
 交互外壳 `src/tui_textual.py`（Textual）是 QLH 的统一终端面，覆盖 **9 个功能屏 + 1 个调试兜底屏**：聊天、状态、模型、分布式、节点、队列、日志、设备、设置、调试。功能屏直接提供领域操作；调试屏只用于尚未形成专用交互的 JSON 合同。分布式与容量数据取自集群只读端点（`/cluster/resources`、`/cluster/layers`、`/cluster/pipeline-capacity` 等），适用于无浏览器环境（SSH、服务器、树莓派等），支持 Windows 10+ / Linux / macOS。
 
-页面通过 HTTP 与后端 API 交互（默认 `http://127.0.0.1:8000/api`）；本机统一入口会在当前进程内按需启动后端并等待健康检查，远程地址只探测目标后端。交互模式默认使用 **Textual 外壳**（`src/tui_textual.py`，2026-09-17 起）：启动屏把 **Koakuma 大标题与启动条放在一起**（标题灰蓝 `#8fa8c4`，条在标题正下方），冷启动阶段以「**少女祈祷中：<阶段>**」实时反馈（检查本地后端 → 加载后端组件 → 启动 API 服务 → 等待健康检查），就绪后自动进入主界面。后端控制台日志不会穿透 TUI，仍保留在 `logs/` 及日志屏中。
+页面通过 HTTP 与后端 API 交互（默认 `http://127.0.0.1:8000/api`）；本机统一入口会在当前进程内按需启动后端并等待健康检查，远程地址只探测目标后端。交互模式默认使用 **Textual 外壳**（`src/tui_textual.py`，2026-09-17 起）：启动屏把 **Koakuma 大标题、副标题和启动条放在一起**，副标题为 `Lightweight Edge Distributed Inference System`，并以较快的逐字动画显示；标题灰蓝 `#8fa8c4`，条在副标题下方。冷启动阶段以「**少女祈祷中：<阶段>**」实时反馈（检查本地后端 → 加载后端组件 → 启动 API 服务 → 等待健康检查），就绪后自动进入主界面。后端控制台日志不会穿透 TUI，仍保留在 `logs/` 及日志屏中。
 
 > **旧标准库 TUI 已归档（2026-09-17）**：`src/tui_admin.py`（3247 行）、`tui_chat_screen.py`、`tui_splash.py`、`tui_chat.py`、走查脚本 `scripts/tui_walkthrough.py` 及其专属测试已移入 `_to_delete/`（该目录不入库，可随时取回）——自绘 ANSI 在真实 conhost 下实测不可见。交互面由 Textual 承担；单命令面由**只读薄层** `src/tui_commands.py` 承担。
 

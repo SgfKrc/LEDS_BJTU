@@ -434,6 +434,7 @@ from model_host import SchedulerCallbackSet, model_host
 from koakuma_engine import (
     Capability,
     accepted_backend_requests,
+    backend_capabilities,
     backend_id_for,
     registered_backends,
     runtime_supports,
@@ -1086,6 +1087,16 @@ class ChatRequest(BaseModel):
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     top_p: float = Field(default=0.9, ge=0.0, le=1.0)
     show_thinking: bool = Field(default=False, description="启用深度思考展示")
+    enable_thinking: Optional[bool] = Field(
+        default=None,
+        description=(
+            "★ 深度思考「开关」（区别于 show_thinking 的「展示」）："
+            "True=强制开启、False=强制关闭、None=沿用模型模板默认。"
+            "对支持关闭思考的模型（如 Qwen3，模板 qwen3_chat_v1）传 False 可真正阻止其生成 "
+            "thinking 内容（省算力），而不是事后把已生成的内容丢掉。"
+            "注意：仅对声明了 enable_thinking 模板的模型生效，其余模型忽略。"
+        ),
+    )
     streaming_mode: str = Field(
         default="full",
         description="流式模式（仅 /api/chat/stream 生效）: full=假流式完整功能（含历史/追问/持久化，默认） | fast=真流式逐token（低延迟，跳过持久化） | interactive=真流式逐token + 完成时会话事务提交（T9 聊天页）",
@@ -3948,6 +3959,8 @@ def _execute_task_graph_chat_with_slot(
             "temperature": req.temperature,
             "top_p": req.top_p,
             "show_thinking": req.show_thinking,
+            # ★ 2026-09-19：深度思考**开关**（与「展示」区分），None ⇒ 沿用模板默认。
+            "enable_thinking": req.enable_thinking,
         },
     }
 
@@ -4483,6 +4496,7 @@ def _execute_chat_full(
                 temperature=req.temperature,
                 top_p=req.top_p,
                 show_thinking=req.show_thinking,
+                enable_thinking=req.enable_thinking,
                 routing_preference=req.routing_preference,
                 session_id=req.session_id,
                 messages=list(history) + [{"role": "user", "content": req.message}],
@@ -4588,6 +4602,7 @@ def _execute_chat_full(
                 session_id=req.session_id,
                 messages=list(history) + [{"role": "user", "content": req.message}],
                 show_thinking=req.show_thinking,
+                enable_thinking=req.enable_thinking,
                 _require_distributed=(req.routing_preference == "distributed_required"),
                 _force_distributed_assignment=True,
                 _cancel_event=cancel_event,
@@ -4693,6 +4708,7 @@ def _execute_chat_full(
                     temperature=req.temperature,
                     top_p=req.top_p,
                     show_thinking=req.show_thinking,
+                    enable_thinking=req.enable_thinking,
                     _cancel_event=cancel_event,
                 )
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
@@ -7271,6 +7287,42 @@ async def consume_cluster_join_grant(req: ClusterJoinConsume):
         raise HTTPException(500, "入群授权消费失败") from exc
 
 
+def _client_supports_forward_layers(node_type: str, capabilities: dict | None) -> bool:
+    """客户端能否承担**层前向传播**（层流水线的一段）。
+
+    ★ 2026-09-19：判据从「**平台**」改为「**能力**」。原实现是 `node_type == "pc"`，
+    理由写作「Android 无 PyTorch 推理能力」—— 该判据**过宽**：**Android 不能跑 PyTorch，
+    但能跑 llama.cpp/GGUF 引擎**，而 llama.cpp 现在**也能做层前向**
+    （`LlamaCppEngine.forward_layers_from_hidden()` 当下游、`forward_layers_to_hidden()` 当上游）⇒
+    有 GGUF 引擎的 Android 可以参与层流水线。
+
+    判定顺序（**保守、向后兼容**）：
+
+    1. `capabilities` 明确给出 `FORWARD_LAYERS`（或 `forward_layers=True`）⇒ **True**（自报最权威）；
+    2. `capabilities["backend_id"]`（或 `"engine"`）给出已知 backend ⇒ 按公开的
+       `backend_capabilities(...)` 判定；
+    3. **未自报** ⇒ 退回旧行为：**仅 `node_type == "pc"`** ⇒ 未声明能力的 Android 仍被拒绝。
+    """
+    info = capabilities if isinstance(capabilities, dict) else {}
+
+    reported = info.get("capabilities")
+    if isinstance(reported, (list, tuple, set, frozenset)):
+        if Capability.FORWARD_LAYERS in set(reported):
+            return True
+    elif isinstance(reported, str) and reported == Capability.FORWARD_LAYERS:
+        return True
+
+    if info.get("forward_layers") is True:
+        return True
+
+    backend_id = info.get("backend_id") or info.get("engine")
+    if isinstance(backend_id, str) and backend_id:
+        if backend_capabilities(backend_id).supports(Capability.FORWARD_LAYERS):
+            return True
+
+    return (node_type or "pc") == "pc"
+
+
 @app.post("/api/bootstrap/first-connect")
 async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Request):
     """
@@ -7329,7 +7381,11 @@ async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Re
         status_code = 403 if register_result.get("status") == "denied" else 400
         raise HTTPException(status_code, register_result.get("reason", "bootstrap registration failed"))
 
-    pipeline_worker = node_type == "pc"
+    # ★ 2026-09-19：不再按平台一刀切。Android 不能跑 PyTorch，**但能跑 llama.cpp/GGUF 引擎**，
+    #   而 llama.cpp 现在也能做层前向（`forward_layers_from_hidden` / `forward_layers_to_hidden`）
+    #   ⇒ 只要客户端**自报**了 `FORWARD_LAYERS` 能力，就承认它可以当流水线工作器；
+    #   **未自报者退回旧行为（仅 pc）**，保证不会无意放行。
+    pipeline_worker = _client_supports_forward_layers(node_type, req.capabilities)
     response = {
         "status": "ok",
         "cluster": {
@@ -7348,7 +7404,8 @@ async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Re
         },
         "android": {
             "presence_interval_seconds": 45,
-            "pipeline_worker": False,
+            # ★ 与此节点的实际能力一致（自报 FORWARD_LAYERS 的 Android 可为 True）。
+            "pipeline_worker": pipeline_worker,
             "model_manifest_url": build_url(
                 "http", master_api_host, master_api_port, "/api/models/downloadable"
             ),

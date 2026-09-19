@@ -12,6 +12,7 @@ import inspect
 import json
 from pathlib import Path
 import re
+import warnings
 import time
 from typing import Any, Iterable
 
@@ -265,11 +266,30 @@ def load_gemma4_text_layer_assignment(
         "fp32": torch.float32,
     }
     if dtype is None:
-        target_dtype = torch.float16 if device.startswith("cuda") else torch.float32
+        # ⚠️ 2026-09-19 实测：**该模型在 CUDA 上 fp16 会溢出 ⇒ 产出 NaN**
+        #   CUDA fp16 段② logits `finite=False`、top5=[1,0,2,4,3]（垃圾）；
+        #   CUDA fp32 则与 CPU fp32 的 top5 完全一致（[258883, 6948, 19523, 48457, 137760]）。
+        # 故**默认改为 fp32**（两种设备一致、行为可预期）；需要 fp16 请**显式**传 dtype。
+        target_dtype = torch.float32
+        if device.startswith("cuda"):
+            warnings.warn(
+                "Gemma 4 sidecar: 未指定 dtype ⇒ 使用 float32（安全默认）。"
+                "实测该模型在 CUDA 上 float16 会溢出并产出 NaN（2026-09-19）—— "
+                "如需 fp16 请显式传 dtype，并自行承担数值风险。",
+                RuntimeWarning, stacklevel=2,
+            )
     else:
         target_dtype = dtype_map.get(str(dtype).lower())
         if target_dtype is None:
             raise Gemma4AdapterError("unsupported Gemma 4 assignment dtype")
+        if device.startswith("cuda") and target_dtype in (torch.float16, torch.bfloat16):
+            warnings.warn(
+                "Gemma 4 sidecar: 在 CUDA 上显式使用 "
+                f"{'float16' if target_dtype is torch.float16 else 'bfloat16'}。"
+                "**实测该模型 fp16 会溢出并产出 NaN**（2026-09-19）；"
+                "若前向输出非有限，请改用 float32。",
+                RuntimeWarning, stacklevel=2,
+            )
 
     try:
         with init_empty_weights():

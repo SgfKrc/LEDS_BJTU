@@ -4,13 +4,15 @@
 # 安装: pip install -r requirements.txt
 #
 # 兼容性说明:
-#   - transformers 推荐 4.x 系列（BitsAndBytesConfig 兼容性已验证）
+#   - transformers 5.17.x（2026-09-19 由 4.47.1 升级；Qwen-1.8B remote code 的 5.x 兼容由
+#     src/transformers5_compat.py 的 get_head_mask 补丁 + src/model_module.py 的「权重守卫」覆盖）
 #   - bitsandbytes >= 0.45.0 支持 Windows + CUDA 12.x
 #   - PyTorch 需与 CUDA 版本匹配
 
 # --- 核心深度学习框架 ---
 torch>=2.2.0
-transformers>=4.47.0,<4.48.0    # Qwen remote code + DeepSeek-R1 Distill 兼容窗口
+transformers>=5.17.0,<5.18.0     # 主运行时统一窗口（含 Qwen remote code + DeepSeek-R1 Distill）
+huggingface_hub>=1.5.0,<2.0.0    # 5.x 传递要求 >=1.5,<2.0；1.x 移除了 huggingface-cli（改用 hf）
 accelerate>=1.0.0                # 模型加载加速（bitsandbytes 依赖）
 transformers-stream-generator>=0.0.4  # Qwen-1.8B remote code 依赖
 einops>=0.6.0                    # Qwen-1.8B rotary embedding / rearrange
@@ -55,3 +57,9 @@ python-dotenv>=1.0.0             # 环境变量加载（从 .env 文件）
 # scripts/cut_layers.py（离线裁层生成器，为层流水线造下游工件）需要它读写 GGUF；
 # 该脚本与 src/relay_contract.py 的 RelayTrimPlan 合同配套，属主仓工具链的一部分。
 gguf>=0.10.0
+
+# --- 图表生成（仅实验文档需要）---
+# build/cross-framework-layer-poc/make_figures.py 直接从 local_docs/CORE-RELAY-XFRAME-02-*.json
+# 生成 docs/figures/cross-frame-relay/ 下的图（图是**提交物**）。除它之外主仓不 import matplotlib。
+# 注：此前它由实验用的 overlay 环境提供，该环境已归档 ⇒ 在此显式声明，避免图表无法再生成。
+matplotlib>=3.8                # 仅 make_figures.py 需要

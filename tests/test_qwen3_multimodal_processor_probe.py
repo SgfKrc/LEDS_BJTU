@@ -323,11 +323,17 @@ def test_real_isolated_autoprocessor_smoke(model_name: str):
         assert len(summary["video"]["pixel_values_shape"]) >= 2
         assert "float" in summary["video"]["dtype"]
         assert summary["video"]["token_count_estimate"] and summary["video"]["token_count_estimate"] > 0
-    assert response["runtime"]["transformers_version"] == "4.57.6"
+    # 版本：sidecar 现随主运行时统一到 5.17（此前 4.57.6）⇒ 断言「不低于契约下限」比钉死小版本更稳
+    # （契约本身的检查在 src/qwen3_multimodal_preflight.py，下限 4.51.0）。
+    _ver = tuple(int(p) for p in response["runtime"]["transformers_version"].split(".")[:2])
+    assert _ver >= (4, 51), response["runtime"]["transformers_version"]
     assert response["runtime"]["processor_class"] == "Qwen3VLProcessor"
-    assert response["runtime"]["image_processor_class"] == "Qwen2VLImageProcessorFast"
+    # 5.x 去掉了 `Fast` 后缀（`Qwen2VLImageProcessorFast` → `Qwen2VLImageProcessor`；
+    # `Qwen2TokenizerFast` → `Qwen2Tokenizer`）⇒ 两者都接受，与 preflight 的允许集合一致。
+    assert response["runtime"]["image_processor_class"] in {
+        "Qwen2VLImageProcessorFast", "Qwen2VLImageProcessor"}
     assert response["runtime"]["video_processor_class"] == "Qwen3VLVideoProcessor"
-    assert response["runtime"]["tokenizer_class"] == "Qwen2TokenizerFast"
+    assert response["runtime"]["tokenizer_class"] in {"Qwen2TokenizerFast", "Qwen2Tokenizer"}
     assert response["cleanup"]["completed"] is True
     assert response["cleanup"]["weight_materialized"] is False
     encoded = json.dumps(report, ensure_ascii=True).lower()

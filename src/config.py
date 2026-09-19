@@ -174,6 +174,12 @@ COMPILE_RECOMPILE_LIMIT = 64   # torch._dynamo.config.recompile_limit / cache_si
 #   compile 相对 eager 快 1.79×（limit=8 默认）→ **2.57×（limit=64）** ⇒ 调大 limit 有 +44% 收益。
 # transformers 自己在 chunked prefill 场景也用 64（generation/utils.py:4113-4115）。
 # ⚠️ torch >= 2.12 起该配置是 **thread-local**：须在使用线程内设置才生效。
+
+# ★ 规模门（2026-09-19 用户裁定）：编译的收益只在 **≥1.5B** 上稳定为正。
+# 依据：D→L 端到端实测里 0.5B/12 层开编译层循环**反而慢约 6×**（上游 84.2 vs 13.9 ms/step），
+#       而 2B/24 层同一开关**快 2.698×**（逐 token 一致）。
+# 1B 以内的小模型即便真能优化也会碰到边际效应 ⇒ 低于该参数量阈值时自动跳过 compile。
+COMPILE_MIN_PARAMS = int(1.5e9)  # 1.5B
 # 注：曾短暂存在过 COMPILE_MAX_SEQ_LEN（按序列长度跳过），依据是「长序列 compile 反而慢」，
 #     但那个结论来自取错模块的错误测量，已撤销（正确答案是长序列也快，且调大 limit 更有效）。
 # 2026-09-18 改为默认 True：装了 triton-windows 后 Windows 下才真正可用

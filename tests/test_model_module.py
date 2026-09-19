@@ -22,6 +22,7 @@ import torch.nn as nn
 from transformers import Qwen2Config, Qwen2ForCausalLM
 
 from model_module import ModelManager, _LayerRangeLoadTracker
+from model_module import _normalize_past_key_values
 import model_config as mc
 
 # ================================================================
@@ -2606,4 +2607,120 @@ class TestGemmaLayerRangeAdapter:
         with pytest.raises(RuntimeError, match="隔离 Transformers sidecar"):
             ModelManager().load_layer_range(
                 0, 2, total_layers=4, model_path=str(tmp_path),
+            )
+
+
+# ================================================================
+# ★ B9：空的 cache 对象规范化
+# ================================================================
+
+class TestEmptyCacheNormalization:
+    """★ B9：调用方常传**空的** cache 对象（如 `DynamicCache()`）而不是 `None`。
+
+    原行为：`len(cache) == 0` ⇒ 报
+        `Qwen2 KV cache 层数不匹配: cache=0, local=N`
+    （报错信息**不指向根因**）；hybrid 架构上还可能直接
+        `IndexError: list index out of range`。
+    新行为：入口统一把「没有任何已写入层的 cache」视同 `None`（由 `forward_layers` 自建）。
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.model = _make_tiny_model()
+        self.mgr = ModelManager()
+        self.mgr.model = self.model
+        self.mgr._engine_type = "pytorch"
+        self.mgr.layer_range = (0, 4)
+
+    # ---------------- 纯逻辑 ----------------
+
+    def test_none_stays_none(self):
+        assert _normalize_past_key_values(None) is None
+
+    def test_empty_tuple_becomes_none(self):
+        assert _normalize_past_key_values(()) is None
+        assert _normalize_past_key_values([]) is None
+
+    def test_all_none_tuple_becomes_none(self):
+        """B14 的 hybrid 收集侧会留 None 占位；全 None 的 tuple 等于没有缓存。"""
+        assert _normalize_past_key_values((None, None, None)) is None
+
+    def test_non_empty_tuple_is_preserved(self):
+        """**部分写入**的缓存必须原样保留（不得被当成空）。"""
+        entry = (torch.zeros(1, 2, 2, 32), torch.zeros(1, 2, 2, 32))
+        pkv = (entry, None)  # 一层有、一层是 None 占位
+        assert _normalize_past_key_values(pkv) is pkv
+
+    def test_real_dynamic_cache_empty_becomes_none(self):
+        """真实 `DynamicCache()` / `DynamicCache(config=...)` 均应视同空。"""
+        cache_utils = pytest.importorskip("transformers.cache_utils")
+        empty = cache_utils.DynamicCache()
+        assert _normalize_past_key_values(empty) is None
+
+    def test_real_dynamic_cache_non_empty_is_preserved(self):
+        """已写入内容的 `DynamicCache` 不得被规范化掉。"""
+        cache_utils = pytest.importorskip("transformers.cache_utils")
+        cache = cache_utils.DynamicCache()
+        k = torch.zeros(1, 2, 3, 32)
+        cache.update(k, k, 0)
+        assert _normalize_past_key_values(cache) is cache
+
+    # ---------------- 集成：forward_layers 不再因空 cache 报错 ----------------
+
+    def test_forward_layers_accepts_empty_dynamic_cache(self):
+        """修前：报 `KV cache 层数不匹配: cache=0, local=4`；修后：正常前向。"""
+        cache_utils = pytest.importorskip("transformers.cache_utils")
+        result = self.mgr.forward_layers(
+            input_ids=torch.tensor([[1, 2, 3]]),
+            past_key_values=cache_utils.DynamicCache(),
+            use_cache=True,
+        )
+        # ⚠️ tiny 模型自带 lm_head ⇒ 末节点返回 logits（不是 hidden_states）
+        assert ("hidden_states" in result) or ("logits" in result)
+        assert len(result["past_key_values"]) == 4  # 4 local layers
+
+    def test_forward_layers_accepts_empty_dynamic_cache_with_config(self):
+        """传 `DynamicCache(config=...)`（hybrid 场景的正确建法）同样应被视同空。"""
+        cache_utils = pytest.importorskip("transformers.cache_utils")
+        try:
+            cache = cache_utils.DynamicCache(config=self.model.config)
+        except (TypeError, AttributeError):
+            pytest.skip("该 transformers 版本不支持 DynamicCache(config=...)")
+        result = self.mgr.forward_layers(
+            input_ids=torch.tensor([[1, 2, 3]]),
+            past_key_values=cache,
+            use_cache=True,
+        )
+        assert ("hidden_states" in result) or ("logits" in result)
+
+    def test_forward_layers_empty_cache_result_matches_none(self):
+        """规范化的语义必须是「等于没传」：结果与 `None` 完全相同。"""
+        cache_utils = pytest.importorskip("transformers.cache_utils")
+        ids = torch.tensor([[1, 2, 3, 4]])
+        with_none = self.mgr.forward_layers(input_ids=ids, past_key_values=None, use_cache=True)
+        with_empty = self.mgr.forward_layers(
+            input_ids=ids, past_key_values=cache_utils.DynamicCache(), use_cache=True
+        )
+        # tiny 模型带 lm_head ⇒ 比较 logits；否则比 hidden_states
+        key = "logits" if "logits" in with_none else "hidden_states"
+        assert key in with_empty
+        assert torch.equal(with_none[key], with_empty[key])
+        assert len(with_none["past_key_values"]) == len(with_empty["past_key_values"])
+
+    def test_forward_layers_empty_tuple_cache_accepted(self):
+        """tuple 形式的空缓存（`()` / `(None,)*n`）同样不应报错。"""
+        for empty in ((), (None, None, None, None)):
+            result = self.mgr.forward_layers(
+                input_ids=torch.tensor([[1, 2, 3]]),
+                past_key_values=empty,
+                use_cache=True,
+            )
+            assert ("hidden_states" in result) or ("logits" in result)
+
+    def test_mismatched_non_empty_cache_still_rejected(self):
+        """★ 回归保护：**非空但层数不对**的缓存仍必须报错（不得被新逻辑放过）。"""
+        bad = ((torch.zeros(1, 2, 2, 32), torch.zeros(1, 2, 2, 32)),)  # 只有 1 层，本地 4 层
+        with pytest.raises(RuntimeError, match="KV cache 层数不匹配"):
+            self.mgr.forward_layers(
+                input_ids=torch.tensor([[7]]), past_key_values=bad, use_cache=True
             )

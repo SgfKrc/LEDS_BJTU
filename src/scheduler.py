@@ -31,7 +31,12 @@ if TYPE_CHECKING:
     from model_host import InferenceHost, SchedulerCallbacks
 
 from model_host import get_model_host
-from koakuma_engine import Capability, backend_id_for, runtime_supports
+from koakuma_engine import (
+    Capability,
+    backend_capabilities,
+    backend_id_for,
+    runtime_supports,
+)
 from network_path import build_client_network_path_view
 from pipeline_capacity import PipelineCapacityError, solve_pipeline_capacity
 from pipeline_node_contract import (
@@ -284,6 +289,48 @@ class NodeInfo:
             "presence_expires_at": self.presence_expires_at,
             "is_available": self.is_available(),
         }
+
+
+def _node_supports_forward_layers(node: "NodeInfo") -> bool:
+    """节点能否承担**层前向传播**（即作为层流水线的一段）。
+
+    ★ 2026-09-19：判据从「**平台**」改为「**能力**」。
+
+    原实现（Phase 4.1，位于 `validate_layer_override`）按 `node_type == "android"` 一律拒绝，
+    理由写作「Android 无 PyTorch 推理能力」。该判据**过宽**：**Android 不能跑 PyTorch，
+    但能跑 llama.cpp/GGUF 引擎**，而 llama.cpp 现在**也能做层前向**
+    （`LlamaCppEngine.forward_layers_from_hidden()` 当下游、`forward_layers_to_hidden()` 当上游，
+    且 `BackendId.LLAMA_CPP` 已声明 `Capability.FORWARD_LAYERS`）⇒ 有 GGUF 引擎的 Android
+    可以参与层流水线。
+
+    判定顺序（**保守、向后兼容**）：
+
+    1. `device_info["capabilities"]` 明确包含 `Capability.FORWARD_LAYERS` ⇒ **允许**
+       （节点自报能力，最权威）；
+    2. 否则若 `device_info["backend_id"]` 给出已知 backend ⇒ 按 `_BACKEND_CAPABILITIES` 判定；
+    3. **两者都未提供** ⇒ 退回旧行为：**仅 `node_type == "pc"` 允许** ⇒
+       **未声明能力的 Android 仍被拒绝**（不会因为本改动被无意放行）。
+    """
+    info = getattr(node, "device_info", None)
+    if not isinstance(info, dict):
+        info = {}
+
+    reported = info.get("capabilities")
+    if isinstance(reported, (list, tuple, set, frozenset)):
+        if Capability.FORWARD_LAYERS in set(reported):
+            return True
+    elif isinstance(reported, str):
+        if reported == Capability.FORWARD_LAYERS:
+            return True
+
+    backend_id = info.get("backend_id") or info.get("engine")
+    if isinstance(backend_id, str) and backend_id:
+        # 用公开 API，不触碰私有表。
+        if backend_capabilities(backend_id).supports(Capability.FORWARD_LAYERS):
+            return True
+
+    # 兜底：保持旧语义（pc 可、android 不可），避免未上报能力的节点被无意放行。
+    return getattr(node, "node_type", "pc") == "pc"
 
 
 @dataclass
@@ -1126,7 +1173,7 @@ class Scheduler:
         self._qwen3_network_transfer_coordinator = None
         self._qwen3_artifact_transfer_runtime = None
         self._qwen3_peer_request_verifier = None
-        # Gemma 4 Unified uses a distinct Transformers 5.10.1 sidecar.  This
+        # Gemma 4 Unified uses a distinct Transformers 5.17.0 sidecar.  This
         # local chain is an explicit development route and never changes the
         # production pipeline runtime allow-list.
         self._gemma4_local_chain: Optional[Gemma4PipelineMultiSidecar] = None
@@ -3751,12 +3798,16 @@ class Scheduler:
 
             if node_id not in self.nodes:
                 return invalid("layer_assignment_node_unknown", f"未知节点: {node_id}")
-            # Phase 4.1: 阻止 Android 节点被分配层（Android 无 PyTorch 推理能力）
-            node_type = self.nodes[node_id].node_type
-            if node_type == "android":
+            # ★ 2026-09-19：判据由「平台」改为「**能力**」。原实现（Phase 4.1）按
+            #   `node_type == "android"` 一律拒绝，理由写「Android 无 PyTorch 推理能力」——
+            #   但 **Android 可以跑 llama.cpp/GGUF 引擎，而 llama.cpp 现在也能做层前向**
+            #   （`forward_layers_from_hidden` / `forward_layers_to_hidden`）⇒ 原判据**过宽**，
+            #   把「有 GGUF 引擎的 Android」也一并挡掉了。详见 `_node_supports_forward_layers`。
+            node = self.nodes[node_id]
+            if not _node_supports_forward_layers(node):
                 return invalid(
                     "layer_assignment_node_unsupported",
-                    f"Android 节点 {node_id} 不支持层前向传播",
+                    f"节点 {node_id}（{node.node_type}）不支持层前向传播",
                 )
             if start < 0 or end > total_layers or start >= end:
                 return invalid(
@@ -9288,6 +9339,7 @@ class Scheduler:
                                      temperature: float = 0.7,
                                      top_p: float = 0.9,
                                      show_thinking: bool = False,
+                                     enable_thinking: Optional[bool] = None,
                                      session_id: Optional[str] = None,
                                      messages: list = None,
                                      request_id: str = None,   # L5: 链路追踪
@@ -9337,6 +9389,7 @@ class Scheduler:
                 "temperature": temperature,
                 "top_p": top_p,
                 "show_thinking": show_thinking,
+                "enable_thinking": enable_thinking,
                 "session_id": session_id,
                 "messages": messages or [{"role": "user", "content": message}],
                 "request_id": request_id,   # L5: 链路追踪
@@ -10026,6 +10079,8 @@ class Scheduler:
         top_p = data.get("top_p", 0.9)
         routing_preference = str(data.get("routing_preference", "auto") or "auto")
         show_thinking = data.get("show_thinking", False)
+        # ★ 2026-09-19：主节点收到转发请求后同样透传深度思考**开关**。
+        enable_thinking = data.get("enable_thinking")
         session_id = data.get("session_id")
         messages = data.get("messages")
         request_id = data.get("request_id")   # L5: 链路追踪
@@ -10066,6 +10121,7 @@ class Scheduler:
                     session_id=session_id,
                     messages=messages,
                     show_thinking=show_thinking,
+                    enable_thinking=enable_thinking,
                     _require_distributed=(routing_preference == "distributed_required"),
                     _force_distributed_assignment=(routing_preference != "local_only"),
                     _cancel_event=cancel_event,
@@ -13700,6 +13756,12 @@ class Scheduler:
         _stream_callback = kwargs.pop('_stream_callback', None)
         fallback_reason = kwargs.pop('_fallback_reason', '') or 'pipeline_fallback_full_model'
         show_thinking = bool(kwargs.pop("show_thinking", False))
+        # ★ 2026-09-19：深度思考**开关**（与 show_thinking 的「展示」语义区分开）。
+        #   None ⇒ 不干预，沿用模型模板默认（Qwen3 模板默认会思考，故会出现超长 <think>）。
+        #   显式 False ⇒ 引擎 `_set_thinking_mode(False)` 会经 chat template 的
+        #   `enable_thinking=False` **真正阻止**模型生成思考内容（省算力），
+        #   而不是靠事后剥离（后者依赖模板含 `<think>` 且能找到 `</think>`，任一不成立即失效）。
+        enable_thinking = kwargs.pop("enable_thinking", None)
         cancel_event = kwargs.pop("_cancel_event", None)
 
         # ★ 若 master 刚执行过流水线裁剪（layer_range != None），
@@ -13738,6 +13800,7 @@ class Scheduler:
                     max_tokens=max_new_tokens,
                     temperature=temperature,
                     top_p=top_p,
+                    enable_thinking=enable_thinking,
                     _cancel_event=cancel_event,
                 ):
                     if chunk:
@@ -13789,6 +13852,7 @@ class Scheduler:
                     max_tokens=max_new_tokens,
                     temperature=temperature,
                     top_p=top_p,
+                    enable_thinking=enable_thinking,
                     _cancel_event=cancel_event,
                 )
                 raw_response_text = result.get("content", "")
@@ -13877,6 +13941,8 @@ class Scheduler:
         temperature = kwargs.pop('temperature', 0.7)
         top_p = kwargs.pop('top_p', 0.9)
         show_thinking = bool(kwargs.pop('show_thinking', False))
+        # ★ 2026-09-19：深度思考**开关**（同另一处路径；None ⇒ 不干预，沿用模板默认）。
+        enable_thinking = kwargs.pop('enable_thinking', None)
         messages = kwargs.pop("messages", None) or [{"role": "user", "content": prompt}]
         engine_name = backend_id_for(mgr, default="pytorch") or "pytorch"
         try:
@@ -13905,6 +13971,7 @@ class Scheduler:
                     temperature=temperature,
                     top_p=top_p,
                     show_thinking=show_thinking,
+                    enable_thinking=enable_thinking,
                     _cancel_event=cancel_event,
                 ):
                     if chunk:
