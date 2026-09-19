@@ -1461,7 +1461,10 @@ class LlamaCppEngine:
         finally:
             M.llama_batch_free(batch)
 
-    def forward_layers_from_hidden(self, hidden, n_past: int = 0):
+    def forward_layers_from_hidden(self, hidden, n_past: int = 0,
+                                   seq_ids: Optional[list] = None,
+                                   positions: Optional[list] = None,
+                                   all_logits: bool = False):
         """★ 层接力下游入口（2026-09-19）：把**上游 hidden** 注入 llama.cpp 的 `embd` 通道，
         只跑**本模型（裁层 GGUF）的层**，返回末位 logits。
 
@@ -1472,10 +1475,17 @@ class LlamaCppEngine:
 
         Args:
             hidden: 形状 `[n_tokens, n_embd]`（或 1D）的上游 `hidden_states`；内部转 f32。
-            n_past: 本模型 KV 里已有的位置数（接力首步传 0）。
+            n_past: 本模型 KV 里已有的位置数（接力首步传 0）。**仅在 `positions` 为 None 时使用。**
+            seq_ids: ★ **多序列（批量交叠）**：长度 `n_tokens` 的序列号列表；None ⇒ 全部为 0（单序列，
+                与旧行为一致）。多条序列须使用**互不相同**的 id。
+            positions: ★ 每个 token 的 KV 位置列表；None ⇒ `[n_past, n_past+1, ...]`（旧行为）。
+                多序列交错推进时必须由调用方显式给出。
+            all_logits: True ⇒ 返回**每个 token** 的 logits（形状 `[n_tokens, n_vocab]`）；
+                False（默认）⇒ 只返回末位（形状 `[n_vocab]`，与旧行为一致）。
+                多序列下需自行按 `seq_ids` 取末位。
 
         Returns:
-            末位 logits 的 `np.ndarray`（长度 n_vocab），或 `None`（未加载）。
+            末位 logits（或全部，见 `all_logits`）的 `np.ndarray`，或 `None`（未加载）。
 
         ⚠️ **KV 位置由调用方管理**：本方法**直接在 KV 里占 `[n_past, n_past+n_tokens)`**；
         接力 decode 的常规用法是逐步推进 `n_past`。若要在**同一位置**重跑，先
@@ -1506,20 +1516,39 @@ class LlamaCppEngine:
         if h.shape[1] != n_embd:
             raise ValueError(f"hidden 宽度 {h.shape[1]} != 模型 n_embd {n_embd}")
 
+        # ★ 多序列（批量交叠）：None 时退化为旧的单序列行为，保证向后兼容。
+        if seq_ids is None:
+            seq_list = [0] * n_tokens
+        else:
+            seq_list = [int(s) for s in seq_ids]
+            if len(seq_list) != n_tokens:
+                raise ValueError(f"seq_ids 长度 {len(seq_list)} != n_tokens {n_tokens}")
+        if positions is None:
+            pos_list = [int(n_past) + i for i in range(n_tokens)]
+        else:
+            pos_list = [int(p) for p in positions]
+            if len(pos_list) != n_tokens:
+                raise ValueError(f"positions 长度 {len(pos_list)} != n_tokens {n_tokens}")
+
         batch = M.llama_batch_init(n_tokens, n_embd, 1)
         try:
             for i in range(n_tokens):
                 batch.n_seq_id[i] = 1
-                batch.seq_id[i][0] = 0
+                batch.seq_id[i][0] = seq_list[i]
+                # ★ 每个 token 都可能是「某条序列的末位」⇒ logits 全开（下游只跑少数 token，开销可接受）
                 batch.logits[i] = 1
-                batch.pos[i] = int(n_past) + i
+                batch.pos[i] = pos_list[i]
             batch.n_tokens = n_tokens
             ctypes.memmove(batch.embd, h.ctypes.data, h.nbytes)
             rc = M.llama_decode(native_ctx, batch)
             if rc != 0:
                 raise RuntimeError(f"llama_decode 失败 rc={rc}")
-            logits_ptr = M.llama_get_logits_ith(native_ctx, n_tokens - 1)
             n_vocab = int(M.llama_vocab_n_tokens(M.llama_model_get_vocab(native_model)))
+            if all_logits:
+                rows = [np.ctypeslib.as_array(M.llama_get_logits_ith(native_ctx, i),
+                                              shape=(n_vocab,)).copy() for i in range(n_tokens)]
+                return np.stack(rows, 0)
+            logits_ptr = M.llama_get_logits_ith(native_ctx, n_tokens - 1)
             return np.ctypeslib.as_array(logits_ptr, shape=(n_vocab,)).copy()
         finally:
             M.llama_batch_free(batch)
