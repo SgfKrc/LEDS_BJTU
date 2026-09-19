@@ -10,8 +10,8 @@
 
 启动体验（2026-09-17 用户要求）：
 
-* **标题页与启动条合体**：LOGO 下方紧跟一条跑马灯启动条 + 状态行，不再"先纯文本等待、
-  再进 TUI"两段式；
+* **标题页与启动条合体**：LOGO 下方依次显示快速流式副标题、跑马灯启动条和状态行，
+  副标题为 ``Lightweight Edge Distributed Inference System``，不再"先纯文本等待、再进 TUI"两段式；
 * 状态文案统一以 **「少女祈祷中：」** 开头（避免与标题 ``Koakuma`` 重复）；
 * 后端冷启动（``BackendSupervisor.ensure_ready``）在启动屏的 worker 线程里执行，
   阶段文本实时反映到启动条下方。
@@ -102,10 +102,13 @@ LOGO = (
 
 #: 启动行前缀（用户 2026-09-17 指定：不用 "Koakuma:"，避免与标题重复）
 SPLASH_PREFIX = "少女祈祷中："
+SPLASH_SUBTITLE = "Lightweight Edge Distributed Inference System"
 BAR_WIDTH = 30
 BAR_MARQUEE = 9
 BAR_BLOCK = "█"
 BAR_EMPTY = "░"
+SUBTITLE_TICK_SECONDS = 0.025
+SUBTITLE_CHARS_PER_TICK = 3
 
 # The backend's distributed read projections can legitimately wait for a
 # remote node.  Keep the fast default for health/core reads, but don't turn a
@@ -131,6 +134,7 @@ Screen { background: $surface; }
 
 /* ---------------------------------------------------------------- 启动屏 */
 #splash-logo { color: #8fa8c4; text-align: center; padding: 1 0 0 0; }
+#splash-subtitle { color: $text-muted; text-align: center; padding: 0 0 0 0; }
 #splash-bar { color: #6b8aa8; text-align: center; padding: 1 0 0 0; }
 #splash-status { color: $text; text-align: center; padding: 0 0 1 0; }
 #splash-hint { text-align: center; color: $text-disabled; }
@@ -241,19 +245,37 @@ class SplashScreen(Screen):
         self.splash_status = status
         self.wait_for_backend = bool(wait_for_backend)
         self.bar_pos = 0
+        self.subtitle_pos = 0
 
     # ------------------------------------------------------------ 渲染
 
     def compose(self) -> ComposeResult:
         yield Static(LOGO, id="splash-logo")
+        yield Static(self.subtitle_text(), id="splash-subtitle")
         yield Static(self.bar_text(), id="splash-bar")
         yield Static(self.status_line(), id="splash-status")
         yield Static("q / ctrl+c 退出 · 任意键进入", id="splash-hint")
 
     def on_mount(self) -> None:
         self.set_interval(0.09, self.tick_bar)
+        self.set_interval(SUBTITLE_TICK_SECONDS, self.tick_subtitle)
         if not self.wait_for_backend:
             self.set_timer(0.6, self.action_finish)
+
+    def subtitle_text(self) -> str:
+        return SPLASH_SUBTITLE[:self.subtitle_pos]
+
+    def tick_subtitle(self) -> None:
+        if self.subtitle_pos >= len(SPLASH_SUBTITLE):
+            return
+        self.subtitle_pos = min(
+            len(SPLASH_SUBTITLE),
+            self.subtitle_pos + SUBTITLE_CHARS_PER_TICK,
+        )
+        try:
+            self.query_one("#splash-subtitle", Static).update(self.subtitle_text())
+        except Exception:  # noqa: BLE001 - 启动屏可能尚未挂载
+            pass
 
     def bar_text(self) -> str:
         cells = [BAR_EMPTY] * BAR_WIDTH
@@ -2618,7 +2640,7 @@ class KoakumaApp(App):
     """统一交互入口的 Textual 实现。"""
 
     TITLE = "Koakuma"
-    SUB_TITLE = "QLH 分布式边缘推理"
+    SUB_TITLE = SPLASH_SUBTITLE
     CSS = CSS
 
     def __init__(self, api: ApiClient, *, interval: float = 5.0,

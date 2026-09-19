@@ -52,10 +52,11 @@ def _run(coro):
 def test_shell_boots_then_switches_to_main():
     from textual.widgets import ContentSwitcher, ListView
 
-    from tui_textual import KoakumaApp, MainScreen, SplashScreen
+    from tui_textual import KoakumaApp, MainScreen, SPLASH_SUBTITLE, SplashScreen
 
     async def _main():
         app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.5))
+        assert app.SUB_TITLE == SPLASH_SUBTITLE
         async with app.run_test() as pilot:
             await pilot.pause()
             assert isinstance(app.screen, SplashScreen), "应先显示启动屏"
@@ -64,6 +65,10 @@ def test_shell_boots_then_switches_to_main():
 
             status = str(splash.query_one("#splash-status", Static).render())
             assert "少女祈祷中" in status, "启动行应以「少女祈祷中：」开头"
+            subtitle = splash.query_one("#splash-subtitle", Static)
+            assert str(subtitle.render()) != "Lightweight Edge Distributed Inference System"
+            await pilot.pause(0.45)
+            assert str(subtitle.render()) == "Lightweight Edge Distributed Inference System"
             bar = str(splash.query_one("#splash-bar", Static).render())
             assert "█" in bar and "░" in bar, "标题下方应有跑马灯启动条"
             app.show_main()
