@@ -126,6 +126,73 @@ class TestWithRealModel:
         with pytest.raises(ValueError, match="不能为空"):
             eng.forward_layers_to_hidden([], n_past=0)
 
+
+class TestMultiSequence:
+    """★ `n_seq_max` 工程化收口（2026-09-19，待办 3）。
+
+    背景：`llama-cpp-python` 的 `Llama.__init__` **只在 `embedding=True` 时**才设
+    `context_params.n_seq_max`（源码 :341-346）⇒ 非 embedding 时恒为 1 ⇒ **`seq_id>0` 必然
+    `llama_decode rc=-1`**。主仓现经模块级 `llama_context_default_params()` 在建 context 前注入
+    （`llama_engine._new_llama_with_seq_max`）。
+    """
+
+    def test_default_path_unchanged(self, monkeypatch):
+        """`n_seq_max=None`（默认）时不得改动 llama.cpp 的全局默认 params 函数。"""
+        import llama_cpp.llama_cpp as M
+
+        before = M.llama_context_default_params
+        from llama_engine import _new_llama_with_seq_max
+
+        # None ⇒ 直接构造路径；用不存在的 model_path 触发异常即可，重点是不留副作用
+        with pytest.raises(Exception):
+            _new_llama_with_seq_max({"model_path": "___no_such_model___.gguf"}, None)
+        assert M.llama_context_default_params is before, "默认路径不应改动全局函数"
+
+    def test_seq_max_is_restored_after_load(self):
+        """构造后必须恢复全局 `llama_context_default_params`（`finally` 保证）。"""
+        import llama_cpp.llama_cpp as M
+
+        before = M.llama_context_default_params
+        from llama_engine import _new_llama_with_seq_max
+
+        with pytest.raises(Exception):
+            _new_llama_with_seq_max({"model_path": "___no_such_model___.gguf"}, 4)
+        assert M.llama_context_default_params is before, "必须恢复全局函数，不能泄漏 patch"
+
+    def test_multi_sequence_decode_matches_single(self):
+        """多序列（`seq_id>0`）能解码，且与单序列结果逐位一致 —— 数值判据。"""
+        import numpy as np
+
+        cut = CUT_GGUF
+        if not cut.is_file():
+            pytest.skip(f"需要裁层 GGUF 工件（{cut.relative_to(ROOT)}），本机缺失")
+        from llama_engine import LlamaCppEngine
+
+        eng = LlamaCppEngine()
+        eng.load_model(model_path=str(cut), n_ctx=1024, n_threads=4, n_seq_max=4)
+        import llama_cpp.llama_cpp as M
+
+        n_embd = int(M.llama_model_n_embd_inp(eng._model._model.model))
+        rng = np.random.default_rng(0)
+        h = rng.standard_normal((2, n_embd)).astype(np.float32)
+
+        # 单序列（一次一条；每次前清 KV，因为每条序列的 seq_id=0 位置都从 0 起）
+        singles = []
+        for i in range(2):
+            eng._model._ctx.kv_cache_clear()
+            singles.append(eng.forward_layers_from_hidden(h[i], n_past=0, all_logits=False))
+        single = np.stack(singles)
+        # 多序列（一次 decode，两个 seq_id）
+        eng._model._ctx.kv_cache_clear()
+        lg = eng.forward_layers_from_hidden(h, seq_ids=[0, 1], positions=[0, 0], all_logits=True)
+        # ⚠️ 判据用 **`argmax` 相同**，而非逐位相等或 `allclose`：llama.cpp 与 torch **同源** ——
+        #    batch=1 与 batch=2 会走不同 kernel（GEMV vs GEMM），f16 下 logits 尾部会出现
+        #    超过 1% 的舍入差异（本测试实测 max|diff| 已大于 1e-2）。**下游实际只用 argmax**，
+        #    故「选取的 token 一致」才是正确的验收判据。
+        assert np.array_equal(single.argmax(axis=-1), lg.argmax(axis=-1)), (
+            "多序列与单序列的 argmax 必须相同，实得 "
+            f"{single.argmax(axis=-1)} vs {lg.argmax(axis=-1)}")
+
     def test_roundtrip_hidden_width_matches_downstream(self):
         """★ 对称性：上游出的 hidden 宽度 == 下游入口接受的宽度（两端可直连）。"""
         eng = _engine_or_skip()

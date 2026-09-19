@@ -70,6 +70,41 @@ def _merge_stop_sequences(stop: List[str] = None) -> List[str]:
     return merged
 
 
+def _new_llama_with_seq_max(load_kwargs: Dict[str, Any], n_seq_max: Optional[int] = None):
+    """构造 `llama_cpp.Llama`，可选地把 context 的 `n_seq_max` 抬到指定值。
+
+    为什么需要：`llama-cpp-python` 的 `Llama.__init__` **只在 `embedding=True` 时**才设置
+    `context_params.n_seq_max`（源码 :341-346）⇒ 非 embedding 时它保持 llama.cpp 的默认值 1 ⇒
+    **任何 `seq_id > 0` 的 `llama_batch` 都会 `llama_decode rc=-1`**，多序列（批量交叠）无法使用。
+
+    绕法：`Llama.__init__:253` 经**模块级** `llama_cpp.llama_cpp.llama_context_default_params()` 取默认
+    params ⇒ 在建 context **之前**临时替换该函数即可。这里用 `try/finally` 严格恢复，
+    并保持其余 `load_kwargs` 语义完全不变（`n_seq_max=None` 时行为与直接 `Llama(**load_kwargs)` 一致）。
+
+    ⚠️ 若同时走 RPC 路径（`patched_llama_loader`），本函数只包住 `Llama(...)` 构造，
+    与注入器的 patch 是**并列**关系，不改变其顺序语义。
+    """
+    from llama_cpp import Llama
+
+    if n_seq_max is None:
+        return Llama(**load_kwargs)
+
+    import llama_cpp.llama_cpp as _lc
+
+    original_default_params = _lc.llama_context_default_params
+
+    def _patched_default_params():
+        params = original_default_params()
+        params.n_seq_max = max(int(n_seq_max), int(params.n_seq_max))
+        return params
+
+    _lc.llama_context_default_params = _patched_default_params
+    try:
+        return Llama(**load_kwargs)
+    finally:
+        _lc.llama_context_default_params = original_default_params
+
+
 class LlamaCppEngine:
     """
     llama.cpp 推理引擎 — 面向 CPU / 集显环境优化。
@@ -217,6 +252,7 @@ class LlamaCppEngine:
         rpc_worker_log: str | None = None,
         rpc_split: float | str | List[float] | None = None,
         align_numerics: bool = False,
+        n_seq_max: int | None = None,
         **kwargs,
     ) -> None:
         """
@@ -227,7 +263,14 @@ class LlamaCppEngine:
             n_ctx: 上下文窗口大小（默认 4096，边缘设备建议 2048）
             n_threads: CPU 推理线程数（默认自动检测：物理核心数）
             chat_format: 对话格式（默认自动检测，Qwen 用 "chatml"）
-            **kwargs: 透传给 `llama_cpp.Llama` 的额外参数。经实测（llama-cpp-python 0.3.35）
+                align_numerics: 跨路径数值对齐（关闭 CPU_REPACK，使 RPC 与本机 no-repack 逐比特一致）。
+            n_seq_max: ★ 抬升 context 的并行序列上限（**多序列 / 批量交叠**所必需）。
+                默认 None ⇒ 行为与旧版完全一致（llama.cpp 默认 1）。**为什么需要**：
+                `llama-cpp-python` 的 `Llama.__init__` 只在 `embedding=True` 时设置它
+                （源码 :341-346）⇒ 非 embedding 时任何 `seq_id > 0` 的批次都会
+                `llama_decode rc=-1`。本实现经模块级 `llama_context_default_params()`
+                在建 context 前注入，并在 `finally` 恢复（见 `_new_llama_with_seq_max`）。
+        **kwargs: 透传给 `llama_cpp.Llama` 的额外参数。经实测（llama-cpp-python 0.3.35）
                 可用且与本项目的容量/放置相关者：
 
                 * `tensor_split` / `main_gpu` / `split_mode` —— 多设备切分；
@@ -349,7 +392,7 @@ class LlamaCppEngine:
                     tensor_split=split,
                     use_extra_bufts=False if align_numerics else None,
                 ):
-                    self._model = Llama(**load_kwargs)
+                    self._model = _new_llama_with_seq_max(load_kwargs, n_seq_max)
                 engine_label = "llama.cpp (RPC)"
                 engine_detail = "devices=" + ",".join(
                     (["CPU"] if split is not None else [])
@@ -370,11 +413,11 @@ class LlamaCppEngine:
                 if align_numerics:
                     from llama_rpc_device import patched_model_params
                     with patched_model_params(use_extra_bufts=False):
-                        self._model = Llama(**load_kwargs)
+                        self._model = _new_llama_with_seq_max(load_kwargs, n_seq_max)
                     engine_detail = "use_extra_bufts=False(repack off)"
                     logger.info("  数值对齐: use_extra_bufts=False —— 关闭 CPU_REPACK")
                 else:
-                    self._model = Llama(**load_kwargs)
+                    self._model = _new_llama_with_seq_max(load_kwargs, n_seq_max)
                     engine_detail = ""
                 engine_label = "llama.cpp (CPU)"
 
