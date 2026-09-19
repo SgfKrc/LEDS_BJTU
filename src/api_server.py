@@ -63,7 +63,8 @@ def _torch_cuda_available() -> bool:
         pass
     return cuda_available(load=should_load)
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
+from fastapi import (Depends, FastAPI, File, Form, Header, HTTPException, Request,
+                    UploadFile)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field, model_validator
@@ -102,6 +103,9 @@ from task_provider import (
     StageRequest as ProviderStageRequest,
 )
 import model_config as mc
+# ★ 2026-09-19：认证改为 monolith 内实现（抛弃 control-svc 反代）
+import auth_app
+import auth_service
 from model_registry_validation import build_manifest, validate_model_artifact, write_manifest
 from config import (
     MODEL_NAME, MODEL_PATH, QUANT_TYPE, USE_COMPILE,
@@ -7071,104 +7075,216 @@ async def bootstrap_info(request: Request):
     }
 
 
+# ============================================================
+# 认证与账户（2026-09-19：**monolith 内实现**，抛弃 control-svc 反代）
+# ------------------------------------------------------------
+# 背景：原设计把账户/登录态/TOTP 放在独立的 control-svc（127.0.0.1:8030），
+# 本进程只做反代。微服务改造叫停后该服务已不存在，反代恒 503 ⇒ 现改为在
+# **本进程内**实现，并复用同一个用户级 SQLite（auth_store）。
+# 差异：无独立进程/端口、无网络跳、无「control service unavailable」。
+# ============================================================
+
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=128)
+    password: str = Field(..., min_length=1, max_length=512)
+    totp_code: Optional[str] = Field(default=None, max_length=16,
+                                     description="已绑定 Auth App 时必填的 6 位码")
+
+
+class CreateUserRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=128)
+    password: str = Field(..., min_length=8, max_length=512)
+    role: Literal["admin", "operator", "viewer"] = "viewer"
+
+
+class PatchUserRequest(BaseModel):
+    role: Optional[Literal["admin", "operator", "viewer"]] = None
+    disabled: Optional[bool] = None
+    password: Optional[str] = Field(default=None, min_length=8, max_length=512)
+
+
+class TotpVerifyRequest(BaseModel):
+    code: str = Field(..., min_length=1, max_length=16)
+
+
+def _principal_payload(p) -> dict:
+    return {"username": p.username, "role": p.role, "is_admin": bool(getattr(p, "is_admin", False))}
+
+
 @app.get("/api/auth/capability")
 async def auth_capability():
-    """Expose the authentication boundary when running the monolith directly.
+    """认证能力探测（**本地**，不再是 control-svc 反代）。
 
-    Auth App provisioning, sessions, and Tailscale binding are owned by the
-    local control service.  The standalone FastAPI process must still expose
-    the capability probe used by the canonical UI; returning an explicit
-    disabled capability is safer than a 404 (or pretending that auth exists).
-    The gateway/control service exposes the enforced ``local_totp`` variant.
+    返回：
+        available       认证实现是否可用（本进程内）
+        required        是否强制登录（`QLH_AUTH_REQUIRED`）
+        bootstrap_open  是否处于首次引导（库中尚无任何账户）
+        user_count      账户数
     """
-    # The monolith remains the default runtime, but the user-owned auth
-    # database lives in control-svc. Probe the local control plane when it is
-    # available so the UI does not confuse "three nodes online" with auth
-    # state, nor report auth disabled while the control service is active.
-    control_url = os.environ.get("QLH_CONTROL_URL", "http://127.0.0.1:8030").strip().rstrip("/")
-    try:
-        import httpx
+    return auth_service.auth_capability_payload()
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(0.35, connect=0.2)) as client:
-            response = await client.get(f"{control_url}/auth/capability")
-        if response.is_success:
-            payload = response.json()
-            if isinstance(payload, dict):
-                return {
-                    **payload,
-                    "required": True,
-                    "available": True,
-                    "mode": payload.get("mode") or "local_totp",
-                    "policy_version": payload.get("policy_version") or "n1a-v1",
-                    "service": payload.get("service") or "control-svc",
-                }
-    except Exception:
-        # Direct API operation must stay usable when control-svc is not
-        # installed; the explicit fail-closed response below preserves that
-        # contract for existing local deployments.
-        pass
 
-    auth_required = os.environ.get("QLH_AUTH_REQUIRED", "").strip().lower() in {
-        "1", "true", "on", "yes"
-    }
+@app.post("/api/auth/login")
+async def auth_login(req: LoginRequest):
+    """登录并签发 Bearer token（**明文只在本次响应返回**）。
+
+    ⚠️ 首次引导（库中无账户）时，请改用 `POST /api/users` 创建第一个 admin —— 该端点
+    在引导期**无需登录**。
+    """
+    token, rec = auth_service.login(req.username, req.password, totp_code=req.totp_code)
     return {
-        "required": auth_required,
-        "enforced": False,
-        "available": False,
-        "mode": "local_totp" if auth_required else "local_primary_node",
-        "policy_version": "n1a-v1",
-        "service": "control-svc" if auth_required else "api_server",
-        "bootstrap_available": False,
-        "reason_code": "auth_control_plane_unavailable",
+        "status": "ok",
+        "token": token,
+        "username": rec.username,
+        "role": rec.role,
+        "expires_at": rec.expires_at,
     }
 
 
-async def _proxy_control_request(request: Request, target_path: str) -> Response:
-    """Forward control-plane auth requests from the monolith when configured."""
-    control_url = os.environ.get("QLH_CONTROL_URL", "http://127.0.0.1:8030").strip().rstrip("/")
-    target = f"{control_url}/{target_path.lstrip('/')}"
-    headers = {
-        key: value
-        for key, value in request.headers.items()
-        if key.lower() in {"authorization", "content-type", "x-qlh-confirm-token"}
+@app.post("/api/auth/logout")
+async def auth_logout(authorization: Optional[str] = Header(default=None)):
+    """吊销当前 Bearer 登录态。"""
+    token = auth_service._extract_bearer(authorization)
+    revoked = auth_service.logout(token) if token else False
+    return {"status": "ok", "revoked": bool(revoked)}
+
+
+@app.get("/api/auth/me")
+async def auth_me(principal=Depends(auth_service.require_session)):
+    """返回当前主体（未强制认证时为 anonymous）。"""
+    return _principal_payload(principal)
+
+
+@app.post("/api/auth/totp/provision")
+async def auth_totp_provision(
+    principal=Depends(auth_service.require_role("admin", "operator")),
+):
+    """为**当前主体**生成并绑定 TOTP 密钥，返回 `otpauth://` URI 供 Auth App 扫码。
+
+    ⚠️ 重新调用会**覆盖**既有密钥（旧 Auth App 条目随即失效）。
+    """
+    secret = auth_app.generate_secret()
+    auth_service.get_auth_store().bind_totp(principal.username, secret)
+    auth_service.get_totp_verifier().reset()
+    return {
+        "status": "ok",
+        "username": principal.username,
+        "secret": secret,
+        "otpauth_uri": auth_app.provisioning_uri(secret, account=principal.username),
+        "algorithm": auth_app.TOTP_ALGORITHM,
+        "digits": auth_app.TOTP_DIGITS,
+        "period": auth_app.TOTP_INTERVAL_SECONDS,
     }
+
+
+@app.post("/api/auth/totp/verify")
+async def auth_totp_verify(
+    req: TotpVerifyRequest,
+    principal=Depends(auth_service.require_role("admin", "operator")),
+):
+    """校验一次当前主体的 TOTP（用于确认 Auth App 绑定成功）。"""
+    secret = auth_service.get_auth_store().get_totp_secret(principal.username)
+    if not secret:
+        raise HTTPException(404, {"code": "totp_not_bound", "message": "尚未绑定 Auth App"})
     try:
-        import httpx
-
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=2.0)) as client:
-            upstream = await client.request(
-                request.method,
-                target,
-                params=list(request.query_params.multi_items()),
-                content=await request.body(),
-                headers=headers,
-            )
-    except Exception as exc:
-        raise HTTPException(503, "Auth control service unavailable") from exc
-    response_headers = {}
-    content_type = upstream.headers.get("content-type")
-    if content_type:
-        response_headers["content-type"] = content_type
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        headers=response_headers,
-    )
+        ok = auth_service.get_totp_verifier().verify(secret, req.code)
+    except auth_app.TotpRateLimitedError as exc:
+        raise HTTPException(429, {"code": exc.code, "message": str(exc)}) from exc
+    except auth_app.TotpReplayError as exc:
+        raise HTTPException(401, {"code": exc.code, "message": str(exc)}) from exc
+    except auth_app.TotpError as exc:
+        raise HTTPException(400, {"code": exc.code, "message": str(exc)}) from exc
+    return {"status": "ok", "verified": bool(ok)}
 
 
-@app.api_route("/api/auth/{path:path}", methods=["GET", "POST", "PATCH", "DELETE"])
-async def proxy_auth_request(path: str, request: Request):
-    return await _proxy_control_request(request, f"/auth/{path}")
+@app.get("/api/users")
+async def list_users(request: Request = None,
+                     principal=Depends(auth_service.require_role("admin"))):
+    """列出账户（不含任何口令/密钥材料）。"""
+    require_model_api_source(request)
+    users = auth_service.get_auth_store().list_users()
+    return {"users": [
+        {"username": u.username, "role": u.role, "disabled": u.disabled,
+         "totp_bound": u.totp_bound, "created_at": u.created_at}
+        for u in users
+    ]}
 
 
-@app.api_route("/api/users/{path:path}", methods=["GET", "POST", "PATCH", "DELETE"])
-async def proxy_users_request(path: str, request: Request):
-    return await _proxy_control_request(request, f"/users/{path}")
+@app.post("/api/users")
+async def create_user(req: CreateUserRequest, request: Request = None,
+                      principal=Depends(auth_service.require_session)):
+    """创建账户。
+
+    ⚠️ **首次引导**（库中尚无账户）时，本端点**无需登录**，但**只允许创建 admin**
+    （否则全新部署无法进入）；此后必须由 admin 调用。
+    """
+    store = auth_service.get_auth_store()
+    bootstrap = store.count_users() == 0
+    if bootstrap:
+        if req.role != "admin":
+            raise HTTPException(400, {
+                "code": "bootstrap_requires_admin",
+                "message": "首次引导只允许创建 admin 账户",
+            })
+    else:
+        require_model_api_source(request)
+        if not getattr(principal, "is_admin", False):
+            raise HTTPException(403, {"code": "insufficient_role", "message": "需要 admin 角色"})
+    try:
+        rec = store.create_user(req.username, req.password, role=req.role)
+    except AuthStoreError as exc:
+        code = 409 if exc.code == "user_exists" else 400
+        raise HTTPException(code, {"code": exc.code, "message": str(exc)}) from exc
+    return {"status": "created", "username": rec.username, "role": rec.role,
+            "bootstrap": bootstrap}
 
 
-@app.api_route("/api/users", methods=["GET", "POST"])
-async def proxy_users_root(request: Request):
-    return await _proxy_control_request(request, "/users")
+@app.patch("/api/users/{username}")
+async def patch_user(username: str, req: PatchUserRequest, request: Request = None,
+                     principal=Depends(auth_service.require_role("admin"))):
+    """修改账户：角色 / 禁用 / 重置口令。禁用会**立即吊销**该用户全部登录态。"""
+    require_model_api_source(request)
+    store = auth_service.get_auth_store()
+    if store.get_user(username) is None:
+        raise HTTPException(404, {"code": "user_not_found", "message": f"用户不存在: {username}"})
+    # ⚠️ 不允许把最后一个 admin 降级或禁用，避免锁死管理面
+    if (req.role not in (None, "admin") or req.disabled is True):
+        admins = [u for u in store.list_users() if u.role == "admin" and not u.disabled]
+        if len(admins) <= 1 and any(u.username == username for u in admins):
+            raise HTTPException(400, {
+                "code": "last_admin_protected",
+                "message": "不能降级或禁用最后一个可用 admin",
+            })
+    changed = {}
+    try:
+        if req.role is not None:
+            changed["role"] = store.set_role(username, req.role)
+        if req.disabled is not None:
+            changed["disabled"] = store.set_disabled(username, bool(req.disabled))
+        if req.password is not None:
+            changed["password"] = store.set_password(username, req.password)
+    except AuthStoreError as exc:
+        raise HTTPException(400, {"code": exc.code, "message": str(exc)}) from exc
+    if not any(changed.values()):
+        raise HTTPException(400, {"code": "nothing_to_change", "message": "未提供任何可变更字段"})
+    return {"status": "updated", "username": username, "changed": changed}
+
+
+@app.delete("/api/users/{username}")
+async def delete_user(username: str, request: Request = None,
+                      principal=Depends(auth_service.require_role("admin"))):
+    """删除账户（及其 TOTP 绑定与登录态，由外键级联）。"""
+    require_model_api_source(request)
+    store = auth_service.get_auth_store()
+    admins = [u for u in store.list_users() if u.role == "admin" and not u.disabled]
+    if len(admins) <= 1 and any(u.username == username for u in admins):
+        raise HTTPException(400, {
+            "code": "last_admin_protected",
+            "message": "不能删除最后一个可用 admin",
+        })
+    if not store.delete_user(username):
+        raise HTTPException(404, {"code": "user_not_found", "message": f"用户不存在: {username}"})
+    return {"status": "deleted", "username": username}
 
 
 @app.post("/api/cluster/connect")
