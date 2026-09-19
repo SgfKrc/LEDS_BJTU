@@ -492,10 +492,50 @@ class _LayerRangeLoadTracker:
         }
 
 
+# ★ A6：`torch._dynamo.config` 是 **thread-local**（torch ≥2.12；本仓实测 2.13.0 亦然 ——
+#   源码 `torch/utils/_config_module.py:53/:394-395/:812` 明确 "User overrides are thread-local"，
+#   且实测「主线程设 64 ⇒ 新线程读回默认 8」）。
+#   主仓 `_apply_compile()` 在**加载线程**设置 `recompile_limit`/`cache_size_limit`，而推理（尤其经
+#   starlette `run_in_threadpool` 的 API 路径）发生在**worker 线程** ⇒ 设置**读不到**、退回默认 8
+#   ⇒ 长序列下过早触发 `recompile_limit` 而放弃编译（与 B1/B2 观测的长序列劣化一致）。
+#   对策：在**每个进入模型访问的线程**里幂等地补设一次（每线程一次，开销可忽略）。
+_compile_limit_tls = threading.local()
+
+
+def _ensure_compile_limits_in_current_thread() -> None:
+    """★ A6：把 `recompile_limit`/`cache_size_limit` 在当前线程内**幂等**补设到配置值。
+
+    `torch._dynamo.config` 是 thread-local ⇒ 仅在 `_apply_compile()`（加载线程）里设是不够的。
+    本函数每个线程只真正执行一次；只在「当前值小于配置值」时才写，避免覆盖用户显式调大的值。
+    """
+    if getattr(_compile_limit_tls, "done", False):
+        return
+    if not globals().get("USE_COMPILE"):
+        _compile_limit_tls.done = True
+        return
+    limit = globals().get("COMPILE_RECOMPILE_LIMIT")
+    if not limit:
+        _compile_limit_tls.done = True
+        return
+    try:
+        import torch._dynamo as _dynamo
+        want = int(limit)
+        if int(_dynamo.config.recompile_limit or 0) < want:
+            _dynamo.config.recompile_limit = want
+        current_cache = getattr(_dynamo.config, "cache_size_limit", None)
+        if current_cache is not None and int(current_cache or 0) < want:
+            _dynamo.config.cache_size_limit = want
+        _compile_limit_tls.done = True
+        logger.debug("A6：已在本线程内补设 recompile_limit/cache_size_limit = %s", want)
+    except Exception as exc:  # noqa: BLE001 - 补设失败不应影响前向
+        logger.debug("A6：线程内补设 recompile_limit 失败（忽略）: %s", exc)
+
+
 def _serialized_model_access(method):
     """Serialize model mutation and inference against the manager RLock."""
     @wraps(method)
     def wrapper(self, *args, **kwargs):
+        _ensure_compile_limits_in_current_thread()  # ★ A6
         with self._lock:
             return method(self, *args, **kwargs)
     return wrapper
@@ -505,6 +545,7 @@ def _serialized_model_stream(method):
     """Keep the model lock for the complete lifetime of a stream."""
     @wraps(method)
     def wrapper(self, *args, **kwargs):
+        _ensure_compile_limits_in_current_thread()  # ★ A6
         with self._lock:
             yield from method(self, *args, **kwargs)
     return wrapper
