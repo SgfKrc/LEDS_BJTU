@@ -90,6 +90,10 @@ API_PATHS = {
     # ---- 2026-09-19 补缺口 D：存储健康（只读）----
     "db_health": "/db/health",                     # GET SQLite 健康
     "storage_health": "/storage/health",           # GET 存储健康
+    # ---- 2026-09-19 补缺口 F：会话细粒度（读为主）----
+    "session_info": "/sessions/{session_id}",              # GET 会话元数据
+    "session_turn": "/sessions/{session_id}/turns/{turn_index}",  # DELETE 删单轮
+    "conversation_sync_status": "/conversations/sync-status",  # GET 持久化状态
 }
 
 # ============================================================
@@ -271,6 +275,10 @@ COMMAND_SPECS: List[Dict[str, str]] = [
     {"name": "/cancel", "args": "", "desc": "取消当前生成"},
     {"name": "/logs", "args": "list | download <file> | read <file> | delete <file> | nodes",
      "desc": "日志细粒度：文件列表 / 下载 / 查看 / 删除（需确认）/ 各节点汇总"},
+    {"name": "/history", "args": "[<session_id>] [limit] | sync-status | info <session_id> "
+                              "| drop-turn <session_id> <turn_index>",
+     "desc": "会话历史：查看对话（默认当前会话）/ 本地持久化状态 / 会话详情 / "
+             "删单轮（需确认，删 user+assistant 两条）"},
     {"name": "/assets", "args": "available | registry | downloadable | gguf",
      "desc": "模型资产浏览（只读）：可选模型与引擎 / 已注册实验模型 / 可下载清单 / 本地 GGUF"},
     {"name": "/storage", "args": "", "desc": "存储与数据库健康（只读）"},

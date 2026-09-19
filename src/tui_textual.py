@@ -95,11 +95,15 @@ from tui_api import (  # noqa: E402
     read_log_file,
     reset_master_identity,
     spare_master_logs,
+    conversation_sync_status,
     db_health,
+    delete_turn,
+    get_conversation,
     list_local_gguf,
     list_model_registry,
     list_models_available,
     list_models_downloadable,
+    session_info,
     storage_health,
     transfer_logs,
     transfer_master,
@@ -543,6 +547,9 @@ class ChatPane(Vertical):
         if text.startswith("/assets"):
             self.cmd_assets(text)
             return
+        if text.startswith("/history"):
+            self.cmd_history(text)
+            return
         if text.startswith("/storage"):
             self.cmd_storage(text)
             return
@@ -626,6 +633,64 @@ class ChatPane(Vertical):
             text = f"[red]模型{label}失败[/]：{exc}"
         self.app.call_from_thread(self.write_line, text)
         self.app.call_from_thread(self.status_line, text)
+
+    def cmd_history(self, text: str) -> None:
+        """★ 2026-09-19 补缺口 F：会话细粒度。
+
+        ``/history [<session_id>] [limit]`` 查看对话历史（默认当前会话）/
+        ``sync-status`` 本地持久化状态 / ``info <session_id>`` 会话元数据 /
+        ``drop-turn <session_id> <turn_index>`` 删单轮（**需确认**，删 user+assistant 两条）。
+        """
+        parts = text.split()
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        if sub == "sync-status":
+            self.history_call("sync-status")
+            return
+        if sub == "info" and len(parts) == 3:
+            self.history_call("info", parts[2])
+            return
+        if sub == "drop-turn" and len(parts) == 4:
+            sid, turn = parts[2], parts[3]
+            self.app.confirm(
+                f"删除第 {turn} 轮对话",
+                "将同时删除该轮的 **user + assistant 两条消息**，不可撤销。",
+                lambda: self.history_call("drop-turn", sid, turn),
+                confirm_label="删除")
+            return
+        if sub in {"info", "drop-turn"}:
+            self.status_line(
+                "用法: /history [<session_id>] [limit] | sync-status"
+                " | info <session_id> | drop-turn <session_id> <turn_index>")
+            return
+        # 默认：查看历史；可带 session_id 与 limit
+        sid = parts[1] if len(parts) > 1 else ""
+        limit = parts[2] if len(parts) > 2 else ""
+        self.history_call("show", sid, limit)
+
+    @work(thread=True, exclusive=True, group="history")
+    def history_call(self, action: str, value: str = "", extra: str = "") -> None:
+        app = self.app
+        self.app.call_from_thread(self.status_line, f"会话历史 {action} …")
+        try:
+            if action == "sync-status":
+                result = conversation_sync_status(app.api)
+            elif action == "info":
+                result = session_info(app.api, value)
+            elif action == "drop-turn":
+                result = delete_turn(app.api, value, int(extra))
+            elif action == "show":
+                sid = value or (app.session_id or "default")
+                limit = int(extra) if extra.isdigit() else 200
+                result = get_conversation(app.api, sid, limit)
+            else:
+                raise ValueError(f"未知会话动作: {action}")
+            body = json.dumps(result, ensure_ascii=False, indent=2)[:4000]
+            label = f"{action} {value}".strip()
+            text = f"[green]会话历史 {label}[/]\n{body}"
+        except (ApiError, ValueError) as exc:
+            text = f"[red]会话历史 {action} 失败[/]：{exc}"
+        self.app.call_from_thread(self.write_line, text)
+        self.app.call_from_thread(self.status_line, text.splitlines()[0])
 
     def cmd_assets(self, text: str) -> None:
         """★ 2026-09-19 补缺口 C：模型资产浏览（只读）。

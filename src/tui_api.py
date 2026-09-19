@@ -484,3 +484,32 @@ def db_health(api: ApiClient) -> Dict[str, Any]:
 def storage_health(api: ApiClient) -> Dict[str, Any]:
     """存储健康（GET ``/storage/health``）。★ 补缺口 D。"""
     return _as_dict(api.get(API_PATHS["storage_health"]))
+
+
+# ---------------------------------------------------------------- 会话细粒度(F)
+def get_conversation(api: ApiClient, session_id: str = "default",
+                     limit: int = 200) -> Dict[str, Any]:
+    """读对话历史（GET ``/conversations?session_id=&limit=``）。★ 补缺口 F。"""
+    query = urllib.parse.urlencode({"session_id": session_id, "limit": int(limit)})
+    return _as_dict(api.get(f"{API_PATHS['conversations']}?{query}"))
+
+
+def conversation_sync_status(api: ApiClient) -> Dict[str, Any]:
+    """本地持久化状态（GET ``/conversations/sync-status``）。★ 补缺口 F。"""
+    return _as_dict(api.get(API_PATHS["conversation_sync_status"]))
+
+
+def session_info(api: ApiClient, session_id: str) -> Dict[str, Any]:
+    """单个会话元数据（GET ``/sessions/{session_id}``）。★ 补缺口 F。"""
+    path = API_PATHS["session_info"].format(**_quoted(session_id=session_id))
+    return _as_dict(api.get(path))
+
+
+def delete_turn(api: ApiClient, session_id: str, turn_index: int) -> Dict[str, Any]:
+    """删单轮（DELETE ``/sessions/{session_id}/turns/{turn_index}``）。
+
+    ⚠️ 同时删除该轮的 user + assistant 两条消息；`turn_index` 为 0-based。★ 补缺口 F。
+    """
+    path = API_PATHS["session_turn"].format(
+        **_quoted(session_id=session_id), turn_index=int(turn_index))
+    return _as_dict(api.request("DELETE", path))
