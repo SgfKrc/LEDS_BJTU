@@ -46,7 +46,14 @@ def test_backend_capabilities_are_public_and_backend_specific() -> None:
     torch = backend_capabilities(BackendId.PYTORCH)
 
     assert llama.supports(Capability.CHAT)
-    assert not llama.supports(Capability.FORWARD_LAYERS)
+    # ★ 2026-09-19：llama.cpp 现在**也能做层前向**（`forward_layers_from_hidden` 当下游、
+    #   `forward_layers_to_hidden` 当上游）⇒ 能力位由「不支持」改为「支持」。
+    #   意义：llama.cpp **不需要 torch** ⇒ Android/边缘设备（无 torch、有 GGUF 引擎）
+    #   可以参与层流水线。
+    assert llama.supports(Capability.FORWARD_LAYERS)
+    # 但 llama.cpp **不**提供 PyTorch 侧的层段物化语义（它用「裁层 GGUF」表达同一意图）。
+    assert not llama.supports(Capability.LOAD_LAYER_RANGE)
+    assert not llama.supports(Capability.ENSURE_FULL_MODEL)
     assert torch.supports(Capability.FORWARD_LAYERS)
 
 

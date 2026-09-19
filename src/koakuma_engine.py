@@ -56,6 +56,17 @@ _BACKEND_CAPABILITIES = {
         capabilities=frozenset({
             *COMMON_CAPABILITIES,
             Capability.CHAT_IMAGE,
+            # ★ 2026-09-19：llama.cpp 现在**也能做层前向**，故补齐层接力能力位。
+            #   理由（本会话实测）：
+            #     * 当**下游** —— `LlamaCppEngine.forward_layers_from_hidden()` 经 `llama_batch.embd`
+            #       注入上游 hidden，跑本 GGUF（裁层）的层并出 logits；
+            #     * 当**上游** —— `LlamaCppEngine.forward_layers_to_hidden()` 出 hidden
+            #       （取「本文件最后一层之后」，故上游需用**切点处的裁层 GGUF**）。
+            #   ⚠️ 这里只是**声明能力**：llama.cpp 不需要 torch ⇒
+            #   **Android/边缘设备（无 torch、有 GGUF 引擎）因此可以参与层流水线**。
+            #   ⚠️ 不含 `LOAD_LAYER_RANGE` / `ENSURE_FULL_MODEL` —— 那两个是 PyTorch 侧语义
+            #   （按 key 物化层段 / 需要整模），llama.cpp 用「裁层 GGUF」表达同一意图。
+            Capability.FORWARD_LAYERS,
         }),
     ),
     BackendId.PYTORCH: BackendCapabilities(

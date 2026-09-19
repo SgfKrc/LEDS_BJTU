@@ -434,6 +434,7 @@ from model_host import SchedulerCallbackSet, model_host
 from koakuma_engine import (
     Capability,
     accepted_backend_requests,
+    backend_capabilities,
     backend_id_for,
     registered_backends,
     runtime_supports,
@@ -7271,6 +7272,42 @@ async def consume_cluster_join_grant(req: ClusterJoinConsume):
         raise HTTPException(500, "入群授权消费失败") from exc
 
 
+def _client_supports_forward_layers(node_type: str, capabilities: dict | None) -> bool:
+    """客户端能否承担**层前向传播**（层流水线的一段）。
+
+    ★ 2026-09-19：判据从「**平台**」改为「**能力**」。原实现是 `node_type == "pc"`，
+    理由写作「Android 无 PyTorch 推理能力」—— 该判据**过宽**：**Android 不能跑 PyTorch，
+    但能跑 llama.cpp/GGUF 引擎**，而 llama.cpp 现在**也能做层前向**
+    （`LlamaCppEngine.forward_layers_from_hidden()` 当下游、`forward_layers_to_hidden()` 当上游）⇒
+    有 GGUF 引擎的 Android 可以参与层流水线。
+
+    判定顺序（**保守、向后兼容**）：
+
+    1. `capabilities` 明确给出 `FORWARD_LAYERS`（或 `forward_layers=True`）⇒ **True**（自报最权威）；
+    2. `capabilities["backend_id"]`（或 `"engine"`）给出已知 backend ⇒ 按公开的
+       `backend_capabilities(...)` 判定；
+    3. **未自报** ⇒ 退回旧行为：**仅 `node_type == "pc"`** ⇒ 未声明能力的 Android 仍被拒绝。
+    """
+    info = capabilities if isinstance(capabilities, dict) else {}
+
+    reported = info.get("capabilities")
+    if isinstance(reported, (list, tuple, set, frozenset)):
+        if Capability.FORWARD_LAYERS in set(reported):
+            return True
+    elif isinstance(reported, str) and reported == Capability.FORWARD_LAYERS:
+        return True
+
+    if info.get("forward_layers") is True:
+        return True
+
+    backend_id = info.get("backend_id") or info.get("engine")
+    if isinstance(backend_id, str) and backend_id:
+        if backend_capabilities(backend_id).supports(Capability.FORWARD_LAYERS):
+            return True
+
+    return (node_type or "pc") == "pc"
+
+
 @app.post("/api/bootstrap/first-connect")
 async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Request):
     """
@@ -7329,7 +7366,11 @@ async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Re
         status_code = 403 if register_result.get("status") == "denied" else 400
         raise HTTPException(status_code, register_result.get("reason", "bootstrap registration failed"))
 
-    pipeline_worker = node_type == "pc"
+    # ★ 2026-09-19：不再按平台一刀切。Android 不能跑 PyTorch，**但能跑 llama.cpp/GGUF 引擎**，
+    #   而 llama.cpp 现在也能做层前向（`forward_layers_from_hidden` / `forward_layers_to_hidden`）
+    #   ⇒ 只要客户端**自报**了 `FORWARD_LAYERS` 能力，就承认它可以当流水线工作器；
+    #   **未自报者退回旧行为（仅 pc）**，保证不会无意放行。
+    pipeline_worker = _client_supports_forward_layers(node_type, req.capabilities)
     response = {
         "status": "ok",
         "cluster": {
@@ -7348,7 +7389,8 @@ async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Re
         },
         "android": {
             "presence_interval_seconds": 45,
-            "pipeline_worker": False,
+            # ★ 与此节点的实际能力一致（自报 FORWARD_LAYERS 的 Android 可为 True）。
+            "pipeline_worker": pipeline_worker,
             "model_manifest_url": build_url(
                 "http", master_api_host, master_api_port, "/api/models/downloadable"
             ),
