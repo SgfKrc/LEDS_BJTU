@@ -87,8 +87,16 @@ from tui_api import (  # noqa: E402
     list_log_files,
     list_sessions,
     load_model,
+    clear_spare_master,
+    designate_spare_master,
+    get_spare_master,
     logs_nodes_summary,
+    master_health,
     read_log_file,
+    reset_master_identity,
+    spare_master_logs,
+    transfer_logs,
+    transfer_master,
     pause_queue,
     rename_session,
     resume_queue,
@@ -523,6 +531,9 @@ class ChatPane(Vertical):
         if text.startswith("/logs"):
             self.cmd_logs(text)
             return
+        if text.startswith("/ha"):
+            self.cmd_ha(text)
+            return
         if text == "/sessions":
             self.cmd_sessions()
             return
@@ -603,6 +614,88 @@ class ChatPane(Vertical):
             text = f"[red]模型{label}失败[/]：{exc}"
         self.app.call_from_thread(self.write_line, text)
         self.app.call_from_thread(self.status_line, text)
+
+    def cmd_ha(self, text: str) -> None:
+        """★ 2026-09-19 补缺口 E：集群高可用（备用主节点 / 主节点转让 / 身份重置）。
+
+        ⚠️ **分级**：``health`` / ``transfer-logs`` / ``spare`` / ``spare-logs`` 为**只读**；
+        ``designate`` / ``clear-spare`` / ``transfer`` / ``reset-identity`` 为**写操作**，
+        一律先经 ``self.app.confirm`` 二次确认，且**文案点明后果**。
+        """
+        parts = text.split()
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        if sub in {"health", "transfer-logs", "spare", "spare-logs"}:
+            self.ha_call(sub)
+            return
+        if sub == "designate" and len(parts) == 3:
+            node = parts[2]
+            self.app.confirm(
+                f"指定备用主节点 {node}",
+                "变更集群高可用配置：该节点将成为主节点宕机时的接管候选。"
+                "要求集群节点数 >= 2 且目标在线。",
+                lambda: self.ha_call("designate", node),
+                confirm_label="指定")
+            return
+        if sub == "clear-spare":
+            self.app.confirm(
+                "清除备用主节点指定",
+                "将取消当前的备用主节点配置。",
+                lambda: self.ha_call("clear-spare"),
+                confirm_label="清除")
+            return
+        if sub == "transfer" and len(parts) == 3:
+            node = parts[2]
+            self.app.confirm(
+                f"⚠️ 转让主节点身份给 {node}",
+                "**高危操作**：主节点身份将转让给该从节点，"
+                "**双方都需要重启服务**才能生效（原主转从、新主转主）。",
+                lambda: self.ha_call("transfer", node),
+                confirm_label="转让")
+            return
+        if sub == "reset-identity":
+            self.app.confirm(
+                "⚠️ 重置主节点身份",
+                "**高危且不可撤销**：将替换主节点数据库中的 MAC 记录并绑定当前物理 MAC。"
+                "仅用于更换机器/网卡后。请确认你确实要这样做。",
+                lambda: self.ha_call("reset-identity"),
+                confirm_label="重置")
+            return
+        self.status_line(
+            "用法: /ha health | transfer-logs | spare | spare-logs | designate <node>"
+            " | clear-spare | transfer <node> | reset-identity")
+
+    @work(thread=True, exclusive=True, group="hactl")
+    def ha_call(self, action: str, value: str = "") -> None:
+        app = self.app
+        self.app.call_from_thread(self.status_line, f"高可用操作 {action} …")
+        try:
+            if action == "health":
+                result = master_health(app.api)
+            elif action == "transfer-logs":
+                result = transfer_logs(app.api)
+            elif action == "spare":
+                result = get_spare_master(app.api)
+            elif action == "spare-logs":
+                result = spare_master_logs(app.api)
+            elif action == "designate":
+                result = designate_spare_master(app.api, value)
+            elif action == "clear-spare":
+                result = clear_spare_master(app.api)
+            elif action == "transfer":
+                result = transfer_master(app.api, value)
+            elif action == "reset-identity":
+                result = reset_master_identity(app.api)
+            else:
+                raise ValueError(f"未知高可用动作: {action}")
+            body = json.dumps(result, ensure_ascii=False, indent=2)[:4000]
+            text = f"[green]高可用 {action}[/] → {value}\n{body}" if value else \
+                f"[green]高可用 {action}[/]\n{body}"
+            if action == "transfer":
+                text += "\n[yellow]提示：转让后需重启双方服务才生效[/]"
+        except (ApiError, ValueError) as exc:
+            text = f"[red]高可用 {action} 失败[/]：{exc}"
+        self.app.call_from_thread(self.write_line, text)
+        self.app.call_from_thread(self.status_line, text.splitlines()[0])
 
     def cmd_logs(self, text: str) -> None:
         """★ 2026-09-19 补缺口 B：日志细粒度（文件列表 / 下载 / 查看 / 删除 / 节点汇总）。

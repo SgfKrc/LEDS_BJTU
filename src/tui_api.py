@@ -326,6 +326,58 @@ def logs_nodes_summary(api: ApiClient) -> Dict[str, Any]:
     """各节点日志汇总（GET ``/logs/nodes-summary``）。★ 补缺口 B。"""
     return _as_dict(api.get(API_PATHS["logs_nodes_summary"], with_log_token=True))
 
+# ---------------------------------------------------------------- 集群高可用(E)
+def master_health(api: ApiClient) -> Dict[str, Any]:
+    """主节点健康（GET ``/cluster/master-health``）。★ 补缺口 E。"""
+    return _as_dict(api.get(API_PATHS["cluster_master_health"]))
+
+
+def transfer_logs(api: ApiClient) -> Dict[str, Any]:
+    """角色转让日志（GET ``/cluster/transfer-logs``）。★ 补缺口 E。"""
+    return _as_dict(api.get(API_PATHS["cluster_transfer_logs"]))
+
+
+def get_spare_master(api: ApiClient) -> Dict[str, Any]:
+    """查询备用主节点（GET ``/cluster/spare-master``）。★ 补缺口 E。"""
+    return _as_dict(api.get(API_PATHS["cluster_spare_master"]))
+
+
+def spare_master_logs(api: ApiClient) -> Dict[str, Any]:
+    """备用主节点操作日志（GET ``/cluster/spare-master/logs``）。★ 补缺口 E。"""
+    return _as_dict(api.get(API_PATHS["cluster_spare_master_logs"]))
+
+
+def designate_spare_master(api: ApiClient, target_node_id: str) -> Dict[str, Any]:
+    """指定备用主节点（POST ``/cluster/spare-master``，仅主节点）。
+
+    ⚠️ 变更集群角色配置：集群节点数需 >= 2，目标须在线且为 client。★ 补缺口 E。
+    """
+    return _as_dict(api.post(API_PATHS["cluster_spare_master"],
+                             {"target_node_id": target_node_id}))
+
+
+def clear_spare_master(api: ApiClient) -> Dict[str, Any]:
+    """清除备用主节点指定（DELETE ``/cluster/spare-master``，仅主节点）。★ 补缺口 E。"""
+    return _as_dict(api.request("DELETE", API_PATHS["cluster_spare_master"]))
+
+
+def transfer_master(api: ApiClient, target_node_id: str) -> Dict[str, Any]:
+    """把主节点身份转让给指定从节点（POST ``/cluster/transfer-master``，仅主节点）。
+
+    ⚠️⚠️ **高危**：转让后**双方需重启**才生效（原主转从、新主转主）。★ 补缺口 E。
+    """
+    return _as_dict(api.post(API_PATHS["cluster_transfer_master"],
+                             {"target_node_id": target_node_id}))
+
+
+def reset_master_identity(api: ApiClient) -> Dict[str, Any]:
+    """重置主节点身份标识（POST ``/cluster/reset-identity``，仅主节点）。
+
+    ⚠️⚠️ **高危**：替换主节点 SQLite 里的 MAC 记录（更换机器/网卡后用），绑定当前物理 MAC。
+    后端要求请求体 ``confirm == "reset"``；本函数已固定填入。★ 补缺口 E。
+    """
+    return _as_dict(api.post(API_PATHS["cluster_reset_identity"], {"confirm": "reset"}))
+
 
 def cancel_queue_task(api: ApiClient, task_id: str) -> Dict[str, Any]:
     """取消**单个**排队任务（DELETE ``/cluster/queue/task/{task_id}``，仅主节点）。
@@ -353,17 +405,6 @@ def read_log_file(api: ApiClient, filename: str) -> Dict[str, Any]:
     """读单个日志文件（GET ``/logs/{filename}``）。★ 补缺口 B。"""
     path = API_PATHS["logs_file"].format(**_quoted(filename=filename))
     return _as_dict(api.get(path, with_log_token=True))
-
-
-def delete_log_file(api: ApiClient, filename: str) -> Dict[str, Any]:
-    """删单个日志文件（DELETE ``/logs/{filename}``）——不可撤销，调用方须先确认。★ 补缺口 B。"""
-    path = API_PATHS["logs_file"].format(**_quoted(filename=filename))
-    return _as_dict(api.request("DELETE", path))
-
-
-def logs_nodes_summary(api: ApiClient) -> Dict[str, Any]:
-    """各节点日志汇总（GET ``/logs/nodes-summary``）。★ 补缺口 B。"""
-    return _as_dict(api.get(API_PATHS["logs_nodes_summary"], with_log_token=True))
 
 
 def iter_chat_payloads(

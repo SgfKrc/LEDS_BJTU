@@ -75,6 +75,13 @@ API_PATHS = {
     "logs_download": "/logs/download",            # GET 下载
     "logs_file": "/logs/{filename}",              # GET 读单文件 / DELETE 删单文件
     "logs_nodes_summary": "/logs/nodes-summary",  # GET 各节点日志汇总
+    # ---- 2026-09-19 补缺口 E：集群高可用（备用主节点 / 主节点转让 / 身份重置）----
+    "cluster_master_health": "/cluster/master-health",       # GET 主节点健康
+    "cluster_transfer_logs": "/cluster/transfer-logs",       # GET 角色转让日志
+    "cluster_spare_master": "/cluster/spare-master",         # GET 查询 / POST 指定 / DELETE 清除
+    "cluster_spare_master_logs": "/cluster/spare-master/logs",  # GET 备用主节点操作日志
+    "cluster_transfer_master": "/cluster/transfer-master",   # POST ⚠️ 高危（需重启）
+    "cluster_reset_identity": "/cluster/reset-identity",     # POST ⚠️ 高危（需 confirm="reset"）
 }
 
 # ============================================================
@@ -256,6 +263,10 @@ COMMAND_SPECS: List[Dict[str, str]] = [
     {"name": "/cancel", "args": "", "desc": "取消当前生成"},
     {"name": "/logs", "args": "list | download <file> | read <file> | delete <file> | nodes",
      "desc": "日志细粒度：文件列表 / 下载 / 查看 / 删除（需确认）/ 各节点汇总"},
+    {"name": "/ha", "args": "health | transfer-logs | spare | spare-logs | designate <node> "
+                            "| clear-spare | transfer <node> | reset-identity",
+     "desc": "集群高可用：健康 / 转让日志 / 备用主节点；⚠️ transfer 与 reset-identity 为高危"
+             "（转让后需重启，身份重置不可撤销）"},
     {"name": "/clear", "args": "", "desc": "清空本地显示（不动后端；清后端用 /reset）"},
     {"name": "/help", "args": "", "desc": "显示本帮助"},
     {"name": "/quit", "args": "", "desc": "退出聊天页"},
