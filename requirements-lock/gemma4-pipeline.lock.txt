@@ -1,10 +1,10 @@
 # ============================================================
 # gemma4-pipeline 依赖精确快照（pip freeze 自动生成，勿手改）
-# 环境: Gemma 4 PyTorch Transformers 5.10.1 侧车（.venv-gemma4-pipeline）
+# 环境: Gemma 4 PyTorch Transformers 5.17.0 侧车（.venv-gemma4-pipeline）
 # 生成: python scripts/setup_envs.py --snapshot
 # 当前 torch 系版本（参考）: torch==2.13.0+cpu
 # 说明: torch/torchvision/torchaudio 与 editable/本地路径安装不在此锁定；
-#       各类依赖按 packaging/requirements-*.txt 安装，torch 按 setup_envs.py 提示手动补齐。
+#       主仓运行时依赖按 requirements*.txt 安装；发布和 TUI 依赖在 qlh-release/qlh-shell 中维护。
 # ============================================================
 accelerate==1.14.0
 annotated-doc==0.0.5
@@ -36,9 +36,9 @@ rich==15.0.0
 safetensors==0.8.0
 shellingham==1.5.4
 sympy==1.14.0
-tokenizers==0.22.2
+tokenizers==0.23.2
 # torch==2.13.0+cpu   # torch 系不自动锁定，手动安装（--torch-index-url）
 tqdm==4.70.0
-transformers==5.10.1
+transformers==5.17.0
 typer==0.27.1
 typing_extensions==4.16.0

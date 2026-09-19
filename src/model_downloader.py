@@ -114,14 +114,30 @@ MODELSCOPE_CMD_SAFETENSORS = (
     "snapshot_download('Qwen/Qwen-1.8B-Chat', local_dir='models/qwen-1_8b-chat')\""
 )
 
+# ----------------------------------------------------------------
+# HuggingFace Hub CLI 命令名（版本自适应）
+# ----------------------------------------------------------------
+# `huggingface_hub` **1.x 移除了 `huggingface-cli`**：`entry_points` 里它指向
+# `huggingface_hub.cli.deprecated_cli:main`，而后者只打印警告并 `sys.exit(1)`
+# ⇒ CLI 下载**完全不工作**。1.x 的新命令是 **`hf`**（参数兼容：`hf download <repo> ...`）。
+# 这里按**实际可用性**探测，以便同一份代码同时兼容 0.x 与 1.x。
+def _hf_cli_name() -> str:
+    """返回本机可用的 HuggingFace Hub CLI 命令名（优先 1.x 的 `hf`）。"""
+    for candidate in ("hf", "huggingface-cli"):
+        if shutil.which(candidate):
+            return candidate
+    return "hf"  # 都没找到时给出新命令名，提示信息里会引导安装/升级
+
+
 # HuggingFace — Safetensors
+# 注：`huggingface_hub` 1.x 下应为 `hf download ...`（0.x 为 `huggingface-cli download ...`）。
 HUGGINGFACE_CMD_SAFETENSORS = (
-    "huggingface-cli download Qwen/Qwen-1.8B-Chat --local-dir models/qwen-1_8b-chat"
+    "hf download Qwen/Qwen-1.8B-Chat --local-dir models/qwen-1_8b-chat"
 )
 
 # HuggingFace — GGUF（推荐仓库）
 HUGGINGFACE_CMD_GGUF = (
-    f"huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf "
+    f"hf download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf "
     f"Qwen-1_8B-Chat-Q4_K_M.gguf --local-dir models/"
 )
 
@@ -392,8 +408,11 @@ def _download_gguf_huggingface():
     except ImportError:
         logger.info("正在安装 HuggingFace Hub CLI...")
         try:
+            # 注：不再使用 `huggingface_hub[hf_transfer]` extra —— `huggingface_hub` **1.x 已移除该
+            # extra**（其 extras 为 oauth/torch/fastai/hf-xet/mcp/testing），装了会静默失效；
+            # 1.x 的传输加速器 `hf-xet` 已在**基础依赖**里。因此直接装基础包即可。
             subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "huggingface_hub[hf_transfer]"],
+                [sys.executable, "-m", "pip", "install", "huggingface_hub"],
                 stdout=subprocess.DEVNULL,
             )
         except subprocess.CalledProcessError:
@@ -416,7 +435,7 @@ def _download_gguf_huggingface():
     try:
         subprocess.check_call(
             [
-                "huggingface-cli", "download",
+                _hf_cli_name(), "download",
                 repo,
                 filename,
                 "--local-dir", gguf_dir,
@@ -453,8 +472,9 @@ def _download_safetensors_huggingface():
     except ImportError:
         logger.info("正在安装 HuggingFace Hub CLI...")
         try:
+            # 注：同上 —— `hf_transfer` extra 在 `huggingface_hub` 1.x 已不存在。
             subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "huggingface_hub[hf_transfer]"],
+                [sys.executable, "-m", "pip", "install", "huggingface_hub"],
                 stdout=subprocess.DEVNULL,
             )
         except subprocess.CalledProcessError:
@@ -472,7 +492,7 @@ def _download_safetensors_huggingface():
     try:
         subprocess.check_call(
             [
-                "huggingface-cli", "download",
+                _hf_cli_name(), "download",
                 "Qwen/Qwen-1.8B-Chat",
                 "--local-dir", safetensors_dir,
             ],

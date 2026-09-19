@@ -12,7 +12,7 @@ def test_pipeline_environment_is_distinct_from_native_mtmd_environment():
     assert setup.VENV_DIR.name == ".venv-gemma4-pipeline"
     assert setup.NATIVE_VENV_DIR.name == ".venv-gemma4-native"
     assert setup.VENV_DIR != setup.NATIVE_VENV_DIR
-    assert setup.TRANSFORMERS_VERSION == "5.10.1"
+    assert setup.TRANSFORMERS_VERSION == "5.17.0"
 
 
 def test_pip_arguments_use_user_proxy_or_offline_wheelhouse(tmp_path):

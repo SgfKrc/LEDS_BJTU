@@ -627,7 +627,8 @@ def _download(source: str, staging: Path, *, use_modelscope: bool, proxy: str,
                 options: dict[str, Any] = {
                     "repo_id": source,
                     "local_dir": str(staging),
-                    "local_dir_use_symlinks": False,
+                    # 注：`local_dir_use_symlinks` 在 huggingface_hub **1.x 已移除**（1.x 会 pop 掉它
+                    # 并给警告，且默认不再使用 symlink）⇒ 不再传入，避免噪声与语义歧义。
                 }
                 if revision:
                     options["revision"] = revision

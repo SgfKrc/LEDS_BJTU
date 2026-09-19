@@ -3,7 +3,7 @@
 # 环境: Gemma 4 MTMD 原生运行时（.venv-gemma4-native；llama.cpp GGUF）
 # 生成: python scripts/setup_envs.py --snapshot
 # 说明: torch/torchvision/torchaudio 与 editable/本地路径安装不在此锁定；
-#       各类依赖按 packaging/requirements-*.txt 安装，torch 按 setup_envs.py 提示手动补齐。
+#       主仓运行时依赖按 requirements*.txt 安装；发布和 TUI 依赖在 qlh-release/qlh-shell 中维护。
 # ============================================================
 diskcache==5.6.3
 Jinja2==3.1.6

@@ -4,13 +4,15 @@
 # 安装: pip install -r requirements.txt
 #
 # 兼容性说明:
-#   - transformers 推荐 4.x 系列（BitsAndBytesConfig 兼容性已验证）
+#   - transformers 5.17.x（2026-09-19 由 4.47.1 升级；Qwen-1.8B remote code 的 5.x 兼容由
+#     src/transformers5_compat.py 的 get_head_mask 补丁 + src/model_module.py 的「权重守卫」覆盖）
 #   - bitsandbytes >= 0.45.0 支持 Windows + CUDA 12.x
 #   - PyTorch 需与 CUDA 版本匹配
 
 # --- 核心深度学习框架 ---
 torch>=2.2.0
-transformers>=4.47.0,<4.48.0    # Qwen remote code + DeepSeek-R1 Distill 兼容窗口
+transformers>=5.17.0,<5.18.0     # 主运行时统一窗口（含 Qwen remote code + DeepSeek-R1 Distill）
+huggingface_hub>=1.5.0,<2.0.0    # 5.x 传递要求 >=1.5,<2.0；1.x 移除了 huggingface-cli（改用 hf）
 accelerate>=1.0.0                # 模型加载加速（bitsandbytes 依赖）
 transformers-stream-generator>=0.0.4  # Qwen-1.8B remote code 依赖
 einops>=0.6.0                    # Qwen-1.8B rotary embedding / rearrange

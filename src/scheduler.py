@@ -1126,7 +1126,7 @@ class Scheduler:
         self._qwen3_network_transfer_coordinator = None
         self._qwen3_artifact_transfer_runtime = None
         self._qwen3_peer_request_verifier = None
-        # Gemma 4 Unified uses a distinct Transformers 5.10.1 sidecar.  This
+        # Gemma 4 Unified uses a distinct Transformers 5.17.0 sidecar.  This
         # local chain is an explicit development route and never changes the
         # production pipeline runtime allow-list.
         self._gemma4_local_chain: Optional[Gemma4PipelineMultiSidecar] = None

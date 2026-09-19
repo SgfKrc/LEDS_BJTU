@@ -28,7 +28,9 @@ from gemma4_pipeline_adapter import (  # noqa: E402
 
 SCHEMA_VERSION = 1
 OPERATION = "gemma4_pipeline_sidecar"
-TRANSFORMERS_VERSION = "5.10.1"
+# 2026-09-19：随主运行时统一到 5.17.0（此前 5.10.1）。下方 :217 会按此值**硬校验** sidecar 的
+# transformers 版本，不匹配即拒绝启动 ⇒ 必须与环境实际安装的版本保持一致。
+TRANSFORMERS_VERSION = "5.17.0"
 MAX_FRAME_BYTES = 256 * 1024
 _DTYPE_BYTES = {
     "BOOL": 1, "U8": 1, "I8": 1, "F8_E4M3": 1, "F8_E5M2": 1,

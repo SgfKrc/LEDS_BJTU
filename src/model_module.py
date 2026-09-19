@@ -579,15 +579,23 @@ def _verify_and_repair_loaded_weights(model, model_path: str) -> Optional[Dict[s
                         target = state.get(key)
                         if target is None or not hasattr(target, "copy_"):
                             continue
+                        # ⚠️ **跨设备**：CUDA 上 `model.state_dict()` 的张量在 GPU，而 safetensors
+                        # 读到的是 CPU。必须**显式搬到 target 的设备**再比较/写入 —— 否则
+                        # `torch.equal` 跨设备恒为 False，会把**全部**键误判为「不一致」并做过量重载
+                        # （2026-09-19 实测：CUDA 上曾误报 195/195）。
+                        if getattr(target, "is_meta", False):
+                            # `device_map` 分片可能把某些键留成 meta 占位，无法就地对写 ⇒ 跳过。
+                            continue
                         raw = handle.get_tensor(key)
                         checked += 1
                         try:
-                            same = raw.shape == target.shape and bool(
-                                torch.equal(raw.to(target.dtype), target))
+                            src = raw.to(device=target.device, dtype=target.dtype)
+                            same = raw.shape == target.shape and bool(torch.equal(src, target))
                         except Exception:  # noqa: BLE001
                             same = False
+                            src = raw
                         if not same:
-                            target.copy_(raw.to(target.dtype))
+                            target.copy_(src)
                             repaired += 1
                             if len(mismatched) < 12:
                                 mismatched.append(key)

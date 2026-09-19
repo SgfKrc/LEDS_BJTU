@@ -106,7 +106,7 @@ ASSETS: dict[str, dict] = {
     "qwen18b-gguf": {
         "path": "models/Qwen-1_8B-Chat.Q4_K_M.gguf", "kind": "file", "scope": "both",
         "desc": "Qwen-1.8B-Chat GGUF Q4_K_M（CPU/Android）",
-        "fetch": "huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf "
+        "fetch": "hf download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf "
                  "Qwen-1_8B-Chat-Q4_K_M.gguf --local-dir models/",
     },
     "qwen3-4b-gguf": {

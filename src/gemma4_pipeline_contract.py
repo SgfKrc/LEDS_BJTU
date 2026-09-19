@@ -10,7 +10,8 @@ from typing import Any, Iterable
 
 SCHEMA_VERSION = 1
 CONTRACT_KIND = "gemma4_pipeline_sidecar"
-TRANSFORMERS_VERSION = "5.10.1"
+# 2026-09-19：随主运行时统一到 5.17.0（此前 5.10.1）。
+TRANSFORMERS_VERSION = "5.17.0"
 MAX_CONTRACT_BYTES = 64 * 1024
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _LAYER_TYPES = {"full_attention", "sliding_attention"}

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Any, Mapping
@@ -185,7 +186,26 @@ def execute_request(
             raise Qwen3MultimodalPreflightError("processor produced no pixel values/grid")
 
         with torch.no_grad():
-            image_embeds, _deepstack = vision_model(pixel_values, grid_thw)
+            vision_out = vision_model(pixel_values, grid_thw)
+        # ⚠️ 返回形状与语义**跨版本都不同**（2026-09-19 实测）：
+        #   * transformers 4.x：`(merged_hidden_states, deepstack_features)` 的 **2 元 tuple**；
+        #   * transformers 5.x：`BaseModelOutputWithDeepstackFeatures`，其中
+        #       `last_hidden_state`  = merger **之前**（hidden_size=1024）
+        #       `pooler_output`      = merger **之后**（投影到文本维度）★ 才是「图像嵌入」
+        #       `deepstack_features` = 各 deepstack 层特征
+        #     且 ModelOutput 的 `__iter__` 会迭代**所有非 None 字段** ⇒ 直接解包会
+        #     `ValueError: too many values to unpack (expected 2)`。
+        # 故：**按属性取、回退按位置取**，并确保取的是 **merger 之后** 的那个。
+        image_embeds = getattr(vision_out, "pooler_output", None)
+        deepstack_features = getattr(vision_out, "deepstack_features", None)
+        if not hasattr(vision_out, "last_hidden_state"):
+            # 4.x：tuple 形态，位置 0 即 merger 之后
+            image_embeds = vision_out[0]
+            if len(vision_out) > 1:
+                deepstack_features = vision_out[1]
+        elif image_embeds is None:
+            image_embeds = vision_out.last_hidden_state  # 理论上不会发生
+        _deepstack = deepstack_features  # 保留原名以最小化改动
         seq_len = int(image_embeds.shape[0])
         hidden_dim = int(image_embeds.shape[-1])
 
@@ -248,17 +268,30 @@ def execute_request(
         return result
     except Qwen3MultimodalPreflightError as exc:
         result["status"] = "vision_tower_contract_rejected"
-        result["errors"] = [{"code": "vision_tower_contract_rejected", "message": exc.__class__.__name__}]
+        result["errors"] = [{"code": "vision_tower_contract_rejected",
+                             "message": _debug_message(exc)}]
         return result
     except Exception as exc:
         result["status"] = "vision_tower_load_failed"
-        result["errors"] = [{"code": "vision_tower_load_failed", "message": exc.__class__.__name__}]
+        result["errors"] = [{"code": "vision_tower_load_failed",
+                             "message": _debug_message(exc)}]
         return result
     finally:
         # Drop references on both success and failure; the worker is isolated,
         # but explicit cleanup keeps repeated probes from retaining CPU pages.
         vision_model = processor = image_embeds = pixel_values = inputs = None
         gc.collect()
+
+
+def _debug_message(exc: BaseException) -> str:
+    """错误信息：默认只给**类名**（fail-closed，不把内部路径/细节带进控制面响应）。
+
+    设 `QLH_MM_DEBUG=1` 时附带异常文本，便于本地定位（主运行时升级后出现过
+    「只给类名无从下手」的情况）。
+    """
+    if os.environ.get("QLH_MM_DEBUG", "").strip() in {"1", "true", "yes"}:
+        return f"{exc.__class__.__name__}: {exc}"
+    return exc.__class__.__name__
 
 
 def main() -> int:

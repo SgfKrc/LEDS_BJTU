@@ -383,6 +383,24 @@ def load_qwen3_layer_assignment(
     return adapter, metrics
 
 
+def _cache_to_legacy(cache: Any) -> tuple[Any, ...]:
+    """把 transformers 的 `Cache` 转成「每层 `(k, v)`」的可序列化元组（跨节点传输用）。
+
+    ⚠️ transformers **5.17 移除了 `Cache.to_legacy_cache()`**（与 `from_legacy_cache` 一起）。
+    新写法是**直接迭代**：5.17 的 `DynamicCache.__iter__` 产出 **3 元**
+    `(keys, values, sliding_window_tensor)` ⇒ 取前两个即得与旧 `to_legacy_cache()` 相同的
+    `tuple[tuple[Tensor, Tensor]]`（2026-09-19 实测：不修则
+    `'DynamicCache' object has no attribute 'to_legacy_cache'`）。
+    """
+    to_legacy = getattr(cache, "to_legacy_cache", None)
+    if callable(to_legacy):
+        return tuple(to_legacy())
+    try:
+        return tuple((layer[0], layer[1]) for layer in cache)
+    except (TypeError, IndexError) as exc:
+        raise Qwen3AdapterError("unsupported Qwen3 KV cache representation") from exc
+
+
 def _layer_result(value: Any) -> tuple[Any, Any]:
     if isinstance(value, tuple):
         return value[0], value[1] if len(value) > 1 else None
@@ -492,7 +510,13 @@ class Qwen3PipelineAdapter:
         if isinstance(past_key_values, Cache):
             return past_key_values
         if isinstance(past_key_values, (tuple, list)):
-            return DynamicCache.from_legacy_cache(tuple(past_key_values))
+            from_legacy = getattr(DynamicCache, "from_legacy_cache", None)
+            if callable(from_legacy):
+                return from_legacy(tuple(past_key_values))
+            # ⚠️ transformers 5.17 **移除了 `DynamicCache.from_legacy_cache`**；而它的
+            # `__init__` 第一个位置参数 `ddp_cache_data` 正是 `Iterable[tuple[Tensor, Tensor]]`
+            # ⇒ 直接用「每层 (k, v)」的元组构造，语义与旧 `from_legacy_cache` 等价。
+            return DynamicCache(tuple(past_key_values))
         if past_key_values is not None:
             raise Qwen3AdapterError("unsupported Qwen3 KV cache representation")
         return DynamicCache()
@@ -517,12 +541,26 @@ class Qwen3PipelineAdapter:
             raise Qwen3AdapterError("Qwen3 model config is unavailable")
         kwargs = {
             "config": config,
-            "input_embeds": hidden_states,
             "attention_mask": attention_mask,
-            "cache_position": cache_position,
             "past_key_values": cache,
             "position_ids": position_ids,
         }
+        # ⚠️ 参数名**跨版本不同**（2026-09-19 实测）：
+        #   * 较早版本：`input_embeds`；
+        #   * transformers 5.17 起：`inputs_embeds`（复数），且 `cache_position` **不在签名里**。
+        # 直接传 `input_embeds` 会 `TypeError: create_causal_mask() got an unexpected keyword
+        # argument 'input_embeds'`。因此与 `src/model_module.py` 同法：**探测签名后按实际参数名传**。
+        import inspect
+
+        params = inspect.signature(create_causal_mask).parameters
+        if "input_embeds" in params:
+            kwargs["input_embeds"] = hidden_states
+        elif "inputs_embeds" in params:
+            kwargs["inputs_embeds"] = hidden_states
+        else:
+            raise Qwen3AdapterError("create_causal_mask 缺少已知的输入张量参数")
+        if "cache_position" in params:
+            kwargs["cache_position"] = cache_position
         masks = {"full_attention": create_causal_mask(**kwargs)}
         if any(getattr(layer, "attention_type", "full_attention") == "sliding_attention" for layer in self._layers):
             masks["sliding_attention"] = create_sliding_window_causal_mask(**kwargs)
@@ -633,7 +671,7 @@ class Qwen3PipelineAdapter:
                     result["hidden_states"] = hidden_states
                 if use_cache:
                     if shared_cache is not None:
-                        result["past_key_values"] = shared_cache.to_legacy_cache()
+                        result["past_key_values"] = _cache_to_legacy(shared_cache)
                     else:
                         result["past_key_values"] = tuple(cache_values)
                 return result

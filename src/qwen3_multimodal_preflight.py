@@ -1307,13 +1307,16 @@ def validate_mm1_processor_smoke_response(
         or runtime["trust_remote_code"] is not False
     ):
         raise Qwen3MultimodalPreflightError("processor smoke runtime is not isolated/offline-safe")
+    # 允许的运行时类集合。**注意**：图像处理器在 transformers 4.x 上是 `Qwen2VLImageProcessorFast`，
+    # 而 **5.x 改为 `Qwen2VLImageProcessor`**（无 Fast 后缀）⇒ 两者都必须接受，否则主运行时一升级
+    # 就会被这里 fail-closed 拒绝（2026-09-19 实测：5.17.0 下三处多模态探测用例因此失败）。
     allowed_classes = {
-        "processor_class": "Qwen3VLProcessor",
-        "image_processor_class": "Qwen2VLImageProcessorFast",
-        "video_processor_class": "Qwen3VLVideoProcessor",
+        "processor_class": {"Qwen3VLProcessor"},
+        "image_processor_class": {"Qwen2VLImageProcessorFast", "Qwen2VLImageProcessor"},
+        "video_processor_class": {"Qwen3VLVideoProcessor"},
     }
-    for name, expected in allowed_classes.items():
-        if runtime[name] != expected:
+    for name, allowed in allowed_classes.items():
+        if runtime[name] not in allowed:
             raise Qwen3MultimodalPreflightError(f"processor smoke {name} is unsupported")
     if runtime["declared_tokenizer_class"] != request["processor"]["tokenizer_class"]:
         raise Qwen3MultimodalPreflightError("processor smoke declared tokenizer class differs")

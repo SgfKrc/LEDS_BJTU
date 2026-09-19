@@ -13,8 +13,11 @@ import venv
 ROOT = Path(__file__).resolve().parents[1]
 VENV_DIR = ROOT / ".venv-gemma4-pipeline"
 NATIVE_VENV_DIR = ROOT / ".venv-gemma4-native"
-REQUIREMENTS = ROOT / "packaging" / "requirements-gemma4-pipeline-sidecar.txt"
-TRANSFORMERS_VERSION = "5.10.1"
+# 修正（2026-09-19）：原为 `packaging/requirements-gemma4-pipeline-sidecar.txt`，该文件**不存在**；
+# 实际位置是 `requirements/`（与 scripts/setup_envs.py 的声明一致）。
+REQUIREMENTS = ROOT / "requirements" / "requirements-gemma4-pipeline-sidecar.txt"
+# 2026-09-19：随主运行时统一到 5.17.0（此前 5.10.1）。
+TRANSFORMERS_VERSION = "5.17.0"
 DEFAULT_TORCH_SPEC = os.environ.get(
     "QLH_GEMMA4_PIPELINE_TORCH_SPEC", "torch>=2.10,<2.14",
 )
