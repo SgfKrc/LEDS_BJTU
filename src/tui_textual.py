@@ -95,6 +95,12 @@ from tui_api import (  # noqa: E402
     read_log_file,
     reset_master_identity,
     spare_master_logs,
+    db_health,
+    list_local_gguf,
+    list_model_registry,
+    list_models_available,
+    list_models_downloadable,
+    storage_health,
     transfer_logs,
     transfer_master,
     pause_queue,
@@ -534,6 +540,12 @@ class ChatPane(Vertical):
         if text.startswith("/ha"):
             self.cmd_ha(text)
             return
+        if text.startswith("/assets"):
+            self.cmd_assets(text)
+            return
+        if text.startswith("/storage"):
+            self.cmd_storage(text)
+            return
         if text == "/sessions":
             self.cmd_sessions()
             return
@@ -614,6 +626,62 @@ class ChatPane(Vertical):
             text = f"[red]模型{label}失败[/]：{exc}"
         self.app.call_from_thread(self.write_line, text)
         self.app.call_from_thread(self.status_line, text)
+
+    def cmd_assets(self, text: str) -> None:
+        """★ 2026-09-19 补缺口 C：模型资产浏览（只读）。
+
+        ``available`` 可选模型配置 + 可用引擎 / ``registry`` 已注册实验模型 /
+        ``downloadable`` 可下载清单 / ``gguf`` 本地 GGUF 文件。
+        """
+        parts = text.split()
+        sub = parts[1].lower() if len(parts) > 1 else "available"
+        if sub not in {"available", "registry", "downloadable", "gguf"}:
+            self.status_line(
+                "用法: /assets available | registry | downloadable | gguf")
+            return
+        self.assets_call(sub)
+
+    @work(thread=True, exclusive=True, group="assets")
+    def assets_call(self, which: str) -> None:
+        app = self.app
+        self.app.call_from_thread(self.status_line, f"资产查询 {which} …")
+        try:
+            if which == "available":
+                result = list_models_available(app.api)
+            elif which == "registry":
+                result = list_model_registry(app.api)
+            elif which == "downloadable":
+                result = list_models_downloadable(app.api)
+            elif which == "gguf":
+                result = list_local_gguf(app.api)
+            else:
+                raise ValueError(f"未知资产查询: {which}")
+            body = json.dumps(result, ensure_ascii=False, indent=2)[:4000]
+            text = f"[green]资产 {which}[/]\n{body}"
+        except (ApiError, ValueError) as exc:
+            text = f"[red]资产 {which} 失败[/]：{exc}"
+        self.app.call_from_thread(self.write_line, text)
+        self.app.call_from_thread(self.status_line, text.splitlines()[0])
+
+    def cmd_storage(self, text: str) -> None:
+        """★ 2026-09-19 补缺口 D：存储与数据库健康（只读）。"""
+        self.storage_call()
+
+    @work(thread=True, exclusive=True, group="storage")
+    def storage_call(self) -> None:
+        app = self.app
+        self.app.call_from_thread(self.status_line, "存储健康查询 …")
+        try:
+            result = {
+                "db": db_health(app.api),
+                "storage": storage_health(app.api),
+            }
+            body = json.dumps(result, ensure_ascii=False, indent=2)[:4000]
+            text = f"[green]存储与数据库健康[/]\n{body}"
+        except (ApiError, ValueError) as exc:
+            text = f"[red]存储健康查询失败[/]：{exc}"
+        self.app.call_from_thread(self.write_line, text)
+        self.app.call_from_thread(self.status_line, text.splitlines()[0])
 
     def cmd_ha(self, text: str) -> None:
         """★ 2026-09-19 补缺口 E：集群高可用（备用主节点 / 主节点转让 / 身份重置）。

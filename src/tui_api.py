@@ -453,3 +453,34 @@ def iter_chat_payloads(
                 payload = decode_json_event(event)
                 if payload:
                     yield payload
+
+
+# ---------------------------------------------------------- 模型资产(C) / 存储(D)
+def list_models_available(api: ApiClient) -> Dict[str, Any]:
+    """可选模型配置 + 可用引擎（GET ``/models/available``）。★ 补缺口 C。"""
+    return _as_dict(api.get(API_PATHS["models_available"]))
+
+
+def list_model_registry(api: ApiClient) -> Dict[str, Any]:
+    """用户注册的实验模型（GET ``/models/registry``）。★ 补缺口 C。"""
+    return _as_dict(api.get(API_PATHS["models_registry"]))
+
+
+def list_models_downloadable(api: ApiClient) -> Dict[str, Any]:
+    """可下载模型清单（GET ``/models/downloadable``）。★ 补缺口 C。"""
+    return _as_dict(api.get(API_PATHS["models_downloadable"]))
+
+
+def list_local_gguf(api: ApiClient) -> Dict[str, Any]:
+    """本地 GGUF 文件（GET ``/models/gguf``）。★ 补缺口 C。"""
+    return _as_dict(api.get(API_PATHS["models_gguf"]))
+
+
+def db_health(api: ApiClient) -> Dict[str, Any]:
+    """数据库健康（GET ``/db/health``）。★ 补缺口 D。"""
+    return _as_dict(api.get(API_PATHS["db_health"]))
+
+
+def storage_health(api: ApiClient) -> Dict[str, Any]:
+    """存储健康（GET ``/storage/health``）。★ 补缺口 D。"""
+    return _as_dict(api.get(API_PATHS["storage_health"]))

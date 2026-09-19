@@ -82,6 +82,14 @@ API_PATHS = {
     "cluster_spare_master_logs": "/cluster/spare-master/logs",  # GET 备用主节点操作日志
     "cluster_transfer_master": "/cluster/transfer-master",   # POST ⚠️ 高危（需重启）
     "cluster_reset_identity": "/cluster/reset-identity",     # POST ⚠️ 高危（需 confirm="reset"）
+    # ---- 2026-09-19 补缺口 C：模型资产浏览（只读）----
+    "models_available": "/models/available",       # GET 可选模型配置 + 可用引擎
+    "models_registry": "/models/registry",         # GET 用户注册的实验模型
+    "models_downloadable": "/models/downloadable",  # GET 可下载清单
+    "models_gguf": "/models/gguf",                 # GET 本地 GGUF 文件
+    # ---- 2026-09-19 补缺口 D：存储健康（只读）----
+    "db_health": "/db/health",                     # GET SQLite 健康
+    "storage_health": "/storage/health",           # GET 存储健康
 }
 
 # ============================================================
@@ -263,6 +271,9 @@ COMMAND_SPECS: List[Dict[str, str]] = [
     {"name": "/cancel", "args": "", "desc": "取消当前生成"},
     {"name": "/logs", "args": "list | download <file> | read <file> | delete <file> | nodes",
      "desc": "日志细粒度：文件列表 / 下载 / 查看 / 删除（需确认）/ 各节点汇总"},
+    {"name": "/assets", "args": "available | registry | downloadable | gguf",
+     "desc": "模型资产浏览（只读）：可选模型与引擎 / 已注册实验模型 / 可下载清单 / 本地 GGUF"},
+    {"name": "/storage", "args": "", "desc": "存储与数据库健康（只读）"},
     {"name": "/ha", "args": "health | transfer-logs | spare | spare-logs | designate <node> "
                             "| clear-spare | transfer <node> | reset-identity",
      "desc": "集群高可用：健康 / 转让日志 / 备用主节点；⚠️ transfer 与 reset-identity 为高危"
