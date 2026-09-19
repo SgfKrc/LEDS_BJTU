@@ -1393,7 +1393,8 @@ class LlamaCppEngine:
             info["memory"] = self.get_memory_usage()
         return info
 
-    def forward_layers_to_hidden(self, input_ids, n_past: int = 0):
+    def forward_layers_to_hidden(self, input_ids, n_past: int = 0,
+                                   all_positions: bool = False):
         """★ 层接力上游入口（2026-09-19）：只跑**本模型（裁层 GGUF = 前 k 层）**的层，
         返回**末位 hidden**（`np.float32`，长度 `n_embd`）。
 
@@ -1407,6 +1408,8 @@ class LlamaCppEngine:
         Args:
             input_ids: token id 序列（list / 1D array）。
             n_past: KV 里已有的位置数（接力首步传 0）。
+            all_positions: True 时返回**每个位置**的 hidden（`[n_tokens, n_embd]`），
+                上游 **prefill 必须**用它（下游要整段）；False（默认）只返回末位。
 
         Returns:
             末位 hidden 的 `np.ndarray`（长度 n_embd），或 `None`（未加载）。
@@ -1442,6 +1445,15 @@ class LlamaCppEngine:
             rc = M.llama_decode(native_ctx, batch)
             if rc != 0:
                 raise RuntimeError(f"llama_decode 失败 rc={rc}")
+            if all_positions:
+                rows = []
+                for i in range(n_tokens):
+                    p = M.llama_get_embeddings_ith(native_ctx, i)
+                    if not p:
+                        raise RuntimeError(
+                            f"llama_get_embeddings_ith({i}) 返回空（embeddings 通道未生效？）")
+                    rows.append(np.ctypeslib.as_array(p, shape=(n_embd,)).copy())
+                return np.stack(rows, axis=0)          # [n_tokens, n_embd]
             emb_ptr = M.llama_get_embeddings_ith(native_ctx, n_tokens - 1)
             if not emb_ptr:
                 raise RuntimeError("llama_get_embeddings_ith 返回空（embeddings 通道未生效？）")
