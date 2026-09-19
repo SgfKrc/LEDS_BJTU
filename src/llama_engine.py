@@ -1408,6 +1408,11 @@ class LlamaCppEngine:
 
         Returns:
             末位 logits 的 `np.ndarray`（长度 n_vocab），或 `None`（未加载）。
+
+        ⚠️ **KV 位置由调用方管理**：本方法**直接在 KV 里占 `[n_past, n_past+n_tokens)`**；
+        接力 decode 的常规用法是逐步推进 `n_past`。若要在**同一位置**重跑，先
+        `self._model._ctx.kv_cache_clear()` —— 注意 `reset_kv_cache()` 是既有的 stateless
+        no-op，**不能**用来清这里的 KV；同 `n_past` 重跑会得到 `llama_decode rc=-1`。
         """
         if not self.is_loaded:
             return None

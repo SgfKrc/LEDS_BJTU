@@ -1878,12 +1878,22 @@ class ModelManager:
         )
 
         with init_empty_weights():
-            model = AutoModelForCausalLM.from_config(
-                config,
-                trust_remote_code=TRUST_REMOTE_CODE,
-                # ★ P6 实测：f16+sdpa 1.665 ms/层为最佳；此前未显式设置（依赖库默认）。
-                attn_implementation="sdpa",
-            )
+            # ★ P6 实测：f16+sdpa 1.665 ms/层为最佳；此前未显式设置（依赖库默认）。
+            # ⚠️ 但并非所有架构都支持 sdpa（如 remote-code 的 QWenLMHeadModel 会抛
+            #    "does not support ... scaled_dot_product_attention"）⇒ **必须可降级**。
+            try:
+                model = AutoModelForCausalLM.from_config(
+                    config,
+                    trust_remote_code=TRUST_REMOTE_CODE,
+                    attn_implementation="sdpa",
+                )
+            except (ValueError, TypeError) as exc:
+                logger.warning("⚠️ 该架构不支持 sdpa，回退 eager：%s", str(exc)[:160])
+                model = AutoModelForCausalLM.from_config(
+                    config,
+                    trust_remote_code=TRUST_REMOTE_CODE,
+                    attn_implementation="eager",
+                )
         load_tracker.observe()
 
         index_path = os.path.join(model_path, "model.safetensors.index.json")
@@ -2070,12 +2080,22 @@ class ModelManager:
         )
 
         with init_empty_weights():
-            model = AutoModelForCausalLM.from_config(
-                config,
-                trust_remote_code=TRUST_REMOTE_CODE,
-                # ★ P6 实测：f16+sdpa 1.665 ms/层为最佳；此前未显式设置（依赖库默认）。
-                attn_implementation="sdpa",
-            )
+            # ★ P6 实测：f16+sdpa 1.665 ms/层为最佳；此前未显式设置（依赖库默认）。
+            # ⚠️ 但并非所有架构都支持 sdpa（如 remote-code 的 QWenLMHeadModel 会抛
+            #    "does not support ... scaled_dot_product_attention"）⇒ **必须可降级**。
+            try:
+                model = AutoModelForCausalLM.from_config(
+                    config,
+                    trust_remote_code=TRUST_REMOTE_CODE,
+                    attn_implementation="sdpa",
+                )
+            except (ValueError, TypeError) as exc:
+                logger.warning("⚠️ 该架构不支持 sdpa，回退 eager：%s", str(exc)[:160])
+                model = AutoModelForCausalLM.from_config(
+                    config,
+                    trust_remote_code=TRUST_REMOTE_CODE,
+                    attn_implementation="eager",
+                )
         load_tracker.observe()
 
         index_path = os.path.join(model_path, "model.safetensors.index.json")
@@ -2483,11 +2503,20 @@ class ModelManager:
             # ---- CUDA 路径 ----
             bnb_config = self._get_bnb_config(self.quant_type)
 
+            # 按架构能力选择 attention 实现：不支持 sdpa 的老架构（remote code）用 eager。
+        try:
+            import transformers as _tf
+            _supports = getattr(_tf, "SUPPORTED_ATTENTION_IMPLEMENTATIONS", None)
+            _impls = set(_supports or ())
+            _sdpa_or_eager = "sdpa" if ("sdpa" in _impls or not _impls) else "eager"
+        except Exception:  # noqa: BLE001
+            _sdpa_or_eager = "sdpa"
             load_kwargs: Dict[str, Any] = dict(
                 device_map="auto",
                 trust_remote_code=TRUST_REMOTE_CODE,
-                # ★ P6 实测：f16+sdpa 1.665 ms/层为最佳（此前未显式设置）。
-                attn_implementation="sdpa",
+                # ★ P6 实测 f16+sdpa 1.665 ms/层最佳；`_attn_impl` 由调用方按架构降级决定
+                #   （不支持的架构会用 "eager"，见下方 except 分支）。
+                attn_implementation=_sdpa_or_eager,
             )
 
             if bnb_config is not None:
