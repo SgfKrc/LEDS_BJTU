@@ -230,6 +230,60 @@ def _new_dynamic_cache(config=None):
         return DynamicCache()
 
 
+def _normalize_past_key_values(past_key_values):
+    """★ B9：把「**空的** cache 对象」规范化成 ``None``（视同没有缓存）。
+
+    为什么需要：调用方很容易传一个**尚未写入任何内容**的 cache 对象（例如
+    ``DynamicCache()`` / ``DynamicCache(config=cfg)``）而不是 ``None``。各架构随后会：
+
+      * ``len(past_key_values)`` ⇒ ``0`` ⇒ 报 ``Qwen2 KV cache 层数不匹配: cache=0, local=N``
+        —— **报错信息不指向根因**（看起来像"层数算错了"，实际是"传了空 cache"）；
+      * 或直接 ``cache.layers[layer_idx]`` ⇒ ``IndexError: list index out of range``
+        （hybrid 架构上尤其容易踩）。
+
+    两者是**同一个坑**。这里统一识别「没有任何已写入层的 cache」并视同 ``None``，
+    由 ``forward_layers`` 自建正确形状的 cache。
+
+    ⚠️ 只处理**完全空**的情况；**部分写入**的 cache（如已缓存若干层）原样返回，不做任何改动。
+    """
+    if past_key_values is None:
+        return None
+
+    # (1) cache 对象（DynamicCache-like）：**以「已缓存长度 == 0」为准**。
+    #     ⚠️ 不能只看层容器是否为空：5.x 的 `DynamicCache(config=...)` 会**按 config 预先建出**
+    #     每层的 `DynamicLayer` 占位对象（实测 `layers=[DynamicLayer×4]`、`len(cache)==4`），
+    #     但 `get_seq_length()` 仍是 0 —— 那些占位对象不是 KV，直接 enumerate 会以
+    #     `k, v = item ⇒ ValueError: too many values to unpack` 失败（本票实际踩到）。
+    try:
+        seq_len = None
+        get_seq_length = getattr(past_key_values, "get_seq_length", None)
+        if callable(get_seq_length):
+            try:
+                seq_len = int(get_seq_length())
+            except (TypeError, ValueError):
+                # 部分实现要求传 layer_idx；无参调用失败时不算"空"
+                seq_len = None
+        if seq_len is not None:
+            return None if seq_len == 0 else past_key_values
+    except Exception as exc:  # noqa: BLE001 - 规范化失败不应影响主流程
+        logger.debug(f"空 cache 规范化：读取 get_seq_length 失败（按原样使用）: {exc}")
+
+    # (2) 无 `get_seq_length` 的层容器（空 list/tuple、或全 None 占位）⇒ 没有任何真实 KV。
+    layers = getattr(past_key_values, "layers", None)
+    if isinstance(layers, (list, tuple)) and (
+        len(layers) == 0 or all(x is None for x in layers)
+    ):
+        return None
+
+    # (3) 纯 tuple/list 形式：空、或全 None 占位（B14 在 hybrid 收集侧会留 None 占位）。
+    if isinstance(past_key_values, (tuple, list)) and (
+        len(past_key_values) == 0 or all(x is None for x in past_key_values)
+    ):
+        return None
+
+    return past_key_values
+
+
 def _locate_text_transformer(model) -> tuple:
     """定位「文本 Transformer 主体」，返回 ``(transformer, layers_attr, embedding_attr)``。
 
@@ -3130,6 +3184,11 @@ class ModelManager:
             raise ValueError("必须提供 input_ids 或 hidden_states 之一")
         if input_ids is not None and hidden_states is not None:
             raise ValueError("input_ids 和 hidden_states 不能同时提供")
+
+        # ★ B9：把「**空的** cache 对象」规范化成 None。调用方常传 `DynamicCache()`（而不是
+        #   `None`），此时 `len(cache) == 0` ⇒ 会报「KV cache 层数不匹配: cache=0, local=N」，
+        #   或（hybrid）直接 IndexError —— 两者报错都**不指向根因**。视同 None 由本方法自建即可。
+        past_key_values = _normalize_past_key_values(past_key_values)
 
         model_type = str(getattr(self.model.config, "model_type", "") or "").lower()
         if model_type == "qwen":
