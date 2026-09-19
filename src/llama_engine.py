@@ -1393,6 +1393,64 @@ class LlamaCppEngine:
             info["memory"] = self.get_memory_usage()
         return info
 
+    def forward_layers_from_hidden(self, hidden, n_past: int = 0):
+        """★ 层接力下游入口（2026-09-19）：把**上游 hidden** 注入 llama.cpp 的 `embd` 通道，
+        只跑**本模型（裁层 GGUF）的层**，返回末位 logits。
+
+        为什么需要：QLH 的跨框架层接力（D→L / L→L）此前**只有实验脚本**用裸 `llama_cpp` API
+        实现（`build/cross-framework-layer-poc/relay_mainrepo_upstream.py`），主仓
+        `llama_engine` **没有入口** —— 与 D21 票面「生产接线后置」吻合。本方法把下游接回主仓，
+        使「上下游都走主仓引擎」成立（上游＝`model_module.forward_layers`）。
+
+        Args:
+            hidden: 形状 `[n_tokens, n_embd]`（或 1D）的上游 `hidden_states`；内部转 f32。
+            n_past: 本模型 KV 里已有的位置数（接力首步传 0）。
+
+        Returns:
+            末位 logits 的 `np.ndarray`（长度 n_vocab），或 `None`（未加载）。
+        """
+        if not self.is_loaded:
+            return None
+        import ctypes
+
+        import numpy as np
+        import llama_cpp.llama_cpp as M
+
+        llm = self._model                                    # llama_cpp.Llama
+        # ⚠️ 实测（probe_llama_handles.py）：`llm._model` 是 `LlamaModel` 包装，
+        #    **不能**直接喂给 `llama_*` C 函数（报 ctypes ArgumentError: wrong type）；
+        #    原生 `llama_model_p` 是它的 `.model` 属性。`llm._ctx.ctx` 即原生 context。
+        native_model = getattr(getattr(llm, "_model", None), "model", None)
+        native_ctx = getattr(getattr(llm, "_ctx", None), "ctx", None)
+        if native_model is None or native_ctx is None:
+            raise RuntimeError("llama_engine: 取不到原生 llama_model / llama_context")
+
+        h = np.ascontiguousarray(np.asarray(hidden, dtype=np.float32))
+        if h.ndim == 1:
+            h = h[None, :]
+        n_tokens = int(h.shape[0])
+        n_embd = int(M.llama_model_n_embd_inp(native_model))
+        if h.shape[1] != n_embd:
+            raise ValueError(f"hidden 宽度 {h.shape[1]} != 模型 n_embd {n_embd}")
+
+        batch = M.llama_batch_init(n_tokens, n_embd, 1)
+        try:
+            for i in range(n_tokens):
+                batch.n_seq_id[i] = 1
+                batch.seq_id[i][0] = 0
+                batch.logits[i] = 1
+                batch.pos[i] = int(n_past) + i
+            batch.n_tokens = n_tokens
+            ctypes.memmove(batch.embd, h.ctypes.data, h.nbytes)
+            rc = M.llama_decode(native_ctx, batch)
+            if rc != 0:
+                raise RuntimeError(f"llama_decode 失败 rc={rc}")
+            logits_ptr = M.llama_get_logits_ith(native_ctx, n_tokens - 1)
+            n_vocab = int(M.llama_vocab_n_tokens(M.llama_model_get_vocab(native_model)))
+            return np.ctypeslib.as_array(logits_ptr, shape=(n_vocab,)).copy()
+        finally:
+            M.llama_batch_free(batch)
+
     def reset_kv_cache(self) -> None:
         """
         清空 KV 缓存（用于多会话切换）。
