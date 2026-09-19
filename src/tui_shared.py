@@ -68,6 +68,13 @@ API_PATHS = {
     "cluster_queue_resume": "/cluster/queue/resume",        # POST（仅主节点）
     "cluster_queue_strategy": "/cluster/queue/strategy",    # POST {strategy: fifo|mlfq}
     "cluster_queue_clear": "/cluster/queue/clear",          # POST（仅主节点）
+    # ---- 2026-09-19 补缺口 A：队列「单任务」取消（此前只能整体 clear）----
+    "cluster_queue_task_cancel": "/cluster/queue/task/{task_id}",  # DELETE（仅主节点）
+    # ---- 2026-09-19 补缺口 B：日志细粒度（此前只有 recent/stats/export/整体清理）----
+    "logs_list": "/logs",                         # GET 日志文件列表
+    "logs_download": "/logs/download",            # GET 下载
+    "logs_file": "/logs/{filename}",              # GET 读单文件 / DELETE 删单文件
+    "logs_nodes_summary": "/logs/nodes-summary",  # GET 各节点日志汇总
 }
 
 # ============================================================
@@ -237,7 +244,8 @@ COMMAND_SPECS: List[Dict[str, str]] = [
     {"name": "/reset", "args": "", "desc": "清空后端会话历史与 KV 缓存（需确认）"},
     {"name": "/model", "args": "load <id> [engine] [quant] | unload",
      "desc": "加载/卸载模型（需确认；仅 loopback 后端可调用）"},
-    {"name": "/queue", "args": "pause | resume | strategy <fifo|mlfq> | clear",
+    {"name": "/queue",
+     "args": "pause | resume | strategy <fifo|mlfq> | clear | cancel <task_id>",
      "desc": "队列控制（clear 需确认）"},
     {"name": "/route", "args": "auto|local|distributed|required",
      "desc": "设置请求级路由偏好"},
@@ -246,6 +254,8 @@ COMMAND_SPECS: List[Dict[str, str]] = [
      "desc": "深度思考**开关**（改变模型行为）：on=强制思考 / off=强制不思考（省算力，"
              "可避免 Qwen3 等模型输出超长 `<think>`）/ auto=沿用模型模板默认"},
     {"name": "/cancel", "args": "", "desc": "取消当前生成"},
+    {"name": "/logs", "args": "list | download <file> | read <file> | delete <file> | nodes",
+     "desc": "日志细粒度：文件列表 / 下载 / 查看 / 删除（需确认）/ 各节点汇总"},
     {"name": "/clear", "args": "", "desc": "清空本地显示（不动后端；清后端用 /reset）"},
     {"name": "/help", "args": "", "desc": "显示本帮助"},
     {"name": "/quit", "args": "", "desc": "退出聊天页"},

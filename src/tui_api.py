@@ -288,6 +288,84 @@ def clear_queue(api: ApiClient) -> Dict[str, Any]:
     return _as_dict(api.post(API_PATHS["cluster_queue_clear"]))
 
 
+def cancel_queue_task(api: ApiClient, task_id: str) -> Dict[str, Any]:
+    """取消**单个**排队任务（DELETE ``/cluster/queue/task/{task_id}``，仅主节点）。
+
+    ★ 2026-09-19 补缺口 A：此前 TUI 只能整体 ``clear``，卡住的单个任务无法取消。
+    执行中的流水线任务会在当前 token step 完成后经 ``PIPELINE_ABORT`` 中止。
+    后端返回 ``{success, task_id, message}``；任务不存在/已完成时 ``success=False``。
+    """
+    path = API_PATHS["cluster_queue_task_cancel"].format(**_quoted(task_id=task_id))
+    return _as_dict(api.request("DELETE", path))
+
+
+def list_log_files(api: ApiClient) -> Dict[str, Any]:
+    """列出后端日志文件（GET ``/logs``）。★ 补缺口 B。"""
+    return _as_dict(api.get(API_PATHS["logs_list"], with_log_token=True))
+
+
+def download_log_file(api: ApiClient, filename: str, target: Path) -> Path:
+    """下载单个日志文件（GET ``/logs/download?filename=...``）。★ 补缺口 B。"""
+    query = urllib.parse.urlencode({"filename": filename})
+    return api.download(f"{API_PATHS['logs_download']}?{query}", target, with_log_token=True)
+
+
+def read_log_file(api: ApiClient, filename: str) -> Dict[str, Any]:
+    """读单个日志文件（GET ``/logs/{filename}``）。★ 补缺口 B。"""
+    path = API_PATHS["logs_file"].format(**_quoted(filename=filename))
+    return _as_dict(api.get(path, with_log_token=True))
+
+
+def delete_log_file(api: ApiClient, filename: str) -> Dict[str, Any]:
+    """删单个日志文件（DELETE ``/logs/{filename}``）——不可撤销，调用方须先确认。★ 补缺口 B。"""
+    path = API_PATHS["logs_file"].format(**_quoted(filename=filename))
+    return _as_dict(api.request("DELETE", path))
+
+
+def logs_nodes_summary(api: ApiClient) -> Dict[str, Any]:
+    """各节点日志汇总（GET ``/logs/nodes-summary``）。★ 补缺口 B。"""
+    return _as_dict(api.get(API_PATHS["logs_nodes_summary"], with_log_token=True))
+
+
+def cancel_queue_task(api: ApiClient, task_id: str) -> Dict[str, Any]:
+    """取消**单个**排队任务（DELETE ``/cluster/queue/task/{task_id}``，仅主节点）。
+
+    ★ 2026-09-19 补缺口 A：此前 TUI 只能整体 ``clear``，卡住的单个任务无法取消。
+    执行中的流水线任务会在当前 token step 完成后经 ``PIPELINE_ABORT`` 中止。
+    后端返回 ``{success, task_id, message}``；任务不存在/已完成时 ``success=False``。
+    """
+    path = API_PATHS["cluster_queue_task_cancel"].format(**_quoted(task_id=task_id))
+    return _as_dict(api.request("DELETE", path))
+
+
+def list_log_files(api: ApiClient) -> Dict[str, Any]:
+    """列出后端日志文件（GET ``/logs``）。★ 补缺口 B。"""
+    return _as_dict(api.get(API_PATHS["logs_list"], with_log_token=True))
+
+
+def download_log_file(api: ApiClient, filename: str, target: Path) -> Path:
+    """下载单个日志文件（GET ``/logs/download?filename=...``）。★ 补缺口 B。"""
+    query = urllib.parse.urlencode({"filename": filename})
+    return api.download(f"{API_PATHS['logs_download']}?{query}", target, with_log_token=True)
+
+
+def read_log_file(api: ApiClient, filename: str) -> Dict[str, Any]:
+    """读单个日志文件（GET ``/logs/{filename}``）。★ 补缺口 B。"""
+    path = API_PATHS["logs_file"].format(**_quoted(filename=filename))
+    return _as_dict(api.get(path, with_log_token=True))
+
+
+def delete_log_file(api: ApiClient, filename: str) -> Dict[str, Any]:
+    """删单个日志文件（DELETE ``/logs/{filename}``）——不可撤销，调用方须先确认。★ 补缺口 B。"""
+    path = API_PATHS["logs_file"].format(**_quoted(filename=filename))
+    return _as_dict(api.request("DELETE", path))
+
+
+def logs_nodes_summary(api: ApiClient) -> Dict[str, Any]:
+    """各节点日志汇总（GET ``/logs/nodes-summary``）。★ 补缺口 B。"""
+    return _as_dict(api.get(API_PATHS["logs_nodes_summary"], with_log_token=True))
+
+
 def iter_chat_payloads(
     api: ApiClient,
     message: str,

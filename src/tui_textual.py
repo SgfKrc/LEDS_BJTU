@@ -80,9 +80,15 @@ from tui_api import (  # noqa: E402
     clear_queue,
     create_session,
     delete_session,
+    cancel_queue_task,
+    delete_log_file,
+    download_log_file,
     iter_chat_payloads,
+    list_log_files,
     list_sessions,
     load_model,
+    logs_nodes_summary,
+    read_log_file,
     pause_queue,
     rename_session,
     resume_queue,
@@ -514,6 +520,9 @@ class ChatPane(Vertical):
         if text.startswith("/queue"):
             self.cmd_queue(text)
             return
+        if text.startswith("/logs"):
+            self.cmd_logs(text)
+            return
         if text == "/sessions":
             self.cmd_sessions()
             return
@@ -595,15 +604,73 @@ class ChatPane(Vertical):
         self.app.call_from_thread(self.write_line, text)
         self.app.call_from_thread(self.status_line, text)
 
+    def cmd_logs(self, text: str) -> None:
+        """★ 2026-09-19 补缺口 B：日志细粒度（文件列表 / 下载 / 查看 / 删除 / 节点汇总）。
+
+        此前 TUI 只有 ``/logs/recent``（筛选）、``/logs/stats``、``/logs/export``（打包导出）
+        与整体 ``DELETE /logs``；**单个文件的浏览/下载/删除**缺失。
+        """
+        parts = text.split()
+        usage = ("用法: /logs list | download <file> | read <file>"
+                 " | delete <file> | nodes")
+        if len(parts) == 2 and parts[1].lower() in {"list", "nodes"}:
+            self.logs_call(parts[1].lower())
+            return
+        if len(parts) == 3 and parts[1].lower() in {"download", "read"}:
+            self.logs_call(parts[1].lower(), parts[2])
+            return
+        if len(parts) == 3 and parts[1].lower() == "delete":
+            filename = parts[2]
+            self.app.confirm(
+                f"删除日志文件 {filename}",
+                "将删除后端该日志文件，**不可撤销**（整体清理请用日志页的 X）。",
+                lambda: self.logs_call("delete", filename),
+                confirm_label="删除")
+            return
+        self.status_line(usage)
+
+    @work(thread=True, exclusive=True, group="logfiles")
+    def logs_call(self, action: str, value: str = "") -> None:
+        app = self.app
+        self.app.call_from_thread(self.status_line, f"日志操作 {action} …")
+        try:
+            if action == "list":
+                result = list_log_files(app.api)
+            elif action == "nodes":
+                result = logs_nodes_summary(app.api)
+            elif action == "read":
+                result = read_log_file(app.api, value)
+            elif action == "download":
+                target = Path("logs") / Path(value).name
+                saved = download_log_file(app.api, value, target)
+                self.app.call_from_thread(self.write_line, f"[green]已下载[/] → {saved}")
+                self.app.call_from_thread(self.status_line, f"日志 {value} 已下载")
+                return
+            elif action == "delete":
+                result = delete_log_file(app.api, value)
+            else:
+                raise ValueError(f"未知日志动作: {action}")
+            body = json.dumps(result, ensure_ascii=False, indent=2)[:4000]
+            text = f"[green]日志 {action}[/] → {value}\n{body}" if value else \
+                f"[green]日志 {action}[/]\n{body}"
+        except (ApiError, ValueError) as exc:
+            text = f"[red]日志 {action} 失败[/]：{exc}"
+        self.app.call_from_thread(self.write_line, text)
+        self.app.call_from_thread(self.status_line, text.splitlines()[0])
+
     def cmd_queue(self, text: str) -> None:
         parts = text.split()
-        usage = "用法: /queue pause | resume | strategy <fifo|mlfq> | clear"
+        usage = ("用法: /queue pause | resume | strategy <fifo|mlfq> | clear"
+                 " | cancel <task_id>")
         if len(parts) == 2 and parts[1].lower() in {"pause", "resume"}:
             self.queue_call(parts[1].lower())
             return
         if len(parts) == 3 and parts[1].lower() == "strategy" \
                 and parts[2].lower() in {"fifo", "mlfq"}:
             self.queue_call("strategy", parts[2].lower())
+            return
+        if len(parts) == 3 and parts[1].lower() == "cancel":
+            self.queue_call("cancel", parts[2])
             return
         if len(parts) == 2 and parts[1].lower() == "clear":
             self.app.confirm(
@@ -627,6 +694,10 @@ class ChatPane(Vertical):
                 set_queue_strategy(app.api, value)
             elif action == "clear":
                 clear_queue(app.api)
+            elif action == "cancel":
+                result = cancel_queue_task(app.api, value)
+                if not result.get("success"):
+                    raise ValueError(str(result.get("message") or "任务不存在或已完成"))
             else:
                 raise ValueError(f"未知队列动作: {action}")
             text = f"[green]队列 {action} 完成[/]" + (f" → {value}" if value else "")
@@ -2434,6 +2505,10 @@ class MainScreen(Screen):
                 set_queue_strategy(app.api, value)
             elif action == "clear":
                 clear_queue(app.api)
+            elif action == "cancel":
+                result = cancel_queue_task(app.api, value)
+                if not result.get("success"):
+                    raise ValueError(str(result.get("message") or "任务不存在或已完成"))
             else:
                 raise ValueError(f"未知队列动作: {action}")
             text = f"[green]队列 {action} 完成[/]" + (f" → {value}" if value else "")
