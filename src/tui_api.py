@@ -43,11 +43,15 @@ class ApiClient:
     """与 FastAPI 后端通信的极简 REST 客户端（纯标准库）。"""
 
     def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
-                 timeout: float = 5.0, log_token: str = "") -> None:
+                 timeout: float = 5.0, log_token: str = "",
+                 auth_token: str = "") -> None:
         self.host = host
         self.port = port
         self.timeout = timeout
         self.log_token = log_token
+        #: ★ 2026-09-19（G-⑤）：登录态 Bearer token。由 TUI 的 /login 写入，
+        #   之后所有请求自动带 `Authorization: Bearer <token>`。
+        self.auth_token = auth_token
 
     @property
     def base_url(self) -> str:
@@ -71,6 +75,8 @@ class ApiClient:
             headers["Content-Type"] = "application/json"
         if with_log_token and self.log_token:
             headers["X-QLH-Log-Token"] = self.log_token
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         effective_timeout = self.timeout if timeout is None else float(timeout)
         try:
@@ -136,6 +142,8 @@ class ApiClient:
         headers = {"Accept": "*/*"}
         if with_log_token and self.log_token:
             headers["X-QLH-Log-Token"] = self.log_token
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
         req = urllib.request.Request(url, headers=headers, method="GET")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -512,4 +520,72 @@ def delete_turn(api: ApiClient, session_id: str, turn_index: int) -> Dict[str, A
     """
     path = API_PATHS["session_turn"].format(
         **_quoted(session_id=session_id), turn_index=int(turn_index))
+    return _as_dict(api.request("DELETE", path))
+
+
+# ---------------------------------------------------- 认证与账户(G-⑤, 2026-09-19)
+def auth_capability(api: ApiClient) -> Dict[str, Any]:
+    """认证能力（GET ``/auth/capability``）：是否强制登录 / 是否处于首次引导。"""
+    return _as_dict(api.get(API_PATHS["auth_capability"]))
+
+
+def auth_login(api: ApiClient, username: str, password: str,
+               totp_code: Optional[str] = None) -> Dict[str, Any]:
+    """登录（POST ``/auth/login``）。返回含明文 ``token``；**调用方须写入 api.auth_token**。"""
+    body: Dict[str, Any] = {"username": username, "password": password}
+    if totp_code:
+        body["totp_code"] = totp_code
+    return _as_dict(api.post(API_PATHS["auth_login"], body))
+
+
+def auth_logout(api: ApiClient) -> Dict[str, Any]:
+    """注销（POST ``/auth/logout``）——服务端吊销当前 Bearer。"""
+    return _as_dict(api.post(API_PATHS["auth_logout"]))
+
+
+def auth_me(api: ApiClient) -> Dict[str, Any]:
+    """当前主体（GET ``/auth/me``）。"""
+    return _as_dict(api.get(API_PATHS["auth_me"]))
+
+
+def auth_totp_provision(api: ApiClient) -> Dict[str, Any]:
+    """生成并绑定 TOTP 密钥（POST ``/auth/totp/provision``）⇒ 返回 ``otpauth_uri``。"""
+    return _as_dict(api.post(API_PATHS["auth_totp_provision"]))
+
+
+def auth_totp_verify(api: ApiClient, code: str) -> Dict[str, Any]:
+    """校验 TOTP（POST ``/auth/totp/verify``）。"""
+    return _as_dict(api.post(API_PATHS["auth_totp_verify"], {"code": code}))
+
+
+def list_auth_users(api: ApiClient) -> Dict[str, Any]:
+    """账户列表（GET ``/users``，需 admin）。"""
+    return _as_dict(api.get(API_PATHS["auth_users"]))
+
+
+def create_auth_user(api: ApiClient, username: str, password: str,
+                     role: str = "viewer") -> Dict[str, Any]:
+    """创建账户（POST ``/users``）。**首次引导**时可无登录调用（仅允许 admin）。"""
+    return _as_dict(api.post(API_PATHS["auth_users"],
+                             {"username": username, "password": password, "role": role}))
+
+
+def patch_auth_user(api: ApiClient, username: str, *, role: Optional[str] = None,
+                    disabled: Optional[bool] = None,
+                    password: Optional[str] = None) -> Dict[str, Any]:
+    """修改账户（PATCH ``/users/{username}``）：角色 / 禁用 / 重置口令。"""
+    path = API_PATHS["auth_user"].format(**_quoted(username=username))
+    body: Dict[str, Any] = {}
+    if role is not None:
+        body["role"] = role
+    if disabled is not None:
+        body["disabled"] = bool(disabled)
+    if password is not None:
+        body["password"] = password
+    return _as_dict(api.request("PATCH", path, body))
+
+
+def delete_auth_user(api: ApiClient, username: str) -> Dict[str, Any]:
+    """删除账户（DELETE ``/users/{username}``）。"""
+    path = API_PATHS["auth_user"].format(**_quoted(username=username))
     return _as_dict(api.request("DELETE", path))

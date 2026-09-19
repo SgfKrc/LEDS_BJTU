@@ -96,13 +96,17 @@ from tui_api import (  # noqa: E402
     reset_master_identity,
     spare_master_logs,
     conversation_sync_status,
+    create_auth_user,
     db_health,
+    delete_auth_user,
     delete_turn,
     get_conversation,
     list_local_gguf,
     list_model_registry,
     list_models_available,
+    list_auth_users,
     list_models_downloadable,
+    patch_auth_user,
     session_info,
     storage_health,
     transfer_logs,
@@ -112,6 +116,12 @@ from tui_api import (  # noqa: E402
     resume_queue,
     set_queue_strategy,
     unload_model,
+    auth_capability,
+    auth_login,
+    auth_logout,
+    auth_me,
+    auth_totp_provision,
+    auth_totp_verify,
 )
 from tui_shared import API_PATHS, COMMAND_SPECS, format_metrics  # noqa: E402
 
@@ -550,6 +560,21 @@ class ChatPane(Vertical):
         if text.startswith("/history"):
             self.cmd_history(text)
             return
+        if text.startswith("/login"):
+            self.cmd_login(text)
+            return
+        if text.strip() == "/logout":
+            self.cmd_logout()
+            return
+        if text.strip() == "/whoami":
+            self.cmd_whoami()
+            return
+        if text.startswith("/totp"):
+            self.cmd_totp(text)
+            return
+        if text.startswith("/users"):
+            self.cmd_users(text)
+            return
         if text.startswith("/storage"):
             self.cmd_storage(text)
             return
@@ -633,6 +658,139 @@ class ChatPane(Vertical):
             text = f"[red]模型{label}失败[/]：{exc}"
         self.app.call_from_thread(self.write_line, text)
         self.app.call_from_thread(self.status_line, text)
+
+    def cmd_login(self, text: str) -> None:
+        """★ 2026-09-19（G-⑤）：登录。`/login <username> <password> [totp_code]`。
+
+        ⚠️ **凭据只在本进程内存中短暂持有**（密码用完即弃）；登录态 token 写入
+        `app.api.auth_token`，**不落盘**。已绑定 Auth App 的账户必须附 6 位验证码。
+        """
+        parts = text.split(maxsplit=3)
+        if len(parts) < 3:
+            self.status_line("用法: /login <username> <password> [totp_code]")
+            return
+        username, password = parts[1], parts[2]
+        totp_code = parts[3] if len(parts) > 3 else None
+        self.auth_call("login", username, password, totp_code)
+
+    def cmd_logout(self) -> None:
+        """注销（服务端吊销登录态，并清空本地 token）。"""
+        self.auth_call("logout")
+
+    def cmd_whoami(self) -> None:
+        """显示当前主体与认证能力（是否强制登录 / 是否首次引导）。"""
+        self.auth_call("whoami")
+
+    def cmd_totp(self, text: str) -> None:
+        """Auth App：`provision` 生成密钥与 otpauth URI；`verify <code>` 校验一次。"""
+        parts = text.split()
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        if sub == "provision":
+            self.auth_call("totp-provision")
+            return
+        if sub == "verify" and len(parts) == 3:
+            self.auth_call("totp-verify", parts[2])
+            return
+        self.status_line("用法: /totp provision | verify <code>")
+
+    def cmd_users(self, text: str) -> None:
+        """账户管理（需 admin）：list / add / role / disable / enable / passwd / del。"""
+        parts = text.split()
+        sub = parts[1].lower() if len(parts) > 1 else "list"
+        if sub == "list":
+            self.auth_call("users-list")
+            return
+        if sub == "add" and len(parts) >= 4:
+            role = parts[4] if len(parts) > 4 else "viewer"
+            self.auth_call("user-add", parts[2], parts[3], role)
+            return
+        if sub == "role" and len(parts) == 4:
+            self.auth_call("user-role", parts[2], parts[3])
+            return
+        if sub in {"disable", "enable"} and len(parts) == 3:
+            self.auth_call("user-disable" if sub == "disable" else "user-enable", parts[2])
+            return
+        if sub == "passwd" and len(parts) == 4:
+            self.auth_call("user-passwd", parts[2], parts[3])
+            return
+        if sub == "del" and len(parts) == 3:
+            target = parts[2]
+            self.app.confirm(
+                f"删除账户 {target}",
+                "将删除该账户及其 Auth App 绑定与全部登录态，**不可撤销**。",
+                lambda: self.auth_call("user-delete", target),
+                confirm_label="删除")
+            return
+        self.status_line(
+            "用法: /users list | add <name> <pass> [role] | role <name> <role>"
+            " | disable|enable <name> | passwd <name> <pass> | del <name>")
+
+    @work(thread=True, exclusive=True, group="authctl")
+    def auth_call(self, action: str, a: str = "", b: str = "", c: str = "") -> None:
+        app = self.app
+        self.app.call_from_thread(self.status_line, f"认证操作 {action} …")
+        try:
+            if action == "login":
+                result = auth_login(app.api, a, b, totp_code=c or None)
+                app.api.auth_token = str(result.get("token") or "")
+                text = (f"[green]已登录[/] {result.get('username')}"
+                        f"（role={result.get('role')}）")
+            elif action == "logout":
+                result = auth_logout(app.api)
+                app.api.auth_token = ""
+                text = f"[green]已注销[/]（revoked={result.get('revoked')}）"
+            elif action == "whoami":
+                me = auth_me(app.api)
+                cap = auth_capability(app.api)
+                text = (f"[green]当前主体[/] {me.get('username')}"
+                        f"（role={me.get('role')}）\n"
+                        f"[dim]认证：required={cap.get('required')} "
+                        f"available={cap.get('available')} "
+                        f"bootstrap_open={cap.get('bootstrap_open')} "
+                        f"users={cap.get('user_count')}[/]")
+            elif action == "totp-provision":
+                result = auth_totp_provision(app.api)
+                text = ("[green]Auth App 已绑定[/]\n"
+                        f"密钥: {result.get('secret')}\n"
+                        f"URI : {result.get('otpauth_uri')}\n"
+                        f"[dim]算法 {result.get('algorithm')} / {result.get('digits')} 位 / "
+                        f"{result.get('period')}s。⚠️ 重新 provision 会使旧条目失效。[/]")
+            elif action == "totp-verify":
+                result = auth_totp_verify(app.api, a)
+                ok = bool(result.get("verified"))
+                text = (f"[{'green' if ok else 'red'}]TOTP 校验 "
+                        f"{'通过' if ok else '未通过'}[/]")
+            elif action == "users-list":
+                result = list_auth_users(app.api)
+                rows = result.get("users") or []
+                lines = [f"  {u.get('username'):<16} {u.get('role'):<9} "
+                         f"{'disabled' if u.get('disabled') else 'active':<9} "
+                         f"totp={'yes' if u.get('totp_bound') else 'no'}"
+                         for u in rows]
+                text = "[green]账户[/]\n" + ("\n".join(lines) if lines else "  （无）")
+            elif action == "user-add":
+                result = create_auth_user(app.api, a, b, role=c or "viewer")
+                text = (f"[green]已创建[/] {result.get('username')}"
+                        f"（role={result.get('role')}）")
+            elif action == "user-role":
+                patch_auth_user(app.api, a, role=b)
+                text = f"[green]已改角色[/] {a} → {b}"
+            elif action in {"user-disable", "user-enable"}:
+                disabled = action == "user-disable"
+                patch_auth_user(app.api, a, disabled=disabled)
+                text = f"[green]{'已禁用' if disabled else '已启用'}[/] {a}"
+            elif action == "user-passwd":
+                patch_auth_user(app.api, a, password=b)
+                text = f"[green]已重置口令[/] {a}"
+            elif action == "user-delete":
+                delete_auth_user(app.api, a)
+                text = f"[green]已删除账户[/] {a}"
+            else:
+                raise ValueError(f"未知认证动作: {action}")
+        except (ApiError, ValueError) as exc:
+            text = f"[red]认证 {action} 失败[/]：{exc}"
+        self.app.call_from_thread(self.write_line, text)
+        self.app.call_from_thread(self.status_line, text.splitlines()[0])
 
     def cmd_history(self, text: str) -> None:
         """★ 2026-09-19 补缺口 F：会话细粒度。
