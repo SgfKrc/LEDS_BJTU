@@ -9339,6 +9339,7 @@ class Scheduler:
                                      temperature: float = 0.7,
                                      top_p: float = 0.9,
                                      show_thinking: bool = False,
+                                     enable_thinking: Optional[bool] = None,
                                      session_id: Optional[str] = None,
                                      messages: list = None,
                                      request_id: str = None,   # L5: 链路追踪
@@ -9388,6 +9389,7 @@ class Scheduler:
                 "temperature": temperature,
                 "top_p": top_p,
                 "show_thinking": show_thinking,
+                "enable_thinking": enable_thinking,
                 "session_id": session_id,
                 "messages": messages or [{"role": "user", "content": message}],
                 "request_id": request_id,   # L5: 链路追踪
@@ -10077,6 +10079,8 @@ class Scheduler:
         top_p = data.get("top_p", 0.9)
         routing_preference = str(data.get("routing_preference", "auto") or "auto")
         show_thinking = data.get("show_thinking", False)
+        # ★ 2026-09-19：主节点收到转发请求后同样透传深度思考**开关**。
+        enable_thinking = data.get("enable_thinking")
         session_id = data.get("session_id")
         messages = data.get("messages")
         request_id = data.get("request_id")   # L5: 链路追踪
@@ -10117,6 +10121,7 @@ class Scheduler:
                     session_id=session_id,
                     messages=messages,
                     show_thinking=show_thinking,
+                    enable_thinking=enable_thinking,
                     _require_distributed=(routing_preference == "distributed_required"),
                     _force_distributed_assignment=(routing_preference != "local_only"),
                     _cancel_event=cancel_event,
@@ -13751,6 +13756,12 @@ class Scheduler:
         _stream_callback = kwargs.pop('_stream_callback', None)
         fallback_reason = kwargs.pop('_fallback_reason', '') or 'pipeline_fallback_full_model'
         show_thinking = bool(kwargs.pop("show_thinking", False))
+        # ★ 2026-09-19：深度思考**开关**（与 show_thinking 的「展示」语义区分开）。
+        #   None ⇒ 不干预，沿用模型模板默认（Qwen3 模板默认会思考，故会出现超长 <think>）。
+        #   显式 False ⇒ 引擎 `_set_thinking_mode(False)` 会经 chat template 的
+        #   `enable_thinking=False` **真正阻止**模型生成思考内容（省算力），
+        #   而不是靠事后剥离（后者依赖模板含 `<think>` 且能找到 `</think>`，任一不成立即失效）。
+        enable_thinking = kwargs.pop("enable_thinking", None)
         cancel_event = kwargs.pop("_cancel_event", None)
 
         # ★ 若 master 刚执行过流水线裁剪（layer_range != None），
@@ -13789,6 +13800,7 @@ class Scheduler:
                     max_tokens=max_new_tokens,
                     temperature=temperature,
                     top_p=top_p,
+                    enable_thinking=enable_thinking,
                     _cancel_event=cancel_event,
                 ):
                     if chunk:
@@ -13840,6 +13852,7 @@ class Scheduler:
                     max_tokens=max_new_tokens,
                     temperature=temperature,
                     top_p=top_p,
+                    enable_thinking=enable_thinking,
                     _cancel_event=cancel_event,
                 )
                 raw_response_text = result.get("content", "")
@@ -13928,6 +13941,8 @@ class Scheduler:
         temperature = kwargs.pop('temperature', 0.7)
         top_p = kwargs.pop('top_p', 0.9)
         show_thinking = bool(kwargs.pop('show_thinking', False))
+        # ★ 2026-09-19：深度思考**开关**（同另一处路径；None ⇒ 不干预，沿用模板默认）。
+        enable_thinking = kwargs.pop('enable_thinking', None)
         messages = kwargs.pop("messages", None) or [{"role": "user", "content": prompt}]
         engine_name = backend_id_for(mgr, default="pytorch") or "pytorch"
         try:
@@ -13956,6 +13971,7 @@ class Scheduler:
                     temperature=temperature,
                     top_p=top_p,
                     show_thinking=show_thinking,
+                    enable_thinking=enable_thinking,
                     _cancel_event=cancel_event,
                 ):
                     if chunk:

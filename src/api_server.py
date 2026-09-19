@@ -1087,6 +1087,16 @@ class ChatRequest(BaseModel):
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     top_p: float = Field(default=0.9, ge=0.0, le=1.0)
     show_thinking: bool = Field(default=False, description="启用深度思考展示")
+    enable_thinking: Optional[bool] = Field(
+        default=None,
+        description=(
+            "★ 深度思考「开关」（区别于 show_thinking 的「展示」）："
+            "True=强制开启、False=强制关闭、None=沿用模型模板默认。"
+            "对支持关闭思考的模型（如 Qwen3，模板 qwen3_chat_v1）传 False 可真正阻止其生成 "
+            "thinking 内容（省算力），而不是事后把已生成的内容丢掉。"
+            "注意：仅对声明了 enable_thinking 模板的模型生效，其余模型忽略。"
+        ),
+    )
     streaming_mode: str = Field(
         default="full",
         description="流式模式（仅 /api/chat/stream 生效）: full=假流式完整功能（含历史/追问/持久化，默认） | fast=真流式逐token（低延迟，跳过持久化） | interactive=真流式逐token + 完成时会话事务提交（T9 聊天页）",
@@ -3949,6 +3959,8 @@ def _execute_task_graph_chat_with_slot(
             "temperature": req.temperature,
             "top_p": req.top_p,
             "show_thinking": req.show_thinking,
+            # ★ 2026-09-19：深度思考**开关**（与「展示」区分），None ⇒ 沿用模板默认。
+            "enable_thinking": req.enable_thinking,
         },
     }
 
@@ -4484,6 +4496,7 @@ def _execute_chat_full(
                 temperature=req.temperature,
                 top_p=req.top_p,
                 show_thinking=req.show_thinking,
+                enable_thinking=req.enable_thinking,
                 routing_preference=req.routing_preference,
                 session_id=req.session_id,
                 messages=list(history) + [{"role": "user", "content": req.message}],
@@ -4589,6 +4602,7 @@ def _execute_chat_full(
                 session_id=req.session_id,
                 messages=list(history) + [{"role": "user", "content": req.message}],
                 show_thinking=req.show_thinking,
+                enable_thinking=req.enable_thinking,
                 _require_distributed=(req.routing_preference == "distributed_required"),
                 _force_distributed_assignment=True,
                 _cancel_event=cancel_event,
@@ -4694,6 +4708,7 @@ def _execute_chat_full(
                     temperature=req.temperature,
                     top_p=req.top_p,
                     show_thinking=req.show_thinking,
+                    enable_thinking=req.enable_thinking,
                     _cancel_event=cancel_event,
                 )
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
