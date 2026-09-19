@@ -67,6 +67,7 @@ from transformers import (
 from config import (
     MODEL_NAME, MODEL_PATH, GGUF_MODEL_PATH,
     COMPILE_RECOMPILE_LIMIT,
+COMPILE_MIN_PARAMS,
     QUANT_TYPE, USE_COMPILE, USE_MONOLITHIC_FORWARD,
     DEVICE, TRUST_REMOTE_CODE,
     INFERENCE_ENGINE,
@@ -1880,6 +1881,8 @@ class ModelManager:
             model = AutoModelForCausalLM.from_config(
                 config,
                 trust_remote_code=TRUST_REMOTE_CODE,
+                # ★ P6 实测：f16+sdpa 1.665 ms/层为最佳；此前未显式设置（依赖库默认）。
+                attn_implementation="sdpa",
             )
         load_tracker.observe()
 
@@ -2070,6 +2073,8 @@ class ModelManager:
             model = AutoModelForCausalLM.from_config(
                 config,
                 trust_remote_code=TRUST_REMOTE_CODE,
+                # ★ P6 实测：f16+sdpa 1.665 ms/层为最佳；此前未显式设置（依赖库默认）。
+                attn_implementation="sdpa",
             )
         load_tracker.observe()
 
@@ -2481,6 +2486,8 @@ class ModelManager:
             load_kwargs: Dict[str, Any] = dict(
                 device_map="auto",
                 trust_remote_code=TRUST_REMOTE_CODE,
+                # ★ P6 实测：f16+sdpa 1.665 ms/层为最佳（此前未显式设置）。
+                attn_implementation="sdpa",
             )
 
             if bnb_config is not None:
@@ -2672,6 +2679,29 @@ class ModelManager:
         # ★ A3：复用共享判定（排除 sliding_attention；不能只看「有无 layer_types」）
         return _is_hybrid_layer_types(getattr(text_cfg, "layer_types", None))
 
+    def _estimate_total_params(self) -> float | None:
+        """按 config 估算**整模**参数量（用于 compile 的规模门）。
+
+        为什么不用 `sum(p.numel() for p in self.model.parameters())`：**分层加载只物化本节点
+        的层段**（可能只有 12/24 层），直接求和会把大模型误判成小模型而错误跳过 compile。
+
+        近似式：`layers × (4·h² + 3·h·i)`（attention 约 4 个 h×h 投影 + MLP 三个 h×i 矩阵），
+        忽略 embedding/lm_head 与 hybrid 的 linear_attn 差异 —— 作为**数量级门槛**足够。
+        """
+        try:
+            cfg = getattr(getattr(self.model, "config", None), "text_config", None) or \
+                getattr(self.model, "config", None)
+            if cfg is None:
+                return None
+            layers = int(getattr(cfg, "num_hidden_layers", 0) or 0)
+            h = int(getattr(cfg, "hidden_size", 0) or 0)
+            i = int(getattr(cfg, "intermediate_size", 0) or 0)
+            if layers <= 0 or h <= 0 or i <= 0:
+                return None
+            return float(layers) * (4.0 * h * h + 3.0 * h * i)
+        except Exception:  # noqa: BLE001
+            return None
+
     def _maybe_apply_compile(self) -> None:
         """按与 ``_load_pytorch`` 相同的条件决定是否启用算子融合。
 
@@ -2691,6 +2721,19 @@ class ModelManager:
             logger.warning(
                 f"⚠️ torch.compile 与 {self.quant_type} 量化不兼容（实测慢 13%），已自动跳过。"
                 f"如需融合，请设置 QUANT_TYPE='fp16'。"
+            )
+            return
+        # ★ 规模门（2026-09-19 用户裁定）：编译的收益**只在 ≥1.5B 上稳定为正**。
+        #   依据：D→L 端到端实测里，0.5B/12 层开 `USE_MONOLITHIC_FORWARD` **反而慢约 6×**
+        #   （上游 84.2 vs 13.9 ms/step）—— 每层计算太轻时，编译的 guard/Python 开销压过
+        #   kernel 收益；而 2B/24 层同一开关实测 **快 2.698×**（逐 token 一致）。
+        #   1B 以内的小模型即便真能优化也会碰到边际效应 ⇒ 低于阈值直接跳过并告知。
+        approx_params = self._estimate_total_params()
+        if approx_params is not None and approx_params < COMPILE_MIN_PARAMS:
+            logger.warning(
+                "⚠️ 模型规模约 %.2fB < %.1fB ⇒ 自动跳过 torch.compile"
+                "（实测该规模下编译反而慢；见 COMPILE_MIN_PARAMS 注释）",
+                approx_params / 1e9, COMPILE_MIN_PARAMS / 1e9,
             )
             return
         if self._is_hybrid_architecture():
