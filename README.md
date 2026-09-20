@@ -292,13 +292,23 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
+The main requirement set includes the pinned CPU/GGUF `llama-cpp-python==0.3.35`
+fallback alongside the PyTorch D track. This is the default CPU wheel contract;
+CUDA llama.cpp builds are optional, separately built artifacts and are not implied
+by the main lock.
+
 Edge 环境只安装 GGUF/llama.cpp 和控制面依赖，不安装 torch、Transformers 或 bitsandbytes：
 
 ```powershell
 python -m venv .venv-edge
 .\.venv-edge\Scripts\python.exe -m pip install -r requirements-edge.txt
 .\.venv-edge\Scripts\python.exe scripts/edge_preflight.py --python .venv-edge\Scripts\python.exe --json
+python scripts/llama_dependency_contract.py --json
 ```
+
+The managed Gemma 4 MTMD profile is separate: `.venv-gemma4-native` uses the
+frozen `llama-cpp-python==0.3.28` binding and must not reuse the ordinary CPU
+wheel. Its ABI marker and lock are checked independently.
 
 Linux/macOS 将 `Scripts\python.exe` 替换为 `bin/python`。交互 TUI 依赖 `Textual`；只读命令、协议层和 CI 检查不需要 Textual。`uvicorn/FastAPI` 只在本机自动启动后端时需要，远程 TUI 不会替远端启动本机后端。
 
