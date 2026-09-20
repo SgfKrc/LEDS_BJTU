@@ -87,6 +87,15 @@ ENVS: tuple[PyEnv, ...] = (
         python_version_hint="3.12",
     ),
     PyEnv(
+        name="edge",
+        description="Edge L runtime (.venv-edge; CPU/GGUF llama.cpp, no torch)",
+        venv_dir=".venv-edge",
+        requirements=("requirements-edge.txt",),
+        lock_file="edge.lock.txt",
+        required_modules=("llama_cpp", "fastapi", "uvicorn", "psutil", "httpx"),
+        python_version_hint="3.12",
+    ),
+    PyEnv(
         name="gemma4-native",
         description="Gemma 4 MTMD 原生运行时（.venv-gemma4-native；llama.cpp GGUF）",
         venv_dir=".venv-gemma4-native",
@@ -470,6 +479,16 @@ def snapshot_env(env: PyEnv, base_python: Path) -> None:
     if freeze.returncode != 0:
         print(f"[{env.name}] [MISSING] pip freeze 失败，跳过")
         return
+    llama_version_result = subprocess.run(
+        [
+            str(py), "-c",
+            "import importlib.metadata as m; print(m.version('llama-cpp-python'))",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    llama_version = llama_version_result.stdout.strip() if llama_version_result.returncode == 0 else ""
     lines: list[str] = [
         "# ============================================================",
         f"# {env.name} 依赖精确快照（pip freeze 自动生成，勿手改）",
@@ -481,7 +500,11 @@ def snapshot_env(env: PyEnv, base_python: Path) -> None:
     ]
     torch_versions: list[str] = []
     for raw_line in freeze.stdout.splitlines():
-        _classify_freeze_line(raw_line.strip(), lines)
+        normalized_line = raw_line.strip()
+        if normalized_line.lower().startswith("llama_cpp_python @ file:") and llama_version:
+            lines.append(f"llama_cpp_python=={llama_version}")
+        else:
+            _classify_freeze_line(normalized_line, lines)
         # 记录 torch 系实际版本（若 freeze 里有），便于提示
         m = re.match(r"([A-Za-z0-9_.-]+)(==.*)$", raw_line.strip())
         if m and m.group(1).lower() in TORCH_SET:

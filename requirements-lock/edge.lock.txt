@@ -1,0 +1,44 @@
+# ============================================================
+# edge 依赖精确快照（pip freeze 自动生成，勿手改）
+# 环境: Edge L runtime (.venv-edge; CPU/GGUF llama.cpp, no torch)
+# 生成: python scripts/setup_envs.py --snapshot
+# 说明: torch/torchvision/torchaudio 与 editable/本地路径安装不在此锁定；
+#       主仓运行时依赖按 requirements*.txt 安装；发布和 TUI 依赖在 qlh-release/qlh-shell 中维护。
+# ============================================================
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+certifi==2026.7.22
+click==8.5.0
+diskcache==5.6.3
+fastapi==0.141.1
+h11==0.16.0
+httpcore==1.0.9
+httptools==0.8.0
+httpx==0.28.1
+idna==3.19
+Jinja2==3.1.6
+linkify-it-py==2.2.0
+llama_cpp_python==0.3.35
+markdown-it-py==4.2.0
+MarkupSafe==3.0.3
+mdit-py-plugins==0.6.1
+mdurl==0.1.2
+numpy==2.5.3
+platformdirs==4.11.11
+psutil==7.2.2
+pydantic==2.13.5
+pydantic_core==2.46.5
+Pygments==2.21.0
+python-dotenv==1.2.3
+python-multipart==0.0.32
+PyYAML==6.0.3
+rich==15.0.0
+sse-starlette==3.4.11
+starlette==1.6.0
+textual==8.2.8
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+uvicorn==0.53.0
+watchfiles==1.2.0
+websockets==17.1

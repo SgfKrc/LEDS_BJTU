@@ -15,7 +15,8 @@
 # ============================================================
 
 # --- llama.cpp GGUF 推理引擎（CPU/集显默认；如需 CUDA 用 CMAKE_ARGS 重建）---
-llama-cpp-python>=0.3.0
+# This is the managed MTMD binding, pinned separately from the default CPU wheel.
+llama-cpp-python==0.3.28
 
 # --- 数值 / 加载辅助 ---
 numpy>=1.26
