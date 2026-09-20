@@ -51,9 +51,15 @@ chat_history/
 /package-lock.json
 
 # Environment
+# ⚠️ `.env.bak*` 必须忽略 —— 备份**含真实密钥**（QLH_DB_PASSWORD / QLH_CLUSTER_SECRET /
+#    QLH_SMTP_PASSWORD）。2026-09-20 实测：`.env.bak-20260920` 曾以 `??` 出现在
+#    `git status` 中，一次 `git add -A` 就会把密钥提交并推送出去。
 .env
 .env.local
 .env.docagent
+.env.bak
+.env.bak-*
+.env.*.bak
 node_config.json
 node_config.json.tmp
 .gitignore_bak
