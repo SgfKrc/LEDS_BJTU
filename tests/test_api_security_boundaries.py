@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -21,6 +22,38 @@ def test_retired_email_surface_has_no_api_routes():
         "/api/cluster/email-config",
         "/api/cluster/review/mail-poll",
     })
+
+
+@pytest.mark.parametrize("method,path,payload", [
+    ("post", "/api/chat", {"message": "boundary"}),
+    ("post", "/api/chat/stream", {"message": "boundary"}),
+    ("post", "/api/cluster/nodes/worker-1/deregister", None),
+    ("put", "/api/cluster/config/max-nodes", {"max_nodes": 2}),
+])
+def test_common_api_boundary_rejects_untrusted_remote_before_handler(
+    method, path, payload, monkeypatch,
+):
+    monkeypatch.delenv("QLH_AUTH_REQUIRED", raising=False)
+    with TestClient(api_server.app, client=("192.0.2.10", 50000)) as client:
+        response = getattr(client, method)(path, json=payload)
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "MODEL_API_SOURCE_UNTRUSTED"
+
+
+def test_common_api_boundary_enforces_bearer_when_enabled(monkeypatch):
+    monkeypatch.setenv("QLH_AUTH_REQUIRED", "1")
+    with TestClient(api_server.app, client=("127.0.0.1", 50000)) as client:
+        response = client.get("/api/cluster/nodes")
+    assert response.status_code == 401
+    assert response.json()["detail"]["code"] == "auth_required"
+
+
+def test_first_user_bootstrap_remains_open_when_auth_is_forced(monkeypatch):
+    monkeypatch.setenv("QLH_AUTH_REQUIRED", "1")
+    monkeypatch.setattr(api_server.auth_service, "is_bootstrap_open", lambda: True)
+    principal = api_server.auth_service.require_session(authorization=None)
+    assert principal.username == "anonymous"
+    assert principal.is_admin is True
 
 
 def _request(host: str, *, headers: dict[str, str] | None = None) -> Request:

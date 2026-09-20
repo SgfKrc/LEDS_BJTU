@@ -44,8 +44,10 @@ __all__ = [
     "get_auth_store",
     "get_totp_verifier",
     "is_bootstrap_open",
+    "auth_required",
     "auth_capability_payload",
     "login",
+    "verify_totp_confirmation",
     "logout",
     "resolve_bearer",
     "require_session",
@@ -101,6 +103,11 @@ def _auth_required() -> bool:
     return os.environ.get("QLH_AUTH_REQUIRED", "").strip().lower() in {"1", "true", "on", "yes"}
 
 
+def auth_required() -> bool:
+    """Return whether HTTP business APIs must carry a valid Bearer session."""
+    return _auth_required()
+
+
 def auth_capability_payload() -> dict:
     """`/api/auth/capability` 的**本地**实现（不再是反代探测）。
 
@@ -144,7 +151,14 @@ class AuthPrincipal:
         return self.role == ROLE_ADMIN
 
 
+def request_source(request: Optional[Request] = None) -> str:
+    """Return the direct peer address; forwarded headers are not trusted."""
+    client = getattr(request, "client", None) if request is not None else None
+    return str(getattr(client, "host", "") or "unknown")[:256]
+
+
 def login(username: str, password: str, *, totp_code: Optional[str] = None,
+          source: Optional[str] = None,
           ttl_seconds: int = SESSION_TTL_SECONDS) -> tuple[str, SessionRecord]:
     """校验口令（**若已绑定 TOTP 则必须同时提供有效一次性码**）并签发登录态。
 
@@ -164,7 +178,8 @@ def login(username: str, password: str, *, totp_code: Optional[str] = None,
                 "message": "该账户已绑定 Auth App，请同时提供 6 位验证码",
             })
         try:
-            ok = get_totp_verifier().verify(secret, totp_code)
+            ok = get_totp_verifier().verify(
+                secret, totp_code, account=username, source=source)
         except auth_app.TotpRateLimitedError as exc:
             raise HTTPException(429, {"code": exc.code, "message": str(exc)}) from exc
         except auth_app.TotpReplayError as exc:
@@ -178,6 +193,46 @@ def login(username: str, password: str, *, totp_code: Optional[str] = None,
         return store.issue_session(username, ttl_seconds=ttl_seconds)
     except AuthStoreError as exc:
         raise HTTPException(403, {"code": exc.code, "message": str(exc)}) from exc
+
+
+def verify_totp_confirmation(
+    principal: AuthPrincipal, code: Optional[str], *, source: Optional[str] = None
+) -> None:
+    """Require a real local identity and consume one Auth App/TOTP code.
+
+    The default compatibility mode may expose an anonymous principal for
+    read-only local use, but a high-risk approval must never treat it as a signer.
+    """
+    if principal is None or principal.username == "anonymous":
+        raise HTTPException(
+            403,
+            {"code": "auth_required", "message": "需要已登录账户进行 Auth App 确认"},
+        )
+    secret = get_auth_store().get_totp_secret(principal.username)
+    if not secret:
+        raise HTTPException(
+            501,
+            {
+                "code": "auth_control_plane_unavailable",
+                "message": "当前账户尚未配置 Auth App/TOTP，拒绝签发入群授权",
+            },
+        )
+    if not code or not code.strip():
+        raise HTTPException(
+            403,
+            {"code": "totp_required", "message": "需要输入当前 Auth App 一次性验证码"},
+        )
+    try:
+        verified = get_totp_verifier().verify(
+            secret, code, account=principal.username, source=source)
+    except auth_app.TotpRateLimitedError as exc:
+        raise HTTPException(429, {"code": "rate_limited", "message": str(exc)}) from exc
+    except auth_app.TotpReplayError as exc:
+        raise HTTPException(403, {"code": "totp_replayed", "message": str(exc)}) from exc
+    except auth_app.TotpError as exc:
+        raise HTTPException(403, {"code": "totp_invalid", "message": str(exc)}) from exc
+    if not verified:
+        raise HTTPException(403, {"code": "totp_invalid", "message": "验证码不正确"})
 
 
 def logout(token: str) -> bool:
@@ -213,7 +268,7 @@ def require_session(authorization: Optional[str] = Header(default=None)) -> Auth
     principal = resolve_bearer(authorization)
     if principal is not None:
         return principal
-    if not _auth_required():
+    if not _auth_required() or is_bootstrap_open():
         # 未强制认证：给一个「匿名」主体，保留既有可用性
         return AuthPrincipal("anonymous", ROLE_ADMIN)
     raise HTTPException(401, {"code": "auth_required", "message": "需要登录（Bearer token）"})

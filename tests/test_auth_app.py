@@ -146,6 +146,52 @@ class TestVerifier:
         assert v.verify(RFC_SECRET, "000000", at=2000.0) is False
         assert v.verify(RFC_SECRET, totp(RFC_SECRET, at=2000.0), at=2000.0) is True
 
+    def test_failure_lockout_is_scoped_to_account_and_source(self):
+        v = TotpVerifier(max_failures=3, lockout_seconds=60)
+        for _ in range(3):
+            assert v.verify(
+                RFC_SECRET, "000000", at=1000.0,
+                account="alice", source="10.0.0.1",
+            ) is False
+        with pytest.raises(TotpRateLimitedError):
+            v.verify(
+                RFC_SECRET, totp(RFC_SECRET, at=1000.0), at=1000.0,
+                account="alice", source="10.0.0.1",
+            )
+        assert v.verify(
+            RFC_SECRET, totp(RFC_SECRET, at=1000.0), at=1000.0,
+            account="bob", source="10.0.0.1",
+        ) is True
+        assert v.verify(
+            RFC_SECRET, totp(RFC_SECRET, at=1000.0), at=1000.0,
+            account="alice", source="10.0.0.2",
+        ) is True
+
+    def test_replay_is_scoped_to_account_not_secret_only(self):
+        v = TotpVerifier()
+        code = totp(RFC_SECRET, at=5000.0)
+        assert v.verify(
+            RFC_SECRET, code, at=5000.0,
+            account="alice", source="local",
+        ) is True
+        assert v.verify(
+            RFC_SECRET, code, at=5000.0,
+            account="bob", source="local",
+        ) is True
+
+    def test_instances_are_process_local_boundary(self):
+        code = totp(RFC_SECRET, at=7000.0)
+        first_process = TotpVerifier()
+        second_process = TotpVerifier()
+        assert first_process.verify(
+            RFC_SECRET, code, at=7000.0,
+            account="alice", source="local",
+        ) is True
+        assert second_process.verify(
+            RFC_SECRET, code, at=7000.0,
+            account="alice", source="local",
+        ) is True
+
     def test_reset_clears_state(self):
         v = TotpVerifier()
         code = totp(RFC_SECRET, at=9000.0)

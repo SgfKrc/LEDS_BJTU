@@ -138,6 +138,11 @@ class AuthStore:
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
+    @staticmethod
+    def _revoke_all_sessions_in_transaction(conn: sqlite3.Connection, username: str) -> int:
+        cur = conn.execute("DELETE FROM auth_sessions WHERE username = ?", (username,))
+        return int(cur.rowcount)
+
     # ---------------------------------------------------------------- 账户
     def count_users(self) -> int:
         with self._lock:
@@ -230,11 +235,10 @@ class AuthStore:
             try:
                 cur = conn.execute("UPDATE auth_users SET disabled = ? WHERE username = ?",
                                    (1 if disabled else 0, username))
+                if cur.rowcount:
+                    # Any account-state transition invalidates every old bearer.
+                    self._revoke_all_sessions_in_transaction(conn, username)
                 conn.commit()
-                if cur.rowcount and disabled:
-                    # 禁用时立即吊销其登录态
-                    conn.execute("DELETE FROM auth_sessions WHERE username = ?", (username,))
-                    conn.commit()
                 return bool(cur.rowcount)
             finally:
                 conn.close()
@@ -247,6 +251,8 @@ class AuthStore:
             try:
                 cur = conn.execute("UPDATE auth_users SET role = ? WHERE username = ?",
                                    (role, username))
+                if cur.rowcount:
+                    self._revoke_all_sessions_in_transaction(conn, username)
                 conn.commit()
                 return bool(cur.rowcount)
             finally:
@@ -263,6 +269,8 @@ class AuthStore:
                     "UPDATE auth_users SET password_hash = ?, salt = ?, password_changed_at = ?"
                     " WHERE username = ?",
                     (_hash_password(password, salt), salt, time.time(), username))
+                if cur.rowcount:
+                    self._revoke_all_sessions_in_transaction(conn, username)
                 conn.commit()
                 return bool(cur.rowcount)
             finally:
@@ -382,9 +390,9 @@ class AuthStore:
         with self._lock:
             conn = self._connect()
             try:
-                cur = conn.execute("DELETE FROM auth_sessions WHERE username = ?", (username,))
+                revoked = self._revoke_all_sessions_in_transaction(conn, username)
                 conn.commit()
-                return int(cur.rowcount)
+                return revoked
             finally:
                 conn.close()
 
