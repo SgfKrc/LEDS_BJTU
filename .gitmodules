@@ -1,9 +1,10 @@
 [submodule "tools/docagent"]
 	path = tools/docagent
 	url = https://github.com/SgfKrc/qlh-docagent.git
-[submodule "tools/reasonix-codex-bridge"]
-	path = tools/reasonix-codex-bridge
-	url = https://github.com/SgfKrc/reasonix-codex-bridge.git
+# ★ 2026-09-20：`tools/reasonix-codex-bridge` **不再是子模块**。
+#   两个桥接器（reasonix-codex-bridge / dsh-codex-bridge）改为**工作区独立目录**：
+#   各自是独立 git 仓（本地 clone），**不进主仓**，指针已剔除（见 .gitignore）。
+#   `dsh-codex-bridge` vendor 了桥接器运行时与测试（DSH 侧自包含）。
 [submodule "packages/spawnledger"]
 	path = packages/spawnledger
 	url = https://github.com/SgfKrc/spawnledger.git

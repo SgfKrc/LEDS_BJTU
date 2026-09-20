@@ -242,7 +242,10 @@ There are 8 external submodules, all registered in `.gitmodules`:
 | `packages/spawnledger/` | `spawnledger` |
 | `tools/docagent/` | `qlh-docagent` |
 | `tools/toolbox/` | `qlh-toolbox` |
-| `tools/reasonix-codex-bridge/` | `reasonix-codex-bridge` |
+
+> **Note (2026-09-20)** — the two bridges (`tools/reasonix-codex-bridge/`, `tools/dsh-codex-bridge/`)
+> are **workspace-local directories, not submodules** any more. They are gitignored and cloned
+> separately; they are intentionally absent from the submodule table above.
 
 `src/` grouped by responsibility (for navigation; per-module interfaces are in [Module Interfaces](模块接口说明.md)):
 
@@ -276,8 +279,12 @@ Submodule remotes are in `.gitmodules`. Common sibling repositories:
 - `https://github.com/SgfKrc/qlh-release.git`
 - `https://github.com/SgfKrc/qlh-toolbox.git`
 - `https://github.com/SgfKrc/qlh-docagent.git`
-- `https://github.com/SgfKrc/reasonix-codex-bridge.git`
 - `https://github.com/SgfKrc/Koakumix.git`
+
+> **Bridges (not submodules since 2026-09-20)** — clone separately into `tools/` if you need them;
+> they are gitignored and intentionally kept out of the main repository:
+> - `https://github.com/SgfKrc/reasonix-codex-bridge.git`
+> - `https://github.com/SgfKrc/dsh-codex-bridge.git`
 
 ### 2. Choose a Runtime Environment
 

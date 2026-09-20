@@ -137,3 +137,11 @@ models/.*.qlh-import-*/
 
 # frontend_cybergothic: abandoned (kept locally, no longer maintained)
 frontend_cybergothic/
+
+# ★ 2026-09-20：两个**桥接器**改为「工作区独立目录」，不再作为主仓子模块。
+# 各自是独立 git 仓（本地 clone 各自维护）；主仓只保留本地目录，不入库。
+#   tools/reasonix-codex-bridge —— Reasonix/Codex 桥（MCP server + ACP transport）
+#   tools/dsh-codex-bridge —— 孪生项目（DSH 侧，vendor 了桥接器运行时与测试）
+tools/reasonix-codex-bridge/
+tools/dsh-codex-bridge/
+
