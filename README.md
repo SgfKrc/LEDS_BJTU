@@ -229,7 +229,7 @@ TUI 与 API 顶层只需知道**聚合资源**（GPU/CPU/内存）和"是否分�
 | `requirements*.txt` / `pytest.ini` / `pyrightconfig.json` / `reasonix.toml` | 依赖清单与工具配置 |
 | `models/`、`chat_history/`、`dist/`、`build/`、`test-results/`、`logs/`、`_to_delete/` | 本地产物或归档区，不入 Git（`logs/`、`_to_delete/` 已 gitignore） |
 
-外置子模块共 8 个，全部登记在 `.gitmodules`：
+**子模块（与主仓功能直接相关，4 个）** —— 由 `.gitmodules` 登记，`git submodule update --init` 拉取：
 
 | 子模块路径 | 远端 |
 | --- | --- |
@@ -237,10 +237,21 @@ TUI 与 API 顶层只需知道**聚合资源**（GPU/CPU/内存）和"是否分�
 | `frontend_cybergothic/` | `qlh-shell` |
 | `packaging/` | `qlh-release` |
 | `harness_workbench/` | `Koakumix` |
-| `packages/spawnledger/` | `spawnledger` |
-| `tools/docagent/` | `qlh-docagent` |
-| `tools/toolbox/` | `qlh-toolbox` |
-| `tools/reasonix-codex-bridge/` | `reasonix-codex-bridge` |
+
+**关联仓库（开发/实验工具，2026-09-20 起不再是子模块）** —— 需**另行 clone 到本地**，已被 `.gitignore` 覆盖、**不进主仓**：
+
+| 本地目录 | 远端 | 说明 |
+| --- | --- | --- |
+| `tools/docagent/` | `qlh-docagent` | 文档维护扫描器 |
+| `tools/toolbox/` | `qlh-toolbox` | 工具集 |
+| `tools/reasonix-codex-bridge/` | `reasonix-codex-bridge` | Reasonix ↔ Codex 受控桥（MCP + ACP） |
+| `tools/dsh-codex-bridge/` | `dsh-codex-bridge` | 孪生项目（DSH 侧，vendor 了桥接器运行时） |
+| `packages/spawnledger/` | `spawnledger` | 进程归属票据工具 |
+
+> **注意**：`tools/`、`packages/`、`logs/`、`docs/agent_tool/` 以及 `scripts/` 的一次性实验脚本
+> 已从主仓裁掉（只留本地）。`scripts/` 中**被 `src/` 或测试 import 的**、以及上手/流水线要用的
+> 工具（`setup_envs.py`、`cut_layers.py`、`run_test_channels.py` 等）仍保留入库。
+
 
 `src/` 按职责分组（便于导航；逐模块接口见 [模块接口说明](docs/模块接口说明.md)）：
 
@@ -255,7 +266,7 @@ TUI 与 API 顶层只需知道**聚合资源**（GPU/CPU/内存）和"是否分�
 | 模型与资产 | `model_config.py`、`model_host.py`、`model_sync.py`、`model_downloader.py`、`model_download_jobs.py`、`model_search.py`、`model_registry_validation.py`、`model_runtime_contracts.py`、`local_model_assets.py` |
 | 任务图与工作流 | `task_graph*.py`、`task_journal.py`、`task_provider.py`、`task_worker_*.py`、`graph_orchestrator.py` |
 | TUI 与交互 | `tui_textual.py`、`tui_api.py`、`tui_shared.py`、`tui_sse.py`、`tui_backend.py`、`tui_commands.py` |
-| 检索、设备与压测 | `rag_store.py`、`rag_embedding.py`、`rag_ann.py`、`rag_quality.py`、`device_profiler.py`、`provider_soak.py` |
+| 设备与压测 | `device_profiler.py`、`provider_soak.py`；RAG 已外置至 `harness_workbench`/Koakumix |
 
 ## 快速开始
 
@@ -264,18 +275,13 @@ TUI 与 API 顶层只需知道**聚合资源**（GPU/CPU/内存）和"是否分�
 ```bash
 git clone https://github.com/SgfKrc/qlh.git
 cd qlh
-git submodule update --init --recursive
+git submodule update --init --recursive     # 只拉 4 个「子模块」（见上表）
 ```
 
-主仓子模块的远端见 `.gitmodules`。常用兄弟仓库包括：
+主仓**子模块**的远端见 `.gitmodules`。**关联仓库**（开发/实验工具，非子模块）按需另 clone 到 `tools/`、`packages/` 下：
 
-- `https://github.com/SgfKrc/qlh-android.git`
-- `https://github.com/SgfKrc/qlh-shell.git`
-- `https://github.com/SgfKrc/qlh-release.git`
-- `https://github.com/SgfKrc/qlh-toolbox.git`
-- `https://github.com/SgfKrc/qlh-docagent.git`
-- `https://github.com/SgfKrc/reasonix-codex-bridge.git`
-- `https://github.com/SgfKrc/Koakumix.git`
+- 子模块：`https://github.com/SgfKrc/qlh-android.git` · `qlh-shell.git` · `qlh-release.git` · `Koakumix.git`
+- 关联仓库：`https://github.com/SgfKrc/qlh-docagent.git` · `qlh-toolbox.git` · `reasonix-codex-bridge.git` · `dsh-codex-bridge.git` · `spawnledger.git`
 
 ### 2. 选择运行环境
 

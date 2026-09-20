@@ -53,7 +53,6 @@ def test_issue_encode_verify_and_consume_client_only_grant(tmp_path):
         request,
         issuer_key_id="owner-20260819",
         issuer_private_key=issuer_private,
-        auth_verified=True,
         now=1_005,
     )
     encoded = encode_join_grant(grant)
@@ -121,7 +120,6 @@ def test_nonce_replay_survives_ledger_restart(tmp_path):
             request,
             issuer_key_id="owner",
             issuer_private_key=issuer_private,
-            auth_verified=True,
             now=2_001,
         )
     )
@@ -156,20 +154,10 @@ def test_fail_closed_for_auth_expiry_tamper_wrong_target_and_wrong_issuer(tmp_pa
         target_public_key=target.public_key,
         requested_at=3_000,
     )
-    with pytest.raises(JoinContractError) as auth_error:
-        issue_join_grant(
-            request,
-            issuer_key_id="owner",
-            issuer_private_key=issuer_private,
-            auth_verified=False,
-            now=3_001,
-        )
-    assert auth_error.value.code == "auth_required"
     grant = issue_join_grant(
         request,
         issuer_key_id="owner",
         issuer_private_key=issuer_private,
-        auth_verified=True,
         now=3_001,
         ttl_seconds=60,
     )
@@ -217,7 +205,6 @@ def test_grant_payload_cannot_be_escalated_or_malformed():
         request,
         issuer_key_id="owner",
         issuer_private_key=issuer_private,
-        auth_verified=True,
     )
     forged = json.loads(json.dumps(grant))
     forged["payload"]["role"] = "master"
@@ -255,7 +242,6 @@ def test_concurrent_nonce_consumption_has_one_winner(tmp_path):
             request,
             issuer_key_id="owner",
             issuer_private_key=issuer_private,
-            auth_verified=True,
             now=4_001,
         )
     )

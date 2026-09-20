@@ -67,7 +67,7 @@ from fastapi import (Depends, FastAPI, File, Form, Header, HTTPException, Reques
                     UploadFile)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse, Response
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.concurrency import run_in_threadpool
 
 from api_errors import coded_http_error, error_response_content
@@ -349,6 +349,67 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+_API_SOURCE_EXEMPT_PATHS = frozenset({
+    "/api/health",
+    "/api/ready",
+    "/api/bootstrap/info",
+    "/api/bootstrap/first-connect",
+})
+_API_AUTH_EXEMPT_PATHS = frozenset({
+    "/api/health",
+    "/api/ready",
+    "/api/bootstrap/info",
+    "/api/bootstrap/first-connect",
+    "/api/auth/capability",
+    "/api/auth/login",
+    # These are node-to-node contracts. They remain source-gated, but do not
+    # require a human Bearer session when auth is enabled.
+    "/api/cluster/join/request",
+    "/api/cluster/join/consume",
+    "/api/cluster/android/register",
+    "/api/cluster/android/heartbeat",
+})
+
+
+def _boundary_response(status_code: int, detail: object) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content={"detail": detail})
+
+
+@app.middleware("http")
+async def api_boundary_middleware(request: Request, call_next):
+    """Apply the common source/auth boundary before route validation or work.
+
+    Individual handlers still keep their role and node-state checks. This
+    layer prevents a newly added API route from accidentally bypassing the
+    common network boundary, while the explicit bootstrap exceptions preserve
+    first-connect and node heartbeat protocols.
+    """
+    path = request.url.path
+    if request.method == "OPTIONS" or not path.startswith("/api/"):
+        return await call_next(request)
+
+    if path not in _API_SOURCE_EXEMPT_PATHS:
+        try:
+            require_model_api_source(request)
+        except HTTPException as exc:
+            return _boundary_response(exc.status_code, exc.detail)
+
+    if (
+        auth_service.auth_required()
+        and path not in _API_AUTH_EXEMPT_PATHS
+        and not (path == "/api/users" and request.method == "POST"
+                 and auth_service.is_bootstrap_open())
+    ):
+        authorization = request.headers.get("Authorization")
+        if auth_service.resolve_bearer(authorization) is None:
+            return _boundary_response(
+                401,
+                {"code": "auth_required", "message": "需要登录（Bearer token）"},
+            )
+
+    return await call_next(request)
 
 def _normalize_request_id(value: str | None) -> str:
     if not value:
@@ -1178,9 +1239,15 @@ class ClusterJoinRequestCreate(BaseModel):
 
 
 class ClusterJoinGrantIssue(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     request_code: Optional[str] = Field(default=None, max_length=16 * 1024)
     request: Optional[dict[str, Any]] = None
-    auth_verified: bool = Field(default=False, description="由 Auth App 控制面确认后才允许签发")
+    otp_code: Optional[str] = Field(
+        default=None,
+        max_length=16,
+        description="当前已登录管理员的 Auth App/TOTP 一次性确认码",
+    )
     ttl_seconds: int = Field(default=300, ge=60, le=900)
 
 
@@ -6866,42 +6933,33 @@ async def create_cluster_join_request(req: ClusterJoinRequestCreate):
 
 
 @app.post("/api/cluster/join/grant")
-async def issue_cluster_join_grant(req: ClusterJoinGrantIssue):
-    """Issue a short-lived client-only grant after explicit Auth App approval.
-
-    `auth_verified` is deliberately a control-plane seam. It must be wired to
-    the real Auth App/TOTP verifier before production exposure; this endpoint
-    never accepts a TOTP seed or code itself.
-    """
+async def issue_cluster_join_grant(
+    req: ClusterJoinGrantIssue,
+    request: Request,
+    principal=Depends(auth_service.require_role("admin")),
+):
+    """Issue a short-lived client-only grant after local TOTP confirmation."""
     if scheduler._effective_role() != "master":
         raise HTTPException(403, "仅主节点可签发入群授权")
-    boolean_approval_enabled = os.environ.get(
-        "QLH_CLUSTER_JOIN_BOOLEAN_APPROVAL", ""
-    ).strip().lower() in {"1", "true", "yes", "on"}
-    if not boolean_approval_enabled:
-        raise HTTPException(
-            501,
-            {
-                "code": "auth_control_plane_unavailable",
-                "message": "真实 Auth App/TOTP 控制面尚未配置，拒绝布尔审批接缝",
-            },
-        )
-    if req.auth_verified is not True:
-        raise HTTPException(403, {"code": "auth_required", "message": "需要先完成 Auth App 审批"})
+    auth_service.verify_totp_confirmation(
+        principal, req.otp_code, source=auth_service.request_source(request)
+    )
     try:
         if bool(req.request_code) == bool(req.request):
             raise JoinContractError("request_code 或 request 必须且只能提供一个", code="invalid_request")
-        request = decode_join_request(req.request_code) if req.request_code else dict(req.request or {})
+        join_request = (
+            decode_join_request(req.request_code)
+            if req.request_code else dict(req.request or {})
+        )
         if req.request is not None:
-            encode_join_request(request)
+            encode_join_request(join_request)
         ledger = _get_join_ledger()
         key_id, keypair = ledger.get_or_create_issuer_keypair()
         grant = issue_join_grant(
-            request,
+            join_request,
             issuer_key_id=key_id,
             issuer_private_key=load_join_private_key(keypair.private_key),
             issuer_public_key=keypair.public_key,
-            auth_verified=True,
             ttl_seconds=req.ttl_seconds,
         )
         code = encode_join_grant(grant)
@@ -6911,7 +6969,7 @@ async def issue_cluster_join_grant(req: ClusterJoinGrantIssue):
             "qr_payload": code,
             "issuer_key_id": key_id,
             "issuer_public_key": keypair.public_key,
-            "target_node_id": request["target_node_id"],
+            "target_node_id": join_request["target_node_id"],
             "expires_at": grant["payload"]["expires_at"],
             "auth_method": "totp",
         }
@@ -7185,13 +7243,16 @@ async def auth_capability():
 
 
 @app.post("/api/auth/login")
-async def auth_login(req: LoginRequest):
+async def auth_login(req: LoginRequest, request: Request):
     """登录并签发 Bearer token（**明文只在本次响应返回**）。
 
     ⚠️ 首次引导（库中无账户）时，请改用 `POST /api/users` 创建第一个 admin —— 该端点
     在引导期**无需登录**。
     """
-    token, rec = auth_service.login(req.username, req.password, totp_code=req.totp_code)
+    token, rec = auth_service.login(
+        req.username, req.password, totp_code=req.totp_code,
+        source=auth_service.request_source(request),
+    )
     return {
         "status": "ok",
         "token": token,
@@ -7240,6 +7301,7 @@ async def auth_totp_provision(
 @app.post("/api/auth/totp/verify")
 async def auth_totp_verify(
     req: TotpVerifyRequest,
+    request: Request,
     principal=Depends(auth_service.require_role("admin", "operator")),
 ):
     """校验一次当前主体的 TOTP（用于确认 Auth App 绑定成功）。"""
@@ -7247,7 +7309,10 @@ async def auth_totp_verify(
     if not secret:
         raise HTTPException(404, {"code": "totp_not_bound", "message": "尚未绑定 Auth App"})
     try:
-        ok = auth_service.get_totp_verifier().verify(secret, req.code)
+        ok = auth_service.get_totp_verifier().verify(
+            secret, req.code, account=principal.username,
+            source=auth_service.request_source(request),
+        )
     except auth_app.TotpRateLimitedError as exc:
         raise HTTPException(429, {"code": exc.code, "message": str(exc)}) from exc
     except auth_app.TotpReplayError as exc:

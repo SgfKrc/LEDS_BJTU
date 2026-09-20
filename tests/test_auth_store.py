@@ -90,9 +90,11 @@ class TestPasswords:
 
     def test_set_password_invalidates_old(self, store):
         store.create_user("g", "oldpassword")
+        old_token, _ = store.issue_session("g")
         assert store.set_password("g", "newpassword") is True
         assert store.verify_password("g", "oldpassword") is False
         assert store.verify_password("g", "newpassword") is True
+        assert store.resolve_session(old_token) is None
 
 
 class TestDisabled:
@@ -103,16 +105,24 @@ class TestDisabled:
 
     def test_disabled_revokes_sessions(self, store):
         store.create_user("h", "password123")
-        token, _ = store.issue_session("h")
-        assert store.resolve_session(token) is not None
+        tokens = [store.issue_session("h")[0] for _ in range(2)]
+        assert all(store.resolve_session(token) is not None for token in tokens)
         store.set_disabled("h", True)
-        assert store.resolve_session(token) is None
+        assert all(store.resolve_session(token) is None for token in tokens)
 
     def test_re_enable_restores_password(self, store):
         store.create_user("h", "password123")
         store.set_disabled("h", True)
         store.set_disabled("h", False)
         assert store.verify_password("h", "password123") is True
+
+
+class TestRoleChanges:
+    def test_role_change_revokes_all_existing_sessions(self, store):
+        store.create_user("role-user", "password123")
+        tokens = [store.issue_session("role-user")[0] for _ in range(2)]
+        assert store.set_role("role-user", ROLE_ADMIN) is True
+        assert all(store.resolve_session(token) is None for token in tokens)
 
 
 class TestSessions:

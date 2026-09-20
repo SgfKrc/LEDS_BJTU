@@ -418,7 +418,12 @@ class ActionFormScreen(ModalScreen[Dict[str, str] | None]):
             yield Static(self.form_body, id="action-form-body")
             for field_id, label, default in self.fields:
                 yield Label(label, classes="form-label")
-                yield Input(value=default, id=f"form-{field_id}", classes="form-input")
+                yield Input(
+                    value=default,
+                    id=f"form-{field_id}",
+                    classes="form-input",
+                    password=field_id in {"otp_code", "password"},
+                )
             with Horizontal(id="action-form-buttons"):
                 yield Button(self.confirm_label, variant="primary", id="form-submit")
                 yield Button("取消", variant="default", id="form-cancel")
@@ -1285,6 +1290,7 @@ class MainScreen(Screen):
         Binding("j", "cluster_connect", "连接主节点"),
         Binding("b", "cluster_join_request", "生成入群请求"),
         Binding("k", "cluster_join_consume", "消费入群授权"),
+        Binding("o", "cluster_join_grant", "签发入群授权"),
         Binding("g", "device_auto_config", "设备配置"),
         Binding("h", "device_select_gpu", "选择 GPU"),
         Binding("e", "logs_export", "导出日志"),
@@ -1302,7 +1308,7 @@ class MainScreen(Screen):
         "chat": "/help 看命令",
         "models": "L 加载 · U 卸载 · D 下载 · C 取消下载 · F 预检 · I 登记",
         "cluster": "T 分布式 · M 最大节点 · R 刷新容量",
-        "nodes": "I 邀请 · J 连接 · B 请求码 · K 消费授权 · X 注销",
+        "nodes": "I 邀请 · J 连接 · B 请求码 · O 签发授权 · K 消费授权 · X 注销",
         "queue": "P 暂停/恢复 · S 策略 · C 清空排队",
         "logs": "F 筛选 · S 统计 · E 导出 · X 清理",
         "device": "G 自动配置 · H 选择 GPU",
@@ -2280,6 +2286,51 @@ class MainScreen(Screen):
             [("grant_code", "一次性授权码", "")],
             self.submit_cluster_join_consume,
             confirm_label="消费授权",
+        )
+
+    def action_cluster_join_grant(self) -> None:
+        if PAGES[self.page_index][0] != "nodes":
+            return
+        self.open_form(
+            "签发入群授权",
+            "主节点管理员必须输入当前 Auth App/TOTP 一次性验证码；旧布尔审批不会被接受。",
+            [
+                ("request_code", "目标节点请求码", ""),
+                ("otp_code", "Auth App 一次性验证码", ""),
+                ("ttl_seconds", "授权有效期（60-900 秒）", "300"),
+            ],
+            self.submit_cluster_join_grant,
+            confirm_label="签发",
+        )
+
+    def submit_cluster_join_grant(self, values: Dict[str, str]) -> None:
+        request_code = values.get("request_code", "").strip()
+        otp_code = values.get("otp_code", "").strip()
+        if not request_code:
+            self.write_status("[red]必须填写 request_code[/]")
+            return
+        if not otp_code:
+            self.write_status("[red]必须填写 Auth App 一次性验证码[/]")
+            return
+        try:
+            ttl = max(60, min(900, int(values.get("ttl_seconds", "300"))))
+        except ValueError:
+            self.write_status("[red]授权有效期必须是整数[/]")
+            return
+        body = {
+            "request_code": request_code,
+            "otp_code": otp_code,
+            "ttl_seconds": ttl,
+        }
+        self.app.confirm(
+            "签发入群授权",
+            f"将为请求 {request_code[:32]}... 签发一次性客户端授权；验证码不会显示在确认文本中。",
+            lambda: self.run_json_operation(
+                "POST", "/cluster/join/grant", body,
+                success="入群授权签发请求已发送",
+                refresh=(self.load_pages, self.load_cluster_aux),
+            ),
+            confirm_label="签发",
         )
 
     def submit_cluster_join_consume(self, values: Dict[str, str]) -> None:

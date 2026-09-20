@@ -25,7 +25,8 @@ QLH 是面向异构边缘设备的**轻量化分布式大模型推理系统**（
 | PC-only Relay R：裁层 GGUF + `embd` L→L 接力 | 2026-09-16：同机单进程逐 token 行为 16/16；D→L 5-token 通过，但 141-token f16/f32 拒绝；生产门关闭 |
 | 子项目：小模型 harness 工作台（S1-S8） | 上下文预算/STATE 记忆/RAG/MCP，本机门 |
 | 子项目：文档维护 Agent（独立仓库 qlh-docagent，主项目 submodule） | 规则数据化 + 演进门控 |
-| 子项目：Reasonix ↔ Codex 桥接（独立仓库 reasonix-codex-bridge，主项目 submodule） | 只读子智能体接入 Codex；受控写入 W1/W2/W3 已落地（默认关闭） |
+| 子项目：Reasonix ↔ Codex 桥接（独立仓库 reasonix-codex-bridge，**2026-09-20 起为工作区独立目录，不再是主仓子模块**） | 只读子智能体接入 Codex；受控写入 W1/W2/W3 已落地（默认关闭） |
+| 孪生项目：DSH ↔ Codex 桥接（`dsh-codex-bridge`，同为工作区独立目录） | DSH 侧自包含（vendor 了桥接器运行时与测试） |
 | 联网搜索/轻量 Fetch（WEB-TOOL G1-G6） | 本机开发门，`production_network_enabled=false` |
 
 ## 还不能宣称什么
@@ -50,8 +51,10 @@ QLH 是面向异构边缘设备的**轻量化分布式大模型推理系统**（
 ### 1. 克隆与一键配环境
 
 ```bash
-git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU   # 含 llama.cpp（第三方）与 docagent、reasonix-codex-bridge 两个自研子模块
+git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU   # 含 llama.cpp（第三方）与 docagent 等自研子模块
 cd LEDS_BJTU
+# 注：两个桥接器（reasonix-codex-bridge / dsh-codex-bridge）自 2026-09-20 起为
+#     **工作区独立目录**、不再是子模块 ⇒ 需另行 clone 到 tools/ 下（见 .gitignore）
 python scripts/setup_envs.py --all            # 主线 Python 环境（默认不含 Node）
 python scripts/setup_envs.py --all --with-node # 另行配置产品壳 Node 迁移源
 python scripts/setup_envs.py --only test,tui  # 只配指定环境

@@ -13,7 +13,7 @@
 * **失败限速**（连续失败达阈值后在冷却期内一律拒绝）。
 
 ## 与集群入群的关系
-`/api/cluster/join/grant` 的 `auth_verified` 此前是**布尔审批接缝**（fail-closed 501）。
+`/api/cluster/join/grant` 此前使用旧布尔字段作为**审批接缝**（fail-closed 501）。
 本模块提供**真正的校验器**：主节点持有人在 Auth App 里输入一次 6 位码即视为审核通过。
 **本模块不接收也不存储明文种子**之外的东西；种子由调用方（本地存储）持有。
 """
@@ -128,44 +128,69 @@ class _RateState:
 class TotpVerifier:
     """一次性验证码校验器（**有状态**：负责重放去重与失败限速）。
 
-    ⚠️ 线程安全：内部一把 `RLock`。失败计数与冷却对所有账号共享一份
-    （本机单用户场景足够；如需按账号细分，实例化多个即可）。
-    """
+    线程安全：内部一把 `RLock`。重放按账户隔离，失败计数与冷却按
+    ``(账户, 实际连接来源)`` 隔离，避免跨账户 DoS。
+    状态是进程内存；多进程全局防护需要共享原子存储。
+   """
 
     interval: int = TOTP_INTERVAL_SECONDS
     digits: int = TOTP_DIGITS
     window: int = TOTP_WINDOW_STEPS
     max_failures: int = TOTP_MAX_FAILURES
     lockout_seconds: int = TOTP_LOCKOUT_SECONDS
-    _used: dict[str, int] = field(default_factory=dict)     # secret -> 最后成功的时间步
-    _rate: _RateState = field(default_factory=_RateState)
+    _used: dict[str, int] = field(default_factory=dict)     # account -> last successful step
+    _rate: dict[tuple[str, str], _RateState] = field(default_factory=dict)
     _lock: threading.RLock = field(default_factory=threading.RLock)
 
     # ---------------------------------------------------------------- 内部
-    def _check_not_locked(self, now: float) -> None:
-        if self._rate.locked_until and now < self._rate.locked_until:
-            remain = int(self._rate.locked_until - now) + 1
+    @staticmethod
+    def _identity(secret: str, account: Optional[str]) -> str:
+        value = (account or "").strip()
+        return value or f"secret:{hashlib.sha256(secret.encode('utf-8')).hexdigest()}"
+
+    @staticmethod
+    def _source(source: Optional[str]) -> str:
+        value = (source or "").strip()
+        return value[:256] or "unknown"
+
+    def _check_not_locked(self, key: tuple[str, str], now: float) -> None:
+        state = self._rate.get(key)
+        if state and state.locked_until and now < state.locked_until:
+            remain = int(state.locked_until - now) + 1
             raise TotpRateLimitedError(
                 "rate_limited", f"失败次数过多，请在 {remain} 秒后重试")
 
-    def _note_failure(self, now: float) -> None:
-        self._rate.failures += 1
-        if self._rate.failures >= self.max_failures:
-            self._rate.locked_until = now + self.lockout_seconds
-            self._rate.failures = 0
+    def _note_failure(self, key: tuple[str, str], now: float) -> None:
+        state = self._rate.setdefault(key, _RateState())
+        state.failures += 1
+        if state.failures >= self.max_failures:
+            state.locked_until = now + self.lockout_seconds
+            state.failures = 0
 
-    def _note_success(self) -> None:
-        self._rate.failures = 0
-        self._rate.locked_until = 0.0
+    def _note_success(self, key: tuple[str, str]) -> None:
+        state = self._rate.get(key)
+        if state is not None:
+            state.failures = 0
+            state.locked_until = 0.0
 
     # ---------------------------------------------------------------- 公开
-    def verify(self, secret: str, code: str, *, at: Optional[float] = None) -> bool:
+    def verify(
+        self,
+        secret: str,
+        code: str,
+        *,
+        at: Optional[float] = None,
+        account: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> bool:
         """校验一次性验证码。
 
         Args:
             secret: base32 共享密钥。
             code: 用户从 Auth App 读到的 6 位码。
             at: 注入当前时间（测试用）。
+            account: 账户/主体标识；省略时退化为密钥指纹，兼容底层调用。
+            source: 已由服务端解析的实际连接来源；不信任客户端自报来源。
 
         Returns:
             True 表示通过。
@@ -177,29 +202,32 @@ class TotpVerifier:
         """
         now = time.time() if at is None else float(at)
         text = (code or "").strip().replace(" ", "")
-        if not text.isdigit() or len(text) != self.digits:
-            raise TotpError("invalid_format", f"验证码必须是 {self.digits} 位数字")
+        identity = self._identity(secret, account)
+        rate_key = (identity, self._source(source))
 
         with self._lock:
-            self._check_not_locked(now)
+            self._check_not_locked(rate_key, now)
+            if not text.isdigit() or len(text) != self.digits:
+                self._note_failure(rate_key, now)
+                raise TotpError("invalid_format", f"验证码必须是 {self.digits} 位数字")
 
             step = int(now // self.interval)
             for delta in range(-self.window, self.window + 1):
                 candidate_step = step + delta
                 if hmac.compare_digest(hotp(secret, candidate_step, digits=self.digits), text):
-                    last = self._used.get(secret)
+                    last = self._used.get(identity)
                     if last is not None and candidate_step <= last:
                         raise TotpReplayError(
                             "replayed", "该验证码已被使用，请等待下一个时间步")
-                    self._used[secret] = candidate_step
-                    self._note_success()
+                    self._used[identity] = candidate_step
+                    self._note_success(rate_key)
                     return True
 
-            self._note_failure(now)
+            self._note_failure(rate_key, now)
             return False
 
     def reset(self) -> None:
         """清空重放记录与限速状态（测试/重置身份时用）。"""
         with self._lock:
             self._used.clear()
-            self._rate = _RateState()
+            self._rate.clear()

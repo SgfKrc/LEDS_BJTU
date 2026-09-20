@@ -178,8 +178,25 @@ class TestUserAdmin:
     def test_set_role_and_disable(self, client):
         hdr = self._admin_headers(client)
         client.post("/api/users", json={"username": "u3", "password": "password123"}, headers=hdr)
+        user_token = client.post(
+            "/api/auth/login",
+            json={"username": "u3", "password": "password123"},
+        ).json()["token"]
+        user_hdr = {"Authorization": f"Bearer {user_token}"}
         r = client.patch("/api/users/u3", json={"role": "operator"}, headers=hdr)
         assert r.status_code == 200 and r.json()["changed"]["role"] is True
+        assert client.get("/api/auth/me", headers=user_hdr).json()["username"] == "anonymous"
+
+        user_token = client.post(
+            "/api/auth/login",
+            json={"username": "u3", "password": "password123"},
+        ).json()["token"]
+        user_hdr = {"Authorization": f"Bearer {user_token}"}
+        r_password = client.patch(
+            "/api/users/u3", json={"password": "newpassword123"}, headers=hdr,
+        )
+        assert r_password.status_code == 200
+        assert client.get("/api/auth/me", headers=user_hdr).json()["username"] == "anonymous"
 
         r2 = client.patch("/api/users/u3", json={"disabled": True}, headers=hdr)
         assert r2.status_code == 200

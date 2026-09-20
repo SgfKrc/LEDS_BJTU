@@ -1,10 +1,10 @@
 """One-time, client-only cluster join grants.
 
-This module deliberately stops at the local authorization contract.  Auth App
-verification happens in the control plane; this layer receives only the
-boolean approval result and never handles a TOTP seed, code, or email secret.
-The resulting short-lived Ed25519 grant can be rendered as both a text code
-and a QR payload.  A SQLite ledger makes nonce consumption survive restart.
+This module deliberately stops at the cryptographic join contract. Auth App
+verification happens at the API service boundary; this layer never receives a
+TOTP seed, code, or boolean approval flag. The resulting short-lived Ed25519
+grant can be rendered as both a text code and a QR payload. A SQLite ledger
+makes nonce consumption survive restart.
 """
 
 from __future__ import annotations
@@ -285,14 +285,11 @@ def issue_join_grant(
     *,
     issuer_key_id: str,
     issuer_private_key: Ed25519PrivateKey,
-    auth_verified: bool,
     now: int | float | None = None,
     ttl_seconds: int = 300,
     issuer_public_key: str | None = None,
 ) -> dict[str, Any]:
-    """Issue a short-lived grant after the control plane verified Auth App/TOTP."""
-    if auth_verified is not True:
-        raise JoinContractError("Auth App approval is required", code="auth_required")
+    """Issue a short-lived client-only grant for an already-authorized request."""
     if not _SAFE_KEY_ID.fullmatch(str(issuer_key_id)):
         raise JoinContractError("issuer_key_id is invalid", code="invalid_field")
     _require_crypto()

@@ -10,11 +10,19 @@ sys.path.insert(0, "src")
 
 @pytest.fixture
 def join_api(monkeypatch, tmp_path):
+    import auth_app
+    import auth_service
     import api_server
+    from auth_store import ROLE_ADMIN
 
     monkeypatch.setenv("QLH_SQLITE_PATH", str(tmp_path / "control.sqlite3"))
     monkeypatch.setenv("QLH_CLUSTER_ID", "cluster-test")
-    monkeypatch.setenv("QLH_CLUSTER_JOIN_BOOLEAN_APPROVAL", "true")
+    auth_service._reset_for_tests()
+    store = auth_service.get_auth_store()
+    store.create_user("root", "password123", role=ROLE_ADMIN)
+    secret = "JBSWY3DPEHPK3PXP"
+    store.bind_totp("root", secret)
+    token, _ = store.issue_session("root")
     monkeypatch.setattr(api_server, "_join_ledger_instance", None)
     role = {"value": "client"}
     monkeypatch.setattr(api_server.scheduler, "_effective_role", lambda: role["value"])
@@ -28,12 +36,16 @@ def join_api(monkeypatch, tmp_path):
         },
     )
     with TestClient(api_server.app) as client:
-        yield client, role
+        client.headers.update({"Authorization": f"Bearer {token}"})
+        yield client, role, secret
     monkeypatch.setattr(api_server, "_join_ledger_instance", None)
+    auth_service._reset_for_tests()
 
 
 def test_join_request_issue_consume_and_replay_rejected(join_api):
-    client, role = join_api
+    import auth_app
+
+    client, role, secret = join_api
     created = client.post(
         "/api/cluster/join/request",
         json={"master_endpoint": "[fd7a:115c::1]:8888", "target_node_id": "client-test"},
@@ -45,13 +57,14 @@ def test_join_request_issue_consume_and_replay_rejected(join_api):
     role["value"] = "master"
     denied = client.post(
         "/api/cluster/join/grant",
-        json={"request_code": request_code, "auth_verified": False},
+        json={"request_code": request_code},
     )
     assert denied.status_code == 403
+    assert denied.json()["detail"]["code"] == "totp_required"
 
     issued = client.post(
         "/api/cluster/join/grant",
-        json={"request_code": request_code, "auth_verified": True},
+        json={"request_code": request_code, "otp_code": auth_app.totp(secret)},
     )
     assert issued.status_code == 200, issued.text
     grant_code = issued.json()["grant_code"]
@@ -69,34 +82,124 @@ def test_join_request_issue_consume_and_replay_rejected(join_api):
 
 
 def test_join_grant_requires_master_role(join_api):
-    client, role = join_api
+    import auth_app
+
+    client, role, secret = join_api
     response = client.post(
         "/api/cluster/join/grant",
-        json={"request_code": "qlhjoinreq1.invalid", "auth_verified": True},
+        json={"request_code": "qlhjoinreq1.invalid", "otp_code": auth_app.totp(secret)},
     )
     assert response.status_code == 403
     role["value"] = "master"
     response = client.post(
         "/api/cluster/join/grant",
-        json={"request_code": "qlhjoinreq1.invalid", "auth_verified": True},
+        json={"request_code": "qlhjoinreq1.invalid", "otp_code": auth_app.totp(secret)},
     )
     assert response.status_code == 400
 
 
-def test_boolean_approval_is_disabled_by_default(join_api, monkeypatch):
-    client, role = join_api
+def test_join_grant_without_totp_binding_fails_closed(join_api):
+    import auth_service
+
+    client, role, _secret = join_api
     role["value"] = "master"
-    monkeypatch.delenv("QLH_CLUSTER_JOIN_BOOLEAN_APPROVAL", raising=False)
+    assert auth_service.get_auth_store().clear_totp("root") is True
     response = client.post(
         "/api/cluster/join/grant",
-        json={"request_code": "qlhjoinreq1.invalid", "auth_verified": True},
+        json={"request_code": "qlhjoinreq1.invalid", "otp_code": "123456"},
     )
     assert response.status_code == 501
     assert response.json()["detail"]["code"] == "auth_control_plane_unavailable"
 
 
+def test_join_grant_rejects_invalid_and_replayed_totp(join_api):
+    import auth_app
+
+    client, role, secret = join_api
+    role["value"] = "master"
+    invalid = client.post(
+        "/api/cluster/join/grant",
+        json={"request_code": "qlhjoinreq1.invalid", "otp_code": "000000"},
+    )
+    assert invalid.status_code == 403
+    assert invalid.json()["detail"]["code"] == "totp_invalid"
+
+    created = client.post(
+        "/api/cluster/join/request",
+        json={"master_endpoint": "[fd7a:115c::1]:8888", "target_node_id": "client-test"},
+    )
+    request_code = created.json()["request_code"]
+    code = auth_app.totp(secret)
+    issued = client.post(
+        "/api/cluster/join/grant",
+        json={"request_code": request_code, "otp_code": code},
+    )
+    assert issued.status_code == 200, issued.text
+    replay = client.post(
+        "/api/cluster/join/grant",
+        json={"request_code": request_code, "otp_code": code},
+    )
+    assert replay.status_code == 403
+    assert replay.json()["detail"]["code"] == "totp_replayed"
+
+
+def test_join_grant_requires_named_bearer_principal_even_when_auth_is_optional(join_api):
+    import auth_app
+
+    client, role, secret = join_api
+    role["value"] = "master"
+    client.headers.pop("Authorization", None)
+    response = client.post(
+        "/api/cluster/join/grant",
+        json={"request_code": "qlhjoinreq1.invalid", "otp_code": auth_app.totp(secret)},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "auth_required"
+
+
+def test_join_grant_rejects_legacy_boolean_field(join_api):
+    client, role, _secret = join_api
+    role["value"] = "master"
+    response = client.post(
+        "/api/cluster/join/grant",
+        json={"request_code": "qlhjoinreq1.invalid", "auth_verified": True},
+    )
+    assert response.status_code == 422
+
+
+def test_totp_failures_for_one_account_do_not_lock_another(join_api):
+    import auth_app
+    import auth_service
+    from auth_store import ROLE_ADMIN
+
+    client, role, _secret = join_api
+    store = auth_service.get_auth_store()
+    store.create_user("second-admin", "password123", role=ROLE_ADMIN)
+    second_secret = "MFRGGZDFMZTWQ2LK"
+    store.bind_totp("second-admin", second_secret)
+    for _ in range(auth_app.TOTP_MAX_FAILURES):
+        failed = client.post(
+            "/api/auth/login",
+            json={
+                "username": "root",
+                "password": "password123",
+                "totp_code": "000000",
+            },
+        )
+        assert failed.status_code == 401
+    recovered = client.post(
+        "/api/auth/login",
+        json={
+            "username": "second-admin",
+            "password": "password123",
+            "totp_code": auth_app.totp(second_secret),
+        },
+    )
+    assert recovered.status_code == 200, recovered.text
+
+
 def test_provisional_master_request_uses_future_client_id(join_api, monkeypatch):
-    client, role = join_api
+    client, role, _secret = join_api
     monkeypatch.setattr("socket.gethostname", lambda: "provisional-box")
     import api_server
     monkeypatch.setattr(api_server.scheduler, "get_effective_node_id", lambda: "master")
