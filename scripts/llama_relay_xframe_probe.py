@@ -26,6 +26,7 @@ from src.relay_contract import (
     RELAY_ACCEPTANCE,
     RELAY_ACCEPTANCE_TOLERANT,
     RELAY_TOLERANT_TOP_K,
+    RelayXFrameEvidence,
     RelayXFrameRequest,
     admit_relay_xframe,
     judge_relay_generation,
@@ -234,7 +235,18 @@ def build_evidence_report(
         top_p=top_p,
     )
     report["xframe_request"] = request.to_dict()
-    report["production_admission"] = admit_relay_xframe(request).to_dict()
+    # ★ 2026-09-19 收口：把**本次探针实际得到的证据范围**一并声明，使准入判定能区分
+    #   「还没验证」与「已验证但性能不具优势（终态）」。**无论哪种情况都不准入。**
+    evidence = RelayXFrameEvidence(
+        correctness_verified=bool(report.get("all_positions_match")),
+        correctness_cases=int(report.get("position_count") or 0),
+        max_tested_prefill=int(report.get("position_count") or 0),
+        performance_verdict="not_advantageous",
+        evidence_refs=("docs/跨框架层接力-项目报告.md#7-结论与边界",),
+    )
+    report["xframe_evidence"] = evidence.to_dict()
+    report["production_admission"] = admit_relay_xframe(request, evidence).to_dict()
+    report["production_admission_without_evidence"] = admit_relay_xframe(request).to_dict()
     report["note"] = (
         "evidence acceptance never enables production relay; the XFRAME policy remains fail-closed"
     )
