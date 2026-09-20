@@ -175,9 +175,11 @@ def test_runner_exception_produces_error_frame_not_a_hang():
         right.close()
         thread.join(timeout=5)
     assert captured and captured[0].closed_cleanly is False
+    assert captured[0].error == "runner_failed"
+    assert "boom" not in captured[0].error
 
 
-def test_unexpected_runner_exception_still_sends_error_frame(monkeypatch):
+def test_unexpected_runner_exception_still_sends_error_frame(monkeypatch, caplog):
     """★ 准入加固：runner 抛**未预期**异常（非 OSError/RelayProtocolError）时也不得挂死。
 
     回归自实测：旧实现只捕 `(OSError, RelayProtocolError)`，runner 抛 `RuntimeError`
@@ -193,12 +195,41 @@ def test_unexpected_runner_exception_still_sends_error_frame(monkeypatch):
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
     try:
-        send_frame(right, RelayFrame(RelayFrameKind.HIDDEN, 0, n_tokens=1,
-                                     payload=b"\x00" * expected_hidden_bytes(1, 2)))
-        response = recv_frame(right, max_payload_bytes=1024)   # 旧实现会在此挂住
+        with caplog.at_level("ERROR", logger="src.relay_transport"):
+            send_frame(right, RelayFrame(RelayFrameKind.HIDDEN, 0, n_tokens=1,
+                                         payload=b"\x00" * expected_hidden_bytes(1, 2)))
+            response = recv_frame(right, max_payload_bytes=1024)   # 旧实现会在此挂住
         assert response.kind == RelayFrameKind.ERROR
-        assert b"RuntimeError" in response.payload, response.payload
+        assert response.payload == b"runner_failed"
+        assert b"RuntimeError" not in response.payload
+        assert b"boom" not in response.payload
     finally:
         right.close()
         thread.join(timeout=5)
     assert captured and captured[0].closed_cleanly is False
+    assert "RuntimeError" in caplog.text
+    assert "boom" in caplog.text
+
+
+def test_remote_error_frame_is_reduced_to_a_stable_code():
+    """A malicious/old peer cannot inject exception text into the local error."""
+    from src.relay_transport import _decode_token
+
+    frame = RelayFrame(
+        RelayFrameKind.ERROR,
+        0,
+        payload=b"RuntimeError: secret-path-and-message",
+    )
+
+    with pytest.raises(RelayProtocolError, match="^remote_error$") as exc_info:
+        _decode_token(frame, 0)
+    assert "secret-path" not in str(exc_info.value)
+
+
+def test_oversized_remote_error_frame_is_reduced_to_remote_error():
+    from src.relay_transport import _decode_token
+
+    frame = RelayFrame(RelayFrameKind.ERROR, 0, payload=b"x" * 65)
+
+    with pytest.raises(RelayProtocolError, match="^remote_error$"):
+        _decode_token(frame, 0)

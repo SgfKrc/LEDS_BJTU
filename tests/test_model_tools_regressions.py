@@ -1,91 +1,30 @@
 """T3：scripts/model_tools 回归测试（测试修复票排期 P1）。
 
 覆盖 2026-08-16/17 的裸修复：
-  - gguf_convert._ensure_converter_patch：自动应用/幂等/apply 失败 fail-closed
-    （2fe47a6、8129806：Qwen 老架构 epsilon 键 + 补丁持久化）
   - import_model ModelScope 子进程 GBK 编码（3e26a35：errors=replace）
+
+★ 2026-09-20：删除了 4 项关于 `gguf_convert._ensure_converter_patch` 的用例
+（`test_patch_idempotent_when_already_applied` / `_auto_applies_when_missing` /
+`_apply_failure_fails_closed` / `_skips_non_submodule_converter`）以及它们的
+辅助函数（`_fake_subprocess` / `_fake_submodule` / `REAL_PATCH`）。
+
+**为什么删**：那套逻辑服务的是 `llama-cpp-converter-qwen-eps.patch` —— 一个只为
+legacy `QWenLMHeadModel`（即 Qwen-1.8B）补 `layer_norm_epsilon` 候选键的转换器补丁。
+Qwen-1.8B 已于 2026-09-19 **退役**（`src/config.py`：`ACTIVE_MODEL_ID = "qwen3-0.6b"`，
+默认模型改按设备画像选择），该补丁**已无消费方** ⇒ 连同补丁文件、lock 条目与
+`gguf_convert` 中的兜底逻辑一并移除（用户裁定 dec-eb2367bb41d9319f）。
+
+⚠️ 若将来又要转换 legacy Qwen 权重，需要重新打这个补丁（历史实现在
+`scripts/model_tools/patches/` 的 git 历史里，commit 2026-08-16 前后）。
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from model_tools import gguf_convert as gc  # noqa: E402
 from model_tools import import_model as im  # noqa: E402
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-REAL_PATCH = (REPO_ROOT / "tools" / "model_tools" / "patches"
-              / "llama-cpp-converter-qwen-eps.patch")
-
-
-def _fake_subprocess(calls: list, returncode: int = 0):
-    rc = returncode
-
-    class R:
-        returncode = rc
-        stdout = ""
-        stderr = "apply failed"
-
-    def run(cmd, **kw):
-        calls.append(cmd)
-        return R()
-
-    return run
-
-
-def _fake_submodule(tmp_path) -> Path:
-    """构造子模块结构（convert_hf_to_gguf.py + conversion/base.py）。"""
-    llama = tmp_path / "llama.cpp"
-    conv = llama / "conversion"
-    conv.mkdir(parents=True)
-    (llama / "convert_hf_to_gguf.py").write_text("x", encoding="utf-8")
-    return llama
-
-
-# ---- _ensure_converter_patch ----
-
-def test_patch_idempotent_when_already_applied(tmp_path, monkeypatch):
-    """已打补丁（marker 在）-> 跳过，不执行 git apply。"""
-    llama = _fake_submodule(tmp_path)
-    (llama / "conversion" / "base.py").write_text(
-        f"# {gc._PATCH_MARKER}\n", encoding="utf-8")
-    calls = []
-    monkeypatch.setattr(gc.subprocess, "run", _fake_subprocess(calls))
-    gc._ensure_converter_patch(llama / "convert_hf_to_gguf.py")
-    assert calls == [], "已打补丁时不应执行 git apply"
-
-
-def test_patch_auto_applies_when_missing(tmp_path, monkeypatch):
-    """未打补丁 -> 自动 git apply 真实补丁文件（tools/model_tools/patches/）。"""
-    assert REAL_PATCH.is_file(), "补丁文件必须入库"
-    llama = _fake_submodule(tmp_path)
-    (llama / "conversion" / "base.py").write_text("unpatched", encoding="utf-8")
-    calls = []
-    monkeypatch.setattr(gc.subprocess, "run", _fake_subprocess(calls))
-    gc._ensure_converter_patch(llama / "convert_hf_to_gguf.py")
-    assert calls and "apply" in calls[0], "未打补丁时应自动 git apply"
-    assert str(REAL_PATCH) in calls[0], "应 apply 入库的补丁文件"
-
-
-def test_patch_apply_failure_fails_closed(tmp_path, monkeypatch):
-    """git apply 失败 -> fail-closed（GGUFConvertError），不静默产出坏 GGUF。"""
-    llama = _fake_submodule(tmp_path)
-    (llama / "conversion" / "base.py").write_text("unpatched", encoding="utf-8")
-    calls = []
-    monkeypatch.setattr(gc.subprocess, "run", _fake_subprocess(calls, returncode=1))
-    with pytest.raises(gc.GGUFConvertError, match="failed to apply"):
-        gc._ensure_converter_patch(llama / "convert_hf_to_gguf.py")
-
-
-def test_patch_skips_non_submodule_converter(tmp_path):
-    """非子模块 converter（无 conversion/base.py）-> 跳过不报错。"""
-    lone = tmp_path / "standalone-convert.py"
-    lone.write_text("x", encoding="utf-8")
-    gc._ensure_converter_patch(lone)  # 不应抛
 
 
 # ---- import_model 子进程 GBK ----

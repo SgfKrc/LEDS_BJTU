@@ -41,6 +41,7 @@ jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
 # (editable 安装已跳过，未锁定)
 linkify-it-py==2.1.0
+llama_cpp_python==0.3.35
 lz4==4.4.5
 markdown-it-py==4.2.0
 MarkupSafe==3.0.3

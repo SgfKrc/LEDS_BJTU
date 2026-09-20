@@ -114,7 +114,7 @@ kiwisolver==1.5.0
 labelImg==1.8.6
 linkify-it-py==2.1.0
 litellm==1.91.0
-llama_cpp_python==0.3.28
+llama_cpp_python==0.3.35
 loguru==0.7.3
 lxml==6.1.1
 lxml_html_clean==0.4.5

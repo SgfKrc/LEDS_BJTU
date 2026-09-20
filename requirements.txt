@@ -57,6 +57,8 @@ python-dotenv>=1.0.0             # 环境变量加载（从 .env 文件）
 # scripts/cut_layers.py（离线裁层生成器，为层流水线造下游工件）需要它读写 GGUF；
 # 该脚本与 src/relay_contract.py 的 RelayTrimPlan 合同配套，属主仓工具链的一部分。
 gguf>=0.10.0
+# CPU/GGUF runtime contract. CUDA llama.cpp builds are separate optional artifacts.
+llama-cpp-python==0.3.35
 
 # --- 图表生成（仅实验文档需要）---
 # build/cross-framework-layer-poc/make_figures.py 直接从 local_docs/CORE-RELAY-XFRAME-02-*.json

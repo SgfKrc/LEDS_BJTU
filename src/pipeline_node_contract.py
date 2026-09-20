@@ -17,11 +17,29 @@ from typing import Any, Iterable, Mapping, Sequence
 
 PIPELINE_NODE_SCHEMA_VERSION = 1
 RESOURCE_VIEW_SCHEMA_VERSION = 1
+
+#: 已知的层流水线节点类型。
+#:
+#: * ``local``            —— 本机 node
+#: * ``remote_rpc``       —— llama.cpp RPC 远端设备
+#: * ``remote_pipeline``  —— 远端层流水线节点（含 Android worker）
+#: * ``cross_framework``  —— 跨框架接力（如 PyTorch 上游 + llama.cpp 下游）
+#: * ``android_worker``   —— **★ 2026-09-20**：Android Full Worker。
+#:
+#: 关于 ``android_worker``：它不是 ``cross_framework`` 的同义词。``cross_framework``
+#: 描述的是**接力两侧框架不同**（PyTorch→llama.cpp）；Android worker 两侧都是
+#: llama.cpp（裁层 GGUF），只是**跑在手机上**且用 JNI 注入 ``llama_batch.embd``。
+#: 单独立一个 kind 是为了让「节点能力探测」能按类型区分 —— 见
+#: ``android/.../AndroidWorkerCapabilities.SUPPORTED_STAGE_TYPES``。
+#:
+#: 注意：本集合目前**仅作声明**（``__all__`` 导出给外部读），``PipelineNode``
+#: 的 ``kind`` 校验并不强制取值在此集合内（见 ``PipelineNode.__post_init__``）。
 KNOWN_NODE_KINDS = frozenset({
     "local",
     "remote_rpc",
     "remote_pipeline",
     "cross_framework",
+    "android_worker",
 })
 
 
