@@ -12,13 +12,6 @@
   "cmake_target": "llama-quantize",
   "patches": [
     {
-      "id": "legacy-qwen-epsilon",
-      "path": "scripts/model_tools/patches/llama-cpp-converter-qwen-eps.patch",
-      "target": "conversion/base.py",
-      "marker": "QLH patch (2026-08-16): legacy Qwen (QWenLMHeadModel)",
-      "sha256": "F4D273E4C4902AC9B0BDC91FF0812C10A5BC383017D233F68A3320FE091B6D33"
-    },
-    {
       "id": "layer-forward-api",
       "path": "scripts/model_tools/patches/llama-cpp-layer-forward-api.patch",
       "targets": [
