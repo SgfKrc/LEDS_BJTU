@@ -15,10 +15,13 @@ P3: 多模型实验支持。提供:
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 # ---- 复用 config.py 的路径工具（避免循环导入） ----
 
@@ -143,7 +146,7 @@ class ModelConfig:
 # 内置模型注册表
 # ================================================================
 
-# ★ 2026-09-19：默认模型由 `qwen-1_8b` 改为 `qwen3-0.6b`。
+# ★ 2026-09-19：默认模型由 `qwen-1_8b` 改为按**设备画像**选择。
 #   原因：Qwen-1.8B 的 remote code（2023 年老架构）与 transformers 5.x **链式不兼容**
 #   （uint8 权重被 `_init_weights` 覆盖 ⇒ 崩溃；缺 `generation_config`；`generate` 依赖
 #   已被移除的 `super().generate`；5.x 生成栈又依赖更多新属性）—— 逐个补属性是无底洞。
@@ -151,7 +154,64 @@ class ModelConfig:
 #   ⚠️ 2026-09-19 用户裁定：**从内置列表中移除该条目**（此前只标「已退役」，
 #   但仍出现在列表第一位，导致 UI 误选/误加载成 1.8B）。模型文件保留在 `models/`
 #   与其 GGUF 路径不变，只是不再作为可选项暴露。
-DEFAULT_MODEL_ID = "qwen3-0.6b"
+#
+# ★ 2026-09-19（用户新裁定）：默认模型**按设备画像分档** ——
+#   **边缘设备（含轻薄本/集显）用 <1B 小模型，PC 用 ~2B（贴合原 1.8B 体量）**。
+#   实现见 `DEFAULT_MODEL_BY_TIER` + `get_default_model_id()`。
+DEFAULT_MODEL_ID = "qwen3-0.6b"          # 兜底（无画像信息时使用；= MOBILE/EDGE 档）
+
+#: 按设备画像分档的默认模型。键取 `device_profiler.DeviceTier` 的**字符串值**
+#: （刻意不 import `DeviceTier`，避免 `model_config` ↔ `device_profiler` 反向依赖）。
+#:
+#: ## 分档依据（2026-09-19 实测，主仓引擎 + int4 + 3 轮重复）
+#: 2B 档实测 **VRAM 峰值 2.24 GB**（`qwen3-5-2b` 与 `qwenseek-2b` 同为 2.24 GB）⇒
+#: `ULTRABOOK`（≤2 GB **共享**显存）**放不下**，必须退到 <1B ⇒ 这是**硬约束**而非偏好。
+#:
+#: ## PC 档为何选 `qwen3-5-2b`
+#: 与 `qwenseek-2b` 的单变量对照（同 prompt / 同贪心 / 同 int4，唯一变量=模型）：
+#:
+#: ======================  ================  ==================
+#: 指标                    qwen3-5-2b        qwenseek-2b
+#: ======================  ================  ==================
+#: 加载                    9.36 s            12.38 s
+#: 稳态吞吐                18.19 ± 1.49      17.57 ± 1.93 tok/s
+#: 轮内波动                ±0.41 ~ 0.72      ±1.74 ~ 2.39
+#: VRAM 峰值               2.24 GB           2.24 GB
+#: 完整性元数据            `.qlh-model-asset.json` 有    无
+#: ======================  ================  ==================
+#:
+#: ① **速度差仅 3.5%，落在 std 内 ⇒ 无显著差异**（不构成选型依据）；
+#: ② `qwen3-5-2b` **加载快 24%** 且**轮内波动小 2~3×**（更稳定）；
+#: ③ 质量（人工对照）：`qwen3-5-2b` 输出更完整（改写题给多方案 + Markdown，复杂度题带公式），
+#:    `qwenseek-2b` 更简洁（改写题只给「这个方案尚可。」）—— **各有取向**，非一边倒；
+#: ④ `qwenseek-2b` **缺 `.qlh-model-asset.json`**（来源/SHA 完整性未受管）⇒ 更适合实验而非默认。
+#: ⇒ 综合取 `qwen3-5-2b`。**若后续要更短的输出风格，可换 `qwenseek-2b`**（此处留可追溯的对照数据）。
+DEFAULT_MODEL_BY_TIER: dict = {
+    "workstation": "qwen3-5-2b",   # 桌面工作站：2B 档，显存充裕
+    "laptop": "qwen3-5-2b",        # 游戏本 / 独显本：2B 档（实测 2.24 GB，8 GB 卡余量充足）
+    "ultrabook": "qwen3-0.6b",     # 轻薄本 / 集显：≤2 GB 共享显存 ⇒ 2B 放不下 ⇒ <1B
+    "edge": "qwen3-0.6b",          # 边缘设备（树莓派 / Jetson / 旧笔记本）：<1B
+    "mobile": "qwen2.5-0.5b",      # 移动端：最小可用
+}
+
+
+def get_default_model_id(tier: str = None) -> str:
+    """按设备画像档位返回默认模型 id。
+
+    Args:
+        tier: `DeviceTier` 的字符串值（``workstation`` / ``laptop`` / ``ultrabook`` /
+            ``edge`` / ``mobile``），或 `DeviceTier` 枚举本身；`None` / 未知值 ⇒ 返回兜底
+            `DEFAULT_MODEL_ID`。
+
+    ⚠️ 分档表里的 id 若在内置注册表中缺失，会**回退到兜底值**（不让画像配置把系统卡死）。
+    """
+    key = getattr(tier, "value", tier)
+    if not key:
+        return DEFAULT_MODEL_ID
+    candidate = DEFAULT_MODEL_BY_TIER.get(str(key))
+    if not candidate or get_builtin_model(candidate) is None:
+        return DEFAULT_MODEL_ID
+    return candidate
 
 BUILTIN_MODELS: list[ModelConfig] = [
     ModelConfig(
@@ -444,16 +504,64 @@ def get_builtin_model(model_id: str) -> Optional[ModelConfig]:
     return None
 
 
+def get_profile_default_model_id() -> str:
+    """按**当前设备画像**返回默认模型 id（惰性探测；探测失败 ⇒ 兜底 `DEFAULT_MODEL_ID`）。
+
+    与 `get_default_model_id(tier)` 的区别：本函数自己去找当前设备的 tier，
+    调用方不必持有画像对象。`device_profiler.get_profile()` 是**全局单例缓存**，
+    因此重复调用几乎无成本；这里用**惰性 import**（`device_profiler` 会 import `config`，
+    顶层 import 会形成循环）。
+    """
+    tier = None
+    try:
+        from device_profiler import get_profile
+
+        tier = get_profile().tier
+    except Exception as exc:  # noqa: BLE001 —— 画像不可用时退到兜底，不能因此让加载失败
+        logger.debug("取设备画像失败，默认模型退到 %s（%s）", DEFAULT_MODEL_ID, exc)
+    return get_default_model_id(tier)
+
+
+def get_profile_default_model_paths() -> dict:
+    """按**当前设备画像**解析默认模型的路径信息（供 `config.MODEL_PATH` 等消费方使用）。
+
+    Returns:
+        dict：``{"model_id", "name", "model_path", "gguf_path", "model_type", "preferred_engine"}``。
+        任何异常都退到兜底模型（不抛），保证「无人值守自动加载」不会因画像问题中断。
+    """
+    model = get_default_model()
+    try:
+        # ⚠️ 必须在此**函数内**导入：`device_profiler` 会 import `config`，顶层导入形成循环。
+        from device_profiler import get_profile
+
+        model = get_default_model(get_profile().tier)
+    except Exception:  # noqa: BLE001 —— 画像不可用 ⇒ 用兜底模型
+        pass
+    return {
+        "model_id": model.model_id,
+        "name": model.name,
+        "model_path": resolve_model_path(model.model_path) if model.model_path else "",
+        "gguf_path": resolve_model_path(model.gguf_path) if model.gguf_path else "",
+        "model_type": model.model_type,
+    }
+
+
 def get_builtin_models() -> list[ModelConfig]:
     """返回所有内置模型（含实验模型）。"""
     return list(BUILTIN_MODELS)
 
 
-def get_default_model() -> ModelConfig:
-    """返回默认模型配置。"""
-    model = get_builtin_model(DEFAULT_MODEL_ID)
+def get_default_model(tier: str = None) -> ModelConfig:
+    """返回默认模型配置（可按设备画像档位选择）。
+
+    Args:
+        tier: `DeviceTier` 的字符串值或枚举；`None` ⇒ 用兜底 `DEFAULT_MODEL_ID`。
+              分档规则与实测依据见 `DEFAULT_MODEL_BY_TIER` 的注释。
+    """
+    model_id = get_default_model_id(tier)
+    model = get_builtin_model(model_id)
     if model is None:
-        raise RuntimeError(f"默认模型 '{DEFAULT_MODEL_ID}' 在内置注册表中未找到")
+        raise RuntimeError(f"默认模型 '{model_id}' 在内置注册表中未找到")
     return model
 
 

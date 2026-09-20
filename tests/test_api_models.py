@@ -609,7 +609,8 @@ def test_load_model_uses_switch_model_internally(monkeypatch):
     )
     result = asyncio.run(api_server.load_model(req))
     assert len(switch_calls) == 1, "应调用 switch_model 而非手动 unload/load"
-    assert switch_calls[0]["model_id"] == api_server.mc.DEFAULT_MODEL_ID
+    # ★ 2026-09-19：未指定 model_id 时按**设备画像**取默认（不再是固定常量）。
+    assert switch_calls[0]["model_id"] == api_server.mc.get_profile_default_model_id()
     assert result["status"] == "ok"
 
 

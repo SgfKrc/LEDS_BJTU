@@ -153,9 +153,15 @@ RECONNECT_DELAY = 2             # 重连间隔（秒）
 # ============================================================
 # 2. 模型配置（绝对路径，兼容 PyInstaller 打包 + 开发模式）
 # ============================================================
-MODEL_NAME = "Qwen/Qwen-1.8B-Chat"          # HuggingFace 模型标识
-MODEL_PATH = os.path.join(_APP_ROOT, "models", "qwen-1_8b-chat")       # Safetensors 格式
-GGUF_MODEL_PATH = os.path.join(_APP_ROOT, "models", "Qwen-1_8B-Chat.Q4_K_M.gguf")  # GGUF 格式
+# ★ 2026-09-19：以下三项原指向**已退役**的 `qwen-1_8b`（导致「自动加载默认模型」
+#   实际加载的就是 1.8B）。现改为指向**兜底默认模型** `qwen3-0.6b`；
+#   **真正的默认模型按设备画像选择**，见文件末尾的 `get_active_model_paths()`
+#   （用法：`_auto_load_default_model` 等消费点应改用它）。
+#   ⚠️ 这里保持**静态常量**而非顶层调用画像：`device_profiler` 会 import 本模块，
+#   顶层触发画像会形成循环 import；消费点调用时 config 已初始化完毕，才安全。
+MODEL_NAME = "Qwen/Qwen3-0.6B"               # HuggingFace 模型标识（兜底默认）
+MODEL_PATH = os.path.join(_APP_ROOT, "models", "qwen3-0.6b")            # Safetensors 格式
+GGUF_MODEL_PATH = os.path.join(_APP_ROOT, "models", "qwen3-0.6b-q8_0.gguf")  # GGUF 格式
 QUANT_TYPE = "int4"                          # 量化精度: "fp16" | "int8" | "int4"
 USE_COMPILE = True                           # 算子融合（仅 FP16+CUDA 有效；INT4/CPU 自动跳过）
 
@@ -637,4 +643,35 @@ def auto_config(profile: dict = None) -> dict:
             "use_compile": False,
             "device": "cuda" if has_cuda else "cpu",
             "description": "未知设备 — 保守配置",
+        }
+
+
+def get_active_model_paths() -> dict:
+    """★ 2026-09-19：按**设备画像**解析默认模型路径（供自动加载消费点使用）。
+
+    背景：`MODEL_PATH` / `GGUF_MODEL_PATH` 是模块级**静态**常量，无法按画像变化；
+    而「自动加载默认模型」（`api_server._auto_load_default_model` /
+    `engine_host._auto_load_default_model`）此前直接读它们 ⇒ 无论什么设备都加载同一个模型。
+
+    用户裁定：**边缘设备（含轻薄本/集显）用 <1B 小模型，PC 用 ~2B**（贴合原 1.8B 体量）。
+    分档表与选型实测依据见 `model_config.DEFAULT_MODEL_BY_TIER`。
+
+    ⚠️ 必须**在这里**（模块加载完成后）调用，不能在顶层求值：`device_profiler`
+    会 import `config`，顶层触发会形成循环 import。
+
+    Returns:
+        dict：``model_id`` / ``name`` / ``model_path`` / ``gguf_path`` / ``model_type``；
+        任何异常都退回静态常量（保证无人值守自动加载不因画像问题中断）。
+    """
+    try:
+        import model_config as _mc
+
+        return _mc.get_profile_default_model_paths()
+    except Exception:  # noqa: BLE001
+        return {
+            "model_id": ACTIVE_MODEL_ID,
+            "name": MODEL_NAME,
+            "model_path": MODEL_PATH,
+            "gguf_path": GGUF_MODEL_PATH,
+            "model_type": "both",
         }

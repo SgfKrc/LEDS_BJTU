@@ -2356,7 +2356,8 @@ class TestSwitchModel:
         monkeypatch.setattr(mgr, "_load_llama_cpp", lambda *a, **kw: None)
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
-        assert mgr.active_model_id == mc.DEFAULT_MODEL_ID
+        # ★ 2026-09-19：构造时的初始活跃模型按**设备画像**取默认（不再是固定常量）。
+        assert mgr.active_model_id == mc.get_profile_default_model_id()
         mgr.switch_model("qwen2.5-7b-gguf")
         assert mgr.active_model_id == "qwen2.5-7b-gguf"
 

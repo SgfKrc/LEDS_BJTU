@@ -2717,7 +2717,8 @@ async def load_model(req: LoadModelRequest, request: Request = None):
         def _do_switch():
             return _run_exclusive_model_change(
                 lambda: model_manager.switch_model(
-                    model_id=req.model_id or mc.DEFAULT_MODEL_ID,
+                    # ★ 2026-09-19：未指定模型时按**设备画像**取默认（边缘 <1B / PC ~2B）。
+                    model_id=req.model_id or mc.get_profile_default_model_id(),
                     quant_type=quant,
                     profile=device_profile,
                     engine=effective_engine if effective_engine != "auto" else None,
@@ -4758,9 +4759,18 @@ def _auto_load_default_model():
         logger.info(f"✅ 孤岛引擎自动连接完成 ({time.time() - t0:.1f}s)")
         return
 
+    # ★ 2026-09-19：**按设备画像**选择默认模型（用户裁定：边缘/轻薄本 <1B，PC ~2B）。
+    #   此前这里直接读 `cfg.GGUF_MODEL_PATH` / `cfg.MODEL_PATH` —— 它们是**静态常量**
+    #   （且原指向已退役的 `qwen-1_8b`）⇒ 无论什么设备都加载同一个模型。
+    #   现在优先用画像模型自己的路径，取不到才回退到旧的「扫 models 目录」逻辑。
+    _active = cfg.get_active_model_paths() if hasattr(cfg, "get_active_model_paths") else {}
+    _active_id = str(_active.get("model_id") or "")
+    _active_gguf = str(_active.get("gguf_path") or "")
+    _active_safetensors = str(_active.get("model_path") or "")
+
     # 1. 优先查找 GGUF 文件（llama.cpp 引擎，不依赖 transformers/bitsandbytes）
     gguf_candidates = []
-    gguf_configured = cfg.GGUF_MODEL_PATH
+    gguf_configured = _active_gguf if _active_gguf and os.path.isfile(_active_gguf) else cfg.GGUF_MODEL_PATH
     if os.path.isfile(gguf_configured):
         gguf_candidates.append(gguf_configured)
     # 搜索 models 目录下的所有 .gguf 文件
@@ -4770,6 +4780,9 @@ def _auto_load_default_model():
             if f not in gguf_candidates:
                 gguf_candidates.append(f)
 
+    if _active_id:
+        logger.info(f"默认模型按设备画像选择: {_active_id}")
+
     if gguf_candidates:
         gguf_path = gguf_candidates[0]
         engine = "llama_cpp"
@@ -4777,8 +4790,13 @@ def _auto_load_default_model():
         quant = "int4"
         if len(gguf_candidates) > 1:
             logger.info(f"发现 {len(gguf_candidates)} 个 GGUF 文件，选择: {os.path.basename(gguf_path)}")
+    elif _active_safetensors and os.path.isdir(_active_safetensors):
+        # 2a. 画像模型的 Safetensors 目录（PyTorch 后端）
+        engine = "pytorch"
+        model_path = _active_safetensors
+        quant = cfg.QUANT_TYPE
     elif os.path.isdir(cfg.MODEL_PATH):
-        # 2. 回退：Safetensors 目录必须使用 PyTorch 后端。
+        # 2b. 回退：Safetensors 目录必须使用 PyTorch 后端。
         engine = "pytorch"
         model_path = cfg.MODEL_PATH
         quant = cfg.QUANT_TYPE

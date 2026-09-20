@@ -819,7 +819,9 @@ class ModelManager:
         self._engine_type: str = ""  # "pytorch" | "llama_cpp" | "island"
 
         # P3: 多模型支持 — 当前活跃的模型 ID
-        self._active_model_id: str = mc.DEFAULT_MODEL_ID
+        # ★ 2026-09-19：默认模型**按设备画像**选择（边缘/轻薄本 <1B，PC ~2B）；
+        #   分档与选型实测依据见 `model_config.DEFAULT_MODEL_BY_TIER`。
+        self._active_model_id: str = mc.get_profile_default_model_id()
         self._previous_engine_type: str = ""      # 用于 rollback
         self._previous_quant_type: Optional[str] = None
 
@@ -1066,14 +1068,17 @@ class ModelManager:
         require_existing: bool,
     ) -> Dict[str, Any]:
         resolved_path = model_path
-        resolved_id = model_id or mc.DEFAULT_MODEL_ID
+        # ★ 2026-09-19：默认模型按设备画像选（`get_profile_default_model_id()` 内部已含兜底，
+        #   且不会因画像不可用而抛）。
+        _default_id = mc.get_profile_default_model_id()
+        resolved_id = model_id or _default_id
         cfg = mc.get_model_config(resolved_id, db_experimental_models) if model_id else None
         resolved_engine = engine if engine and engine != "auto" else self.select_engine(profile)
 
         if resolved_engine != "island":
             if model_id and cfg is None and not resolved_path:
                 raise ValueError(f"模型 '{model_id}' 未在注册表中找到")
-            if resolved_id != mc.DEFAULT_MODEL_ID and cfg:
+            if resolved_id != _default_id and cfg:
                 if cfg.model_type == "gguf" and resolved_engine == "pytorch":
                     logger.warning(
                         "模型 '%s' 仅有 GGUF 格式，引擎从 pytorch 切换为 llama_cpp",
@@ -2325,7 +2330,7 @@ class ModelManager:
         ):
             return
 
-        model_id = self._active_model_id or mc.DEFAULT_MODEL_ID
+        model_id = self._active_model_id or mc.get_profile_default_model_id()
         q = quant_type or self._full_model_quant_type or self.quant_type or QUANT_TYPE
         model_path = self._full_model_path or self._model_path
         logger.info(
@@ -2376,10 +2381,23 @@ class ModelManager:
         gguf_path = None
         if model_path and model_path.endswith(".gguf"):
             gguf_path = model_path
-        elif os.path.isfile(GGUF_MODEL_PATH):
-            gguf_path = GGUF_MODEL_PATH
         else:
-            gguf_path = get_gguf_model_path()
+            # ★ 2026-09-19 BUG 修复：优先按**当前活跃模型**在注册表里的 `gguf_path` 解析。
+            #   原逻辑直接落到模块级静态常量 `GGUF_MODEL_PATH`（兜底默认模型），
+            #   于是**切到任意 GGUF 模型都会加载成兜底那个**（实测：切 `qwen3-5-2b`
+            #   实际加载 `qwen3-0.6b-q8_0.gguf`）。safetensors 目录路径不会以 `.gguf`
+            #   结尾，所以走 registered-model 分支正是 GGUF 模型的正常入口。
+            _active_id = self._active_model_id or mc.get_profile_default_model_id()
+            _registered = mc.get_builtin_model(_active_id)
+            _reg_gguf = mc.resolve_model_path(_registered.gguf_path) if (
+                _registered is not None and _registered.gguf_path
+            ) else ""
+            if _reg_gguf and os.path.isfile(_reg_gguf):
+                gguf_path = _reg_gguf
+            elif os.path.isfile(GGUF_MODEL_PATH):
+                gguf_path = GGUF_MODEL_PATH
+            else:
+                gguf_path = get_gguf_model_path()
 
         if not gguf_path or not os.path.isfile(gguf_path):
             raise FileNotFoundError(

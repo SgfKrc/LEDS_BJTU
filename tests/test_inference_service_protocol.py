@@ -991,6 +991,10 @@ def test_engine_host_auto_load_selects_sorted_gguf_candidate(tmp_path, monkeypat
     )
     monkeypatch.setattr(cfg, "GGUF_MODEL_PATH", str(models_dir / "missing.gguf"))
     monkeypatch.setattr(cfg, "MODEL_PATH", str(tmp_path / "missing-pytorch"))
+    # ★ 2026-09-19：`_auto_load_default_model` 现在优先按**设备画像**解析默认模型路径
+    #   （用户裁定：边缘 <1B / PC ~2B）。本用例验的是「无画像模型时回退到扫目录 +
+    #   **按文件名排序**取第一个」，故把画像解析结果置空以保持该路径可达。
+    monkeypatch.setattr(cfg, "get_active_model_paths", lambda: {})
     monkeypatch.setattr(cfg, "INFERENCE_ENGINE", "pytorch")
     monkeypatch.setattr(cfg, "QUANT_TYPE", "fp16")
     monkeypatch.setattr(cfg, "USE_COMPILE", True)
