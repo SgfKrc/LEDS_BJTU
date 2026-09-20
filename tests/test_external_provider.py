@@ -772,6 +772,11 @@ def api_env(monkeypatch, tmp_path):
             config, "GGUF_MODEL_PATH", str(tmp_path / "no-model.gguf"),
         )
         monkeypatch.setattr(config, "MODEL_PATH", str(tmp_path / "no-model-dir"))
+        # ★ 2026-09-19：`_auto_load_default_model` 现在走**设备画像**解析
+        #   （`config.get_active_model_paths()`），不再读上面的两个静态常量 ⇒
+        #   必须一并 patch 成「空」，否则本机画像会在测试里**真的自动加载** 2B 模型，
+        #   使「本地无模型 ⇒ 400」的断言失效（实测返回 200）。
+        monkeypatch.setattr(config, "get_active_model_paths", lambda: {})
         monkeypatch.setattr(config, "ISLAND_ENABLED", False, raising=False)
         client = TestClient(api_server.app)
         yield {

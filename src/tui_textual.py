@@ -80,14 +80,48 @@ from tui_api import (  # noqa: E402
     clear_queue,
     create_session,
     delete_session,
+    cancel_queue_task,
+    delete_log_file,
+    download_log_file,
     iter_chat_payloads,
+    list_log_files,
     list_sessions,
     load_model,
+    clear_spare_master,
+    designate_spare_master,
+    get_spare_master,
+    logs_nodes_summary,
+    master_health,
+    read_log_file,
+    reset_master_identity,
+    spare_master_logs,
+    conversation_sync_status,
+    create_auth_user,
+    db_health,
+    delete_auth_user,
+    delete_turn,
+    get_conversation,
+    list_local_gguf,
+    list_model_registry,
+    list_models_available,
+    list_auth_users,
+    list_models_downloadable,
+    patch_auth_user,
+    session_info,
+    storage_health,
+    transfer_logs,
+    transfer_master,
     pause_queue,
     rename_session,
     resume_queue,
     set_queue_strategy,
     unload_model,
+    auth_capability,
+    auth_login,
+    auth_logout,
+    auth_me,
+    auth_totp_provision,
+    auth_totp_verify,
 )
 from tui_shared import API_PATHS, COMMAND_SPECS, format_metrics  # noqa: E402
 
@@ -514,6 +548,36 @@ class ChatPane(Vertical):
         if text.startswith("/queue"):
             self.cmd_queue(text)
             return
+        if text.startswith("/logs"):
+            self.cmd_logs(text)
+            return
+        if text.startswith("/ha"):
+            self.cmd_ha(text)
+            return
+        if text.startswith("/assets"):
+            self.cmd_assets(text)
+            return
+        if text.startswith("/history"):
+            self.cmd_history(text)
+            return
+        if text.startswith("/login"):
+            self.cmd_login(text)
+            return
+        if text.strip() == "/logout":
+            self.cmd_logout()
+            return
+        if text.strip() == "/whoami":
+            self.cmd_whoami()
+            return
+        if text.startswith("/totp"):
+            self.cmd_totp(text)
+            return
+        if text.startswith("/users"):
+            self.cmd_users(text)
+            return
+        if text.startswith("/storage"):
+            self.cmd_storage(text)
+            return
         if text == "/sessions":
             self.cmd_sessions()
             return
@@ -595,15 +659,402 @@ class ChatPane(Vertical):
         self.app.call_from_thread(self.write_line, text)
         self.app.call_from_thread(self.status_line, text)
 
+    def cmd_login(self, text: str) -> None:
+        """★ 2026-09-19（G-⑤）：登录。`/login <username> <password> [totp_code]`。
+
+        ⚠️ **凭据只在本进程内存中短暂持有**（密码用完即弃）；登录态 token 写入
+        `app.api.auth_token`，**不落盘**。已绑定 Auth App 的账户必须附 6 位验证码。
+        """
+        parts = text.split(maxsplit=3)
+        if len(parts) < 3:
+            self.status_line("用法: /login <username> <password> [totp_code]")
+            return
+        username, password = parts[1], parts[2]
+        totp_code = parts[3] if len(parts) > 3 else None
+        self.auth_call("login", username, password, totp_code)
+
+    def cmd_logout(self) -> None:
+        """注销（服务端吊销登录态，并清空本地 token）。"""
+        self.auth_call("logout")
+
+    def cmd_whoami(self) -> None:
+        """显示当前主体与认证能力（是否强制登录 / 是否首次引导）。"""
+        self.auth_call("whoami")
+
+    def cmd_totp(self, text: str) -> None:
+        """Auth App：`provision` 生成密钥与 otpauth URI；`verify <code>` 校验一次。"""
+        parts = text.split()
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        if sub == "provision":
+            self.auth_call("totp-provision")
+            return
+        if sub == "verify" and len(parts) == 3:
+            self.auth_call("totp-verify", parts[2])
+            return
+        self.status_line("用法: /totp provision | verify <code>")
+
+    def cmd_users(self, text: str) -> None:
+        """账户管理（需 admin）：list / add / role / disable / enable / passwd / del。"""
+        parts = text.split()
+        sub = parts[1].lower() if len(parts) > 1 else "list"
+        if sub == "list":
+            self.auth_call("users-list")
+            return
+        if sub == "add" and len(parts) >= 4:
+            role = parts[4] if len(parts) > 4 else "viewer"
+            self.auth_call("user-add", parts[2], parts[3], role)
+            return
+        if sub == "role" and len(parts) == 4:
+            self.auth_call("user-role", parts[2], parts[3])
+            return
+        if sub in {"disable", "enable"} and len(parts) == 3:
+            self.auth_call("user-disable" if sub == "disable" else "user-enable", parts[2])
+            return
+        if sub == "passwd" and len(parts) == 4:
+            self.auth_call("user-passwd", parts[2], parts[3])
+            return
+        if sub == "del" and len(parts) == 3:
+            target = parts[2]
+            self.app.confirm(
+                f"删除账户 {target}",
+                "将删除该账户及其 Auth App 绑定与全部登录态，**不可撤销**。",
+                lambda: self.auth_call("user-delete", target),
+                confirm_label="删除")
+            return
+        self.status_line(
+            "用法: /users list | add <name> <pass> [role] | role <name> <role>"
+            " | disable|enable <name> | passwd <name> <pass> | del <name>")
+
+    @work(thread=True, exclusive=True, group="authctl")
+    def auth_call(self, action: str, a: str = "", b: str = "", c: str = "") -> None:
+        app = self.app
+        self.app.call_from_thread(self.status_line, f"认证操作 {action} …")
+        try:
+            if action == "login":
+                result = auth_login(app.api, a, b, totp_code=c or None)
+                app.api.auth_token = str(result.get("token") or "")
+                text = (f"[green]已登录[/] {result.get('username')}"
+                        f"（role={result.get('role')}）")
+            elif action == "logout":
+                result = auth_logout(app.api)
+                app.api.auth_token = ""
+                text = f"[green]已注销[/]（revoked={result.get('revoked')}）"
+            elif action == "whoami":
+                me = auth_me(app.api)
+                cap = auth_capability(app.api)
+                text = (f"[green]当前主体[/] {me.get('username')}"
+                        f"（role={me.get('role')}）\n"
+                        f"[dim]认证：required={cap.get('required')} "
+                        f"available={cap.get('available')} "
+                        f"bootstrap_open={cap.get('bootstrap_open')} "
+                        f"users={cap.get('user_count')}[/]")
+            elif action == "totp-provision":
+                result = auth_totp_provision(app.api)
+                text = ("[green]Auth App 已绑定[/]\n"
+                        f"密钥: {result.get('secret')}\n"
+                        f"URI : {result.get('otpauth_uri')}\n"
+                        f"[dim]算法 {result.get('algorithm')} / {result.get('digits')} 位 / "
+                        f"{result.get('period')}s。⚠️ 重新 provision 会使旧条目失效。[/]")
+            elif action == "totp-verify":
+                result = auth_totp_verify(app.api, a)
+                ok = bool(result.get("verified"))
+                text = (f"[{'green' if ok else 'red'}]TOTP 校验 "
+                        f"{'通过' if ok else '未通过'}[/]")
+            elif action == "users-list":
+                result = list_auth_users(app.api)
+                rows = result.get("users") or []
+                lines = [f"  {u.get('username'):<16} {u.get('role'):<9} "
+                         f"{'disabled' if u.get('disabled') else 'active':<9} "
+                         f"totp={'yes' if u.get('totp_bound') else 'no'}"
+                         for u in rows]
+                text = "[green]账户[/]\n" + ("\n".join(lines) if lines else "  （无）")
+            elif action == "user-add":
+                result = create_auth_user(app.api, a, b, role=c or "viewer")
+                text = (f"[green]已创建[/] {result.get('username')}"
+                        f"（role={result.get('role')}）")
+            elif action == "user-role":
+                patch_auth_user(app.api, a, role=b)
+                text = f"[green]已改角色[/] {a} → {b}"
+            elif action in {"user-disable", "user-enable"}:
+                disabled = action == "user-disable"
+                patch_auth_user(app.api, a, disabled=disabled)
+                text = f"[green]{'已禁用' if disabled else '已启用'}[/] {a}"
+            elif action == "user-passwd":
+                patch_auth_user(app.api, a, password=b)
+                text = f"[green]已重置口令[/] {a}"
+            elif action == "user-delete":
+                delete_auth_user(app.api, a)
+                text = f"[green]已删除账户[/] {a}"
+            else:
+                raise ValueError(f"未知认证动作: {action}")
+        except (ApiError, ValueError) as exc:
+            text = f"[red]认证 {action} 失败[/]：{exc}"
+        self.app.call_from_thread(self.write_line, text)
+        self.app.call_from_thread(self.status_line, text.splitlines()[0])
+
+    def cmd_history(self, text: str) -> None:
+        """★ 2026-09-19 补缺口 F：会话细粒度。
+
+        ``/history [<session_id>] [limit]`` 查看对话历史（默认当前会话）/
+        ``sync-status`` 本地持久化状态 / ``info <session_id>`` 会话元数据 /
+        ``drop-turn <session_id> <turn_index>`` 删单轮（**需确认**，删 user+assistant 两条）。
+        """
+        parts = text.split()
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        if sub == "sync-status":
+            self.history_call("sync-status")
+            return
+        if sub == "info" and len(parts) == 3:
+            self.history_call("info", parts[2])
+            return
+        if sub == "drop-turn" and len(parts) == 4:
+            sid, turn = parts[2], parts[3]
+            self.app.confirm(
+                f"删除第 {turn} 轮对话",
+                "将同时删除该轮的 **user + assistant 两条消息**，不可撤销。",
+                lambda: self.history_call("drop-turn", sid, turn),
+                confirm_label="删除")
+            return
+        if sub in {"info", "drop-turn"}:
+            self.status_line(
+                "用法: /history [<session_id>] [limit] | sync-status"
+                " | info <session_id> | drop-turn <session_id> <turn_index>")
+            return
+        # 默认：查看历史；可带 session_id 与 limit
+        sid = parts[1] if len(parts) > 1 else ""
+        limit = parts[2] if len(parts) > 2 else ""
+        self.history_call("show", sid, limit)
+
+    @work(thread=True, exclusive=True, group="history")
+    def history_call(self, action: str, value: str = "", extra: str = "") -> None:
+        app = self.app
+        self.app.call_from_thread(self.status_line, f"会话历史 {action} …")
+        try:
+            if action == "sync-status":
+                result = conversation_sync_status(app.api)
+            elif action == "info":
+                result = session_info(app.api, value)
+            elif action == "drop-turn":
+                result = delete_turn(app.api, value, int(extra))
+            elif action == "show":
+                sid = value or (app.session_id or "default")
+                limit = int(extra) if extra.isdigit() else 200
+                result = get_conversation(app.api, sid, limit)
+            else:
+                raise ValueError(f"未知会话动作: {action}")
+            body = json.dumps(result, ensure_ascii=False, indent=2)[:4000]
+            label = f"{action} {value}".strip()
+            text = f"[green]会话历史 {label}[/]\n{body}"
+        except (ApiError, ValueError) as exc:
+            text = f"[red]会话历史 {action} 失败[/]：{exc}"
+        self.app.call_from_thread(self.write_line, text)
+        self.app.call_from_thread(self.status_line, text.splitlines()[0])
+
+    def cmd_assets(self, text: str) -> None:
+        """★ 2026-09-19 补缺口 C：模型资产浏览（只读）。
+
+        ``available`` 可选模型配置 + 可用引擎 / ``registry`` 已注册实验模型 /
+        ``downloadable`` 可下载清单 / ``gguf`` 本地 GGUF 文件。
+        """
+        parts = text.split()
+        sub = parts[1].lower() if len(parts) > 1 else "available"
+        if sub not in {"available", "registry", "downloadable", "gguf"}:
+            self.status_line(
+                "用法: /assets available | registry | downloadable | gguf")
+            return
+        self.assets_call(sub)
+
+    @work(thread=True, exclusive=True, group="assets")
+    def assets_call(self, which: str) -> None:
+        app = self.app
+        self.app.call_from_thread(self.status_line, f"资产查询 {which} …")
+        try:
+            if which == "available":
+                result = list_models_available(app.api)
+            elif which == "registry":
+                result = list_model_registry(app.api)
+            elif which == "downloadable":
+                result = list_models_downloadable(app.api)
+            elif which == "gguf":
+                result = list_local_gguf(app.api)
+            else:
+                raise ValueError(f"未知资产查询: {which}")
+            body = json.dumps(result, ensure_ascii=False, indent=2)[:4000]
+            text = f"[green]资产 {which}[/]\n{body}"
+        except (ApiError, ValueError) as exc:
+            text = f"[red]资产 {which} 失败[/]：{exc}"
+        self.app.call_from_thread(self.write_line, text)
+        self.app.call_from_thread(self.status_line, text.splitlines()[0])
+
+    def cmd_storage(self, text: str) -> None:
+        """★ 2026-09-19 补缺口 D：存储与数据库健康（只读）。"""
+        self.storage_call()
+
+    @work(thread=True, exclusive=True, group="storage")
+    def storage_call(self) -> None:
+        app = self.app
+        self.app.call_from_thread(self.status_line, "存储健康查询 …")
+        try:
+            result = {
+                "db": db_health(app.api),
+                "storage": storage_health(app.api),
+            }
+            body = json.dumps(result, ensure_ascii=False, indent=2)[:4000]
+            text = f"[green]存储与数据库健康[/]\n{body}"
+        except (ApiError, ValueError) as exc:
+            text = f"[red]存储健康查询失败[/]：{exc}"
+        self.app.call_from_thread(self.write_line, text)
+        self.app.call_from_thread(self.status_line, text.splitlines()[0])
+
+    def cmd_ha(self, text: str) -> None:
+        """★ 2026-09-19 补缺口 E：集群高可用（备用主节点 / 主节点转让 / 身份重置）。
+
+        ⚠️ **分级**：``health`` / ``transfer-logs`` / ``spare`` / ``spare-logs`` 为**只读**；
+        ``designate`` / ``clear-spare`` / ``transfer`` / ``reset-identity`` 为**写操作**，
+        一律先经 ``self.app.confirm`` 二次确认，且**文案点明后果**。
+        """
+        parts = text.split()
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        if sub in {"health", "transfer-logs", "spare", "spare-logs"}:
+            self.ha_call(sub)
+            return
+        if sub == "designate" and len(parts) == 3:
+            node = parts[2]
+            self.app.confirm(
+                f"指定备用主节点 {node}",
+                "变更集群高可用配置：该节点将成为主节点宕机时的接管候选。"
+                "要求集群节点数 >= 2 且目标在线。",
+                lambda: self.ha_call("designate", node),
+                confirm_label="指定")
+            return
+        if sub == "clear-spare":
+            self.app.confirm(
+                "清除备用主节点指定",
+                "将取消当前的备用主节点配置。",
+                lambda: self.ha_call("clear-spare"),
+                confirm_label="清除")
+            return
+        if sub == "transfer" and len(parts) == 3:
+            node = parts[2]
+            self.app.confirm(
+                f"⚠️ 转让主节点身份给 {node}",
+                "**高危操作**：主节点身份将转让给该从节点，"
+                "**双方都需要重启服务**才能生效（原主转从、新主转主）。",
+                lambda: self.ha_call("transfer", node),
+                confirm_label="转让")
+            return
+        if sub == "reset-identity":
+            self.app.confirm(
+                "⚠️ 重置主节点身份",
+                "**高危且不可撤销**：将替换主节点数据库中的 MAC 记录并绑定当前物理 MAC。"
+                "仅用于更换机器/网卡后。请确认你确实要这样做。",
+                lambda: self.ha_call("reset-identity"),
+                confirm_label="重置")
+            return
+        self.status_line(
+            "用法: /ha health | transfer-logs | spare | spare-logs | designate <node>"
+            " | clear-spare | transfer <node> | reset-identity")
+
+    @work(thread=True, exclusive=True, group="hactl")
+    def ha_call(self, action: str, value: str = "") -> None:
+        app = self.app
+        self.app.call_from_thread(self.status_line, f"高可用操作 {action} …")
+        try:
+            if action == "health":
+                result = master_health(app.api)
+            elif action == "transfer-logs":
+                result = transfer_logs(app.api)
+            elif action == "spare":
+                result = get_spare_master(app.api)
+            elif action == "spare-logs":
+                result = spare_master_logs(app.api)
+            elif action == "designate":
+                result = designate_spare_master(app.api, value)
+            elif action == "clear-spare":
+                result = clear_spare_master(app.api)
+            elif action == "transfer":
+                result = transfer_master(app.api, value)
+            elif action == "reset-identity":
+                result = reset_master_identity(app.api)
+            else:
+                raise ValueError(f"未知高可用动作: {action}")
+            body = json.dumps(result, ensure_ascii=False, indent=2)[:4000]
+            text = f"[green]高可用 {action}[/] → {value}\n{body}" if value else \
+                f"[green]高可用 {action}[/]\n{body}"
+            if action == "transfer":
+                text += "\n[yellow]提示：转让后需重启双方服务才生效[/]"
+        except (ApiError, ValueError) as exc:
+            text = f"[red]高可用 {action} 失败[/]：{exc}"
+        self.app.call_from_thread(self.write_line, text)
+        self.app.call_from_thread(self.status_line, text.splitlines()[0])
+
+    def cmd_logs(self, text: str) -> None:
+        """★ 2026-09-19 补缺口 B：日志细粒度（文件列表 / 下载 / 查看 / 删除 / 节点汇总）。
+
+        此前 TUI 只有 ``/logs/recent``（筛选）、``/logs/stats``、``/logs/export``（打包导出）
+        与整体 ``DELETE /logs``；**单个文件的浏览/下载/删除**缺失。
+        """
+        parts = text.split()
+        usage = ("用法: /logs list | download <file> | read <file>"
+                 " | delete <file> | nodes")
+        if len(parts) == 2 and parts[1].lower() in {"list", "nodes"}:
+            self.logs_call(parts[1].lower())
+            return
+        if len(parts) == 3 and parts[1].lower() in {"download", "read"}:
+            self.logs_call(parts[1].lower(), parts[2])
+            return
+        if len(parts) == 3 and parts[1].lower() == "delete":
+            filename = parts[2]
+            self.app.confirm(
+                f"删除日志文件 {filename}",
+                "将删除后端该日志文件，**不可撤销**（整体清理请用日志页的 X）。",
+                lambda: self.logs_call("delete", filename),
+                confirm_label="删除")
+            return
+        self.status_line(usage)
+
+    @work(thread=True, exclusive=True, group="logfiles")
+    def logs_call(self, action: str, value: str = "") -> None:
+        app = self.app
+        self.app.call_from_thread(self.status_line, f"日志操作 {action} …")
+        try:
+            if action == "list":
+                result = list_log_files(app.api)
+            elif action == "nodes":
+                result = logs_nodes_summary(app.api)
+            elif action == "read":
+                result = read_log_file(app.api, value)
+            elif action == "download":
+                target = Path("logs") / Path(value).name
+                saved = download_log_file(app.api, value, target)
+                self.app.call_from_thread(self.write_line, f"[green]已下载[/] → {saved}")
+                self.app.call_from_thread(self.status_line, f"日志 {value} 已下载")
+                return
+            elif action == "delete":
+                result = delete_log_file(app.api, value)
+            else:
+                raise ValueError(f"未知日志动作: {action}")
+            body = json.dumps(result, ensure_ascii=False, indent=2)[:4000]
+            text = f"[green]日志 {action}[/] → {value}\n{body}" if value else \
+                f"[green]日志 {action}[/]\n{body}"
+        except (ApiError, ValueError) as exc:
+            text = f"[red]日志 {action} 失败[/]：{exc}"
+        self.app.call_from_thread(self.write_line, text)
+        self.app.call_from_thread(self.status_line, text.splitlines()[0])
+
     def cmd_queue(self, text: str) -> None:
         parts = text.split()
-        usage = "用法: /queue pause | resume | strategy <fifo|mlfq> | clear"
+        usage = ("用法: /queue pause | resume | strategy <fifo|mlfq> | clear"
+                 " | cancel <task_id>")
         if len(parts) == 2 and parts[1].lower() in {"pause", "resume"}:
             self.queue_call(parts[1].lower())
             return
         if len(parts) == 3 and parts[1].lower() == "strategy" \
                 and parts[2].lower() in {"fifo", "mlfq"}:
             self.queue_call("strategy", parts[2].lower())
+            return
+        if len(parts) == 3 and parts[1].lower() == "cancel":
+            self.queue_call("cancel", parts[2])
             return
         if len(parts) == 2 and parts[1].lower() == "clear":
             self.app.confirm(
@@ -627,6 +1078,10 @@ class ChatPane(Vertical):
                 set_queue_strategy(app.api, value)
             elif action == "clear":
                 clear_queue(app.api)
+            elif action == "cancel":
+                result = cancel_queue_task(app.api, value)
+                if not result.get("success"):
+                    raise ValueError(str(result.get("message") or "任务不存在或已完成"))
             else:
                 raise ValueError(f"未知队列动作: {action}")
             text = f"[green]队列 {action} 完成[/]" + (f" → {value}" if value else "")
@@ -1254,41 +1709,73 @@ class MainScreen(Screen):
 
     # ------------------------------------------------------------ 模型页
 
+    def _models_cursor_key(self, table: DataTable) -> str:
+        """记住模型表当前光标行的 row key（空表 / 坐标越界时返回空串）。"""
+        try:
+            if not table.row_count:
+                return ""
+            row_key, _column_key = table.coordinate_to_cell_key(table.cursor_coordinate)
+            return str(row_key.value or "")
+        except Exception:  # noqa: BLE001 - 空表或坐标越界
+            return ""
+
+    def _restore_models_cursor(self, table: DataTable, key: str) -> None:
+        """把光标恢复到 row key 命中的行（**不依赖行序**）；找不到就留在原位。"""
+        if not key or not table.row_count:
+            return
+        try:
+            for index, row_key in enumerate(table.rows.keys()):
+                if str(row_key.value) == key:
+                    table.move_cursor(row=index)
+                    return
+        except Exception:  # noqa: BLE001
+            pass
+
     def fill_models(self, registry: Dict[str, Any], status: Dict[str, Any]) -> None:
         """``/models`` → ``{models: [...], active_model_id}``（19 个内置模型）。
 
         此前误用 ``/models/current``——它只返回 ``{loaded, quant_type, model_id}``
         且未加载时 ``model_id`` 为 null，于是页面显示"后端未返回模型列表"。
+
+        ★ 2026-09-19 BUG 修复：**保留光标位置**。此前 ``table.clear()`` 后重建会让光标
+        跳回第 0 行，而本页会被后台刷新反复重建；用户按视觉记忆选好行再按 ``L`` 加载，
+        实际加载的却是**列表第一项**（历史上第一位正是 ``qwen-1_8b``）——
+        对应报障「选择了其他模型光标还在第一位，然后加载成 1.8B」。
+        现在按 **row key**（而非行号）记住并恢复，行序变化也不受影响。
         """
         table = self.query_one("#models-table", DataTable)
-        table.clear()
-        self.model_rows = {}
-        if "_error" in registry:
-            table.add_row("", "[red]后端不可用[/]", "", "", "", registry["_error"])
-            return
-        rows = registry.get("models")
-        if not isinstance(rows, list) or not rows:
-            table.add_row("", "[dim]（后端未返回模型列表）[/]", "", "", "", "")
-            return
-        active = registry.get("active_model_id") or status.get("active_model_id")
-        for item in rows[:64]:
-            if not isinstance(item, dict):
-                continue
-            model_id = str(item.get("model_id") or "—")
-            if item.get("is_available") is False:
-                state = f"[yellow]不可用[/] {item.get('unavailable_reason') or ''}".strip()
-            else:
-                state = "[green]可用[/]"
-            self.model_rows[model_id] = item
-            table.add_row(
-                "[green]◆[/]" if model_id == active else "",
-                model_id,
-                str(item.get("name") or "—"),
-                _join(item.get("available_formats")),
-                str(item.get("preferred_engine") or "—"),
-                state,
-                key=model_id,  # 写操作按 row key 取模型，不依赖行序
-            )
+        previous_key = self._models_cursor_key(table)
+        try:
+            table.clear()
+            self.model_rows = {}
+            if "_error" in registry:
+                table.add_row("", "[red]后端不可用[/]", "", "", "", registry["_error"])
+                return
+            rows = registry.get("models")
+            if not isinstance(rows, list) or not rows:
+                table.add_row("", "[dim]（后端未返回模型列表）[/]", "", "", "", "")
+                return
+            active = registry.get("active_model_id") or status.get("active_model_id")
+            for item in rows[:64]:
+                if not isinstance(item, dict):
+                    continue
+                model_id = str(item.get("model_id") or "—")
+                if item.get("is_available") is False:
+                    state = f"[yellow]不可用[/] {item.get('unavailable_reason') or ''}".strip()
+                else:
+                    state = "[green]可用[/]"
+                self.model_rows[model_id] = item
+                table.add_row(
+                    "[green]◆[/]" if model_id == active else "",
+                    model_id,
+                    str(item.get("name") or "—"),
+                    _join(item.get("available_formats")),
+                    str(item.get("preferred_engine") or "—"),
+                    state,
+                    key=model_id,  # 写操作按 row key 取模型，不依赖行序
+                )
+        finally:
+            self._restore_models_cursor(table, previous_key)
 
     @work(thread=True, exclusive=True, group="modelaux")
     def load_model_aux(self) -> None:
@@ -2434,6 +2921,10 @@ class MainScreen(Screen):
                 set_queue_strategy(app.api, value)
             elif action == "clear":
                 clear_queue(app.api)
+            elif action == "cancel":
+                result = cancel_queue_task(app.api, value)
+                if not result.get("success"):
+                    raise ValueError(str(result.get("message") or "任务不存在或已完成"))
             else:
                 raise ValueError(f"未知队列动作: {action}")
             text = f"[green]队列 {action} 完成[/]" + (f" → {value}" if value else "")

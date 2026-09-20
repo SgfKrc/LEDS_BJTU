@@ -329,6 +329,19 @@ def serve_relay_connection(
         except OSError:
             pass
         return RelayBridgeResult(frames, tokens, payload_bytes, False, reason)
+    except Exception as exc:  # noqa: BLE001
+        # ★ 2026-09-19（CORE-RELAY-XFRAME-01 准入：弱网/断线 fail-closed）：
+        #   **未预期异常也不得让客户端挂死**。契约内的 `StdioRelayRunner` 只抛
+        #   `RelayProtocolError`/`OSError`，但本函数是**信任边界**：任何异常都必须
+        #   转成 ERROR 帧，否则对端会阻塞在 `recv` 上直到自身超时（或永久挂起）。
+        #   实测：runner 抛出 `RuntimeError` 时，旧实现会让客户端一直等（测试挂起）。
+        #   ⚠️ 这里**不吞掉**信息：异常类型与文本写进 reason 一并回给对端。
+        reason = f"{exc.__class__.__name__}: {exc}"[:200]
+        try:
+            _send_error(sock, sequence, reason)
+        except OSError:
+            pass
+        return RelayBridgeResult(frames, tokens, payload_bytes, False, reason)
 
 
 def open_loopback_listener(host: str, port: int, *, backlog: int = 1) -> socket.socket:

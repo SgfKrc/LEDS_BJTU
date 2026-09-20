@@ -11,9 +11,13 @@ from typing import Any, Mapping
 
 
 PROTOCOL_NAME = "qlh.task_worker"
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 MIN_PROTOCOL_VERSION = 1
-MAX_PROTOCOL_VERSION = 2
+#: ★ 2026-09-20：v3 引入**层段**（`layer_forward`）。v1/v2 只支持整模型
+#: （`full_inference`）与聚合（`aggregate`），因此**不具备**参与层流水线的能力。
+#: 加版本而不改旧版：v1/v2 客户端仍可协商成功，只是在 `layer_forward` 上会被
+#: `unsupported_stage_type` 拒绝（fail-closed，不做静默降级）。
+MAX_PROTOCOL_VERSION = 3
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 FULL_WORKER_KINDS = frozenset({"pc_full_worker", "android_full_worker"})
 
@@ -45,7 +49,33 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SUPPORTED_ENGINES = frozenset({
     "pytorch", "llama_cpp", "island", "external_api", "speculative_assisted",
 })
-_TEXT_STAGE_TYPES = frozenset({"full_inference", "aggregate"})
+_TEXT_STAGE_TYPES = frozenset({"full_inference", "aggregate", "layer_forward"})
+
+#: ★ 2026-09-20：**层段**（v3）要求的 `stage_offer` 附加字段。
+#: 层段节点用 llama.cpp 承一段层：加载**裁层 GGUF**，接收上游 hidden 并注入
+#: （`llama_batch.embd`），只算自己负责的层区间。字段设计对齐
+#: `src/pipeline_node_contract.py` 的 `PipelineNode(Layer_range/handoff_at)` 与
+#: `src/relay_contract.py` 的判据（per-token argmax，不认 bitwise）。
+_LAYER_FORWARD_OFFER_FIELDS = {
+    #: 本节点负责的**源模型**层区间 [start, end)（闭开）。必须与裁层 GGUF 的
+    #: `block_count` 自洽，由接收方核对，防止「声明与实际加载的工件不符」。
+    "layer_range",
+    #: 上游交接点：hidden 从源模型第 `handoff_at` 层之后跨边界。与
+    #: `PipelineNode.handoff_at` 同义，供 `cross_framework` 节点使用。
+    "handoff_at",
+    #: 上游 hidden 的 wire 摘要（算法 + 值），用于对账与防串话。
+    "hidden_sha256",
+    #: hidden 的形状：`{"n_tokens": int, "n_embd": int, "dtype": "float32"}`。
+    "hidden_spec",
+}
+
+#: 层段 `stage_result` 的结果字段：**放在 `output` 或 `metadata` 对象内**，不扩顶层。
+#: 原因：`stage_result` 的 payload 里没有 `stage_type`，无法按类型做动态字段校验；
+#: 而 `output` / `metadata` 本就是自由对象（仅校验类型与摘要一致性），可安全承载。
+_LAYER_FORWARD_RESULT_FIELDS = {
+    "hidden_out_sha256",
+    "token_argmax",
+}
 
 _ENVELOPE_FIELDS = {
     "protocol", "version", "message_type", "message_id", "sent_at_ms",
@@ -85,6 +115,17 @@ _PAYLOAD_FIELDS_V2 = {
     **_PAYLOAD_FIELDS,
     "stage_offer": _PAYLOAD_FIELDS["stage_offer"] | {"model_identity"},
     "stage_accept": _PAYLOAD_FIELDS["stage_accept"] | {"retryable"},
+}
+#: ★ 2026-09-20（v3）：层段承载。**注意这里不扩任何顶层字段** ——
+#: 层段字段**只对 `stage_type == "layer_forward"` 生效**，由 `_validate_payload`
+#: 在精确字段校验时按 `stage_type` **动态**并入（否则 `full_inference` 也会被要求
+#: 提供 hidden 字段 —— 实测会让既有任务图全线 500）。
+#:
+#: 层段的**结果**字段（`hidden_out_sha256` / `token_argmax`）刻意**不扩顶层**：
+#: `stage_result` 的 payload 里**没有** `stage_type`，无法做动态判断 ⇒ 放进本来就
+#: 自由的 `output` / `metadata` 对象内（见 `_LAYER_FORWARD_RESULT_FIELDS` 的说明）。
+_PAYLOAD_FIELDS_V3 = {
+    **_PAYLOAD_FIELDS_V2,
 }
 
 
@@ -441,8 +482,23 @@ def _validate_payload(
     payload: dict[str, Any],
     version: int,
 ) -> None:
-    fields = _PAYLOAD_FIELDS_V2 if version >= 2 else _PAYLOAD_FIELDS
-    _require_exact_fields(payload, fields[message_type], "payload")
+    fields = (
+        _PAYLOAD_FIELDS_V3 if version >= 3
+        else _PAYLOAD_FIELDS_V2 if version >= 2
+        else _PAYLOAD_FIELDS
+    )
+    required = fields[message_type]
+    # ★ 2026-09-20（v3）：层段字段**按 `stage_type` 动态并入**。
+    #   只有声明 `layer_forward` 的 `stage_offer` 才要求 hidden 交接字段；
+    #   非层段 stage 携带这些字段会被精确字段校验拒绝（既不漏也不多）。
+    if (
+        message_type == "stage_offer"
+        and version >= 3
+        and isinstance(payload, Mapping)
+        and payload.get("stage_type") == "layer_forward"
+    ):
+        required = required | _LAYER_FORWARD_OFFER_FIELDS
+    _require_exact_fields(payload, required, "payload")
     if message_type == "hello":
         _require_string(payload["node_id"], "payload.node_id", pattern=_SAFE_ID)
         if payload["worker_kind"] not in FULL_WORKER_KINDS:
@@ -511,6 +567,50 @@ def _validate_payload(
             raise _error(
                 "input_digest_mismatch", "payload.input_sha256",
                 "stage input digest does not match payload",
+            )
+        # ★ 2026-09-20（v3）：**层段**专项校验。缺字段由上面的精确字段集校验先拦下；
+        #   这里校验**值的合法性**，防止「声明与实际加载的工件不符」的静默错配。
+        #   ⚠️ 必须限定 `version >= 3`：v1/v2 的字段表里**没有**层段字段，
+        #      若不加该判定，v2 客户端声明 `layer_forward` 会在此处 KeyError 而非
+        #      返回稳定的 `field_mismatch`（实测）。
+        if version >= 3 and payload["stage_type"] == "layer_forward":
+            # 字段存在性已由上面的精确字段集校验保证，这里只校验值。
+            layer_range = payload["layer_range"]
+            if not isinstance(layer_range, (list, tuple)) or len(layer_range) != 2:
+                raise _error(
+                    "invalid_layer_range", "payload.layer_range",
+                    "layer_range must be [start, end)",
+                )
+            start = _require_int(layer_range[0], "payload.layer_range[0]", minimum=0)
+            end = _require_int(layer_range[1], "payload.layer_range[1]", minimum=1)
+            if end <= start:
+                raise _error(
+                    "invalid_layer_range", "payload.layer_range",
+                    "layer_range must satisfy end > start",
+                )
+            _require_int(payload["handoff_at"], "payload.handoff_at", minimum=0)
+            _require_string(
+                payload["hidden_sha256"], "payload.hidden_sha256", pattern=_SHA256,
+            )
+            hidden_spec = _require_object(
+                payload["hidden_spec"], "payload.hidden_spec"
+            )
+            _require_exact_fields(
+                hidden_spec, {"n_tokens", "n_embd", "dtype"}, "payload.hidden_spec"
+            )
+            _require_int(hidden_spec["n_tokens"], "payload.hidden_spec.n_tokens", minimum=1)
+            _require_int(hidden_spec["n_embd"], "payload.hidden_spec.n_embd", minimum=1)
+            dtype = _require_string(hidden_spec["dtype"], "payload.hidden_spec.dtype")
+            if dtype not in {"float32", "float16"}:
+                raise _error(
+                    "unsupported_hidden_dtype", "payload.hidden_spec.dtype",
+                    "hidden dtype must be float32 or float16",
+                )
+        elif "layer_range" in payload or "handoff_at" in payload:
+            # 非层段 stage 不得携带层段字段（精确字段集已拦，这里是双保险）
+            raise _error(
+                "unexpected_layer_fields", "payload",
+                "layer fields are only valid for layer_forward",
             )
         if version >= 2:
             _validate_model_identity(

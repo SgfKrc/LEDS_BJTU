@@ -399,6 +399,47 @@ class RelayXFrameRequest:
 
 
 @dataclass(frozen=True)
+class RelayXFrameEvidence:
+    """CORE-RELAY-XFRAME-01 已**独立取得**的证据范围声明。
+
+    加入动机（2026-09-19 收口）：`admit_relay_xframe` 原先无论正确性验证到什么程度都只回
+    ``xframe_evidence_required``（「缺证据」），**无法区分**两种完全不同的状态：
+
+    * ①「还没做验证」——需要继续投入；
+    * ②「正确性已验证，但**性能不具优势**」——结论是**不做生产路由**，属终态。
+
+    二者对调用方与后续票据的含义相反（继续 vs 关闭），故把已验证范围显式化。
+    ⚠️ 无论哪种情况 `admitted` **仍然是 False**：性能结论（最优 333 ms/步 vs
+    llama.cpp 原生整模 GPU 13.5 ms/步，约 20×）决定 Relay 的定位是**能力组合**而非提速。
+
+    见 `docs/跨框架层接力-项目报告.md` §7 与 `local_docs/CORE-RELAY-XFRAME-0*-*.json`。
+    """
+
+    correctness_verified: bool = False
+    #: 逐 token 一致的用例数（每例一次完整贪心生成对照）。
+    correctness_cases: int = 0
+    #: 已验证的最长 prefill（token 数）。
+    max_tested_prefill: int = 0
+    prompt_distribution_verified: bool = False
+    long_sequence_verified: bool = False
+    weak_network_verified: bool = False
+    protocol_consistency_verified: bool = False
+    #: 性能判定；`not_advantageous` 表示「正确但比整模 GPU 慢约 20×」。
+    performance_verdict: str = "unknown"
+    evidence_refs: tuple = ()
+
+    def admits_production(self) -> bool:
+        """本票的准入判据：性能不具优势 ⇒ **永不允许**进入默认生产路由。"""
+        return False
+
+    def to_dict(self) -> dict[str, Any]:
+        result = asdict(self)
+        result["evidence_refs"] = list(self.evidence_refs)
+        result["admits_production"] = self.admits_production()
+        return result
+
+
+@dataclass(frozen=True)
 class RelayXFrameDecision:
     admitted: bool
     reason: str
@@ -411,12 +452,19 @@ class RelayXFrameDecision:
         return result
 
 
-def admit_relay_xframe(request: RelayXFrameRequest | None) -> RelayXFrameDecision:
+def admit_relay_xframe(
+    request: RelayXFrameRequest | None,
+    evidence: RelayXFrameEvidence | None = None,
+) -> RelayXFrameDecision:
     """Fail closed until D->L and network handoff have independent evidence.
 
     This is deliberately a policy gate, not a claim that hidden-state transport is
     production-ready.  Only deterministic PC experiments over loopback/SSH are
     eligible; the normal caller must still provide a separate acceptance report.
+
+    ★ 2026-09-19：传入 `evidence` 时**拒绝理由会精确化**——正确性已验证但性能不具优势会回
+    ``xframe_correctness_verified_performance_not_advantageous``（终态结论），而非笼统的
+    ``xframe_evidence_required``（待验证）。**两种情况下 admitted 都是 False。**
     """
     if not isinstance(request, RelayXFrameRequest):
         reason = "invalid_xframe_request"
@@ -445,6 +493,10 @@ def admit_relay_xframe(request: RelayXFrameRequest | None) -> RelayXFrameDecisio
                 or top_p != 1.0
             ):
                 reason = "sampling_matrix_not_admitted"
+            elif isinstance(evidence, RelayXFrameEvidence) and evidence.correctness_verified:
+                # ★ 正确性已独立验证 ⇒ 拒绝理由从「缺证据」精确化为「性能结论是终态」
+                #   （仍 fail-closed：性能不具优势 ⇒ 不做默认生产路由）。
+                reason = "xframe_correctness_verified_performance_not_advantageous"
             else:
                 reason = "xframe_evidence_required"
     return RelayXFrameDecision(False, reason, relay_fallback(reason))

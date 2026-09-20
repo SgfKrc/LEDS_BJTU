@@ -609,7 +609,8 @@ def test_load_model_uses_switch_model_internally(monkeypatch):
     )
     result = asyncio.run(api_server.load_model(req))
     assert len(switch_calls) == 1, "应调用 switch_model 而非手动 unload/load"
-    assert switch_calls[0]["model_id"] == api_server.mc.DEFAULT_MODEL_ID
+    # ★ 2026-09-19：未指定 model_id 时按**设备画像**取默认（不再是固定常量）。
+    assert switch_calls[0]["model_id"] == api_server.mc.get_profile_default_model_id()
     assert result["status"] == "ok"
 
 
@@ -974,21 +975,22 @@ def test_local_native_image_chat_rejects_multi_image_fallback(monkeypatch):
 
 def test_list_models_includes_active_model_id(monkeypatch):
     """GET /api/models 应返回 active_model_id"""
+    # ★ 2026-09-19：`qwen-1_8b` 已从内置列表**移除**（用户裁定），改用当前默认模型。
     class FakeManager:
-        active_model_id = "qwen-1_8b"
+        active_model_id = "qwen3-0.6b"
 
     monkeypatch.setattr(api_server, "model_manager", FakeManager())
     monkeypatch.setattr(model_host, "model_loaded", True)
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: False)
 
     result = asyncio.run(api_server.list_models())
-    assert result["active_model_id"] == "qwen-1_8b"
+    assert result["active_model_id"] == "qwen3-0.6b"
     assert isinstance(result["models"], list)
     assert len(result["models"]) > 0
 
     # 默认模型应在列表中
     model_ids = [m["model_id"] for m in result["models"]]
-    assert "qwen-1_8b" in model_ids
+    assert "qwen3-0.6b" in model_ids
 
 
 def test_list_models_exposes_new_model_assets_for_frontend_selection(monkeypatch):

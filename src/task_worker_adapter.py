@@ -191,6 +191,8 @@ class TaskWorkerControlPlane:
                 except WorkerProtocolError:
                     accepted = False
                     selected_version = 0
+                    # ⚠️ 该 code 是稳定契约值（**不改**，避免破坏既有消费者）；
+                    # 但语义是「双方版本区间无交集」，不是「必须 v2」——见 v3 层段引入后。
                     reason_code = "protocol_v2_required"
 
             ack_version = selected_version if accepted else message.version
@@ -342,7 +344,10 @@ class TaskWorkerControlPlane:
         )
         snapshot["task_dispatch_enabled"] = False
         snapshot["manual_stage_dispatch_enabled"] = bool(
-            snapshot["healthy"] and snapshot.get("selected_version") == 2
+            # ★ 2026-09-20：原为硬编码 `selected_version == 2`，协议升到 v3 后
+            #   **永远为 False**（实测：能力正常但 provider 一直 unhealthy）。
+            #   语义是「v2 及以上的数据面通道可用」，故与当前版本号解耦。
+            snapshot["healthy"] and int(snapshot.get("selected_version") or 0) >= 2
         )
         return snapshot
 
@@ -556,7 +561,9 @@ class RemoteFullWorkerProvider:
         healthy = bool(
             not closed
             and snapshot.get("healthy")
-            and snapshot.get("selected_version") == 2
+            # ★ 2026-09-20：原为硬编码 `== 2`（第二处），协议升 v3 后 provider 恒 unhealthy。
+            #   语义是「v2 及以上的数据面通道可用」，与具体版本号解耦。
+            and int(snapshot.get("selected_version") or 0) >= 2
             and snapshot.get("manual_stage_dispatch_enabled")
             and resource_admitted
         )
@@ -565,7 +572,9 @@ class RemoteFullWorkerProvider:
             provider_kind=self.provider_kind,
             supported_stage_types=tuple(
                 value for value in stage_types
-                if value in {"full_inference", "aggregate"}
+                # ★ 2026-09-20：`layer_forward`（v3 层段）也必须能透传，否则
+                #   安卓 worker 即使声明了层段能力，也会在这里被静默抹掉。
+                if value in {"full_inference", "aggregate", "layer_forward"}
             ),
             max_concurrency=max_concurrency,
             active_reservations=active,

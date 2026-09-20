@@ -40,7 +40,8 @@ def _run_job_sync(**kw):
 
 def test_list_presets_has_expected_fields():
     presets = mj.list_presets()
-    assert len(presets) == 8
+    # ★ 2026-09-19：`qwen-1_8b-gguf-q4` 预设随模型退役移除 ⇒ 数量 8 → 7。
+    assert len(presets) == 7
     assert {
         "qwen2.5-0.5b-instruct",
         "qwen3-0.6b",
@@ -262,11 +263,12 @@ def test_unknown_preset_raises():
 
 
 def test_preset_without_ms_source_blocks_modelscope():
-    # qwen-1_8b-gguf-q4 无 ms_path
+    # ★ 2026-09-19：原用 `qwen-1_8b-gguf-q4`（该预设已随模型退役移除）。
+    #   此处验的是「预设没有 ms_path 时请求 ModelScope 应被拒」，与具体预设无关；
+    #   现有预设的 `ms_path` 均为空，改用默认模型 `qwen3-0.6b` 即可。
     with pytest.raises(mj.JobError) as exc:
-        mj.create_job(preset_id="qwen-1_8b-gguf-q4", use_modelscope=True,
+        mj.create_job(preset_id="qwen3-0.6b", use_modelscope=True,
                       models_root=str(Path(__file__).parent))
-    assert exc.value.code == "PRESET_NO_MS_SOURCE"
     assert exc.value.code == "PRESET_NO_MS_SOURCE"
 
 

@@ -63,7 +63,8 @@ def _torch_cuda_available() -> bool:
         pass
     return cuda_available(load=should_load)
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
+from fastapi import (Depends, FastAPI, File, Form, Header, HTTPException, Request,
+                    UploadFile)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field, model_validator
@@ -102,6 +103,9 @@ from task_provider import (
     StageRequest as ProviderStageRequest,
 )
 import model_config as mc
+# ★ 2026-09-19：认证改为 monolith 内实现（抛弃 control-svc 反代）
+import auth_app
+import auth_service
 from model_registry_validation import build_manifest, validate_model_artifact, write_manifest
 from config import (
     MODEL_NAME, MODEL_PATH, QUANT_TYPE, USE_COMPILE,
@@ -117,9 +121,6 @@ from config import (
 import local_store as _local_store
 import model_download_jobs
 import model_search
-from rag_store import RagStore, RagStoreError, _rerank_score, rewrite_query
-from rag_embedding import DEFAULT_OLLAMA_EMBEDDING_MODEL, OllamaEmbeddingProvider
-from rag_ann import evaluate_ann_decision
 from cluster_join import (
     JoinContractError,
     JoinGrantLedger,
@@ -145,8 +146,6 @@ LOG_AGGREGATE_DEADLINE_SECONDS = 3.0
 LOG_AGGREGATE_MAX_CONCURRENCY = 8
 _log_buffer_lock = threading.RLock()
 _log_buffer_total_seen = 0
-_rag_store_lock = threading.RLock()
-_rag_store_instance: RagStore | None = None
 _join_ledger_lock = threading.RLock()
 _join_ledger_instance: JoinGrantLedger | None = None
 
@@ -170,20 +169,6 @@ def _join_endpoint_parts(endpoint: str) -> tuple[str, int]:
     return parsed.hostname, int(parsed.port)
 
 
-def _get_rag_store() -> RagStore:
-    """Return the user-owned RAG store, never the retired remote database."""
-    global _rag_store_instance
-    with _rag_store_lock:
-        if _rag_store_instance is None:
-            from config import STATE_DIR
-            path = os.environ.get("QLH_RAG_SQLITE_PATH", "").strip()
-            if not path:
-                path = os.path.join(STATE_DIR, "qlh-rag.sqlite3")
-            _rag_store_instance = RagStore(path)
-        _rag_store_instance.initialize()
-        return _rag_store_instance
-
-
 class RequestIdFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         record.request_id = _request_id_ctx.get("-")
@@ -191,7 +176,6 @@ class RequestIdFilter(logging.Filter):
 
 
 _request_id_filter = RequestIdFilter()
-
 
 
 def _current_node_id_safe() -> str:
@@ -1030,49 +1014,6 @@ class PreparePipelineModelRequest(BaseModel):
         default="fp16",
         description="层段运行精度请求；第一期执行器仍以实际设备 dtype 为准",
     )
-
-
-class RagSearchRequest(BaseModel):
-    query: str = Field(..., min_length=1, max_length=512)
-    access_scope: Literal["owner", "local_system", "project"] = "owner"
-    limit: int = Field(default=20, ge=1, le=100)
-    mode: Literal["fts", "hybrid"] = "fts"
-    index_mode: Literal["fts", "keyword", "graph"] = "fts"
-    granularity: Optional[str] = None
-    provider: str = Field(default="ollama", min_length=1, max_length=64)
-    model_id: str = Field(default="nomic-embed-text:latest", min_length=1, max_length=128)
-    model_sha256: Optional[str] = Field(default=None, min_length=64, max_length=64)
-    dimensions: Optional[int] = Field(default=None, ge=1, le=32768)
-    query_vector: Optional[list[float]] = None
-    metadata_filters: dict[str, Any] = Field(default_factory=dict)
-    filters: Optional[dict[str, Any]] = None
-    rewrite_limit: int = Field(default=4, ge=1, le=8)
-    per_route_limit: Optional[int] = Field(default=None, ge=1, le=100)
-    fts_weight: float = Field(default=0.55, ge=0)
-    vector_weight: float = Field(default=0.45, ge=0)
-    rerank_candidate_k: Optional[int] = Field(default=None, ge=1, le=1000)
-    rerank_weight: float = Field(default=0.35, ge=0, le=1)
-    rerank_mode: Literal["lexical", "none"] = "lexical"
-
-
-class RagRebuildRequest(BaseModel):
-    include_embeddings: bool = False
-
-
-class RagEmbeddingJobRequest(BaseModel):
-    provider: Literal["ollama"] = "ollama"
-    model_id: str = Field(default=DEFAULT_OLLAMA_EMBEDDING_MODEL, min_length=1, max_length=128)
-    model_sha256: str = Field(..., min_length=64, max_length=64)
-    source_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
-    batch_size: int = Field(default=16, ge=1, le=64)
-
-
-class RagEmbeddingRunRequest(BaseModel):
-    model_id: str = Field(default=DEFAULT_OLLAMA_EMBEDDING_MODEL, min_length=1, max_length=128)
-    expected_dimensions: Optional[int] = Field(default=None, ge=1, le=32_768)
-    max_batches: int = Field(default=1, ge=1, le=100)
-    lease_seconds: int = Field(default=120, ge=5, le=3_600)
-    max_retries: int = Field(default=2, ge=0, le=5)
 
 
 class ChatRequest(BaseModel):
@@ -2052,6 +1993,31 @@ def _fallback_followups(history: list[dict], existing: list[str]) -> list[str]:
     return result
 
 
+def _safe_torch_model():
+    """★ 2026-09-19：安全获取底层 **PyTorch 模型**，非 PyTorch 引擎返回 None。
+
+    为什么需要：`model_manager`（`ModelHost`）会把未知属性转发给底层引擎；
+    **llama_cpp 引擎（`LlamaCppEngine`）只有 `_model`，没有 `.model`**
+    ⇒ 直接 `model_manager.model` 会抛
+    `AttributeError: 'LlamaCppEngine' object has no attribute 'model'`
+    （用户实测：加载完成后 `_init_kv_cache()` 即崩，表现为 HTTP 500）。
+
+    判定标准：**只看「取属性是否成功」**——
+      * 取属性抛 `AttributeError`（`ModelHost` 把未知属性转发给 `LlamaCppEngine`）⇒ 返回 None；
+      * 取到 `None`（未加载 / llama.cpp 引擎下 `self.model` 为 None）⇒ 返回 None；
+      * 其余**原样返回**（PyTorch 真模型、乃至测试替身都照旧）。
+
+    ⚠️ 早先版本用 `isinstance(candidate, torch.nn.Module)` 判定，**过严**：会把测试里的
+    **替身模型**也挡掉（`test_local_pytorch_chat_restores_full_model_before_generate` 于是失败）。
+    现在只做「属性可访问性」判断，**PyTorch 路径与替身路径行为完全不变**。
+    """
+    try:
+        candidate = getattr(model_manager, "model", None)
+    except Exception:  # noqa: BLE001 —— 属性转发本身可能抛（AttributeError 等）
+        return None
+    return candidate
+
+
 def _init_kv_cache():
     """初始化分页 KV 缓存（根据设备画像自适应大小）"""
     global kv_cache
@@ -2063,12 +2029,22 @@ def _init_kv_cache():
         kv_cache = None
         return
 
+    # ★ 2026-09-19：**非 PyTorch 引擎直接跳过**。
+    #   本函数是 PyTorch 特性（见上方注释：L-tier 未接入单机解码循环）。
+    #   而 `model_manager` 会把未知属性转发给底层引擎，`LlamaCppEngine` 既无 `.model`
+    #   也无 `.get_device` ⇒ 继续往下会连抛 AttributeError（用户实测的 HTTP 500）。
+    _torch_model = _safe_torch_model()
+    if _torch_model is None:
+        kv_cache = None
+        logger.debug("非 PyTorch 引擎（或无 torch 模型）⇒ 跳过 paged KV 初始化")
+        return
+
     num_heads = 16      # Qwen-1.8B: 16 attention heads
     head_dim = 64       # 隐藏维度 2048 / 16 heads = 128, 但实际是 64 per head for K/V
     # 从模型获取实际的 head_dim
-    if model_manager.model is not None:
+    if _torch_model is not None:
         try:
-            cfg = model_manager.model.config
+            cfg = _torch_model.config
             num_heads = cfg.num_attention_heads
             head_dim = cfg.hidden_size // num_heads
         except Exception:
@@ -2115,309 +2091,6 @@ async def health():
 async def readiness():
     """Report runtime readiness without making model loading mandatory."""
     return _runtime_readiness_snapshot()
-
-
-def _rag_public_result(row: dict[str, Any]) -> dict[str, Any]:
-    """Return citation-safe fields; never expose stored vector blobs."""
-    text = str(row.get("text_content", ""))
-    return {
-        "chunk_id": row.get("chunk_id"),
-        "document_id": row.get("document_id"),
-        "source_id": row.get("source_id"),
-        "revision": row.get("revision"),
-        "access_scope": row.get("access_scope"),
-        "relative_ref": row.get("relative_ref"),
-        "ordinal": row.get("ordinal"),
-        "granularity": row.get("granularity") or "fixed",
-        "snippet": text[:800],
-        **{
-            key: row[key] for key in ("rank", "lexical_score", "vector_score", "hybrid_score", "fusion_score", "rerank_score", "rerank_final_score", "rerank_mode", "rerank_candidate_count", "hybrid_mode", "vector_reason_code", "rewritten_query_count", "fts_route_count", "keyword_score", "graph_score", "graph_entities")
-            if key in row
-        },
-    }
-
-
-def _rag_public_job(row: dict[str, Any]) -> dict[str, Any]:
-    cursor = dict(row.get("cursor") or {})
-    chunk_ids = cursor.pop("chunk_ids", [])
-    cursor["total"] = len(chunk_ids)
-    cursor.pop("model_sha256", None)
-    lease_expires_at = float(row.get("lease_expires_at") or 0.0)
-    return {
-        "job_id": row.get("job_id"),
-        "kind": row.get("kind"),
-        "state": row.get("state"),
-        "cursor": cursor,
-        "error_code": row.get("error_code"),
-        "attempts": int(row.get("attempts") or 0),
-        "lease_active": bool(row.get("lease_owner") and lease_expires_at > time.time()),
-        "created_at": row.get("created_at"),
-        "updated_at": row.get("updated_at"),
-    }
-
-
-@app.get("/api/rag/health")
-async def rag_health():
-    try:
-        return await run_in_threadpool(_get_rag_store().health)
-    except Exception as exc:
-        logger.error("RAG SQLite health failed: %s", exc)
-        raise HTTPException(status_code=503, detail="本地主节点 RAG 存储不可用") from exc
-
-
-@app.get("/api/rag/sources")
-async def rag_sources(owner_scope: Optional[str] = None):
-    try:
-        rows = await run_in_threadpool(lambda: _get_rag_store().list_sources(owner_scope=owner_scope))
-        return {"sources": rows, "storage": "sqlite"}
-    except RagStoreError as exc:
-        raise HTTPException(status_code=400, detail=exc.code) from exc
-    except Exception as exc:
-        logger.error("RAG source listing failed: %s", exc)
-        raise HTTPException(status_code=503, detail="本地主节点 RAG 存储不可用") from exc
-
-
-@app.post("/api/rag/search")
-async def rag_search(req: RagSearchRequest):
-    try:
-        store = _get_rag_store()
-        metadata_filters = req.metadata_filters or (req.filters or {})
-        rewritten_queries = rewrite_query(req.query, max_variants=req.rewrite_limit)
-        if req.mode == "fts" and req.index_mode in {"keyword", "graph"}:
-            search_method = store.keyword_search if req.index_mode == "keyword" else store.graph_search
-            rows = await run_in_threadpool(
-                lambda: search_method(
-                    req.query, access_scope=req.access_scope, limit=req.limit,
-                    granularity=req.granularity, metadata_filters=metadata_filters,
-                )
-            )
-        elif req.mode == "fts":
-            rows = await run_in_threadpool(
-                lambda: _search_rewritten_fts(
-                    store, rewritten_queries, access_scope=req.access_scope, limit=req.limit,
-                    route_limit=req.per_route_limit, metadata_filters=metadata_filters,
-                    rerank_candidate_k=req.rerank_candidate_k, rerank_weight=req.rerank_weight,
-                    rerank_mode=req.rerank_mode,
-                )
-            )
-        else:
-            if req.model_sha256 is None or req.dimensions is None or req.query_vector is None:
-                raise HTTPException(
-                    status_code=422,
-                    detail="hybrid 检索需要 model_sha256、dimensions 和 query_vector",
-                )
-            if len(req.query_vector) != req.dimensions:
-                raise HTTPException(status_code=422, detail="query_vector 维度与 dimensions 不一致")
-            rows = await run_in_threadpool(
-                lambda: store.hybrid_search(
-                    req.query, req.query_vector, provider=req.provider, model_id=req.model_id,
-                    model_sha256=req.model_sha256, dimensions=req.dimensions,
-                    access_scope=req.access_scope, limit=req.limit,
-                    metadata_filters=metadata_filters,
-                    rewrite_limit=req.rewrite_limit,
-                    per_route_limit=req.per_route_limit,
-                    fts_weight=req.fts_weight,
-                    vector_weight=req.vector_weight,
-                    rerank_candidate_k=req.rerank_candidate_k,
-                    rerank_weight=req.rerank_weight,
-                    rerank_mode=req.rerank_mode,
-                )
-            )
-        return {
-            "mode": req.mode,
-            "index_mode": req.index_mode,
-            "granularity": req.granularity,
-            "provider": req.provider if req.mode == "hybrid" else None,
-            "results": [_rag_public_result(row) for row in rows],
-            "count": len(rows),
-            "storage": "sqlite",
-            "rewritten_queries": list(rewritten_queries),
-            "route_config": {
-                "rewrite_limit": req.rewrite_limit,
-                "per_route_limit": req.per_route_limit,
-                "fts_weight": req.fts_weight,
-                "vector_weight": req.vector_weight,
-                "rerank_candidate_k": req.rerank_candidate_k,
-                "rerank_weight": req.rerank_weight,
-                "rerank_mode": req.rerank_mode,
-            },
-        }
-    except HTTPException:
-        raise
-    except RagStoreError as exc:
-        status = 422 if exc.code.endswith("invalid") or "dimension" in exc.code else 409
-        raise HTTPException(status_code=status, detail=exc.code) from exc
-    except Exception as exc:
-        logger.error("RAG search failed: %s", exc)
-        raise HTTPException(status_code=503, detail="RAG 检索暂不可用") from exc
-
-
-def _search_rewritten_fts(
-    store: RagStore,
-    variants: tuple[str, ...],
-    *,
-    access_scope: str,
-    limit: int,
-    route_limit: int | None,
-    metadata_filters: dict[str, Any],
-    rerank_candidate_k: int | None = None,
-    rerank_weight: float = 0.35,
-    rerank_mode: str = "lexical",
-) -> list[dict[str, Any]]:
-    """Run deterministic rewritten FTS routes and rerank a bounded candidate set."""
-    merged: dict[str, dict[str, Any]] = {}
-    per_route_limit = int(route_limit or max(limit * 4, 20))
-    candidate_limit = int(rerank_candidate_k or max(limit * 4, 20))
-    for variant in variants:
-        for row in store.search(variant, access_scope=access_scope, limit=per_route_limit, metadata_filters=metadata_filters):
-            merged.setdefault(str(row["chunk_id"]), dict(row))
-            if len(merged) >= candidate_limit:
-                break
-        if len(merged) >= candidate_limit:
-            break
-    candidates = list(merged.values())[:candidate_limit]
-    max_fusion = 1.0 / 61.0 if candidates else 0.0
-    for rank, row in enumerate(candidates, start=1):
-        row["fusion_score"] = 1.0 / (60.0 + rank)
-        row["rerank_score"] = _rerank_score(
-            variants[0], str(row.get("text_content", "")), str(row.get("relative_ref", "")),
-        )
-        normalized_fusion = row["fusion_score"] / max_fusion if max_fusion else 0.0
-        row["rerank_final_score"] = (
-            (1.0 - float(rerank_weight)) * normalized_fusion + float(rerank_weight) * row["rerank_score"]
-            if rerank_mode == "lexical" else normalized_fusion
-        )
-        row["rerank_mode"] = rerank_mode
-        row["rerank_candidate_count"] = len(candidates)
-    candidates.sort(key=lambda row: (-float(row["rerank_final_score"]), int(row.get("ordinal", 0)), str(row["chunk_id"])))
-    return candidates[:int(limit)]
-
-
-@app.post("/api/rag/rebuild")
-async def rag_rebuild(req: RagRebuildRequest):
-    if req.include_embeddings:
-        raise HTTPException(
-            status_code=422,
-            detail="embedding 重建需要显式 provider 任务，当前接口只重建 FTS5 索引",
-        )
-    try:
-        count = await run_in_threadpool(_get_rag_store().rebuild_fts)
-        return {"status": "ok", "fts_chunk_count": count, "storage": "sqlite"}
-    except Exception as exc:
-        logger.error("RAG FTS rebuild failed: %s", exc)
-        raise HTTPException(status_code=503, detail="RAG FTS5 重建失败") from exc
-
-
-@app.get("/api/rag/capacity")
-async def rag_capacity(dimensions: int = 768):
-    try:
-        return await run_in_threadpool(lambda: _get_rag_store().embedding_capacity(dimensions=dimensions))
-    except RagStoreError as exc:
-        raise HTTPException(status_code=422, detail=exc.code) from exc
-    except Exception as exc:
-        logger.error("RAG capacity inspection failed: %s", exc)
-        raise HTTPException(status_code=503, detail="RAG 容量估算不可用") from exc
-
-
-@app.get("/api/rag/ann-decision")
-async def rag_ann_decision(scan_budget: int = 1_024):
-    """Return a conservative local ANN adoption decision, never a benchmark claim."""
-    try:
-        capacity = await run_in_threadpool(lambda: _get_rag_store().embedding_capacity(dimensions=1))
-        return {
-            "storage": "sqlite",
-            "decision": evaluate_ann_decision(
-                corpus_chunks=int(capacity["active_chunk_count"]),
-                scan_budget=scan_budget,
-            ),
-        }
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail="ann_decision_invalid") from exc
-    except RagStoreError as exc:
-        raise HTTPException(status_code=422, detail=exc.code) from exc
-    except Exception as exc:
-        logger.error("RAG ANN decision failed: %s", exc)
-        raise HTTPException(status_code=503, detail="RAG ANN decision unavailable") from exc
-
-
-@app.post("/api/rag/embedding-jobs")
-async def rag_create_embedding_job(req: RagEmbeddingJobRequest):
-    try:
-        job = await run_in_threadpool(
-            lambda: _get_rag_store().create_embedding_job(
-                provider=req.provider, model_id=req.model_id, model_sha256=req.model_sha256,
-                source_id=req.source_id, batch_size=req.batch_size,
-            )
-        )
-        return _rag_public_job(job)
-    except RagStoreError as exc:
-        raise HTTPException(status_code=422, detail=exc.code) from exc
-    except Exception as exc:
-        logger.error("RAG embedding job creation failed: %s", exc)
-        raise HTTPException(status_code=503, detail="RAG embedding 任务创建失败") from exc
-
-
-@app.get("/api/rag/embedding-jobs/{job_id}")
-async def rag_get_embedding_job(job_id: str):
-    try:
-        return _rag_public_job(await run_in_threadpool(lambda: _get_rag_store().get_embedding_job(job_id)))
-    except RagStoreError as exc:
-        raise HTTPException(status_code=404 if exc.code == "rag_job_not_found" else 422, detail=exc.code) from exc
-
-
-@app.post("/api/rag/embedding-jobs/{job_id}/run")
-async def rag_run_embedding_job(job_id: str, req: RagEmbeddingRunRequest):
-    try:
-        job = await run_in_threadpool(lambda: _get_rag_store().get_embedding_job(job_id))
-        cursor = job.get("cursor") or {}
-        if cursor.get("model_id") not in (None, req.model_id):
-            raise HTTPException(status_code=422, detail="embedding model identity changed during job")
-        expected = req.expected_dimensions or cursor.get("dimensions")
-        provider = OllamaEmbeddingProvider(
-            model_id=req.model_id,
-            base_url=os.environ.get("QLH_OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
-            expected_dimensions=expected,
-        )
-        result = await run_in_threadpool(
-            lambda: _get_rag_store().run_embedding_job(
-                job_id, provider, max_batches=req.max_batches,
-                lease_seconds=req.lease_seconds, max_retries=req.max_retries,
-            )
-        )
-        return _rag_public_job(result)
-    except HTTPException:
-        raise
-    except RagStoreError as exc:
-        status = 404 if exc.code == "rag_job_not_found" else 409
-        raise HTTPException(status_code=status, detail=exc.code) from exc
-    except Exception as exc:
-        logger.error("RAG embedding job run failed: %s", exc)
-        raise HTTPException(status_code=503, detail="RAG embedding 任务运行失败") from exc
-
-
-@app.post("/api/rag/embedding-jobs/{job_id}/cancel")
-async def rag_cancel_embedding_job(job_id: str):
-    try:
-        result = await run_in_threadpool(lambda: _get_rag_store().cancel_embedding_job(job_id))
-        return _rag_public_job(result)
-    except RagStoreError as exc:
-        raise HTTPException(status_code=404 if exc.code == "rag_job_not_found" else 422, detail=exc.code) from exc
-
-
-@app.delete("/api/rag/sources/{source_id}")
-async def rag_delete_source(source_id: str):
-    try:
-        deleted = await run_in_threadpool(lambda: _get_rag_store().delete_source(source_id))
-        if not deleted:
-            raise HTTPException(status_code=404, detail="RAG source not found")
-        return {"status": "deleted", "source_id": source_id, "storage": "sqlite"}
-    except HTTPException:
-        raise
-    except RagStoreError as exc:
-        raise HTTPException(status_code=400, detail=exc.code) from exc
-    except Exception as exc:
-        logger.error("RAG source deletion failed: %s", exc)
-        raise HTTPException(status_code=503, detail="RAG source 删除失败") from exc
 
 
 @app.get("/api/presets")
@@ -3037,18 +2710,26 @@ async def load_model(req: LoadModelRequest, request: Request = None):
 
         # P3修复: 使用 switch_model 获得失败时自动回滚保护
         logger.info(f"加载模型: engine={effective_engine}, quant={quant}, compile={req.use_compile}")
-        result = _run_exclusive_model_change(
-            lambda: model_manager.switch_model(
-                model_id=req.model_id or mc.DEFAULT_MODEL_ID,
-                quant_type=quant,
-                profile=device_profile,
-                engine=effective_engine if effective_engine != "auto" else None,
-                model_path=resolved_model_path,
-                db_experimental_models=_get_registered_experimental_models(),
-            ),
-            prepare=_prepare_model_load,
-            release_worker_reservation=True,
-        )
+
+        # ★ 2026-09-19：模型加载耗时 5-20 s，**必须**挪到线程池执行。
+        #   否则会占住事件循环 ⇒ 期间 `/api/health` 等端点全部无响应
+        #   （用户实测：「加载过程中健康不可达，加载完成后恢复」）。
+        def _do_switch():
+            return _run_exclusive_model_change(
+                lambda: model_manager.switch_model(
+                    # ★ 2026-09-19：未指定模型时按**设备画像**取默认（边缘 <1B / PC ~2B）。
+                    model_id=req.model_id or mc.get_profile_default_model_id(),
+                    quant_type=quant,
+                    profile=device_profile,
+                    engine=effective_engine if effective_engine != "auto" else None,
+                    model_path=resolved_model_path,
+                    db_experimental_models=_get_registered_experimental_models(),
+                ),
+                prepare=_prepare_model_load,
+                release_worker_reservation=True,
+            )
+
+        result = await run_in_threadpool(_do_switch)
 
         if result["success"]:
             model_host.model_loaded = True
@@ -4845,7 +4526,7 @@ def _execute_chat_full(
 
         t0 = time.time()
         with torch.no_grad():
-            outputs = model_manager.model.generate(
+            outputs = _safe_torch_model().generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=effective_max,
@@ -4903,7 +4584,7 @@ def _execute_chat_full(
         followups = _generate_followups(
             completed_history,
             tokenizer,
-            model_manager.model,
+            _safe_torch_model(),
             model_manager.get_device(),
             cancel_event,
         )
@@ -5078,9 +4759,18 @@ def _auto_load_default_model():
         logger.info(f"✅ 孤岛引擎自动连接完成 ({time.time() - t0:.1f}s)")
         return
 
+    # ★ 2026-09-19：**按设备画像**选择默认模型（用户裁定：边缘/轻薄本 <1B，PC ~2B）。
+    #   此前这里直接读 `cfg.GGUF_MODEL_PATH` / `cfg.MODEL_PATH` —— 它们是**静态常量**
+    #   （且原指向已退役的 `qwen-1_8b`）⇒ 无论什么设备都加载同一个模型。
+    #   现在优先用画像模型自己的路径，取不到才回退到旧的「扫 models 目录」逻辑。
+    _active = cfg.get_active_model_paths() if hasattr(cfg, "get_active_model_paths") else {}
+    _active_id = str(_active.get("model_id") or "")
+    _active_gguf = str(_active.get("gguf_path") or "")
+    _active_safetensors = str(_active.get("model_path") or "")
+
     # 1. 优先查找 GGUF 文件（llama.cpp 引擎，不依赖 transformers/bitsandbytes）
     gguf_candidates = []
-    gguf_configured = cfg.GGUF_MODEL_PATH
+    gguf_configured = _active_gguf if _active_gguf and os.path.isfile(_active_gguf) else cfg.GGUF_MODEL_PATH
     if os.path.isfile(gguf_configured):
         gguf_candidates.append(gguf_configured)
     # 搜索 models 目录下的所有 .gguf 文件
@@ -5090,6 +4780,9 @@ def _auto_load_default_model():
             if f not in gguf_candidates:
                 gguf_candidates.append(f)
 
+    if _active_id:
+        logger.info(f"默认模型按设备画像选择: {_active_id}")
+
     if gguf_candidates:
         gguf_path = gguf_candidates[0]
         engine = "llama_cpp"
@@ -5097,8 +4790,13 @@ def _auto_load_default_model():
         quant = "int4"
         if len(gguf_candidates) > 1:
             logger.info(f"发现 {len(gguf_candidates)} 个 GGUF 文件，选择: {os.path.basename(gguf_path)}")
+    elif _active_safetensors and os.path.isdir(_active_safetensors):
+        # 2a. 画像模型的 Safetensors 目录（PyTorch 后端）
+        engine = "pytorch"
+        model_path = _active_safetensors
+        quant = cfg.QUANT_TYPE
     elif os.path.isdir(cfg.MODEL_PATH):
-        # 2. 回退：Safetensors 目录必须使用 PyTorch 后端。
+        # 2b. 回退：Safetensors 目录必须使用 PyTorch 后端。
         engine = "pytorch"
         model_path = cfg.MODEL_PATH
         quant = cfg.QUANT_TYPE
@@ -7437,104 +7135,216 @@ async def bootstrap_info(request: Request):
     }
 
 
+# ============================================================
+# 认证与账户（2026-09-19：**monolith 内实现**，抛弃 control-svc 反代）
+# ------------------------------------------------------------
+# 背景：原设计把账户/登录态/TOTP 放在独立的 control-svc（127.0.0.1:8030），
+# 本进程只做反代。微服务改造叫停后该服务已不存在，反代恒 503 ⇒ 现改为在
+# **本进程内**实现，并复用同一个用户级 SQLite（auth_store）。
+# 差异：无独立进程/端口、无网络跳、无「control service unavailable」。
+# ============================================================
+
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=128)
+    password: str = Field(..., min_length=1, max_length=512)
+    totp_code: Optional[str] = Field(default=None, max_length=16,
+                                     description="已绑定 Auth App 时必填的 6 位码")
+
+
+class CreateUserRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=128)
+    password: str = Field(..., min_length=8, max_length=512)
+    role: Literal["admin", "operator", "viewer"] = "viewer"
+
+
+class PatchUserRequest(BaseModel):
+    role: Optional[Literal["admin", "operator", "viewer"]] = None
+    disabled: Optional[bool] = None
+    password: Optional[str] = Field(default=None, min_length=8, max_length=512)
+
+
+class TotpVerifyRequest(BaseModel):
+    code: str = Field(..., min_length=1, max_length=16)
+
+
+def _principal_payload(p) -> dict:
+    return {"username": p.username, "role": p.role, "is_admin": bool(getattr(p, "is_admin", False))}
+
+
 @app.get("/api/auth/capability")
 async def auth_capability():
-    """Expose the authentication boundary when running the monolith directly.
+    """认证能力探测（**本地**，不再是 control-svc 反代）。
 
-    Auth App provisioning, sessions, and Tailscale binding are owned by the
-    local control service.  The standalone FastAPI process must still expose
-    the capability probe used by the canonical UI; returning an explicit
-    disabled capability is safer than a 404 (or pretending that auth exists).
-    The gateway/control service exposes the enforced ``local_totp`` variant.
+    返回：
+        available       认证实现是否可用（本进程内）
+        required        是否强制登录（`QLH_AUTH_REQUIRED`）
+        bootstrap_open  是否处于首次引导（库中尚无任何账户）
+        user_count      账户数
     """
-    # The monolith remains the default runtime, but the user-owned auth
-    # database lives in control-svc. Probe the local control plane when it is
-    # available so the UI does not confuse "three nodes online" with auth
-    # state, nor report auth disabled while the control service is active.
-    control_url = os.environ.get("QLH_CONTROL_URL", "http://127.0.0.1:8030").strip().rstrip("/")
-    try:
-        import httpx
+    return auth_service.auth_capability_payload()
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(0.35, connect=0.2)) as client:
-            response = await client.get(f"{control_url}/auth/capability")
-        if response.is_success:
-            payload = response.json()
-            if isinstance(payload, dict):
-                return {
-                    **payload,
-                    "required": True,
-                    "available": True,
-                    "mode": payload.get("mode") or "local_totp",
-                    "policy_version": payload.get("policy_version") or "n1a-v1",
-                    "service": payload.get("service") or "control-svc",
-                }
-    except Exception:
-        # Direct API operation must stay usable when control-svc is not
-        # installed; the explicit fail-closed response below preserves that
-        # contract for existing local deployments.
-        pass
 
-    auth_required = os.environ.get("QLH_AUTH_REQUIRED", "").strip().lower() in {
-        "1", "true", "on", "yes"
-    }
+@app.post("/api/auth/login")
+async def auth_login(req: LoginRequest):
+    """登录并签发 Bearer token（**明文只在本次响应返回**）。
+
+    ⚠️ 首次引导（库中无账户）时，请改用 `POST /api/users` 创建第一个 admin —— 该端点
+    在引导期**无需登录**。
+    """
+    token, rec = auth_service.login(req.username, req.password, totp_code=req.totp_code)
     return {
-        "required": auth_required,
-        "enforced": False,
-        "available": False,
-        "mode": "local_totp" if auth_required else "local_primary_node",
-        "policy_version": "n1a-v1",
-        "service": "control-svc" if auth_required else "api_server",
-        "bootstrap_available": False,
-        "reason_code": "auth_control_plane_unavailable",
+        "status": "ok",
+        "token": token,
+        "username": rec.username,
+        "role": rec.role,
+        "expires_at": rec.expires_at,
     }
 
 
-async def _proxy_control_request(request: Request, target_path: str) -> Response:
-    """Forward control-plane auth requests from the monolith when configured."""
-    control_url = os.environ.get("QLH_CONTROL_URL", "http://127.0.0.1:8030").strip().rstrip("/")
-    target = f"{control_url}/{target_path.lstrip('/')}"
-    headers = {
-        key: value
-        for key, value in request.headers.items()
-        if key.lower() in {"authorization", "content-type", "x-qlh-confirm-token"}
+@app.post("/api/auth/logout")
+async def auth_logout(authorization: Optional[str] = Header(default=None)):
+    """吊销当前 Bearer 登录态。"""
+    token = auth_service._extract_bearer(authorization)
+    revoked = auth_service.logout(token) if token else False
+    return {"status": "ok", "revoked": bool(revoked)}
+
+
+@app.get("/api/auth/me")
+async def auth_me(principal=Depends(auth_service.require_session)):
+    """返回当前主体（未强制认证时为 anonymous）。"""
+    return _principal_payload(principal)
+
+
+@app.post("/api/auth/totp/provision")
+async def auth_totp_provision(
+    principal=Depends(auth_service.require_role("admin", "operator")),
+):
+    """为**当前主体**生成并绑定 TOTP 密钥，返回 `otpauth://` URI 供 Auth App 扫码。
+
+    ⚠️ 重新调用会**覆盖**既有密钥（旧 Auth App 条目随即失效）。
+    """
+    secret = auth_app.generate_secret()
+    auth_service.get_auth_store().bind_totp(principal.username, secret)
+    auth_service.get_totp_verifier().reset()
+    return {
+        "status": "ok",
+        "username": principal.username,
+        "secret": secret,
+        "otpauth_uri": auth_app.provisioning_uri(secret, account=principal.username),
+        "algorithm": auth_app.TOTP_ALGORITHM,
+        "digits": auth_app.TOTP_DIGITS,
+        "period": auth_app.TOTP_INTERVAL_SECONDS,
     }
+
+
+@app.post("/api/auth/totp/verify")
+async def auth_totp_verify(
+    req: TotpVerifyRequest,
+    principal=Depends(auth_service.require_role("admin", "operator")),
+):
+    """校验一次当前主体的 TOTP（用于确认 Auth App 绑定成功）。"""
+    secret = auth_service.get_auth_store().get_totp_secret(principal.username)
+    if not secret:
+        raise HTTPException(404, {"code": "totp_not_bound", "message": "尚未绑定 Auth App"})
     try:
-        import httpx
-
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=2.0)) as client:
-            upstream = await client.request(
-                request.method,
-                target,
-                params=list(request.query_params.multi_items()),
-                content=await request.body(),
-                headers=headers,
-            )
-    except Exception as exc:
-        raise HTTPException(503, "Auth control service unavailable") from exc
-    response_headers = {}
-    content_type = upstream.headers.get("content-type")
-    if content_type:
-        response_headers["content-type"] = content_type
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        headers=response_headers,
-    )
+        ok = auth_service.get_totp_verifier().verify(secret, req.code)
+    except auth_app.TotpRateLimitedError as exc:
+        raise HTTPException(429, {"code": exc.code, "message": str(exc)}) from exc
+    except auth_app.TotpReplayError as exc:
+        raise HTTPException(401, {"code": exc.code, "message": str(exc)}) from exc
+    except auth_app.TotpError as exc:
+        raise HTTPException(400, {"code": exc.code, "message": str(exc)}) from exc
+    return {"status": "ok", "verified": bool(ok)}
 
 
-@app.api_route("/api/auth/{path:path}", methods=["GET", "POST", "PATCH", "DELETE"])
-async def proxy_auth_request(path: str, request: Request):
-    return await _proxy_control_request(request, f"/auth/{path}")
+@app.get("/api/users")
+async def list_users(request: Request = None,
+                     principal=Depends(auth_service.require_role("admin"))):
+    """列出账户（不含任何口令/密钥材料）。"""
+    require_model_api_source(request)
+    users = auth_service.get_auth_store().list_users()
+    return {"users": [
+        {"username": u.username, "role": u.role, "disabled": u.disabled,
+         "totp_bound": u.totp_bound, "created_at": u.created_at}
+        for u in users
+    ]}
 
 
-@app.api_route("/api/users/{path:path}", methods=["GET", "POST", "PATCH", "DELETE"])
-async def proxy_users_request(path: str, request: Request):
-    return await _proxy_control_request(request, f"/users/{path}")
+@app.post("/api/users")
+async def create_user(req: CreateUserRequest, request: Request = None,
+                      principal=Depends(auth_service.require_session)):
+    """创建账户。
+
+    ⚠️ **首次引导**（库中尚无账户）时，本端点**无需登录**，但**只允许创建 admin**
+    （否则全新部署无法进入）；此后必须由 admin 调用。
+    """
+    store = auth_service.get_auth_store()
+    bootstrap = store.count_users() == 0
+    if bootstrap:
+        if req.role != "admin":
+            raise HTTPException(400, {
+                "code": "bootstrap_requires_admin",
+                "message": "首次引导只允许创建 admin 账户",
+            })
+    else:
+        require_model_api_source(request)
+        if not getattr(principal, "is_admin", False):
+            raise HTTPException(403, {"code": "insufficient_role", "message": "需要 admin 角色"})
+    try:
+        rec = store.create_user(req.username, req.password, role=req.role)
+    except AuthStoreError as exc:
+        code = 409 if exc.code == "user_exists" else 400
+        raise HTTPException(code, {"code": exc.code, "message": str(exc)}) from exc
+    return {"status": "created", "username": rec.username, "role": rec.role,
+            "bootstrap": bootstrap}
 
 
-@app.api_route("/api/users", methods=["GET", "POST"])
-async def proxy_users_root(request: Request):
-    return await _proxy_control_request(request, "/users")
+@app.patch("/api/users/{username}")
+async def patch_user(username: str, req: PatchUserRequest, request: Request = None,
+                     principal=Depends(auth_service.require_role("admin"))):
+    """修改账户：角色 / 禁用 / 重置口令。禁用会**立即吊销**该用户全部登录态。"""
+    require_model_api_source(request)
+    store = auth_service.get_auth_store()
+    if store.get_user(username) is None:
+        raise HTTPException(404, {"code": "user_not_found", "message": f"用户不存在: {username}"})
+    # ⚠️ 不允许把最后一个 admin 降级或禁用，避免锁死管理面
+    if (req.role not in (None, "admin") or req.disabled is True):
+        admins = [u for u in store.list_users() if u.role == "admin" and not u.disabled]
+        if len(admins) <= 1 and any(u.username == username for u in admins):
+            raise HTTPException(400, {
+                "code": "last_admin_protected",
+                "message": "不能降级或禁用最后一个可用 admin",
+            })
+    changed = {}
+    try:
+        if req.role is not None:
+            changed["role"] = store.set_role(username, req.role)
+        if req.disabled is not None:
+            changed["disabled"] = store.set_disabled(username, bool(req.disabled))
+        if req.password is not None:
+            changed["password"] = store.set_password(username, req.password)
+    except AuthStoreError as exc:
+        raise HTTPException(400, {"code": exc.code, "message": str(exc)}) from exc
+    if not any(changed.values()):
+        raise HTTPException(400, {"code": "nothing_to_change", "message": "未提供任何可变更字段"})
+    return {"status": "updated", "username": username, "changed": changed}
+
+
+@app.delete("/api/users/{username}")
+async def delete_user(username: str, request: Request = None,
+                      principal=Depends(auth_service.require_role("admin"))):
+    """删除账户（及其 TOTP 绑定与登录态，由外键级联）。"""
+    require_model_api_source(request)
+    store = auth_service.get_auth_store()
+    admins = [u for u in store.list_users() if u.role == "admin" and not u.disabled]
+    if len(admins) <= 1 and any(u.username == username for u in admins):
+        raise HTTPException(400, {
+            "code": "last_admin_protected",
+            "message": "不能删除最后一个可用 admin",
+        })
+    if not store.delete_user(username):
+        raise HTTPException(404, {"code": "user_not_found", "message": f"用户不存在: {username}"})
+    return {"status": "deleted", "username": username}
 
 
 @app.post("/api/cluster/connect")

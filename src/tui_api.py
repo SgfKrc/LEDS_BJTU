@@ -43,11 +43,15 @@ class ApiClient:
     """与 FastAPI 后端通信的极简 REST 客户端（纯标准库）。"""
 
     def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
-                 timeout: float = 5.0, log_token: str = "") -> None:
+                 timeout: float = 5.0, log_token: str = "",
+                 auth_token: str = "") -> None:
         self.host = host
         self.port = port
         self.timeout = timeout
         self.log_token = log_token
+        #: ★ 2026-09-19（G-⑤）：登录态 Bearer token。由 TUI 的 /login 写入，
+        #   之后所有请求自动带 `Authorization: Bearer <token>`。
+        self.auth_token = auth_token
 
     @property
     def base_url(self) -> str:
@@ -71,6 +75,8 @@ class ApiClient:
             headers["Content-Type"] = "application/json"
         if with_log_token and self.log_token:
             headers["X-QLH-Log-Token"] = self.log_token
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         effective_timeout = self.timeout if timeout is None else float(timeout)
         try:
@@ -136,6 +142,8 @@ class ApiClient:
         headers = {"Accept": "*/*"}
         if with_log_token and self.log_token:
             headers["X-QLH-Log-Token"] = self.log_token
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
         req = urllib.request.Request(url, headers=headers, method="GET")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -288,6 +296,125 @@ def clear_queue(api: ApiClient) -> Dict[str, Any]:
     return _as_dict(api.post(API_PATHS["cluster_queue_clear"]))
 
 
+def cancel_queue_task(api: ApiClient, task_id: str) -> Dict[str, Any]:
+    """取消**单个**排队任务（DELETE ``/cluster/queue/task/{task_id}``，仅主节点）。
+
+    ★ 2026-09-19 补缺口 A：此前 TUI 只能整体 ``clear``，卡住的单个任务无法取消。
+    执行中的流水线任务会在当前 token step 完成后经 ``PIPELINE_ABORT`` 中止。
+    后端返回 ``{success, task_id, message}``；任务不存在/已完成时 ``success=False``。
+    """
+    path = API_PATHS["cluster_queue_task_cancel"].format(**_quoted(task_id=task_id))
+    return _as_dict(api.request("DELETE", path))
+
+
+def list_log_files(api: ApiClient) -> Dict[str, Any]:
+    """列出后端日志文件（GET ``/logs``）。★ 补缺口 B。"""
+    return _as_dict(api.get(API_PATHS["logs_list"], with_log_token=True))
+
+
+def download_log_file(api: ApiClient, filename: str, target: Path) -> Path:
+    """下载单个日志文件（GET ``/logs/download?filename=...``）。★ 补缺口 B。"""
+    query = urllib.parse.urlencode({"filename": filename})
+    return api.download(f"{API_PATHS['logs_download']}?{query}", target, with_log_token=True)
+
+
+def read_log_file(api: ApiClient, filename: str) -> Dict[str, Any]:
+    """读单个日志文件（GET ``/logs/{filename}``）。★ 补缺口 B。"""
+    path = API_PATHS["logs_file"].format(**_quoted(filename=filename))
+    return _as_dict(api.get(path, with_log_token=True))
+
+
+def delete_log_file(api: ApiClient, filename: str) -> Dict[str, Any]:
+    """删单个日志文件（DELETE ``/logs/{filename}``）——不可撤销，调用方须先确认。★ 补缺口 B。"""
+    path = API_PATHS["logs_file"].format(**_quoted(filename=filename))
+    return _as_dict(api.request("DELETE", path))
+
+
+def logs_nodes_summary(api: ApiClient) -> Dict[str, Any]:
+    """各节点日志汇总（GET ``/logs/nodes-summary``）。★ 补缺口 B。"""
+    return _as_dict(api.get(API_PATHS["logs_nodes_summary"], with_log_token=True))
+
+# ---------------------------------------------------------------- 集群高可用(E)
+def master_health(api: ApiClient) -> Dict[str, Any]:
+    """主节点健康（GET ``/cluster/master-health``）。★ 补缺口 E。"""
+    return _as_dict(api.get(API_PATHS["cluster_master_health"]))
+
+
+def transfer_logs(api: ApiClient) -> Dict[str, Any]:
+    """角色转让日志（GET ``/cluster/transfer-logs``）。★ 补缺口 E。"""
+    return _as_dict(api.get(API_PATHS["cluster_transfer_logs"]))
+
+
+def get_spare_master(api: ApiClient) -> Dict[str, Any]:
+    """查询备用主节点（GET ``/cluster/spare-master``）。★ 补缺口 E。"""
+    return _as_dict(api.get(API_PATHS["cluster_spare_master"]))
+
+
+def spare_master_logs(api: ApiClient) -> Dict[str, Any]:
+    """备用主节点操作日志（GET ``/cluster/spare-master/logs``）。★ 补缺口 E。"""
+    return _as_dict(api.get(API_PATHS["cluster_spare_master_logs"]))
+
+
+def designate_spare_master(api: ApiClient, target_node_id: str) -> Dict[str, Any]:
+    """指定备用主节点（POST ``/cluster/spare-master``，仅主节点）。
+
+    ⚠️ 变更集群角色配置：集群节点数需 >= 2，目标须在线且为 client。★ 补缺口 E。
+    """
+    return _as_dict(api.post(API_PATHS["cluster_spare_master"],
+                             {"target_node_id": target_node_id}))
+
+
+def clear_spare_master(api: ApiClient) -> Dict[str, Any]:
+    """清除备用主节点指定（DELETE ``/cluster/spare-master``，仅主节点）。★ 补缺口 E。"""
+    return _as_dict(api.request("DELETE", API_PATHS["cluster_spare_master"]))
+
+
+def transfer_master(api: ApiClient, target_node_id: str) -> Dict[str, Any]:
+    """把主节点身份转让给指定从节点（POST ``/cluster/transfer-master``，仅主节点）。
+
+    ⚠️⚠️ **高危**：转让后**双方需重启**才生效（原主转从、新主转主）。★ 补缺口 E。
+    """
+    return _as_dict(api.post(API_PATHS["cluster_transfer_master"],
+                             {"target_node_id": target_node_id}))
+
+
+def reset_master_identity(api: ApiClient) -> Dict[str, Any]:
+    """重置主节点身份标识（POST ``/cluster/reset-identity``，仅主节点）。
+
+    ⚠️⚠️ **高危**：替换主节点 SQLite 里的 MAC 记录（更换机器/网卡后用），绑定当前物理 MAC。
+    后端要求请求体 ``confirm == "reset"``；本函数已固定填入。★ 补缺口 E。
+    """
+    return _as_dict(api.post(API_PATHS["cluster_reset_identity"], {"confirm": "reset"}))
+
+
+def cancel_queue_task(api: ApiClient, task_id: str) -> Dict[str, Any]:
+    """取消**单个**排队任务（DELETE ``/cluster/queue/task/{task_id}``，仅主节点）。
+
+    ★ 2026-09-19 补缺口 A：此前 TUI 只能整体 ``clear``，卡住的单个任务无法取消。
+    执行中的流水线任务会在当前 token step 完成后经 ``PIPELINE_ABORT`` 中止。
+    后端返回 ``{success, task_id, message}``；任务不存在/已完成时 ``success=False``。
+    """
+    path = API_PATHS["cluster_queue_task_cancel"].format(**_quoted(task_id=task_id))
+    return _as_dict(api.request("DELETE", path))
+
+
+def list_log_files(api: ApiClient) -> Dict[str, Any]:
+    """列出后端日志文件（GET ``/logs``）。★ 补缺口 B。"""
+    return _as_dict(api.get(API_PATHS["logs_list"], with_log_token=True))
+
+
+def download_log_file(api: ApiClient, filename: str, target: Path) -> Path:
+    """下载单个日志文件（GET ``/logs/download?filename=...``）。★ 补缺口 B。"""
+    query = urllib.parse.urlencode({"filename": filename})
+    return api.download(f"{API_PATHS['logs_download']}?{query}", target, with_log_token=True)
+
+
+def read_log_file(api: ApiClient, filename: str) -> Dict[str, Any]:
+    """读单个日志文件（GET ``/logs/{filename}``）。★ 补缺口 B。"""
+    path = API_PATHS["logs_file"].format(**_quoted(filename=filename))
+    return _as_dict(api.get(path, with_log_token=True))
+
+
 def iter_chat_payloads(
     api: ApiClient,
     message: str,
@@ -334,3 +461,131 @@ def iter_chat_payloads(
                 payload = decode_json_event(event)
                 if payload:
                     yield payload
+
+
+# ---------------------------------------------------------- 模型资产(C) / 存储(D)
+def list_models_available(api: ApiClient) -> Dict[str, Any]:
+    """可选模型配置 + 可用引擎（GET ``/models/available``）。★ 补缺口 C。"""
+    return _as_dict(api.get(API_PATHS["models_available"]))
+
+
+def list_model_registry(api: ApiClient) -> Dict[str, Any]:
+    """用户注册的实验模型（GET ``/models/registry``）。★ 补缺口 C。"""
+    return _as_dict(api.get(API_PATHS["models_registry"]))
+
+
+def list_models_downloadable(api: ApiClient) -> Dict[str, Any]:
+    """可下载模型清单（GET ``/models/downloadable``）。★ 补缺口 C。"""
+    return _as_dict(api.get(API_PATHS["models_downloadable"]))
+
+
+def list_local_gguf(api: ApiClient) -> Dict[str, Any]:
+    """本地 GGUF 文件（GET ``/models/gguf``）。★ 补缺口 C。"""
+    return _as_dict(api.get(API_PATHS["models_gguf"]))
+
+
+def db_health(api: ApiClient) -> Dict[str, Any]:
+    """数据库健康（GET ``/db/health``）。★ 补缺口 D。"""
+    return _as_dict(api.get(API_PATHS["db_health"]))
+
+
+def storage_health(api: ApiClient) -> Dict[str, Any]:
+    """存储健康（GET ``/storage/health``）。★ 补缺口 D。"""
+    return _as_dict(api.get(API_PATHS["storage_health"]))
+
+
+# ---------------------------------------------------------------- 会话细粒度(F)
+def get_conversation(api: ApiClient, session_id: str = "default",
+                     limit: int = 200) -> Dict[str, Any]:
+    """读对话历史（GET ``/conversations?session_id=&limit=``）。★ 补缺口 F。"""
+    query = urllib.parse.urlencode({"session_id": session_id, "limit": int(limit)})
+    return _as_dict(api.get(f"{API_PATHS['conversations']}?{query}"))
+
+
+def conversation_sync_status(api: ApiClient) -> Dict[str, Any]:
+    """本地持久化状态（GET ``/conversations/sync-status``）。★ 补缺口 F。"""
+    return _as_dict(api.get(API_PATHS["conversation_sync_status"]))
+
+
+def session_info(api: ApiClient, session_id: str) -> Dict[str, Any]:
+    """单个会话元数据（GET ``/sessions/{session_id}``）。★ 补缺口 F。"""
+    path = API_PATHS["session_info"].format(**_quoted(session_id=session_id))
+    return _as_dict(api.get(path))
+
+
+def delete_turn(api: ApiClient, session_id: str, turn_index: int) -> Dict[str, Any]:
+    """删单轮（DELETE ``/sessions/{session_id}/turns/{turn_index}``）。
+
+    ⚠️ 同时删除该轮的 user + assistant 两条消息；`turn_index` 为 0-based。★ 补缺口 F。
+    """
+    path = API_PATHS["session_turn"].format(
+        **_quoted(session_id=session_id), turn_index=int(turn_index))
+    return _as_dict(api.request("DELETE", path))
+
+
+# ---------------------------------------------------- 认证与账户(G-⑤, 2026-09-19)
+def auth_capability(api: ApiClient) -> Dict[str, Any]:
+    """认证能力（GET ``/auth/capability``）：是否强制登录 / 是否处于首次引导。"""
+    return _as_dict(api.get(API_PATHS["auth_capability"]))
+
+
+def auth_login(api: ApiClient, username: str, password: str,
+               totp_code: Optional[str] = None) -> Dict[str, Any]:
+    """登录（POST ``/auth/login``）。返回含明文 ``token``；**调用方须写入 api.auth_token**。"""
+    body: Dict[str, Any] = {"username": username, "password": password}
+    if totp_code:
+        body["totp_code"] = totp_code
+    return _as_dict(api.post(API_PATHS["auth_login"], body))
+
+
+def auth_logout(api: ApiClient) -> Dict[str, Any]:
+    """注销（POST ``/auth/logout``）——服务端吊销当前 Bearer。"""
+    return _as_dict(api.post(API_PATHS["auth_logout"]))
+
+
+def auth_me(api: ApiClient) -> Dict[str, Any]:
+    """当前主体（GET ``/auth/me``）。"""
+    return _as_dict(api.get(API_PATHS["auth_me"]))
+
+
+def auth_totp_provision(api: ApiClient) -> Dict[str, Any]:
+    """生成并绑定 TOTP 密钥（POST ``/auth/totp/provision``）⇒ 返回 ``otpauth_uri``。"""
+    return _as_dict(api.post(API_PATHS["auth_totp_provision"]))
+
+
+def auth_totp_verify(api: ApiClient, code: str) -> Dict[str, Any]:
+    """校验 TOTP（POST ``/auth/totp/verify``）。"""
+    return _as_dict(api.post(API_PATHS["auth_totp_verify"], {"code": code}))
+
+
+def list_auth_users(api: ApiClient) -> Dict[str, Any]:
+    """账户列表（GET ``/users``，需 admin）。"""
+    return _as_dict(api.get(API_PATHS["auth_users"]))
+
+
+def create_auth_user(api: ApiClient, username: str, password: str,
+                     role: str = "viewer") -> Dict[str, Any]:
+    """创建账户（POST ``/users``）。**首次引导**时可无登录调用（仅允许 admin）。"""
+    return _as_dict(api.post(API_PATHS["auth_users"],
+                             {"username": username, "password": password, "role": role}))
+
+
+def patch_auth_user(api: ApiClient, username: str, *, role: Optional[str] = None,
+                    disabled: Optional[bool] = None,
+                    password: Optional[str] = None) -> Dict[str, Any]:
+    """修改账户（PATCH ``/users/{username}``）：角色 / 禁用 / 重置口令。"""
+    path = API_PATHS["auth_user"].format(**_quoted(username=username))
+    body: Dict[str, Any] = {}
+    if role is not None:
+        body["role"] = role
+    if disabled is not None:
+        body["disabled"] = bool(disabled)
+    if password is not None:
+        body["password"] = password
+    return _as_dict(api.request("PATCH", path, body))
+
+
+def delete_auth_user(api: ApiClient, username: str) -> Dict[str, Any]:
+    """删除账户（DELETE ``/users/{username}``）。"""
+    path = API_PATHS["auth_user"].format(**_quoted(username=username))
+    return _as_dict(api.request("DELETE", path))

@@ -991,6 +991,10 @@ def test_engine_host_auto_load_selects_sorted_gguf_candidate(tmp_path, monkeypat
     )
     monkeypatch.setattr(cfg, "GGUF_MODEL_PATH", str(models_dir / "missing.gguf"))
     monkeypatch.setattr(cfg, "MODEL_PATH", str(tmp_path / "missing-pytorch"))
+    # ★ 2026-09-19：`_auto_load_default_model` 现在优先按**设备画像**解析默认模型路径
+    #   （用户裁定：边缘 <1B / PC ~2B）。本用例验的是「无画像模型时回退到扫目录 +
+    #   **按文件名排序**取第一个」，故把画像解析结果置空以保持该路径可达。
+    monkeypatch.setattr(cfg, "get_active_model_paths", lambda: {})
     monkeypatch.setattr(cfg, "INFERENCE_ENGINE", "pytorch")
     monkeypatch.setattr(cfg, "QUANT_TYPE", "fp16")
     monkeypatch.setattr(cfg, "USE_COMPILE", True)
@@ -2438,8 +2442,10 @@ def test_v1_models_current_unloaded_shape_real_host():
 #    - 引擎大小写经 _check_load_engine 归一化后执行（校验与执行同值）
 # ----------------------------------------------------------------------
 def test_models_load_invalid_engine_400(client):
+    # ★ 2026-09-19：`qwen-1_8b` 已从内置列表移除 ⇒ 改用 `qwen3-0.6b`
+    #   （本用例验的是「引擎白名单」，与具体模型无关）。
     resp = client.post("/v1/models/load", json={
-        "engine": "torch", "model_id": "qwen-1_8b"})
+        "engine": "torch", "model_id": "qwen3-0.6b"})
     assert resp.status_code == 400
     assert resp.json()["error_code"] == "MODEL_ENGINE_UNSUPPORTED"
 
@@ -2448,13 +2454,13 @@ def test_models_load_engine_case_normalized(client):
     """大写的 LLAMA_CPP：白名单校验用小写归一化，执行侧也必须用小写
     （修复前校验通过但执行传原始大小写会走错引擎分支）。"""
     resp = client.post("/v1/models/load", json={
-        "engine": "LLAMA_CPP", "model_id": "qwen-1_8b"})
+        "engine": "LLAMA_CPP", "model_id": "qwen3-0.6b"})
     assert resp.status_code == 200
 
 
 def test_models_switch_invalid_engine_400(client):
     resp = client.post("/v1/models/switch", json={
-        "model_id": "qwen-1_8b", "engine": "tensorrt"})
+        "model_id": "qwen3-0.6b", "engine": "tensorrt"})
     assert resp.status_code == 400
     assert resp.json()["error_code"] == "MODEL_ENGINE_UNSUPPORTED"
 
