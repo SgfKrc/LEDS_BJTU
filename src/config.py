@@ -320,7 +320,9 @@ SPEC_STATEFUL_VERIFY = _env_bool("QLH_SPEC_STATEFUL_VERIFY", False)
 SPEC_LABEL = _env_first("QLH_SPEC_LABEL", default="投机解码外部辅助")  # 展示名
 
 # --- 多模型实验支持 (P3) ---
-ACTIVE_MODEL_ID = "qwen-1_8b"            # 当前活跃的模型 ID
+# ★ 2026-09-19：`qwen-1_8b` 已退役并从内置列表移除 ⇒ 活跃模型 ID 同步为默认模型
+#   （须与 `model_config.DEFAULT_MODEL_ID` 保持一致）。
+ACTIVE_MODEL_ID = "qwen3-0.6b"           # 当前活跃的模型 ID
 EXPERIMENTAL_MODELS_ENABLED = False      # 运行时由 CUDA 检测设置（torch.cuda.is_available()）
 
 # ============================================================

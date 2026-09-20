@@ -2438,8 +2438,10 @@ def test_v1_models_current_unloaded_shape_real_host():
 #    - 引擎大小写经 _check_load_engine 归一化后执行（校验与执行同值）
 # ----------------------------------------------------------------------
 def test_models_load_invalid_engine_400(client):
+    # ★ 2026-09-19：`qwen-1_8b` 已从内置列表移除 ⇒ 改用 `qwen3-0.6b`
+    #   （本用例验的是「引擎白名单」，与具体模型无关）。
     resp = client.post("/v1/models/load", json={
-        "engine": "torch", "model_id": "qwen-1_8b"})
+        "engine": "torch", "model_id": "qwen3-0.6b"})
     assert resp.status_code == 400
     assert resp.json()["error_code"] == "MODEL_ENGINE_UNSUPPORTED"
 
@@ -2448,13 +2450,13 @@ def test_models_load_engine_case_normalized(client):
     """大写的 LLAMA_CPP：白名单校验用小写归一化，执行侧也必须用小写
     （修复前校验通过但执行传原始大小写会走错引擎分支）。"""
     resp = client.post("/v1/models/load", json={
-        "engine": "LLAMA_CPP", "model_id": "qwen-1_8b"})
+        "engine": "LLAMA_CPP", "model_id": "qwen3-0.6b"})
     assert resp.status_code == 200
 
 
 def test_models_switch_invalid_engine_400(client):
     resp = client.post("/v1/models/switch", json={
-        "model_id": "qwen-1_8b", "engine": "tensorrt"})
+        "model_id": "qwen3-0.6b", "engine": "tensorrt"})
     assert resp.status_code == 400
     assert resp.json()["error_code"] == "MODEL_ENGINE_UNSUPPORTED"
 

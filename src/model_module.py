@@ -573,6 +573,47 @@ def _is_transformers_5_or_newer() -> bool:
         return False
 
 
+def _model_declares_remote_code(model_dir) -> bool:
+    """该模型目录的 ``config.json`` 是否声明 ``auto_map`` —— 即**真的**依赖 remote code。
+
+    ★ BUG 修复（2026-09-19，实测单变量对照）：**不能**用全局 ``TRUST_REMOTE_CODE`` 当判据。
+
+    ``TRUST_REMOTE_CODE`` 是**用户授权开关**（主仓默认 ``True``），只表示「允许加载
+    remote code」，**不代表当前这个模型真的需要它**。用它做判据会把**原生模型**一并
+    纳入 ``_premark_hf_initialized`` 的作用域 ⇒ 跳过整个 ``from_pretrained`` 窗口的
+    权重初始化 ⇒ **原生模型的 buffer（如 RoPE ``inv_freq``）不被初始化**。
+
+    实测（`qwen3-0.6b` + int4，主仓引擎，仅切换这一个变量）：
+
+    ==================  ==================  ==========================================
+    变量                权重审计            输出
+    ==================  ==================  ==========================================
+    允许 premark        全 0（健康）        ``<think>`` 重复 12 次 + ``رو``/``ismatic`` 乱码
+    **禁用 premark**    全 0（健康）        ``<think>\\n好的，用户让我用一句话自我介绍…`` 通顺
+    ==================  ==================  ==========================================
+
+    ⚠️ 注意审计查 NaN/Inf/零值**全为 0** —— 这类「值不合理但非 NaN」的损坏**逃过审计**，
+    所以必须靠**输出对照**才能发现（这正是用户报的「其他模型回复脏 token」）。
+
+    实测各模型 ``auto_map``：**只有** ``qwen-1_8b-chat`` 与 ``minicpm4-0.5b`` 声明了
+    ``auto_map``；``qwen3-0.6b`` / ``qwen3-4b`` / ``qwen3-5-2b`` / ``qwenseek-2b`` /
+    ``qwen3-5-9b`` / ``qwen3-vl-4b`` / ``deepseek-r1-*`` / ``distilqwen*`` / ``gemma4-*`` /
+    ``qwen2.5-*`` **全部是原生架构**。
+    """
+    try:
+        import json
+        import os as _os
+
+        cfg_path = _os.path.join(str(model_dir), "config.json")
+        if not _os.path.isfile(cfg_path):
+            return False
+        with open(cfg_path, encoding="utf-8") as fp:
+            cfg = json.load(fp)
+        return bool(cfg.get("auto_map"))
+    except Exception:  # noqa: BLE001 —— 读不到就按「非 remote code」保守处理
+        return False
+
+
 def _verify_and_repair_loaded_weights(model, model_path: str) -> Optional[Dict[str, Any]]:
     """★ A7/B7：transformers 5.x 下 remote-code 模型的「**权重被 `_init_weights` 覆盖**」守卫。
 
@@ -2588,8 +2629,14 @@ class ModelManager:
         #   加载窗口内**禁止** `_init_weights` 覆盖已装载权重（否则 Qwen-1.8B 会在
         #   `modeling_qwen.py:_init_weights` 里对 uint8 权重调 `normal_()` 而崩溃）。
         #   作用域收窄：仅三条件同时成立才打补丁。
+        #
+        #   ⚠️ 判据必须是 `_model_declares_remote_code(path)`（该模型自己声明了 `auto_map`），
+        #   **不能**用全局 `TRUST_REMOTE_CODE` —— 那是**用户授权开关**且主仓默认 True，
+        #   拿它当判据会把**原生模型**也纳入作用域 ⇒ 跳过其权重/buffer 初始化 ⇒ **脏 token**。
+        #   实测（qwen3-0.6b + int4，单变量对照）：允许 premark ⇒ `<think>` 重复 12 次 + 乱码；
+        #   禁用 ⇒ 输出通顺。见 `_model_declares_remote_code` 的 docstring。
         _needs_premark = (
-            TRUST_REMOTE_CODE
+            _model_declares_remote_code(path)
             and _is_transformers_5_or_newer()
             and self.quant_type in ("int4", "int8")
         )

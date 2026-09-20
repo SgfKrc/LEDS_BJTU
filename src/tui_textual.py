@@ -1709,41 +1709,73 @@ class MainScreen(Screen):
 
     # ------------------------------------------------------------ 模型页
 
+    def _models_cursor_key(self, table: DataTable) -> str:
+        """记住模型表当前光标行的 row key（空表 / 坐标越界时返回空串）。"""
+        try:
+            if not table.row_count:
+                return ""
+            row_key, _column_key = table.coordinate_to_cell_key(table.cursor_coordinate)
+            return str(row_key.value or "")
+        except Exception:  # noqa: BLE001 - 空表或坐标越界
+            return ""
+
+    def _restore_models_cursor(self, table: DataTable, key: str) -> None:
+        """把光标恢复到 row key 命中的行（**不依赖行序**）；找不到就留在原位。"""
+        if not key or not table.row_count:
+            return
+        try:
+            for index, row_key in enumerate(table.rows.keys()):
+                if str(row_key.value) == key:
+                    table.move_cursor(row=index)
+                    return
+        except Exception:  # noqa: BLE001
+            pass
+
     def fill_models(self, registry: Dict[str, Any], status: Dict[str, Any]) -> None:
         """``/models`` → ``{models: [...], active_model_id}``（19 个内置模型）。
 
         此前误用 ``/models/current``——它只返回 ``{loaded, quant_type, model_id}``
         且未加载时 ``model_id`` 为 null，于是页面显示"后端未返回模型列表"。
+
+        ★ 2026-09-19 BUG 修复：**保留光标位置**。此前 ``table.clear()`` 后重建会让光标
+        跳回第 0 行，而本页会被后台刷新反复重建；用户按视觉记忆选好行再按 ``L`` 加载，
+        实际加载的却是**列表第一项**（历史上第一位正是 ``qwen-1_8b``）——
+        对应报障「选择了其他模型光标还在第一位，然后加载成 1.8B」。
+        现在按 **row key**（而非行号）记住并恢复，行序变化也不受影响。
         """
         table = self.query_one("#models-table", DataTable)
-        table.clear()
-        self.model_rows = {}
-        if "_error" in registry:
-            table.add_row("", "[red]后端不可用[/]", "", "", "", registry["_error"])
-            return
-        rows = registry.get("models")
-        if not isinstance(rows, list) or not rows:
-            table.add_row("", "[dim]（后端未返回模型列表）[/]", "", "", "", "")
-            return
-        active = registry.get("active_model_id") or status.get("active_model_id")
-        for item in rows[:64]:
-            if not isinstance(item, dict):
-                continue
-            model_id = str(item.get("model_id") or "—")
-            if item.get("is_available") is False:
-                state = f"[yellow]不可用[/] {item.get('unavailable_reason') or ''}".strip()
-            else:
-                state = "[green]可用[/]"
-            self.model_rows[model_id] = item
-            table.add_row(
-                "[green]◆[/]" if model_id == active else "",
-                model_id,
-                str(item.get("name") or "—"),
-                _join(item.get("available_formats")),
-                str(item.get("preferred_engine") or "—"),
-                state,
-                key=model_id,  # 写操作按 row key 取模型，不依赖行序
-            )
+        previous_key = self._models_cursor_key(table)
+        try:
+            table.clear()
+            self.model_rows = {}
+            if "_error" in registry:
+                table.add_row("", "[red]后端不可用[/]", "", "", "", registry["_error"])
+                return
+            rows = registry.get("models")
+            if not isinstance(rows, list) or not rows:
+                table.add_row("", "[dim]（后端未返回模型列表）[/]", "", "", "", "")
+                return
+            active = registry.get("active_model_id") or status.get("active_model_id")
+            for item in rows[:64]:
+                if not isinstance(item, dict):
+                    continue
+                model_id = str(item.get("model_id") or "—")
+                if item.get("is_available") is False:
+                    state = f"[yellow]不可用[/] {item.get('unavailable_reason') or ''}".strip()
+                else:
+                    state = "[green]可用[/]"
+                self.model_rows[model_id] = item
+                table.add_row(
+                    "[green]◆[/]" if model_id == active else "",
+                    model_id,
+                    str(item.get("name") or "—"),
+                    _join(item.get("available_formats")),
+                    str(item.get("preferred_engine") or "—"),
+                    state,
+                    key=model_id,  # 写操作按 row key 取模型，不依赖行序
+                )
+        finally:
+            self._restore_models_cursor(table, previous_key)
 
     @work(thread=True, exclusive=True, group="modelaux")
     def load_model_aux(self) -> None:

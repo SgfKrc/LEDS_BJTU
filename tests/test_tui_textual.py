@@ -458,3 +458,54 @@ def test_route_command_updates_preference():
             assert app.routing_preference == "distributed_preferred"
 
     _run(_main())
+
+
+def test_models_table_cursor_is_preserved_across_refresh():
+    """★ 2026-09-19 回归：模型表刷新后光标必须**停在同一个 row key**。
+
+    用户报障：「选择了其他模型光标还在第一位，然后加载成 1.8B」。
+    成因：`fill_models` 每轮后台刷新都 `clear()` 后重建，光标跳回第 0 行；用户按**视觉记忆**
+    选好行再按 `L`，`action_load_model` 读的却是光标行 ⇒ 加载了**列表第一项**
+    （历史上第一位正是 `qwen-1_8b`）。修法：按 row key 记住并恢复（不依赖行序）。
+    """
+    from textual.widgets import DataTable
+
+    from tui_textual import KoakumaApp
+
+    registry = {
+        "models": [
+            {"model_id": "qwen3-0.6b", "name": "Qwen3-0.6B", "is_available": True},
+            {"model_id": "qwen3-5-2b", "name": "Qwen3.5-2B", "is_available": True},
+            {"model_id": "qwenseek-2b", "name": "QwenSeek-2B", "is_available": True},
+        ],
+        "active_model_id": "qwen3-0.6b",
+    }
+
+    async def _main():
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.5), interval=3)
+        app.api = _StubApi()
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.show_main()
+            await pilot.pause(2.0)
+            screen = app.screen
+            table = screen.query_one("#models-table", DataTable)
+
+            screen.fill_models(registry, {})
+            await pilot.pause()
+            assert table.row_count == 3
+
+            # 用户选中第 3 行（qwenseek-2b）
+            table.move_cursor(row=2)
+            await pilot.pause()
+            assert screen.selected_model_id(table) == "qwenseek-2b"
+
+            # 触发一次「后台刷新」（同一份数据重建表格）
+            screen.fill_models(registry, {})
+            await pilot.pause()
+
+            assert table.cursor_coordinate.row == 2, "刷新后光标不应跳回第一行"
+            assert screen.selected_model_id(table) == "qwenseek-2b", (
+                "刷新后仍应指向用户选择的模型（否则会误加载列表第一项）"
+            )
+
+    _run(_main())

@@ -2261,10 +2261,12 @@ class TestSwitchModel:
         assert mgr._active_model_id == "qwen2.5-7b-gguf"
 
         # 切换到模型 B（默认模型）
-        result = mgr.switch_model("qwen-1_8b")
+        # ★ 2026-09-19：`qwen-1_8b` 已从内置列表移除 ⇒ 改用当前默认模型 `qwen3-0.6b`
+        #   （同为 safetensors + GGUF 的 both 形态，测试语义不变）。
+        result = mgr.switch_model("qwen3-0.6b")
         assert result["success"] is True
-        assert result["model_id"] == "qwen-1_8b"
-        assert mgr._active_model_id == "qwen-1_8b"
+        assert result["model_id"] == "qwen3-0.6b"
+        assert mgr._active_model_id == "qwen3-0.6b"
 
     def test_switch_rollback_on_failure(self, monkeypatch):
         """加载新模型失败 → 回滚到旧模型"""
@@ -2276,8 +2278,9 @@ class TestSwitchModel:
         mgr = ModelManager()
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
-        # 第一次加载成功（模型 A = qwen-1_8b，需同时 mock 双引擎）
+        # 第一次加载成功（模型 A = qwen3-0.6b，需同时 mock 双引擎）
         # 注意: 必须设置 self.model 使 is_loaded 返回 True（否则 switch_model 跳过 unload/rollback）
+        # ★ 2026-09-19：原用 `qwen-1_8b`，该模型已从内置列表移除 ⇒ 改用默认模型 `qwen3-0.6b`。
         def fake_load_llama(*a, **kw):
             mgr._active_model_id = kw.get("model_id", mgr._active_model_id)
             mgr._engine_type = "llama_cpp"
@@ -2294,18 +2297,18 @@ class TestSwitchModel:
         monkeypatch.setattr(mgr, "_load_pytorch", fake_load_pytorch)
 
         # 首次加载模型 A
-        mgr.switch_model("qwen-1_8b")
-        assert mgr._active_model_id == "qwen-1_8b"
+        mgr.switch_model("qwen3-0.6b")
+        assert mgr._active_model_id == "qwen3-0.6b"
 
         # 切换到模型 B — 仅让 _load_llama_cpp 抛出异常
         # （qwen2.5-7b-gguf 是 GGUF-only，引擎会从 pytorch 修正为 llama_cpp）
-        # 回滚时用 pytorch 加载 qwen-1_8b，所以 _load_pytorch 仍需正常工作
+        # 回滚时用 pytorch 加载 qwen3-0.6b，所以 _load_pytorch 仍需正常工作
         monkeypatch.setattr(mgr, "_load_llama_cpp", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("模拟加载失败")))
 
         result = mgr.switch_model("qwen2.5-7b-gguf")
         assert result["success"] is False
-        # 应回滚到 qwen-1_8b
-        assert result["model_id"] == "qwen-1_8b"
+        # 应回滚到 qwen3-0.6b
+        assert result["model_id"] == "qwen3-0.6b"
         assert "已回滚" in result["error"]
 
     def test_switch_with_db_experimental_models(self, monkeypatch, tmp_path):
@@ -2424,7 +2427,9 @@ class TestP6SameModelSwitchShortCircuit:
         mgr, load_calls = self._loaded_mgr(monkeypatch)
         before = len(load_calls)
 
-        other = mgr.switch_model("qwen-1_8b")
+        # ★ 2026-09-19：原用 `qwen-1_8b`（已从内置列表移除）⇒ 改用 `qwen3-0.6b`。
+        #   `_loaded_mgr` 先加载的是 `qwen2.5-7b-gguf`，故仍是「不同模型 ⇒ 必须重新加载」。
+        other = mgr.switch_model("qwen3-0.6b")
 
         assert other["success"] is True
         assert other.get("reused") is None

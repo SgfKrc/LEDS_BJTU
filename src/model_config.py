@@ -147,25 +147,13 @@ class ModelConfig:
 #   原因：Qwen-1.8B 的 remote code（2023 年老架构）与 transformers 5.x **链式不兼容**
 #   （uint8 权重被 `_init_weights` 覆盖 ⇒ 崩溃；缺 `generation_config`；`generate` 依赖
 #   已被移除的 `super().generate`；5.x 生成栈又依赖更多新属性）—— 逐个补属性是无底洞。
-#   同体积新模型已有替代（`qwen3-0.6b` / `qwen2.5-0.5b`）⇒ 该模型**退役**。
-#   ⚠️ 模型文件与其专属代码**保留**（不删），GGUF 路径仍可正常使用。
+#   同体积新模型已有替代（`qwen3-0.6b` / `qwen2.5-0.5b`）。
+#   ⚠️ 2026-09-19 用户裁定：**从内置列表中移除该条目**（此前只标「已退役」，
+#   但仍出现在列表第一位，导致 UI 误选/误加载成 1.8B）。模型文件保留在 `models/`
+#   与其 GGUF 路径不变，只是不再作为可选项暴露。
 DEFAULT_MODEL_ID = "qwen3-0.6b"
 
 BUILTIN_MODELS: list[ModelConfig] = [
-    ModelConfig(
-        model_id="qwen-1_8b",
-        name="Qwen-1.8B-Chat（⚠️ 已退役）",
-        model_type="both",
-        model_path=os.path.join(_APP_ROOT, "models", "qwen-1_8b-chat"),
-        gguf_path=os.path.join(_APP_ROOT, "models", "Qwen-1_8B-Chat.Q4_K_M.gguf"),
-        recommended_vram_gb=3.5,
-        max_context=4096,
-        is_experimental=True,
-        huggingface_id="Qwen/Qwen-1.8B-Chat",
-        quant_types=["fp16", "int8", "int4"],
-        description="⚠️ **已退役**（2026-09-19）：其 remote code 与 transformers 5.x 链式不兼容（详见 `DEFAULT_MODEL_ID` 处注释），不再是默认模型。同体积请改用 qwen3-0.6b / qwen2.5-0.5b。GGUF (Q4_K_M 1.16GB) 路径仍可用；Safetensors+PyTorch 路径在新版 transformers 下不可用。",
-        location="bundled",
-    ),
     ModelConfig(
         model_id="qwen2.5-7b",
         name="Qwen2.5-7B-Instruct",
@@ -335,6 +323,111 @@ BUILTIN_MODELS: list[ModelConfig] = [
         quant_types=["Q4_K_M"],
         description="受管 HF bartowski GGUF + mmproj，原生 llama.cpp MTMD 图像理解；需先通过冻结记录校验。",
         location="bundled",
+    ),
+    # ============================================================
+    # ★ 2026-09-19 补注册：此前 `models/` 里已存在但**不在内置清单**的模型。
+    #   用户报障「有些模型不在列表里，比如有些 2B 模型」⇒ 逐一按磁盘实际资产登记。
+    #   路径/量化名均以磁盘为准（见 `models/*/.qlh-model-asset.json` 与 GGUF header）。
+    # ============================================================
+    ModelConfig(
+        model_id="qwen3-4b",
+        name="Qwen3-4B",
+        model_type="both",
+        model_path=os.path.join(_APP_ROOT, "models", "qwen3-4b"),
+        gguf_path=os.path.join(_APP_ROOT, "models", "qwen3-4b-gguf", "Qwen3-4B-Q4_K_M.gguf"),
+        recommended_vram_gb=4.0,
+        max_context=40960,
+        is_experimental=True,
+        huggingface_id="Qwen/Qwen3-4B",
+        quant_types=["fp16", "int8", "int4", "Q4_K_M"],
+        description="Qwen3 4B Dense（36 层 / hidden 2560 / vocab 151936，tie embeddings）。磁盘 8.04 GB safetensors + Q4_K_M GGUF。",
+        location="external",
+    ),
+    ModelConfig(
+        model_id="qwen3-5-2b",
+        name="Qwen3.5-2B",
+        model_type="both",
+        model_path=os.path.join(_APP_ROOT, "models", "qwen3-5-2b"),
+        gguf_path=os.path.join(_APP_ROOT, "models", "qwen3-5-2b-gguf", "qwen35-2b-Q4_K_M.gguf"),
+        recommended_vram_gb=3.0,
+        max_context=262144,
+        is_experimental=True,
+        huggingface_id="Qwen/Qwen3.5-2B",
+        quant_types=["fp16", "int8", "int4", "Q4_K_M"],
+        description="Qwen3.5 2B（架构 qwen3_5，24 层 / hidden 2048 / vocab 248320，tie embeddings）。磁盘 4.55 GB safetensors + Q4_K_M GGUF。",
+        location="external",
+    ),
+    ModelConfig(
+        model_id="qwen3-5-9b",
+        name="Qwen3.5-9B",
+        model_type="both",
+        model_path=os.path.join(_APP_ROOT, "models", "qwen3-5-9b"),
+        gguf_path=os.path.join(_APP_ROOT, "models", "qwen3-5-9b-gguf", "Qwen3.5-9B-Q4_K_M.gguf"),
+        recommended_vram_gb=8.0,
+        max_context=262144,
+        is_experimental=True,
+        huggingface_id="Qwen/Qwen3.5-9B",
+        quant_types=["fp16", "int8", "int4", "Q4_K_M"],
+        description="Qwen3.5 9B（架构 qwen3_5，32 层 / hidden 4096 / 不共享词表）。磁盘 19.31 GB safetensors + Q4_K_M GGUF（INT4 需 8GB+ VRAM）。",
+        location="external",
+    ),
+    ModelConfig(
+        model_id="qwen3-vl-4b-instruct",
+        name="Qwen3-VL-4B-Instruct（多模态）",
+        model_type="both",
+        model_path=os.path.join(_APP_ROOT, "models", "qwen3-vl-4b-instruct"),
+        gguf_path=os.path.join(
+            _APP_ROOT, "models", "qwen3-vl-4b-instruct-gguf", "Qwen3VL-4B-Instruct-Q4_K_M.gguf"
+        ),
+        recommended_vram_gb=4.0,
+        max_context=262144,
+        is_experimental=True,
+        huggingface_id="Qwen/Qwen3-VL-4B-Instruct",
+        quant_types=["fp16", "int8", "int4", "Q4_K_M"],
+        description="⚠️ **多模态（视觉）**：与 `gemma4-native` 同定位。磁盘含 `mmproj-Qwen3VL-4B-Instruct-F16.gguf` 视觉投影件，需 llama.cpp MTMD 路径。架构 qwen3_vl / 36 层 / hidden 2560。",
+        location="external",
+    ),
+    ModelConfig(
+        model_id="qwenseek-2b",
+        name="QwenSeek-2B",
+        model_type="both",
+        model_path=os.path.join(_APP_ROOT, "models", "qwenseek-2b"),
+        gguf_path=os.path.join(_APP_ROOT, "models", "qwenseek-2b-q4_k_m.gguf"),
+        recommended_vram_gb=3.0,
+        max_context=262144,
+        is_experimental=True,
+        huggingface_id="",
+        quant_types=["fp16", "int8", "int4", "Q4_K_M"],
+        description="QwenSeek 2B（架构 qwen3_5_text，24 层 / hidden 2048 / vocab 248320，tie embeddings）。磁盘 3.76 GB safetensors + Q4_K_M GGUF（1.27 GB）。",
+        location="external",
+    ),
+    ModelConfig(
+        model_id="gemma4-12b-safetensors",
+        name="Gemma 4 12B（Safetensors 多模态）",
+        model_type="safetensors",
+        model_path=os.path.join(_APP_ROOT, "models", "gemma4-12b-safetensors"),
+        gguf_path="",
+        recommended_vram_gb=12.0,
+        max_context=262144,
+        is_experimental=True,
+        huggingface_id="google/gemma-4-12b-it",
+        quant_types=["fp16", "int8", "int4"],
+        description="⚠️ **多模态**：与 `gemma4-native`（GGUF+MTMD）同定位的 safetensors 版本。架构 gemma4_unified / 48 层 / hidden 3840 / vocab 262144。磁盘 23.92 GB ⇒ INT4 建议 12GB+ VRAM。",
+        location="external",
+    ),
+    ModelConfig(
+        model_id="qwen35-9b-dsv4flash",
+        name="Qwen3.5-9B-DS v4 Flash（GGUF）",
+        model_type="gguf",
+        model_path="",
+        gguf_path=os.path.join(_APP_ROOT, "models", "qwen35-9b-dsv4flash-q4_k_m.gguf"),
+        recommended_vram_gb=7.5,
+        max_context=32768,
+        is_experimental=True,
+        huggingface_id="",
+        quant_types=["Q4_K_M"],
+        description="Qwen3.5 9B 的 DeepSeek-V4-Flash 蒸馏版（GGUF header：arch=qwen35, size_label=9.0B）。仅 Q4_K_M GGUF 形态，5.63 GB。",
+        location="external",
     ),
 ]
 
