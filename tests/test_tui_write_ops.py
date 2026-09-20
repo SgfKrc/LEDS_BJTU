@@ -340,6 +340,21 @@ def test_domain_screens_route_functional_operations_to_real_paths():
             assert await _wait_for(pilot, lambda: api.find("/cluster/join/request", "POST") is not None)
             assert api.find("/cluster/join/request", "POST")["body"]["master_endpoint"] == "100.100.52.106:8888"
 
+            screen.submit_cluster_join_grant({
+                "request_code": "qlhjoinreq1.fixture",
+                "otp_code": "123456",
+                "ttl_seconds": "300",
+            })
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press("y")
+            assert await _wait_for(pilot, lambda: api.find("/cluster/join/grant", "POST") is not None)
+            assert api.find("/cluster/join/grant", "POST")["body"] == {
+                "request_code": "qlhjoinreq1.fixture",
+                "otp_code": "123456",
+                "ttl_seconds": 300,
+            }
+
             screen.submit_cluster_join_consume({"grant_code": "qlhjoin1.fixture"})
             await pilot.pause()
             assert isinstance(app.screen, ConfirmScreen)

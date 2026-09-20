@@ -59,6 +59,25 @@ class ApiClient:
 
         return build_url("http", self.host, self.port)
 
+    def _request_headers(self, *, accept: str = "application/json",
+                         content_type: bool = False,
+                         with_log_token: bool = False) -> Dict[str, str]:
+        """Build headers shared by REST, downloads, and streaming requests.
+
+        The API source boundary is the direct TCP peer observed by the
+        backend; it is intentionally not represented by a caller-controlled
+        source header.  Authentication and optional log credentials are the
+        only client headers that need to be propagated here.
+        """
+        headers = {"Accept": accept}
+        if content_type:
+            headers["Content-Type"] = "application/json"
+        if with_log_token and self.log_token:
+            headers["X-QLH-Log-Token"] = self.log_token
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
+        return headers
+
     # ------------------------------------------------------------ 底层请求
 
     def _request_url(self, method: str, url: str, body=None, params=None,
@@ -69,14 +88,12 @@ class ApiClient:
             if qs:
                 url = url + ("&" if "?" in url else "?") + qs
         data = None
-        headers = {"Accept": "application/json"}
+        headers = self._request_headers(
+            content_type=body is not None,
+            with_log_token=with_log_token,
+        )
         if body is not None:
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-        if with_log_token and self.log_token:
-            headers["X-QLH-Log-Token"] = self.log_token
-        if self.auth_token:
-            headers["Authorization"] = f"Bearer {self.auth_token}"
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         effective_timeout = self.timeout if timeout is None else float(timeout)
         try:
@@ -139,11 +156,9 @@ class ApiClient:
         if normalized.startswith("/api/"):
             normalized = normalized[4:]
         url = self.base_url + "/api" + normalized
-        headers = {"Accept": "*/*"}
-        if with_log_token and self.log_token:
-            headers["X-QLH-Log-Token"] = self.log_token
-        if self.auth_token:
-            headers["Authorization"] = f"Bearer {self.auth_token}"
+        headers = self._request_headers(
+            accept="*/*", with_log_token=with_log_token,
+        )
         req = urllib.request.Request(url, headers=headers, method="GET")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -448,19 +463,39 @@ def iter_chat_payloads(
     req = urllib.request.Request(
         url,
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+        headers=api._request_headers(
+            accept="text/event-stream", content_type=True,
+        ),
         method="POST",
     )
     decoder = SSEDecoder()
-    with urllib.request.urlopen(req, timeout=read_timeout) as resp:
-        while True:
-            chunk = resp.read(4096)
-            if not chunk:
-                break
-            for event in decoder.feed(chunk):
-                payload = decode_json_event(event)
-                if payload:
-                    yield payload
+    try:
+        with urllib.request.urlopen(req, timeout=read_timeout) as resp:
+            while True:
+                chunk = resp.read(4096)
+                if not chunk:
+                    break
+                for event in decoder.feed(chunk):
+                    payload = decode_json_event(event)
+                    if payload:
+                        yield payload
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+            parsed = json.loads(raw) if raw else {}
+            detail = parsed.get("detail", raw) if isinstance(parsed, dict) else raw
+            if isinstance(detail, dict):
+                detail = detail.get("message") or json.dumps(detail, ensure_ascii=False)
+        except Exception:  # noqa: BLE001 - preserve the HTTP status on bad bodies
+            detail = ""
+        raise ApiError(
+            "HTTP %d: %s" % (exc.code, detail or exc.reason), status=exc.code,
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise ApiError("无法连接后端（SSE）：%s" % getattr(exc, "reason", exc)) from exc
+    except OSError as exc:
+        raise ApiError("SSE 网络错误: %s" % exc) from exc
 
 
 # ---------------------------------------------------------- 模型资产(C) / 存储(D)
