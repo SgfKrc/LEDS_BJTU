@@ -1,13 +1,15 @@
-[submodule "tools/docagent"]
-	path = tools/docagent
-	url = https://github.com/SgfKrc/qlh-docagent.git
-# ★ 2026-09-20：`tools/reasonix-codex-bridge` **不再是子模块**。
-#   两个桥接器（reasonix-codex-bridge / dsh-codex-bridge）改为**工作区独立目录**：
-#   各自是独立 git 仓（本地 clone），**不进主仓**，指针已剔除（见 .gitignore）。
-#   `dsh-codex-bridge` vendor 了桥接器运行时与测试（DSH 侧自包含）。
-[submodule "packages/spawnledger"]
-	path = packages/spawnledger
-	url = https://github.com/SgfKrc/spawnledger.git
+# QLH 主仓子模块（**只保留与主仓功能直接相关者**）
+#
+# ★ 2026-09-20 用户裁定：开发/实验工具**不再作为子模块**，改为**工作区独立目录**
+#   （各自独立 clone，`.gitignore` 覆盖，不进主仓）：
+#     - tools/docagent            → https://github.com/SgfKrc/qlh-docagent.git
+#     - tools/reasonix-codex-bridge → https://github.com/SgfKrc/reasonix-codex-bridge.git
+#     - tools/dsh-codex-bridge    → https://github.com/SgfKrc/dsh-codex-bridge.git（孪生）
+#     - tools/toolbox             → https://github.com/SgfKrc/qlh-toolbox.git
+#     - packages/spawnledger      → https://github.com/SgfKrc/spawnledger.git
+#   整个 `tools/` 与 `packages/` 目录已从主仓裁掉（只留本地）。
+#
+# 下列四项是**与主仓功能直接相关**的子模块（引擎/发行/产品壳），继续保留：
 [submodule "harness_workbench"]
 	path = harness_workbench
 	url = https://github.com/SgfKrc/Koakumix.git
@@ -17,9 +19,6 @@
 [submodule "packaging"]
 	path = packaging
 	url = https://github.com/SgfKrc/qlh-release.git
-[submodule "tools/toolbox"]
-	path = tools/toolbox
-	url = https://github.com/SgfKrc/qlh-toolbox.git
 [submodule "android"]
 	path = android
 	url = https://github.com/SgfKrc/qlh-android.git

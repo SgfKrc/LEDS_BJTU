@@ -209,7 +209,10 @@ PRESETS: list[dict[str, Any]] = [
     },
 ]
 _PRESETS_BY_ID = {p["id"]: p for p in PRESETS}
-_PIN_MANIFEST_PATH = Path(__file__).resolve().parents[1] / "docs" / "agent_tool" / "model-artifacts" / "remote-model-pins-2026-09-09.json"
+# ★ 2026-09-20：pin manifest 原在 `docs/agent_tool/model-artifacts/`，而 `docs/agent_tool/`
+#   是**开发工具**（已从主仓裁掉、只留本地）⇒ 该文件是**运行时数据**，已随迁到
+#   `fixtures/model-artifacts/`（入库）。**不要**再指回 `docs/agent_tool/`。
+_PIN_MANIFEST_PATH = Path(__file__).resolve().parents[1] / "fixtures" / "model-artifacts" / "remote-model-pins-2026-09-09.json"
 _PINNED_PRESET_IDS = {
     "qwen2.5-0.5b-instruct",
     "qwen3-0.6b",

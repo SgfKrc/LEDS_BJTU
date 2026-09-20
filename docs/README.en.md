@@ -231,7 +231,7 @@ The main project keeps no image-generation runtime or assets; image generation b
 | `requirements*.txt` / `pytest.ini` / `pyrightconfig.json` / `reasonix.toml` | Dependency lists and tool configuration |
 | `models/`, `chat_history/`, `dist/`, `build/`, `test-results/`, `logs/`, `_to_delete/` | Local artifacts or archive areas, not in Git (`logs/`, `_to_delete/` are gitignored) |
 
-There are 8 external submodules, all registered in `.gitmodules`:
+**Submodules (directly tied to main-repo functionality — 4)** — declared in `.gitmodules`, fetched by `git submodule update --init`:
 
 | Submodule path | Remote |
 | --- | --- |
@@ -239,13 +239,22 @@ There are 8 external submodules, all registered in `.gitmodules`:
 | `frontend_cybergothic/` | `qlh-shell` |
 | `packaging/` | `qlh-release` |
 | `harness_workbench/` | `Koakumix` |
-| `packages/spawnledger/` | `spawnledger` |
-| `tools/docagent/` | `qlh-docagent` |
-| `tools/toolbox/` | `qlh-toolbox` |
 
-> **Note (2026-09-20)** — the two bridges (`tools/reasonix-codex-bridge/`, `tools/dsh-codex-bridge/`)
-> are **workspace-local directories, not submodules** any more. They are gitignored and cloned
-> separately; they are intentionally absent from the submodule table above.
+**Related repositories (dev/experiment tooling — no longer submodules as of 2026-09-20)** — clone them
+**separately** into the workspace; they are gitignored and **intentionally kept out of the main repository**:
+
+| Local directory | Remote | Purpose |
+| --- | --- | --- |
+| `tools/docagent/` | `qlh-docagent` | Documentation maintenance scanner |
+| `tools/toolbox/` | `qlh-toolbox` | Tool collection |
+| `tools/reasonix-codex-bridge/` | `reasonix-codex-bridge` | Reasonix ↔ Codex controlled bridge (MCP + ACP) |
+| `tools/dsh-codex-bridge/` | `dsh-codex-bridge` | Twin project (DSH side, vendors the bridge runtime) |
+| `packages/spawnledger/` | `spawnledger` | Process-ownership ledger |
+
+> **Note** — `tools/`, `packages/`, `logs/`, `docs/agent_tool/` and the one-off experiment scripts under
+> `scripts/` have been **dropped from the repository** (kept locally only). Scripts that are **imported by
+> `src/` or by tests**, plus onboarding/pipeline tools (`setup_envs.py`, `cut_layers.py`,
+> `run_test_channels.py`, …), remain tracked.
 
 `src/` grouped by responsibility (for navigation; per-module interfaces are in [Module Interfaces](模块接口说明.md)):
 
@@ -260,7 +269,7 @@ There are 8 external submodules, all registered in `.gitmodules`:
 | Models and assets | `model_config.py`, `model_host.py`, `model_sync.py`, `model_downloader.py`, `model_download_jobs.py`, `model_search.py`, `model_registry_validation.py`, `model_runtime_contracts.py`, `local_model_assets.py` |
 | Task graph and workflows | `task_graph*.py`, `task_journal.py`, `task_provider.py`, `task_worker_*.py`, `graph_orchestrator.py` |
 | TUI and interaction | `tui_textual.py`, `tui_api.py`, `tui_shared.py`, `tui_sse.py`, `tui_backend.py`, `tui_commands.py` |
-| Retrieval, devices and soak | `rag_store.py`, `rag_embedding.py`, `rag_ann.py`, `rag_quality.py`, `device_profiler.py`, `provider_soak.py` |
+| Devices and soak | `device_profiler.py`, `provider_soak.py`; RAG is externalized to `harness_workbench`/Koakumix |
 
 ## Quick Start
 

@@ -145,3 +145,65 @@ frontend_cybergothic/
 tools/reasonix-codex-bridge/
 tools/dsh-codex-bridge/
 
+# ============================================================================
+# ★ 2026-09-20 主仓瘦身（用户裁定）：**开发/实验工具与运行时产物不入库，只留本地**
+# ============================================================================
+# 整目录裁掉：
+#   tools/            —— 开发工具（docagent / toolbox / model_tools 补丁 / modelscope 下载等）
+#                        其中 tools/docagent、tools/toolbox 原为子模块，指针已剔除
+#   packages/         —— spawnledger（原子模块，指针已剔除）
+#   logs/             —— 运行时日志产物（代码里的 /api/logs/* 路由不受影响）
+#   docs/agent_tool/  —— 文档审计工具；**注意**其 model-artifacts/remote-model-pins-*.json
+#                        是运行时数据，已随迁到 fixtures/model-artifacts/（仍入库）
+tools/
+packages/
+logs/
+docs/agent_tool/
+
+# scripts/ —— 只裁「一次性实验/基准」，**保留**基础设施与常用工具。
+# 策略：先整体忽略，再白名单放回下列必需项（被 src/ import 的、被测试 import 的、
+# 以及上手/流水线要用到的工具）。
+scripts/*
+!scripts/model_tools/
+!scripts/model_tools.py
+!scripts/android_validation.py
+!scripts/edge_preflight.py
+!scripts/experiment_core/
+!scripts/experiment_gemma_judge_real.py
+!scripts/llama_pc_rpc.py
+!scripts/llama_relay_probe.py
+!scripts/llama_relay_xframe_probe.py
+!scripts/llama_rpc_sim.py
+!scripts/setup_envs.py
+!scripts/setup_test_env.py
+!scripts/setup_qwen3_sidecar_env.py
+!scripts/setup_gemma4_pipeline_env.py
+!scripts/init-submodules.bat
+!scripts/init-submodules.sh
+!scripts/run_test_channels.py
+!scripts/run_simulation.py
+!scripts/startup_matrix.py
+!scripts/test_classification_report.py
+!scripts/edge_sim_setup.sh
+!scripts/cut_layers.py
+!scripts/quantize_model.py
+!scripts/build_llama_quantize.py
+!scripts/inspect_repo_state.py
+!scripts/export_model_catalog.py
+!scripts/qlh_log.py
+!scripts/cluster_node_preflight.py
+!scripts/ipv6_dual_stack_gate.py
+!scripts/check_doc_links.py
+!scripts/find_broken_links.py
+!scripts/fix_broken_links.py
+!scripts/check_readme_l10n.py
+
+# 根目录：过时日志 / 备份（2026-09-20 剔除）
+# ⚠️ `bjtu.bat` / `bjtu.sh` **保留** —— 它们仍是活跃入口：
+#    `tests/test_qlh_cli.py` 与 `tests/test_test_environment_scripts.py` 直接读它们，
+#    `docs/TUI使用指南.md` 等多处引用。原先以为它是「旧项目名遗留」是**误判**。
+runtime-master*.log
+surface-ssh*.log
+.gitignore_bak
+
+
