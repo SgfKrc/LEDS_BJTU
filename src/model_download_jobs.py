@@ -65,26 +65,9 @@ _LOCK = threading.Lock()
 # 每项枚举了双源 repo、默认文件名量化、resource_gate 与元数据。
 # NOTE: 真实 repo id / 受控 SHA 需逐项核实后再启用严格校验（见 docs 计划）。
 PRESETS: list[dict[str, Any]] = [
-    {
-        "id": "qwen-1_8b-gguf-q4",
-        "display": "Qwen-1.8B-Chat Q4_K_M (GGUF)",
-        "kind": "gguf",
-        "default_engine": "llama_cpp",
-        "default_quant": "Q4_K_M",
-        "default_model_id": "qwen-1_8b",
-        "default_target": "qwen-1_8b-chat",
-        "hf_repo": "Qwen/Qwen-1.8B-Chat",
-        "ms_path": "",
-        "file_pattern": "Qwen-1_8B-Chat.Q4_K_M.gguf",
-        "expected_sha256": "",
-        "resource_gate": {
-            "min_ram_gb": 4.0,
-            "min_vram_gb": 0.0,
-            "min_disk_gb": 2.0,
-            "allow_cpu": True,
-        },
-        "description": "Qwen-1.8B 的 4-bit GGUF，CPU 可跑，适合低显存环境。",
-    },
+    # ★ 2026-09-19：原 `qwen-1_8b-gguf-q4` 预设**已移除**（用户裁定）——该模型已退役
+    #   并从内置列表移除，保留下载入口只会让用户下到一个跑不起来的模型。
+    #   模型文件与 GGUF 仍在 `models/` 保留，只是不再提供下载预设。
     {
         "id": "qwen3-3_8b-gguf-q4",
         "display": "Qwen3-3.8B Q4_K_M (GGUF)",
