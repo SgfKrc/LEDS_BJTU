@@ -54,9 +54,9 @@ qlh models
 | 设备 | G 按画像和评分自动配置；H 选择 GPU；查看 CPU、内存、磁盘、GPU 和档位建议 |
 | 设置 | W 读取当前设置并编辑完整 JSON 后写回用户设置 |
 
-模型下载任务、模型搜索和日志导出在后台线程执行，避免阻塞终端；远程日志操作使用 `--log-token` 传递 `X-QLH-Log-Token`。
+模型下载任务、模型搜索和日志导出在后台线程执行，避免阻塞终端；远程日志操作使用 `--log-token` 传递 `X-QLH-Log-Token`。TUI 登录后，REST、下载和 SSE 流式聊天均使用内存中的 `Authorization: Bearer <token>`；请求来源不由客户端自报，后端按直接 TCP peer 地址判断。
 
-入群请求码生成和授权消费已在节点屏接入。主节点签发授权仍必须经过后端 Auth App/TOTP 控制面；控制面未配置时后端会拒绝签发，TUI 不会伪造 `auth_verified`。
+入群请求码生成、主节点授权签发和授权消费均已在节点屏接入：`B` 生成请求码，主节点按 `O` 输入当前 Auth App/TOTP 一次性验证码和 TTL 后签发，`K` 消费授权。签发端点只接受已登录管理员的真实 OTP；未绑定 Auth App/TOTP 时后端保持 `501 auth_control_plane_unavailable`。
 
 ### 调试兜底（非功能验收）
 
