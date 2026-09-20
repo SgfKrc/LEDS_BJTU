@@ -218,10 +218,12 @@ def test_v2_hello_negotiates_and_reports_control_plane_only():
 
     master_status = coordinator.status(role="master")
     worker_status = worker.status(role="client")
+    # ★ 2026-09-20：协议升到 v3（层段）。`begin_worker_hello` 用默认 min/max ⇒ 协商出 3。
+    #   本用例验的是「协商成功 + 控制面已连、数据面未接」，与具体版本号无关。
     assert ack.payload == {
         "coordinator_node_id": "master",
         "accepted": True,
-        "selected_version": 2,
+        "selected_version": 3,
         "reason_code": "",
     }
     assert master_status["control_plane_connected"] is True
@@ -229,7 +231,7 @@ def test_v2_hello_negotiates_and_reports_control_plane_only():
     assert master_status["workers"][0]["capabilities"] == _capabilities()
     assert master_status["adapter_connected"] is False
     assert master_status["task_dispatch_enabled"] is False
-    assert worker_status["coordinator"]["selected_version"] == 2
+    assert worker_status["coordinator"]["selected_version"] == 3
 
 
 def test_android_full_worker_provider_requires_resource_gate_and_exact_model():

@@ -168,8 +168,10 @@ def test_protocol_status_exposes_n2_transport_without_claiming_stage_readiness()
     assert status["schema_ready"] is True
     assert status["adapter_connected"] is False
     assert status["transport"] == "existing_tcp_length_prefixed"
-    assert status["preferred_version"] == 2
-    assert status["max_version"] == 2
+    # ★ 2026-09-20：协议升到 v3（层段承载）。本用例验的是「暴露 N2 传输状态、
+    #   不谎称 stage 就绪」，与具体版本号无关。
+    assert status["preferred_version"] == 3
+    assert status["max_version"] == 3
     assert status["admission_state"] == "n2_4_experiment_disabled"
 
 
