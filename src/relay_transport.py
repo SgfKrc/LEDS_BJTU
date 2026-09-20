@@ -9,6 +9,7 @@ production admission gate.
 from __future__ import annotations
 
 import ipaddress
+import logging
 import socket
 import struct
 import subprocess
@@ -26,6 +27,47 @@ RELAY_DEFAULT_MAX_PAYLOAD = 256 * 1024 * 1024
 _HEADER = struct.Struct("!4sBBHIIQ")
 _TOKEN = struct.Struct("<i")
 _COUNT = struct.Struct("<i")
+_RELAY_ERROR_PAYLOAD_LIMIT = 64
+
+logger = logging.getLogger(__name__)
+
+# These are the only values allowed to cross the Relay trust boundary.  The
+# existing protocol codes remain stable; implementation failures are grouped
+# so exception class names and messages never become wire data.
+RELAY_REMOTE_ERROR = "remote_error"
+RELAY_PROTOCOL_ERROR = "relay_protocol_error"
+RELAY_TRANSPORT_ERROR = "relay_transport_error"
+RELAY_INTERNAL_ERROR = "relay_internal_error"
+RELAY_RUNNER_ERROR = "runner_failed"
+_RELAY_ERROR_CODES = frozenset({
+    "client_closed",
+    "connection_closed_mid_frame",
+    "hidden_frame_required",
+    "hidden_payload_size_mismatch",
+    "invalid_close_ack",
+    "invalid_close_frame",
+    "invalid_frame_header",
+    "invalid_hidden_shape",
+    "invalid_token_response",
+    "invalid_transport_limits",
+    "non_loopback_bind_rejected",
+    "non_loopback_endpoint_rejected",
+    "payload_too_large",
+    "request_sequence_mismatch",
+    "response_sequence_mismatch",
+    "runner_closed_mid_response",
+    "runner_failed",
+    "runner_not_available",
+    "runner_pipe_missing",
+    "token_count_exceeds_limit",
+    "unknown_frame_kind",
+    "unsupported_flags",
+    "unsupported_version",
+    RELAY_INTERNAL_ERROR,
+    RELAY_PROTOCOL_ERROR,
+    RELAY_REMOTE_ERROR,
+    RELAY_TRANSPORT_ERROR,
+})
 
 
 class RelayFrameKind(IntEnum):
@@ -129,8 +171,17 @@ def recv_frame(
 
 def _decode_token(frame: RelayFrame, expected_sequence: int) -> int:
     if frame.kind == RelayFrameKind.ERROR:
-        message = frame.payload.decode("utf-8", errors="replace") or "remote_error"
-        raise RelayProtocolError(message)
+        if frame.sequence != expected_sequence:
+            raise RelayProtocolError("response_sequence_mismatch")
+        if len(frame.payload) > _RELAY_ERROR_PAYLOAD_LIMIT:
+            raise RelayProtocolError(RELAY_REMOTE_ERROR)
+        try:
+            code = frame.payload.decode("ascii")
+        except UnicodeDecodeError:
+            code = RELAY_REMOTE_ERROR
+        if code not in _RELAY_ERROR_CODES:
+            code = RELAY_REMOTE_ERROR
+        raise RelayProtocolError(code)
     if frame.sequence != expected_sequence:
         raise RelayProtocolError("response_sequence_mismatch")
     if frame.kind != RelayFrameKind.TOKEN or frame.n_tokens != 1 or len(frame.payload) != 4:
@@ -269,8 +320,15 @@ class StdioRelayRunner:
             self._process.wait(timeout=5)
 
 
-def _send_error(sock: socket.socket, sequence: int, reason: str) -> None:
-    payload = str(reason).encode("utf-8", errors="replace")[:1024]
+def _safe_error_code(value: BaseException | str, fallback: str) -> str:
+    candidate = getattr(value, "code", None) or str(value)
+    return candidate if candidate in _RELAY_ERROR_CODES else fallback
+
+
+def _send_error(sock: socket.socket, sequence: int, code: str) -> None:
+    payload = _safe_error_code(code, RELAY_INTERNAL_ERROR).encode("ascii")
+    if len(payload) > _RELAY_ERROR_PAYLOAD_LIMIT:
+        payload = RELAY_INTERNAL_ERROR.encode("ascii")
     send_frame(sock, RelayFrame(RelayFrameKind.ERROR, sequence, payload=payload))
 
 
@@ -298,7 +356,11 @@ def serve_relay_connection(
             if frame.kind == RelayFrameKind.CLOSE:
                 if frame.n_tokens != 0 or frame.payload:
                     raise RelayProtocolError("invalid_close_frame")
-                runner.close()
+                try:
+                    runner.close()
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Relay runner close failed: code=%s", RELAY_RUNNER_ERROR)
+                    raise RelayProtocolError(RELAY_RUNNER_ERROR) from exc
                 send_frame(
                     sock,
                     RelayFrame(RelayFrameKind.TOKEN, sequence, n_tokens=1, payload=_TOKEN.pack(-1)),
@@ -311,7 +373,13 @@ def serve_relay_connection(
             if len(frame.payload) != expected_hidden_bytes(frame.n_tokens, width):
                 raise RelayProtocolError("hidden_payload_size_mismatch")
 
-            token = int(runner.request_token(frame.payload, n_tokens=frame.n_tokens))
+            try:
+                token = int(runner.request_token(frame.payload, n_tokens=frame.n_tokens))
+            except RelayProtocolError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Relay runner request failed: code=%s", RELAY_RUNNER_ERROR)
+                raise RelayProtocolError(RELAY_RUNNER_ERROR) from exc
             if token < 0:
                 raise RelayProtocolError("runner_failed")
             send_frame(
@@ -322,26 +390,29 @@ def serve_relay_connection(
             tokens += frame.n_tokens
             payload_bytes += len(frame.payload)
             sequence += 1
-    except (OSError, RelayProtocolError) as exc:
-        reason = str(exc) or exc.__class__.__name__
+    except RelayProtocolError as exc:
+        code = _safe_error_code(exc, RELAY_PROTOCOL_ERROR)
+        logger.warning("Relay protocol failure: code=%s detail=%s", code, str(exc))
         try:
-            _send_error(sock, sequence, reason)
+            _send_error(sock, sequence, code)
         except OSError:
             pass
-        return RelayBridgeResult(frames, tokens, payload_bytes, False, reason)
+        return RelayBridgeResult(frames, tokens, payload_bytes, False, code)
+    except OSError as exc:
+        logger.warning("Relay transport failure: code=%s detail=%s", RELAY_TRANSPORT_ERROR, exc)
+        try:
+            _send_error(sock, sequence, RELAY_TRANSPORT_ERROR)
+        except OSError:
+            pass
+        return RelayBridgeResult(frames, tokens, payload_bytes, False, RELAY_TRANSPORT_ERROR)
     except Exception as exc:  # noqa: BLE001
-        # ★ 2026-09-19（CORE-RELAY-XFRAME-01 准入：弱网/断线 fail-closed）：
-        #   **未预期异常也不得让客户端挂死**。契约内的 `StdioRelayRunner` 只抛
-        #   `RelayProtocolError`/`OSError`，但本函数是**信任边界**：任何异常都必须
-        #   转成 ERROR 帧，否则对端会阻塞在 `recv` 上直到自身超时（或永久挂起）。
-        #   实测：runner 抛出 `RuntimeError` 时，旧实现会让客户端一直等（测试挂起）。
-        #   ⚠️ 这里**不吞掉**信息：异常类型与文本写进 reason 一并回给对端。
-        reason = f"{exc.__class__.__name__}: {exc}"[:200]
+        # Never put exception class names or messages on the Relay wire.
+        logger.exception("Relay internal failure: code=%s", RELAY_INTERNAL_ERROR)
         try:
-            _send_error(sock, sequence, reason)
+            _send_error(sock, sequence, RELAY_INTERNAL_ERROR)
         except OSError:
             pass
-        return RelayBridgeResult(frames, tokens, payload_bytes, False, reason)
+        return RelayBridgeResult(frames, tokens, payload_bytes, False, RELAY_INTERNAL_ERROR)
 
 
 def open_loopback_listener(host: str, port: int, *, backlog: int = 1) -> socket.socket:
