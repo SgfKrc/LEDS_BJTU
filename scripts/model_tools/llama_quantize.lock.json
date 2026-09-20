@@ -6,8 +6,30 @@
     "revision": "47e1de77aa0f06bf73cfd8c5281d95979f89fcbe",
     "license": "MIT"
   },
-  "source": "../qlh-android/app/src/main/cpp/llama.cpp",
+  "revision_local": "cb5f7b7a8539108f5680b789afbe9e368d297c25",
+  "revision_local_note": "★ 2026-09-20：QLH 在 submodule 内提交的补丁 commit（detached HEAD）。`upstream.revision` 仍是它基于的上游 commit，用于溯源；submodule 的 HEAD 应当等于本字段。若把补丁改为「只在工作树、不提交」的形态，删掉本字段即可回落到只认 upstream.revision。",
+  "source": "android/app/src/main/cpp/llama.cpp",
   "cmake_target": "llama-quantize",
+  "patches": [
+    {
+      "id": "legacy-qwen-epsilon",
+      "path": "scripts/model_tools/patches/llama-cpp-converter-qwen-eps.patch",
+      "target": "conversion/base.py",
+      "marker": "QLH patch (2026-08-16): legacy Qwen (QWenLMHeadModel)",
+      "sha256": "F4D273E4C4902AC9B0BDC91FF0812C10A5BC383017D233F68A3320FE091B6D33"
+    },
+    {
+      "id": "layer-forward-api",
+      "path": "scripts/model_tools/patches/llama-cpp-layer-forward-api.patch",
+      "targets": [
+        "include/llama.h",
+        "src/models/qwen2.cpp"
+      ],
+      "marker": "★ QLH 2026-09-20",
+      "sha256": "D674FCAB150A56CB8A9470E9F24388D0C7E1FCC307FE966952C224CED318EEA4",
+      "note": "层段接力（layer_forward）所需的上游能力：(1) 把 src/llama-context.cpp 里早已实现但未导出的 set/get_embeddings_layer_inp、set_embeddings_nextn、set_nextn_layer_offset、get_embeddings_nextn[_ith] 这 6 个 API 补进 include/llama.h；(2) src/models/qwen2.cpp 登记 res->t_layer_inp[il]（原先只有 qwen3/qwen35/llama/gemma4 等架构登记，qwen2 缺失会导致 layer_inp 导出触发 GGML_ASSERT），并把最后一层输出（output_norm 之前）挂到 t_h_nextn。不改任何计算语义，全部受 cparams 开关控制（默认关闭）⇒ 正常推理零影响。C+ 层验证：x86_64 自编译后两个 prompt 共 11 步逐 token 一致。"
+    }
+  ],
   "targets": {
     "windows-x86_64": {
       "platform": "windows",

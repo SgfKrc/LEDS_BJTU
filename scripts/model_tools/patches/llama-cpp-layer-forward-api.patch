@@ -1,0 +1,83 @@
+diff --git a/include/llama.h b/include/llama.h
+index b89ab758b..cdde636ec 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1037,6 +1037,31 @@ extern "C" {
+     // otherwise: float[n_embd] (1-dimensional)
+     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
+ 
++    // ★ QLH 2026-09-20：把子模块里**已实现但未导出**的「层输入 / nextn 隐藏态」API 补上声明。
++    //
++    // 背景：android 子模块的 llama.cpp（b9902）在 `src/llama-context.cpp` 里**已经有**
++    // 这几个函数的实现（:3702-3738），但 `llama.h` 没导出，因此外部（含 JNI 层与
++    // 实验探针）无法使用。它们正是**层段接力（layer_forward）**所需要的：
++    // 上游节点要能取出「某一层的输入」交给下游。
++    //
++    // `llama_get_embeddings_layer_inp(ctx, lid)` 返回 **第 lid 层的输入**（即第 lid-1 层
++    // 的输出），形状与 `n_embd` 一致。**这正是裁层模型（保留 blk.K..blk.N-1 并重编号为
++    // blk.0..）的 blk.0 所期望的输入** —— 用它可以在**同一份模型源码**上拼出
++    // 「上游 hidden → 下游 embd 注入 → 续算」的完整接力链。
++    //
++    // 用法：先 `llama_set_embeddings_layer_inp(ctx, lid, true)` 打开要导出的层（可在
++    // 每次 decode 前重设），decode 后用 `llama_get_embeddings_layer_inp(ctx, lid)` 取。
++    // 未开启该层的导出时返回 NULL。
++    //
++    // ⚠️ 这些 API 处于上游的实验性形态（`cparams.output_layer_inp` 系列），跨版本可能变动；
++    // 升级 llama.cpp 时需重新核对。此处只做**声明补齐**，不修改任何实现语义。
++    LLAMA_API void    llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
++    LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
++    LLAMA_API void    llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
++    LLAMA_API void    llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
++    LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
++    LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
++
+     //
+     // backend sampling API [EXPERIMENTAL]
+     // note: use only if the llama_context was created with at least one llama_sampler_seq_config
+diff --git a/src/models/qwen2.cpp b/src/models/qwen2.cpp
+index e9c2ea80a..d708bdaa4 100644
+--- a/src/models/qwen2.cpp
++++ b/src/models/qwen2.cpp
+@@ -69,6 +69,17 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
+     for (int il = 0; il < n_layer; ++il) {
++        // ★ QLH 2026-09-20（层段接力 / C+ 验证）：登记「进入本层的张量」，
++        //   供 `llama_get_embeddings_layer_inp(ctx, il)` 导出（需先用
++        //   `llama_set_embeddings_layer_inp(ctx, il, true)` 打开）。
++        //   语义：这是**未经 attn_norm/ffn_norm** 的层输入，也就是**上一层输出的原样**。
++        //   ⇒ 「layer_inp(K)」= 「原模型 blk.(K-1) 的输出」= **裁层模型
++        //   （保留 blk.K..blk.N-1 并重编号为 blk.0..）的 blk.0 所期望的输入**。
++        //   与 qwen3.cpp / qwen35.cpp / llama.cpp 等架构写法一致。
++        //   默认不开启导出（cparams.embeddings_layer_inp 全 false），因此对正常
++        //   推理路径零影响：t_layer_inp 只在 set_outputs 里被 ggml_set_output。
++        res->t_layer_inp[il] = inpL;
++
+         ggml_tensor * inpSA = inpL;
+ 
+         // norm
+@@ -134,6 +145,24 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
+     }
+     cur = inpL;
+ 
++    // ★ QLH 2026-09-20（层段接力 / C+ 验证）：把「最后一层的输出」暴露到 t_h_nextn。
++    //
++    // 语义：此处 `cur` 是**未经 output_norm** 的层输出，正是**裁层模型**（保留
++    // blk.K..blk.N-1、重编号为 blk.0..）的 blk.0 所期望的输入形态。有了它，
++    // 上层就能在**同一个模型源码**上构造出「上游 hidden → 下游注入」的接力链，
++    // 而不必依赖较新 fork 才有的 `llama_get_hidden_state`（android 子模块的
++    // llama.cpp 为 b9902，没有该 API）。
++    //
++    // ⚠️ 与 qwen35 的 h_nextn **不是同一个东西**：qwen35.cpp 把 t_h_nextn 设在
++    // `build_norm` **之后**，因为那里的消费方是 MTP head（期望 norm 后）。这里
++    // 的消费方是**下游层段**，期望 norm 前 ⇒ 必须设在 norm 之前。
++    //
++    // ⚠️ 只在 `embeddings_nextn` 打开时才会被读取（见 llama-context.cpp 的
++    // `cparams.embeddings_nextn ? res->get_h_nextn() : nullptr`），因此对正常
++    // 推理路径**零影响**（多出的 tensor 不进 sched、不参与计算）。
++    cb(cur, "h_nextn", -1);
++    res->t_h_nextn = cur;
++
+     cur = build_norm(cur,
+             model.output_norm, NULL,
+             LLM_NORM_RMS, -1);
