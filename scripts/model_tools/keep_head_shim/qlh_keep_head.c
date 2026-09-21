@@ -249,6 +249,20 @@ int32_t qlh_kh_n_layer(void * handle_void) {
     return handle == NULL ? 0 : handle->n_layer;
 }
 
+/* ★ P3：清空 KV / recurrent 记忆。跨机服务在**同一进程**里服务多条连接时必须调用 ——
+ * 否则新连接从位置 0 开始会与上一条连接留下的位置冲突（llama.cpp 报
+ * "tokens ... have inconsistent sequence positions"，实测表现为远端 runner_failed）。 */
+void qlh_kh_reset(void * handle_void) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL || handle->ctx == NULL) {
+        return;
+    }
+    llama_memory_t mem = llama_get_memory(handle->ctx);
+    if (mem != NULL) {
+        llama_memory_clear(mem, true);
+    }
+}
+
 void qlh_kh_close(void * handle_void) {
     qlh_keep_head * handle = (qlh_keep_head *) handle_void;
     if (handle == NULL) {

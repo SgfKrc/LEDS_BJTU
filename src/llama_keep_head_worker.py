@@ -59,6 +59,10 @@ def main() -> int:
             if operation == "close":
                 _response(ok=True)
                 return 0
+            if operation == "reset":
+                upstream.reset()
+                _response(ok=True)
+                continue
             if operation == "tokens":
                 _array_response(upstream.forward_tokens_to_hidden(
                     request.get("tokens", []), n_past=int(request.get("n_past", 0))))

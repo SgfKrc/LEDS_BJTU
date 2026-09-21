@@ -374,8 +374,10 @@ class _RemoteMiddleSegment:
         self.n_embd = int(n_embd)
         self._client = RelayTcpClient(host, int(port), n_embd=self.n_embd, timeout=timeout)
 
-    def forward_hidden_to_hidden(self, hidden, *, n_past: int = 0):
-        """`n_past` 由**远端**自己维护（每连接从 0 起），这里只做形状校验与往返。"""
+    def forward_hidden_to_hidden(self, hidden, *, n_past: int = 0,
+                                 seq_ids=None, positions=None):
+        """`n_past` 由**远端**自己维护（单序列每连接从 0 起）；给了 `seq_ids`/`positions`
+        则走 `HIDDEN_SEQ` 帧（**P3 多序列**，远端按显式位置绑定，不再依赖本段累加）。"""
         import numpy as np  # noqa: PLC0415
 
         arr = np.ascontiguousarray(np.asarray(hidden, dtype=np.float32))
@@ -383,7 +385,17 @@ class _RemoteMiddleSegment:
             arr = arr[None, :]
         if arr.ndim != 2 or arr.shape[1] != self.n_embd:
             raise ValueError(f"hidden 形状应为 [n_tokens, {self.n_embd}]，实得 {arr.shape}")
-        payload = self._client.request_hidden(arr.tobytes(), n_tokens=int(arr.shape[0]))
+        n_tokens = int(arr.shape[0])
+        if seq_ids is None and positions is None:
+            payload = self._client.request_hidden(arr.tobytes(), n_tokens=n_tokens)
+        else:
+            meta: dict[str, object] = {}
+            if seq_ids is not None:
+                meta["seq_ids"] = [int(value) for value in seq_ids]
+            if positions is not None:
+                meta["positions"] = [int(value) for value in positions]
+            payload = self._client.request_hidden_seq(arr.tobytes(), n_tokens=n_tokens,
+                                                      meta=meta)
         return np.frombuffer(payload, dtype=np.float32).reshape(arr.shape).copy()
 
     def close(self) -> None:
@@ -444,6 +456,10 @@ def _load_keep_head_segment(args: argparse.Namespace, model_path: str, *,
     upstream = KeepHeadUpstream(args.keep_head_shim, model_path, mode="nextn",
                                 n_ctx=args.n_ctx, n_threads=args.threads,
                                 n_seq_max=max(1, int(args.batch)),
+                                # ★ P3 长序列 × 多序列：一次 prefill 的 token 数是
+                                # batch × prefill_length，n_batch 必须够（否则 llama.cpp
+                                # 直接拒绝该批次）。
+                                n_batch=max(512, int(args.batch) * max(1, int(args.prefill))),
                                 extra_dll_dirs=extra)
     return {
         "keep_head": upstream,
@@ -523,7 +539,10 @@ def _load_downstream_engine(args: argparse.Namespace):
     engine = LlamaCppEngine()
     started = time.perf_counter()
     engine.load_model(model_path=str(args.cut_model), n_ctx=args.n_ctx,
-                      n_threads=args.threads, n_seq_max=max(1, args.batch))
+                      n_threads=args.threads, n_seq_max=max(1, args.batch),
+                      # ★ P3 长序列 × 多序列：prefill 一次给 batch × prefill_length 个 token，
+                      # n_batch 不够会直接撞 GGML_ASSERT(n_tokens_all <= cparams.n_batch)。
+                      n_batch=max(512, int(args.batch) * max(1, int(args.prefill))))
     if not engine.is_loaded:
         raise SystemExit("FAIL: LlamaCppEngine 未加载成功")
     native = engine._model._model.model
@@ -762,11 +781,6 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                              "（远端用 scripts/relay_mid_service.py --role middle 起服务）")
         if args.mid_layers is None:
             raise SystemExit("FAIL: --path d2l2l_keep_head_net 需要 --mid-layers（K2，仅用于记录）")
-        if args.batch != 1:
-            # P3：Relay HIDDEN 帧还没带 seq_ids/positions ⇒ 多序列跨机必须在协议上加字段
-            # 之前 fail-loud（否则远端会按单序列隐式位置算，结果静默错）。
-            raise SystemExit("FAIL: --path d2l2l_keep_head_net 目前只支持 --batch 1"
-                             "（多序列跨机需要先扩展 HIDDEN 帧的 seq/pos 字段）")
     if not args.model_dir:
         raise SystemExit(
             "FAIL: 需要 --model-dir（HF 模型目录）—— 它同时是 tokenizer 来源；"

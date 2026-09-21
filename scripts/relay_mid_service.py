@@ -51,7 +51,7 @@ class KeepHeadMiddleRunner:
     """中间段：吃 hidden → 吐 hidden（keep-head 语义）。模型只加载一次，多次连接复用。"""
 
     def __init__(self, *, shim: str, model: str, n_ctx: int, n_threads: int,
-                 extra_dll_dirs: list[str]) -> None:
+                 n_seq_max: int, n_batch: int, extra_dll_dirs: list[str]) -> None:
         import os  # noqa: PLC0415
 
         from llama_keep_head import KeepHeadUpstream  # noqa: PLC0415
@@ -60,17 +60,23 @@ class KeepHeadMiddleRunner:
         dirs.extend(d for d in (os.environ.get("QLH_KEEP_HEAD_DLL_DIRS") or "")
                     .split(os.pathsep) if d)
         self._upstream = KeepHeadUpstream(shim, model, mode="nextn", n_ctx=n_ctx,
-                                          n_threads=n_threads, extra_dll_dirs=dirs)
+                                          n_threads=n_threads,
+                                          n_seq_max=max(1, int(n_seq_max)),
+                                          n_batch=max(512, int(n_batch)),
+                                          extra_dll_dirs=dirs)
         self.n_embd = self._upstream.n_embd
         self.n_layer = self._upstream.n_layer
+        self.n_seq_max = max(1, int(n_seq_max))
         self._pos = 0
         print(json.dumps({"role": "middle", "n_embd": self.n_embd,
-                          "n_layer": self.n_layer,
+                          "n_layer": self.n_layer, "n_seq_max": self.n_seq_max,
+                          "n_batch": max(512, int(n_batch)),
                           "channel": "keep_head_nextn"}), flush=True)
 
     def reset(self) -> None:
-        """每条连接从位置 0 开始（KV 位置由本段自己维护）。"""
+        """每条连接从干净状态开始：位置归零 + **清 KV/recurrent 记忆**（同进程多连接必需）。"""
         self._pos = 0
+        self._upstream.reset()
 
     def request_hidden(self, hidden_bytes: bytes, *, n_tokens: int) -> bytes:
         import numpy as np  # noqa: PLC0415
@@ -79,6 +85,22 @@ class KeepHeadMiddleRunner:
         incoming = np.frombuffer(hidden_bytes, dtype=np.float32).reshape(count, self.n_embd)
         produced = self._upstream.forward_hidden_to_hidden(incoming, n_past=self._pos)
         self._pos += count
+        return produced.astype(np.float32).tobytes()
+
+    def request_hidden_seq(self, hidden_bytes: bytes, *, n_tokens: int,
+                           meta: dict[str, object]) -> bytes:
+        """★ P3 多序列：按帧里的 `seq_ids` / `positions` 显式绑定（不依赖本段位置累加）。
+
+        远端每步都拿到**完整位置**，因此不需要（也不应该）维护 `self._pos`。
+        """
+        import numpy as np  # noqa: PLC0415
+
+        count = int(n_tokens)
+        incoming = np.frombuffer(hidden_bytes, dtype=np.float32).reshape(count, self.n_embd)
+        produced = self._upstream.forward_hidden_to_hidden(
+            incoming,
+            seq_ids=meta.get("seq_ids"),
+            positions=meta.get("positions"))
         return produced.astype(np.float32).tobytes()
 
     def close(self) -> None:
@@ -134,6 +156,10 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--n-embd", type=int, default=None, help="可选：与本地期望宽度核对")
     ap.add_argument("--n-ctx", type=int, default=4096)
     ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--n-seq-max", type=int, default=8,
+                    help="★ P3：允许的并行序列上限（跨机多序列要求 ≥ 调用方 batch）")
+    ap.add_argument("--n-batch", type=int, default=1024,
+                    help="★ P3：batch 容量下限（≥ 调用方 batch × prefill 长度）")
     ap.add_argument("--max-tokens", type=int, default=RELAY_DEFAULT_MAX_TOKENS)
     ap.add_argument("--dll-dir", action="append", default=[])
     ap.add_argument("--ready-file", default=None, help="写就绪标记（含实际端点），供驱动等待")
@@ -157,6 +183,7 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("FAIL: --role middle 需要 --keep-head-shim")
         runner: Any = KeepHeadMiddleRunner(shim=args.keep_head_shim, model=args.model,
                                            n_ctx=args.n_ctx, n_threads=args.threads,
+                                           n_seq_max=args.n_seq_max, n_batch=args.n_batch,
                                            extra_dll_dirs=list(args.dll_dir))
         serve = serve_relay_middle_connection
     else:

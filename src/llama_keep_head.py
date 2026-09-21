@@ -48,8 +48,8 @@ EXTRA_DLL_DIRS_ENV = "QLH_KEEP_HEAD_DLL_DIRS"
 
 #: shim 必须导出的符号（缺任何一个都说明编译产物不对）。
 SHIM_SYMBOLS = ("qlh_kh_load", "qlh_kh_forward", "qlh_kh_forward_embd",
-                "qlh_kh_forward_embd_seq", "qlh_kh_n_embd", "qlh_kh_n_layer",
-                "qlh_kh_close")
+                "qlh_kh_forward_embd_seq", "qlh_kh_reset", "qlh_kh_n_embd",
+                "qlh_kh_n_layer", "qlh_kh_close")
 
 #: `qlh_kh_forward*` 的错误码 → 说明。
 FORWARD_ERRORS = {
@@ -178,6 +178,8 @@ class KeepHeadUpstream:
         lib.qlh_kh_n_layer.restype = ctypes.c_int32
         lib.qlh_kh_close.argtypes = [ctypes.c_void_p]
         lib.qlh_kh_close.restype = None
+        lib.qlh_kh_reset.argtypes = [ctypes.c_void_p]
+        lib.qlh_kh_reset.restype = None
 
         n_embd_out = ctypes.c_int32(0)
         n_layer_out = ctypes.c_int32(0)
@@ -382,6 +384,19 @@ class KeepHeadUpstream:
         return result
 
     # ------------------------------------------------------------------ 资源
+    def reset(self) -> None:
+        """★ P3：清空 KV / recurrent 记忆。
+
+        跨机的中间段服务在**同一进程**里服务多条连接（`--max-connections`），新连接必须
+        从干净的记忆开始 —— 否则上一条连接留下的位置会让本篇的 position 0 触发
+        "tokens ... have inconsistent sequence positions"（远端表现为 `runner_failed`）。
+        """
+        if self._worker is not None:
+            self._worker_request({"op": "reset"})
+            return
+        if getattr(self, "_handle", None) and getattr(self, "_lib", None) is not None:
+            self._lib.qlh_kh_reset(self._handle)
+
     def close(self) -> None:
         process = getattr(self, "_worker", None)
         if process is not None:
