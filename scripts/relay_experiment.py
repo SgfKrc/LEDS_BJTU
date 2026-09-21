@@ -116,6 +116,21 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _margin(row) -> float:
+    """★ P4：top-1 与 top-2 的 logits 差（边距）。
+
+    argmax 仍是唯一的**一致性判据**；margin 只用于回答"这个档位是否已经脆弱" ——
+    同一档位若 argmax 全对但边距普遍很小，换个 prompt 就可能翻，属于"尚未暴露"而非"安全"。
+    """
+    import numpy as np  # noqa: PLC0415
+
+    arr = np.asarray(row, dtype=np.float32).reshape(-1)
+    if arr.size < 2:
+        return float("nan")
+    top2 = np.partition(arr, -2)[-2:]
+    return float(top2[1] - top2[0])
+
+
 def _stat(values: list[float]) -> dict[str, Any]:
     if not values:
         return {"n": 0, "mean": None, "std": None}
@@ -295,7 +310,7 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
                          "绝对/相对误差，用于看 int8 误差是否随序列长度与步数累积。"
                          "**不改变任何数值**（量化本身与不开启时逐位一致）")
     ap.add_argument("--hidden-quant", default="none",
-                    choices=["none", "f16", "bf16", "int8_block128"],
+                    choices=["none", "f16", "bf16", "int8_block128", "int4_block128"],
                     help="★ P3：hidden 数值量化往返模拟（当前 Relay wire 仍为 float32）。"
                          "判据仍是 **per-token argmax** —— 不得用 cosine 代替；"
                          "分叉即如实标 FAIL，不得当作「可接受的近似」")
@@ -500,6 +515,10 @@ def _hidden_bytes(n_embd: int | None, hidden_quant: str) -> int | None:
     if hidden_quant == "int8_block128":
         blocks = (width + 127) // 128
         return width * 1 + blocks * 4
+    if hidden_quant == "int4_block128":
+        # ★ P4：4bit 打包（两元素一字节，向上取整）+ 每块一个 f32 scale
+        blocks = (width + 127) // 128
+        return (width + 1) // 2 + blocks * 4
     return None
 
 
@@ -594,6 +613,22 @@ def _quantize_hidden(hidden, mode: str, tag: str = ""):
         scale[scale == 0] = 1.0
         quantized = np.round(flat / scale * 127.0).clip(-127, 127)
         out = (quantized / 127.0 * scale).astype(np.float32).reshape(padded.shape)[..., :width]
+    elif mode == "int4_block128":
+        # ★ P4：有符号 4bit 块量化（每 128 元素一个 f32 scale）。刻意只用到 -7..7，
+        # 不用 -8：对称范围换来的是"无额外偏置"，便于把误差变化归因到位宽本身。
+        width = int(arr.shape[-1])
+        blocks = (width + 127) // 128
+        padded_width = blocks * 128
+        if padded_width != width:
+            padded = np.zeros((*arr.shape[:-1], padded_width), dtype=np.float32)
+            padded[..., :width] = arr
+        else:
+            padded = arr
+        flat = padded.reshape(-1, 128)
+        scale = np.abs(flat).max(axis=1, keepdims=True)
+        scale[scale == 0] = 1.0
+        quantized = np.round(flat / scale * 7.0).clip(-7, 7)
+        out = (quantized / 7.0 * scale).astype(np.float32).reshape(padded.shape)[..., :width]
     else:
         raise ValueError(f"未知 hidden-quant 模式：{mode!r}")
     _QUANT_TRACKER.record(arr, out, mode=mode, tag=tag)
@@ -654,6 +689,7 @@ def _baseline_tokens(args: argparse.Namespace, prompt: list[int]) -> tuple[list[
     batch = M.llama_batch_init(batch_capacity, 0, 1)
     tokens: list[int] = []
     step_ms: list[float] = []
+    margins: list[float] = []      # ★ P4：整模基线每步的 top1-top2 边距（与接力路径对照）
     pos = 0
     try:
         for step in range(args.gen):
@@ -669,7 +705,9 @@ def _baseline_tokens(args: argparse.Namespace, prompt: list[int]) -> tuple[list[
             if M.llama_decode(ctx, batch) != 0:
                 raise SystemExit("FAIL: 整模 decode 失败")
             logits = M.llama_get_logits_ith(ctx, len(toks) - 1)
-            tokens.append(int(np.ctypeslib.as_array(logits, shape=(n_vocab,)).argmax()))
+            row = np.ctypeslib.as_array(logits, shape=(n_vocab,))
+            margins.append(_margin(row))          # ★ P4：整模基线边距
+            tokens.append(int(row.argmax()))
             step_ms.append((time.perf_counter() - started) * 1000)
             pos += len(toks)
     finally:
@@ -681,6 +719,7 @@ def _baseline_tokens(args: argparse.Namespace, prompt: list[int]) -> tuple[list[
         "model_bytes": model_bytes,
         "artifact_sha256": _sha256(whole),
         "decode_ms": _stat(step_ms[1:]),
+        "logit_margin": _stat(margins),      # ★ P4：整模基线的边距分布
     }
 
 
@@ -722,6 +761,7 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
     up_decode: list[float] = []
     dn_decode: list[float] = []
     mid_decode: list[float] = []
+    margins: list[float] = []      # ★ P4：每步（每序列）的 top1-top2 边距
     failure: str | None = None
     pos = 0
 
@@ -770,8 +810,9 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
             if not is_prefill:
                 dn_decode.append(dn_ms)
             for b in range(batch_n):
-                upstream_tokens[b].append(int(np.asarray(
-                    logits[b * n_tok + n_tok - 1]).argmax()))
+                row = np.asarray(logits[b * n_tok + n_tok - 1], dtype=np.float32)
+                margins.append(_margin(row))     # ★ P4：top1-top2 边距（判据仍是 argmax）
+                upstream_tokens[b].append(int(row.argmax()))
             ids_t = [[upstream_tokens[b][-1]] for b in range(batch_n)]
             upstream_pos += n_tok
             pos += n_tok
@@ -844,7 +885,9 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
             if not is_prefill:
                 dn_decode.append(dn_ms)
             for b in range(batch_n):
-                upstream_tokens[b].append(int(np.asarray(logits[b * n_tok + n_tok - 1]).argmax()))
+                row = np.asarray(logits[b * n_tok + n_tok - 1], dtype=np.float32)
+                margins.append(_margin(row))     # ★ P4：top1-top2 边距（判据仍是 argmax）
+                upstream_tokens[b].append(int(row.argmax()))
             ids_t = torch.tensor([[upstream_tokens[b][-1]] for b in range(batch_n)],
                                  dtype=torch.long, device=device)
             pos += n_tok
@@ -862,6 +905,8 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
         "upstream_decode_ms": _stat(up_decode),
         "downstream_decode_ms": _stat(dn_decode),
         "middle_decode_ms": _stat(mid_decode),
+        # ★ P4：top1-top2 边距分布（判据仍是 argmax；边距小 = 档位已脆弱）
+        "logit_margin": _stat(margins),
         # ★ P3 弱网：跨机中间段的线路口径字节（压缩后）
         "mid_uplink_bytes": (int(getattr(middle, "uplink_bytes", 0))
                              if middle is not None else None),
@@ -1145,7 +1190,11 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "hidden_wire_bytes_per_token": _wire_hidden_bytes(n_embd),
         # ★ P3 误差测量（--track-quant-error）：量化往返误差的分布与"前后半段"对照
         "hidden_quant_error": _QUANT_TRACKER.summary(),
+        # ★ P4：边距统计（接力路径；与 baseline 对照看"压缩是否把边距压薄"）
+        "logit_margin": relay.get("logit_margin"),
         "baseline_ms_per_step": baseline["decode_ms"],
+        # ★ P4：整模基线的边距（与接力路径的 logit_margin 对照）
+        "baseline_logit_margin": baseline.get("logit_margin"),
         "capacity_gain_x": (round(baseline["model_bytes"] / max_segment, 4)
                             if max_segment else None),
         "resident_weight_bytes": {"whole": baseline["model_bytes"],
