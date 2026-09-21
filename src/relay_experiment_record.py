@@ -40,40 +40,56 @@ EXPERIMENT_KINDS = (KIND_MAINREPO_END_TO_END, KIND_RAW_BINDING_PROBE, KIND_CAPAC
 PATH_D2L_MAINREPO = "d2l_mainrepo"
 PATH_D2L_RAW = "d2l_raw_binding"
 PATH_L2L = "l2l_llama"
+PATH_L2L_KEEP_HEAD = "l2l_keep_head"
+PATH_D2L2L_KEEP_HEAD = "d2l2l_keep_head"
 PATH_CAPACITY = "capacity_scan"
-EXPERIMENT_PATHS = (PATH_D2L_MAINREPO, PATH_D2L_RAW, PATH_L2L, PATH_CAPACITY)
+EXPERIMENT_PATHS = (PATH_D2L_MAINREPO, PATH_D2L_RAW, PATH_L2L, PATH_L2L_KEEP_HEAD,
+                    PATH_D2L2L_KEEP_HEAD, PATH_CAPACITY)
 
 #: 引擎接口标识串（必须与实际调用的入口一一对应，不允许同义改写）。
 IFACE_MODEL_MODULE_UPSTREAM = "model_module.forward_layers"
 IFACE_LLAMA_UPSTREAM = "llama_engine.forward_layers_to_hidden"
+IFACE_KEEP_HEAD_UPSTREAM = "llama_keep_head.KeepHeadUpstream.forward_tokens_to_hidden"
 IFACE_LLAMA_ENGINE_DOWNSTREAM = "llama_engine.forward_layers_from_hidden"
 IFACE_RAW_LLAMA_DOWNSTREAM = "llama_cpp.llama_decode"
 #: 容量专项只加载、不生成 ⇒ 接口是两侧的加载入口。
 IFACE_MODEL_MODULE_LOADER = "model_module.load_layer_range"
 IFACE_LLAMA_MODEL_LOADER = "llama_cpp.llama_model_load_from_file"
 
-#: (上游接口, 下游接口) -> (kind, path)。未登记的组合一律拒绝：新链路必须显式登记。
-_PATH_BY_IFACES: dict[tuple[str, str], tuple[str, str]] = {
-    (IFACE_MODEL_MODULE_UPSTREAM, IFACE_LLAMA_ENGINE_DOWNSTREAM): (
+#: (上游接口, 下游接口, 中间段接口) -> (kind, path)。未登记的组合一律拒绝：新链路必须显式登记。
+#: 中间段为空串表示两段链路。三段必须在这里登记，否则会被误判成两段 D→L。
+_PATH_BY_IFACES: dict[tuple[str, str, str], tuple[str, str]] = {
+    (IFACE_MODEL_MODULE_UPSTREAM, IFACE_LLAMA_ENGINE_DOWNSTREAM, ""): (
         KIND_MAINREPO_END_TO_END, PATH_D2L_MAINREPO),
-    (IFACE_MODEL_MODULE_UPSTREAM, IFACE_RAW_LLAMA_DOWNSTREAM): (
+    (IFACE_MODEL_MODULE_UPSTREAM, IFACE_RAW_LLAMA_DOWNSTREAM, ""): (
         KIND_RAW_BINDING_PROBE, PATH_D2L_RAW),
-    (IFACE_LLAMA_UPSTREAM, IFACE_LLAMA_ENGINE_DOWNSTREAM): (
+    (IFACE_LLAMA_UPSTREAM, IFACE_LLAMA_ENGINE_DOWNSTREAM, ""): (
         KIND_RAW_BINDING_PROBE, PATH_L2L),
-    (IFACE_LLAMA_UPSTREAM, IFACE_RAW_LLAMA_DOWNSTREAM): (
+    (IFACE_LLAMA_UPSTREAM, IFACE_RAW_LLAMA_DOWNSTREAM, ""): (
         KIND_RAW_BINDING_PROBE, PATH_L2L),
-    (IFACE_MODEL_MODULE_LOADER, IFACE_LLAMA_MODEL_LOADER): (
+    # 补丁版 keep-head 通道（P2 路线 C）：llama 能当上游/中间段 ⇒ 真正的 L→L 与三段。
+    (IFACE_KEEP_HEAD_UPSTREAM, IFACE_LLAMA_ENGINE_DOWNSTREAM, ""): (
+        KIND_RAW_BINDING_PROBE, PATH_L2L_KEEP_HEAD),
+    (IFACE_MODEL_MODULE_UPSTREAM, IFACE_LLAMA_ENGINE_DOWNSTREAM, IFACE_KEEP_HEAD_UPSTREAM): (
+        KIND_MAINREPO_END_TO_END, PATH_D2L2L_KEEP_HEAD),
+    (IFACE_MODEL_MODULE_LOADER, IFACE_LLAMA_MODEL_LOADER, ""): (
         KIND_CAPACITY_ONLY, PATH_CAPACITY),
 }
 
 
-def classify_path(upstream_iface: str, downstream_iface: str) -> tuple[str, str]:
+def _iface_key(upstream_iface: str, downstream_iface: str,
+               middle_iface: str | None = None) -> tuple[str, str, str]:
+    return (str(upstream_iface), str(downstream_iface), str(middle_iface or ""))
+
+
+def classify_path(upstream_iface: str, downstream_iface: str,
+                  middle_iface: str | None = None) -> tuple[str, str]:
     """由引擎接口反推 `(kind, path)`。未登记组合抛 `ValueError`（而不是猜一个）。"""
-    key = (str(upstream_iface), str(downstream_iface))
+    key = _iface_key(upstream_iface, downstream_iface, middle_iface)
     try:
         return _PATH_BY_IFACES[key]
     except KeyError:
-        known = ", ".join(f"{u} + {d}" for u, d in _PATH_BY_IFACES)
+        known = ", ".join(f"{u} + {m or '-'} + {d}" for u, d, m in _PATH_BY_IFACES)
         raise ValueError(
             f"未登记的引擎接口组合 {key}；已登记：{known}。"
             "新链路必须在 src/relay_experiment_record.py 显式登记后才允许写记录。") from None
@@ -172,6 +188,7 @@ def build_record(
     *,
     upstream_iface: str,
     downstream_iface: str,
+    middle_iface: str | None = None,
     models: Mapping[str, Any],
     layer_layout: Mapping[str, Any],
     handoff: Mapping[str, Any],
@@ -196,7 +213,7 @@ def build_record(
     `validate=True`（默认）会在返回前跑 schema 校验 —— 保证「强制写入合法记录」，
     而不是等报告阶段才发现混表。
     """
-    inferred_kind, inferred_path = classify_path(upstream_iface, downstream_iface)
+    inferred_kind, inferred_path = classify_path(upstream_iface, downstream_iface, middle_iface)
     if kind is not None and kind != inferred_kind:
         raise ValueError(
             f"kind={kind!r} 与引擎接口不一致（按 {upstream_iface} + {downstream_iface} 应为 "
@@ -224,7 +241,8 @@ def build_record(
         "device_profile": dict(device_profile or {}),
         "models": {k: dict(v) for k, v in models.items()},
         "layer_layout": dict(layer_layout),
-        "engines": {"upstream_iface": upstream_iface, "downstream_iface": downstream_iface},
+        "engines": {"upstream_iface": upstream_iface, "downstream_iface": downstream_iface,
+                    "middle_iface": middle_iface},
         "handoff": dict(handoff),
         "load": dict(load),
         "criterion": criterion,

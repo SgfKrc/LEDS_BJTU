@@ -192,6 +192,47 @@ def test_cli_dry_run_capacity_record_has_no_fake_metrics(capsys):
     assert payload["models"]["downstream"]["model_bytes"] is None
 
 
+# --------------------------------------------------------------- keep-head / 三段链路
+def test_three_segment_path_has_its_own_signature():
+    """三段链路必须与两段 D→L 分开登记（中间段接口参与链路签名），否则就是混表。"""
+    from src.relay_experiment_record import (
+        IFACE_KEEP_HEAD_UPSTREAM,
+        PATH_D2L2L_KEEP_HEAD,
+    )
+
+    assert classify_path(IFACE_MODEL_MODULE_UPSTREAM, IFACE_LLAMA_ENGINE_DOWNSTREAM) == (
+        KIND_MAINREPO_END_TO_END, PATH_D2L_MAINREPO)
+    assert classify_path(IFACE_MODEL_MODULE_UPSTREAM, IFACE_LLAMA_ENGINE_DOWNSTREAM,
+                         IFACE_KEEP_HEAD_UPSTREAM) == (KIND_MAINREPO_END_TO_END,
+                                                       PATH_D2L2L_KEEP_HEAD)
+
+
+def test_keep_head_paths_require_the_shim():
+    """keep-head 链路没有 shim 就直接 fail-loud（不要退回 embeddings 通道）。"""
+    from src.relay_experiment_record import PATH_L2L_KEEP_HEAD
+
+    module = _cli_module()
+    with pytest.raises(SystemExit, match="keep-head-shim"):
+        module._check_l2l_upstream_channel(PATH_L2L_KEEP_HEAD, False, None)
+    module._check_l2l_upstream_channel(PATH_L2L_KEEP_HEAD, False, "shim.dll")
+
+
+@pytest.mark.parametrize("path", ["l2l_keep_head", "d2l2l_keep_head"])
+def test_cli_dry_run_covers_keep_head_paths(path, capsys):
+    module = _cli_module()
+    argv = ["--path", path, "--dry-run", "--cut-model", "cut.gguf",
+            "--whole-model", "whole.gguf", "--keep-head-shim", "shim.dll", "--json-out", "-"]
+    if path == "l2l_keep_head":
+        argv += ["--upstream-model", "head.gguf"]
+    else:
+        argv += ["--mid-model", "mid.gguf", "--mid-layers", "16"]
+    assert module.main(argv) == 0
+    out = capsys.readouterr().out
+    payload = json.loads(out[: out.rfind("}") + 1])
+    assert payload["path"] == path
+    validate_record(payload)
+
+
 # --------------------------------------------------------------- L→L 上游通道守卫
 def test_l2l_upstream_channel_guard_is_fail_loud():
     """pip 绑定的 embeddings 通道 = output_norm(H) ⇒ 默认拒绝，必须显式开关才放行。"""

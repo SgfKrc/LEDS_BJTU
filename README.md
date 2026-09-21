@@ -68,7 +68,7 @@ QLH 是一个面向异构边缘设备的分布式推理核心：主线是 GGUF/l
 | --- | --- |
 | 正确性 | 主仓双引擎 D→L 矩阵 **27/27 逐 token 一致**（qwen2.5-0.5B K=4/8/12/16/20、qwen3.5-2B K=8/12/16/20；负载 prefill 32/128/512、decode 32/64/256；batch 2/4；混合精度 fp16·f32·NF4 × Q4_K_M）；逐 token 判据与速度、容量分开记录 |
 | 混合精度 | 上游 PyTorch 全精度、下游 GGUF 量化是有意的“不完整量化”策略；必须与同精度下游整模对拍 |
-| L→L 上游通道 | pip 绑定的 `llama_get_embeddings_ith` 返回 `output_norm(H)`（实测 cos 0.999998）⇒ **不能**当层接力上游；统一驱动 `scripts/relay_experiment.py` 对 `l2l_llama` 默认 fail-loud，L→L 上游需自建 llama.cpp 的 keep-head 通道 |
+| L→L 上游通道 | pip 绑定的 `llama_get_embeddings_ith` 返回 `output_norm(H)`（实测 cos 0.999998）⇒ **不能**当层接力上游；补丁版 **keep-head 通道已打通**：`--path l2l_keep_head` / `d2l2l_keep_head` 实测 **32/32**（含「1 torch 上游 + 2 llama 下游」三段），旧 `l2l_llama` 保留为 fail-loud 反例 |
 | 切点求解 | `scripts/relay_cut_plan.py` + `src/relay_cut_objective.py`：从**实测**拟合段画像（固定开销 + 每层耗时）再求解，输出 `capacity_feasible` / `latency_estimate` / `risk_penalty`；n 段、含 Qwen3.5 的 4 层倍数硬约束。2 段闭环在 qwen2.5（r² 0.96/0.99）与 qwen3.5（0.79/0.96）上均通过 |
 | Windows 算子 | Windows 原生 `triton-windows==3.8.0.post28` 已实测可用；`PYTHONUTF8=1` 是编译路径前置条件；WSL2/fla 是并行路径，不是唯一方案 |
 | 生产定位 | 正确性证据满足 Relay 合同准入；速度只影响默认路由倾向，长时、远端资产自动分发和多段故障验收仍待完成 |

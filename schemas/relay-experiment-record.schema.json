@@ -41,11 +41,13 @@
    ]
   },
   "path": {
-   "description": "实际运行链路。L→L 对照与裸绑定探针同属探针族，但必须在这里区分。",
+   "description": "实际运行链路。L→L 对照与裸绑定探针同属探针族，但必须在这里区分；keep_head 后缀表示上游/中间段走补丁版 keep-head 通道（P2 路线 C）。",
    "enum": [
     "d2l_mainrepo",
     "d2l_raw_binding",
     "l2l_llama",
+    "l2l_keep_head",
+    "d2l2l_keep_head",
     "capacity_scan"
    ]
   },
@@ -132,6 +134,7 @@
    "type": "object",
    "properties": {
     "upstream_iface": {"type": ["string", "null"]},
+    "middle_iface": {"type": ["string", "null"]},
     "downstream_iface": {"type": ["string", "null"]}
    }
   },
@@ -209,7 +212,7 @@
    "if": {"properties": {"kind": {"const": "mainrepo_end_to_end"}}},
    "then": {
     "properties": {
-     "path": {"const": "d2l_mainrepo"},
+     "path": {"enum": ["d2l_mainrepo", "d2l2l_keep_head"]},
      "engines": {
       "properties": {
        "downstream_iface": {"const": "llama_engine.forward_layers_from_hidden"}
@@ -222,7 +225,7 @@
    "if": {"properties": {"kind": {"const": "raw_binding_probe"}}},
    "then": {
     "properties": {
-     "path": {"enum": ["d2l_raw_binding", "l2l_llama"]}
+     "path": {"enum": ["d2l_raw_binding", "l2l_llama", "l2l_keep_head"]}
     }
    }
   },

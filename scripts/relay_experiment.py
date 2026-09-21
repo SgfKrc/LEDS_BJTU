@@ -40,6 +40,7 @@ import argparse
 import ctypes
 import hashlib
 import json
+import os
 import statistics
 import sys
 import time
@@ -58,6 +59,7 @@ from src.relay_contract import (  # noqa: E402
     RelayXFrameEvidence,
 )
 from src.relay_experiment_record import (  # noqa: E402
+    IFACE_KEEP_HEAD_UPSTREAM,
     IFACE_LLAMA_ENGINE_DOWNSTREAM,
     IFACE_LLAMA_MODEL_LOADER,
     IFACE_LLAMA_UPSTREAM,
@@ -65,20 +67,29 @@ from src.relay_experiment_record import (  # noqa: E402
     IFACE_MODEL_MODULE_UPSTREAM,
     IFACE_RAW_LLAMA_DOWNSTREAM,
     PATH_CAPACITY,
+    PATH_D2L2L_KEEP_HEAD,
     PATH_D2L_MAINREPO,
     PATH_D2L_RAW,
     PATH_L2L,
+    PATH_L2L_KEEP_HEAD,
     build_record,
     write_record,
 )
 
-#: path -> (上游接口, 下游接口)。kind 由 build_record()/classify_path() 反推，驱动不自行标注。
-_IFACES_BY_PATH: dict[str, tuple[str, str]] = {
-    PATH_D2L_MAINREPO: (IFACE_MODEL_MODULE_UPSTREAM, IFACE_LLAMA_ENGINE_DOWNSTREAM),
-    PATH_D2L_RAW: (IFACE_MODEL_MODULE_UPSTREAM, IFACE_RAW_LLAMA_DOWNSTREAM),
-    PATH_L2L: (IFACE_LLAMA_UPSTREAM, IFACE_LLAMA_ENGINE_DOWNSTREAM),
-    PATH_CAPACITY: (IFACE_MODEL_MODULE_LOADER, IFACE_LLAMA_MODEL_LOADER),
+#: path -> (上游接口, 下游接口, 中间段接口)。kind 由 build_record()/classify_path() 反推。
+#: ⚠️ 中间段接口必须显式登记：否则三段链路会与两段 D→L 撞键（那就是"混表"）。
+_IFACES_BY_PATH: dict[str, tuple[str, str, str]] = {
+    PATH_D2L_MAINREPO: (IFACE_MODEL_MODULE_UPSTREAM, IFACE_LLAMA_ENGINE_DOWNSTREAM, ""),
+    PATH_D2L_RAW: (IFACE_MODEL_MODULE_UPSTREAM, IFACE_RAW_LLAMA_DOWNSTREAM, ""),
+    PATH_L2L: (IFACE_LLAMA_UPSTREAM, IFACE_LLAMA_ENGINE_DOWNSTREAM, ""),
+    PATH_L2L_KEEP_HEAD: (IFACE_KEEP_HEAD_UPSTREAM, IFACE_LLAMA_ENGINE_DOWNSTREAM, ""),
+    PATH_D2L2L_KEEP_HEAD: (IFACE_MODEL_MODULE_UPSTREAM, IFACE_LLAMA_ENGINE_DOWNSTREAM,
+                           IFACE_KEEP_HEAD_UPSTREAM),
+    PATH_CAPACITY: (IFACE_MODEL_MODULE_LOADER, IFACE_LLAMA_MODEL_LOADER, ""),
 }
+
+#: 用 keep-head 通道当上游/中间段的链路（需要 `--keep-head-shim`）。
+KEEP_HEAD_PATHS = (PATH_L2L_KEEP_HEAD, PATH_D2L2L_KEEP_HEAD)
 
 _QUANT_TYPE_BY_UPSTREAM = {
     "fp16": None,      # 沿用主仓 profile / ckpt 的 fp16
@@ -200,25 +211,35 @@ def _performance_verdict(relay_ms: float | None, baseline_ms: float | None) -> s
     return "advantageous" if relay_ms < baseline_ms else "not_advantageous"
 
 
-def _check_l2l_upstream_channel(path: str, allow_normed_upstream: bool) -> None:
+def _check_l2l_upstream_channel(path: str, allow_normed_upstream: bool,
+                                keep_head_shim: str | None = None) -> None:
     """L→L 上游通道守卫（fail-loud）。
 
-    实测证据（`build/cross-framework-layer-poc/diag_l2l_head_norm.py`，qwen2.5-0.5B）：
+    实测证据（`scripts/relay_diag_head_norm.py`，qwen2.5-0.5B）：
     pip 绑定的 `llama_get_embeddings_ith`（即 `llama_engine.forward_layers_to_hidden()` 的底层）
     返回的是 **`output_norm(H)`** —— 与 `RMSNorm(H) * model.norm.weight` 的
     `rel_err=0.0018 / cos=0.999998`。而层接力上游需要的是**未过 final norm** 的层输出，
     因此该通道直接当上游会多一次归一化，必然与整模对拍分叉（实测 `first_mismatch=2`）。
 
-    正确做法：用 PyTorch 上游（`--path d2l_mainrepo`），或用自建 llama.cpp 的
-    keep-head / 层输入通道（`build/cross-framework-layer-poc/llama.cpp` 的补丁 + exe）。
+    正确做法（P2 路线 C，已验证 32/32）：
+      用**补丁版 keep-head 通道**（`--path l2l_keep_head` / `d2l2l_keep_head`）——
+      `llama_set_embeddings_nextn` / `llama_get_embeddings_nextn_ith` 给出**末层输出
+      （`output_norm` 之前）**，配 head 裁层工件即得前 K 层输出。
     """
+    if path in KEEP_HEAD_PATHS:
+        if not keep_head_shim:
+            raise SystemExit(
+                f"FAIL: --path {path} 需要 --keep-head-shim 指向 qlh_keep_head.dll"
+                "（用 scripts/model_tools/build_keep_head_shim.ps1 生成）")
+        return
     if path == PATH_L2L and not allow_normed_upstream:
         raise SystemExit(
             "FAIL: l2l_llama 的上游通道语义不成立 —— pip 绑定的 embeddings 通道返回 "
             "output_norm(H)（实测 vs RMSNorm(H)*w：rel_err=0.0018 / cos=0.999998），"
             "比层接力上游所需的 hidden 多一次归一化。\n"
-            "  正确做法：(a) 用 PyTorch 上游：--path d2l_mainrepo；或 (b) 用自建 llama.cpp 的 "
-            "keep-head/层输入通道。\n"
+            "  正确做法：(a) 用 PyTorch 上游：--path d2l_mainrepo；或 (b) 用补丁版 keep-head "
+            "通道：--path l2l_keep_head（+ --keep-head-shim / --upstream-model=head 工件），"
+            "三段链路用 --path d2l2l_keep_head。\n"
             "  若你明确只要「含 output_norm 的对照」，显式加 --allow-normed-upstream 自行承担口径。")
 
 
@@ -228,7 +249,15 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--path", required=True, choices=sorted(_IFACES_BY_PATH))
     ap.add_argument("--model-dir", default=None, help="上游 PyTorch 模型目录（d2l_* 必需）")
     ap.add_argument("--upstream-model", default=None,
-                    help="上游 GGUF（l2l_llama 必需，通常是用 cut_layers.py 生成的 head 工件）")
+                    help="上游 GGUF（l2l_llama / l2l_keep_head 必需：前者是 head 工件、"
+                         "后者是前 K 层的裁层工件）")
+    ap.add_argument("--keep-head-shim", default=None,
+                    help="补丁版 keep-head shim（qlh_keep_head.dll）；l2l_keep_head 与 "
+                         "d2l2l_keep_head 必需。生成：scripts/model_tools/build_keep_head_shim.ps1")
+    ap.add_argument("--mid-model", default=None,
+                    help="d2l2l_keep_head 的中间段工件（保留 blk.K1..K2-1 的裁层 GGUF）")
+    ap.add_argument("--mid-layers", type=int, default=None,
+                    help="d2l2l_keep_head 的第二个切点 K2（中间段覆盖 blk.K1..K2-1）")
     ap.add_argument("--layers", type=int, default=12, help="切点 K：上游层数")
     ap.add_argument("--cut-model", required=True, help="下游裁层 GGUF（保留后 N-K 层）")
     ap.add_argument("--whole-model", required=True, help="对照整模 GGUF（同精度）")
@@ -296,6 +325,30 @@ def _load_upstream(args: argparse.Namespace) -> dict[str, Any]:
         "load_mode": (getattr(mgr, "_layer_load_metrics", {}) or {}).get("mode"),
         "compiled": getattr(mgr, "_compiled_transformer", None) is not None,
         "n_embd": int(mgr.model.config.hidden_size),
+    }
+
+
+def _load_keep_head_segment(args: argparse.Namespace, model_path: str, *,
+                            role: str) -> dict[str, Any]:
+    """用补丁版 keep-head 通道加载一个段（`role` 仅用于记录）。"""
+    from llama_keep_head import KeepHeadUpstream  # noqa: PLC0415
+
+    extra = [d for d in (os.environ.get("QLH_KEEP_HEAD_DLL_DIRS") or "").split(os.pathsep) if d]
+    started = time.perf_counter()
+    upstream = KeepHeadUpstream(args.keep_head_shim, model_path, mode="nextn",
+                                n_ctx=args.n_ctx, n_threads=args.threads,
+                                extra_dll_dirs=extra)
+    return {
+        "keep_head": upstream,
+        "load_s": round(time.perf_counter() - started, 2),
+        "device": "cpu",
+        "dtype": "float32",
+        "nf4_replaced": 0,
+        "param_bytes": Path(model_path).stat().st_size,
+        "load_mode": f"keep_head_shim(nextn, {role})",
+        "compiled": False,
+        "n_embd": upstream.n_embd,
+        "n_layer": upstream.n_layer,
     }
 
 
@@ -387,24 +440,33 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
     up_prefill_ms = dn_prefill_ms = None
     up_decode: list[float] = []
     dn_decode: list[float] = []
+    mid_decode: list[float] = []
     failure: str | None = None
     pos = 0
 
-    if args.path == PATH_L2L:
-        up_engine = upstream["upstream_engine"]
+    if args.path in (PATH_L2L, PATH_L2L_KEEP_HEAD):
+        keep_head_up = upstream.get("keep_head")
+        llama_up = upstream.get("upstream_engine")
+
+        def _up_hidden(tokens, pos, want_all):
+            """上游取 hidden：keep-head 通道（补丁版，末层输出）或 llama_engine embeddings。"""
+            if keep_head_up is not None:
+                return np.asarray(keep_head_up.forward_tokens_to_hidden(tokens, n_past=pos),
+                                  dtype=np.float32)
+            return np.asarray(
+                llama_up.forward_layers_to_hidden(tokens, n_past=pos, all_positions=want_all),
+                dtype=np.float32)
+
         ids_t = [[int(t) for t in prompt]] * batch_n
         upstream_pos = 0
         while len(upstream_tokens[0]) < args.gen:
             is_prefill = not upstream_tokens[0]
             started = time.perf_counter()
             if is_prefill and batch_n == 1:
-                hidden = up_engine.forward_layers_to_hidden(ids_t[0], n_past=0, all_positions=True)
-                hidden = np.asarray(hidden, dtype=np.float32)
+                hidden = _up_hidden(ids_t[0], 0, True)
             else:
-                hidden = np.stack([
-                    np.asarray(up_engine.forward_layers_to_hidden(ids_t[b], n_past=upstream_pos),
-                               dtype=np.float32)
-                    for b in range(batch_n)], axis=0)
+                hidden = np.stack([_up_hidden(ids_t[b], upstream_pos, False)
+                                   for b in range(batch_n)], axis=0)
             up_ms = (time.perf_counter() - started) * 1000
             up_prefill_ms = up_ms if is_prefill else up_prefill_ms
             if not is_prefill:
@@ -432,6 +494,8 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
         mgr = upstream["mgr"]
         device = upstream["device"]
         forward = downstream["forward"]
+        middle = upstream.get("keep_head_middle")     # 三段链路的中段（keep-head）
+        mid_pos = 0
         for _ in range(max(0, args.warmup)):
             with torch.no_grad():
                 out = mgr.forward_layers(
@@ -457,6 +521,14 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
             hidden = np.ascontiguousarray(
                 hidden_t.reshape(batch_n * n_tok, -1).to(torch.float32).cpu().numpy(),
                 dtype=np.float32)
+            if middle is not None:
+                # 三段：把上游 hidden 交给 keep-head 中段，吃 hidden 吐 hidden
+                started = time.perf_counter()
+                hidden = middle.forward_hidden_to_hidden(hidden, n_past=mid_pos)
+                mid_ms = (time.perf_counter() - started) * 1000
+                if not is_prefill:
+                    mid_decode.append(mid_ms)
+                mid_pos += n_tok
             logits, dn_ms = forward(hidden, is_prefill, pos)
             if logits is None:
                 failure = f"下游未返回 logits（step {step}）"
@@ -477,6 +549,7 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
         "downstream_prefill_ms": dn_prefill_ms,
         "upstream_decode_ms": _stat(up_decode),
         "downstream_decode_ms": _stat(dn_decode),
+        "middle_decode_ms": _stat(mid_decode),
     }
 
 
@@ -544,10 +617,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     cut_path = Path(args.cut_model)
     whole_path = Path(args.whole_model)
     prompt_path = Path(args.prompt)
-    upstream_iface, downstream_iface = _IFACES_BY_PATH[args.path]
-    _check_l2l_upstream_channel(args.path, args.allow_normed_upstream)
-    if args.path == PATH_L2L and args.batch != 1:
-        raise SystemExit("FAIL: l2l_llama 目前只支持 --batch 1（上游 head 的整段 prefill 通道）")
+    upstream_iface, downstream_iface, middle_iface = _IFACES_BY_PATH[args.path]
+    _check_l2l_upstream_channel(args.path, args.allow_normed_upstream, args.keep_head_shim)
+    if args.path in (PATH_L2L, PATH_L2L_KEEP_HEAD) and args.batch != 1:
+        raise SystemExit("FAIL: L→L（含 keep_head）目前只支持 --batch 1")
+    if args.path == PATH_D2L2L_KEEP_HEAD and (not args.mid_model or args.mid_layers is None):
+        raise SystemExit("FAIL: --path d2l2l_keep_head 需要 --mid-model 与 --mid-layers")
     if not args.model_dir:
         raise SystemExit(
             "FAIL: 需要 --model-dir（HF 模型目录）—— 它同时是 tokenizer 来源；"
@@ -608,7 +683,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                                "upstream_dtype_effective": upstream["dtype"],
                                "upstream_compiled": upstream["compiled"]})
         return build_record(
-            upstream_iface=upstream_iface, downstream_iface=downstream_iface, path=args.path,
+            upstream_iface=upstream_iface, downstream_iface=downstream_iface,
+            middle_iface=middle_iface, path=args.path,
             models=models, layer_layout=layer_layout, handoff=_handoff(n_embd),
             load={"prompt": str(prompt_path), "prefill_tokens": args.prefill,
                   "gen_tokens": args.gen, "batch": args.batch},
@@ -624,7 +700,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                        "model_bytes": baseline["model_bytes"],
                        "quant": args.downstream_quant or args.downstream_dtype}
 
-    if args.path == PATH_L2L:
+    if args.path == PATH_L2L_KEEP_HEAD:
+        upstream = _load_keep_head_segment(args, args.upstream_model, role="upstream")
+    elif args.path == PATH_L2L:
         from llama_engine import LlamaCppEngine  # noqa: PLC0415
 
         up_engine = LlamaCppEngine()
@@ -642,6 +720,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         }
     else:
         upstream = _load_upstream(args)
+
+    if args.path == PATH_D2L2L_KEEP_HEAD:
+        # 三段：torch 上游 → keep-head 中段 → llama 末段
+        upstream["keep_head_middle"] = _load_keep_head_segment(
+            args, args.mid_model, role="middle")["keep_head"]
+        layer_layout["middle_layers"] = int(args.mid_layers) - int(args.layers)
 
     downstream: dict[str, Any] = {}
     if args.path == PATH_D2L_RAW:
@@ -703,6 +787,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "downstream_prefill_ms": relay["downstream_prefill_ms"],
         "upstream_decode_ms": relay["upstream_decode_ms"],
         "downstream_decode_ms": relay["downstream_decode_ms"],
+        "middle_decode_ms": (relay.get("middle_decode_ms")
+                             if args.path == PATH_D2L2L_KEEP_HEAD else None),
         "baseline_ms_per_step": baseline["decode_ms"],
         "capacity_gain_x": (round(baseline["model_bytes"] / max_segment, 4)
                             if max_segment else None),
@@ -738,7 +824,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     ).to_dict()
 
     return build_record(
-        upstream_iface=upstream_iface, downstream_iface=downstream_iface, path=args.path,
+        upstream_iface=upstream_iface, downstream_iface=downstream_iface,
+        middle_iface=middle_iface, path=args.path,
         models=models, layer_layout=layer_layout, handoff=_handoff(n_embd, args.path),
         load={"prompt": str(prompt_path), "prefill_tokens": len(prompt),
               "gen_tokens": args.gen, "batch": args.batch},
@@ -781,9 +868,10 @@ def _vram_gb() -> float | None:
 
 def _dry_run_record(args: argparse.Namespace) -> dict[str, Any]:
     """不加载模型，只产出记录骨架（仍过 schema 校验）。"""
-    upstream_iface, downstream_iface = _IFACES_BY_PATH[args.path]
+    upstream_iface, downstream_iface, middle_iface = _IFACES_BY_PATH[args.path]
     return build_record(
-        upstream_iface=upstream_iface, downstream_iface=downstream_iface, path=args.path,
+        upstream_iface=upstream_iface, downstream_iface=downstream_iface,
+        middle_iface=middle_iface, path=args.path,
         models={
             "upstream": {"id": Path(args.model_dir or args.upstream_model or "").name or None,
                          "path": args.model_dir or args.upstream_model,

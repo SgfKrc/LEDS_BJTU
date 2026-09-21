@@ -74,8 +74,10 @@ fixture，并在 Python/TS 同一变更中更新。
 （`scripts/relay_experiment.py`）的强制记录格式：
 
 - `kind` 三类互斥：`mainrepo_end_to_end` / `raw_binding_probe` / `capacity_only`；
-- `kind` 与 `path` / `engines.*_iface` 的一致性由 schema 条件规则（`allOf` + `if/then`）强制 ——
-  **错标会被拒绝**，这是"不同层级的数字不得混进同一张表"的机器判据；
+- `path` 六条：`d2l_mainrepo` / `d2l_raw_binding` / `l2l_llama` / `l2l_keep_head` /
+  `d2l2l_keep_head`（三段）/ `capacity_scan`；
+- `kind` 与 `path` / `engines.*_iface`（含 `middle_iface`）的一致性由 schema 条件规则
+  （`allOf` + `if/then`）强制 —— **错标会被拒绝**，这是"不同层级的数字不得混进同一张表"的机器判据；
 - 构建/校验在 `src/relay_experiment_record.py`，守卫用例在
   `tests/test_relay_experiment_record.py`（25 用例，不需要模型工件）；
 - 纯实验记录，**没有 TS 侧对应物**，不进入控制面契约。
