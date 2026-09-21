@@ -51,7 +51,8 @@ class KeepHeadMiddleRunner:
     """中间段：吃 hidden → 吐 hidden（keep-head 语义）。模型只加载一次，多次连接复用。"""
 
     def __init__(self, *, shim: str, model: str, n_ctx: int, n_threads: int,
-                 n_seq_max: int, n_batch: int, extra_dll_dirs: list[str]) -> None:
+                 n_seq_max: int, n_batch: int, mode: str = "nextn",
+                 cut_layer: int | None = None, extra_dll_dirs: list[str]) -> None:
         import os  # noqa: PLC0415
 
         from llama_keep_head import KeepHeadUpstream  # noqa: PLC0415
@@ -59,7 +60,8 @@ class KeepHeadMiddleRunner:
         dirs = list(extra_dll_dirs)
         dirs.extend(d for d in (os.environ.get("QLH_KEEP_HEAD_DLL_DIRS") or "")
                     .split(os.pathsep) if d)
-        self._upstream = KeepHeadUpstream(shim, model, mode="nextn", n_ctx=n_ctx,
+        self._upstream = KeepHeadUpstream(shim, model, mode=mode, cut_layer=cut_layer,
+                                          n_ctx=n_ctx,
                                           n_threads=n_threads,
                                           n_seq_max=max(1, int(n_seq_max)),
                                           n_batch=max(512, int(n_batch)),
@@ -67,11 +69,15 @@ class KeepHeadMiddleRunner:
         self.n_embd = self._upstream.n_embd
         self.n_layer = self._upstream.n_layer
         self.n_seq_max = max(1, int(n_seq_max))
+        self.mode = mode
+        self.cut_layer = cut_layer
         self._pos = 0
         print(json.dumps({"role": "middle", "n_embd": self.n_embd,
                           "n_layer": self.n_layer, "n_seq_max": self.n_seq_max,
-                          "n_batch": max(512, int(n_batch)),
-                          "channel": "keep_head_nextn"}), flush=True)
+                          "n_batch": max(512, int(n_batch)), "mode": mode,
+                          "cut_layer": cut_layer,
+                          "channel": "keep_head_nextn" if mode == "nextn"
+                                     else "layer_inp"}), flush=True)
 
     def reset(self) -> None:
         """每条连接从干净状态开始：位置归零 + **清 KV/recurrent 记忆**（同进程多连接必需）。"""
@@ -160,6 +166,12 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
                     help="★ P3：允许的并行序列上限（跨机多序列要求 ≥ 调用方 batch）")
     ap.add_argument("--n-batch", type=int, default=1024,
                     help="★ P3：batch 容量下限（≥ 调用方 batch × prefill 长度）")
+    ap.add_argument("--mode", choices=("nextn", "layer_inp"), default="nextn",
+                    help="中间段的 keep-head 通道：nextn（配 head 裁层工件，只跑本段层）/"
+                         "layer_inp（配整模工件 + --cut-layer，取第 cut-layer 层输入；"
+                         "会跑满全部层，只适合验证或没有裁层工件时）")
+    ap.add_argument("--cut-layer", type=int, default=None,
+                    help="--mode layer_inp 必需：切点 K（取第 K 层输入 = 前 K 层输出）")
     ap.add_argument("--max-tokens", type=int, default=RELAY_DEFAULT_MAX_TOKENS)
     ap.add_argument("--dll-dir", action="append", default=[])
     ap.add_argument("--ready-file", default=None, help="写就绪标记（含实际端点），供驱动等待")
@@ -181,9 +193,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.role == "middle":
         if not args.keep_head_shim:
             raise SystemExit("FAIL: --role middle 需要 --keep-head-shim")
+        if args.mode == "layer_inp" and args.cut_layer is None:
+            raise SystemExit("FAIL: --mode layer_inp 需要 --cut-layer（整模 + 切点 K）")
         runner: Any = KeepHeadMiddleRunner(shim=args.keep_head_shim, model=args.model,
                                            n_ctx=args.n_ctx, n_threads=args.threads,
                                            n_seq_max=args.n_seq_max, n_batch=args.n_batch,
+                                           mode=args.mode, cut_layer=args.cut_layer,
                                            extra_dll_dirs=list(args.dll_dir))
         serve = serve_relay_middle_connection
     else:

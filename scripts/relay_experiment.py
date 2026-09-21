@@ -952,8 +952,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "downstream_prefill_ms": relay["downstream_prefill_ms"],
         "upstream_decode_ms": relay["upstream_decode_ms"],
         "downstream_decode_ms": relay["downstream_decode_ms"],
-        "middle_decode_ms": (relay.get("middle_decode_ms")
-                             if args.path == PATH_D2L2L_KEEP_HEAD else None),
+        # 中段耗时：本机三段与**跨机三段**都要记（跨机的中段耗时正是"值不值得跨机"的关键数据）
+        "middle_decode_ms": (relay.get("middle_decode_ms") if middle_iface else None),
         "baseline_ms_per_step": baseline["decode_ms"],
         "capacity_gain_x": (round(baseline["model_bytes"] / max_segment, 4)
                             if max_segment else None),
