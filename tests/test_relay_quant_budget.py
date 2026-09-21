@@ -14,6 +14,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "relay_quant_budget.py"
 
@@ -58,7 +60,7 @@ def test_budget_separates_no_headroom_prompts(tmp_path: Path) -> None:
                   passed=True, relay=3.7611, base=3.7555)
     _write_record(tmp_path / "p4b-natural-short-fp16-f16.json", prompt="natural-short",
                   passed=True, relay=6.1583, base=6.1491)
-    done = _run("--records", str(tmp_path / "p4b-*.json"))
+    done = _run("--records", str(tmp_path / "p4b-*.json"), "--min-prompts", "2")
     assert done.returncode == 0, done.stderr
     assert "safe" in done.stdout
     assert "no_hd" in done.stdout
@@ -70,16 +72,16 @@ def test_budget_marks_unsafe_when_headroom_prompts_flip(tmp_path: Path) -> None:
                   prompt="natural-short", passed=False, relay=4.0134, base=6.1491)
     _write_record(tmp_path / "p4b-natural-long-int4-int4_block128.json",
                   prompt="natural-long", passed=False, relay=3.8284, base=5.8149)
-    done = _run("--records", str(tmp_path / "p4b-*.json"))
+    done = _run("--records", str(tmp_path / "p4b-*.json"), "--min-prompts", "2")
     assert done.returncode == 0, done.stderr
-    assert "tight" in done.stdout
+    assert "unsafe" in done.stdout
     assert "没有" in done.stdout          # 无 safe 档时给明确建议
 
 
 def test_budget_reports_no_headroom_when_all_baselines_low(tmp_path: Path) -> None:
     _write_record(tmp_path / "p4b-code-fp16-f16.json", prompt="code",
                   passed=True, relay=3.7611, base=3.7555)
-    done = _run("--records", str(tmp_path / "p4b-*.json"))
+    done = _run("--records", str(tmp_path / "p4b-*.json"), "--min-prompts", "1")
     assert done.returncode == 0, done.stderr
     assert "no-headroom" in done.stdout
 
@@ -89,9 +91,43 @@ def test_budget_skips_unparseable_filenames(tmp_path: Path) -> None:
                   passed=True, relay=6.1583, base=6.1491)
     _write_record(tmp_path / "unrelated-name.json", prompt="x", passed=True,
                   relay=1.0, base=1.0)
-    done = _run("--records", str(tmp_path / "*.json"))
+    done = _run("--records", str(tmp_path / "*.json"), "--min-prompts", "1")
     assert done.returncode == 0, done.stderr
     assert "无法从文件名解析档位" in (done.stdout + done.stderr)
+
+
+def test_budget_rejects_incomplete_prompt_set_by_default(tmp_path: Path) -> None:
+    _write_record(tmp_path / "p4b-natural-short-fp16-f16.json", prompt="natural-short",
+                  passed=True, relay=6.1583, base=6.1491)
+    done = _run("--records", str(tmp_path / "p4b-*.json"))
+    assert done.returncode == 2
+    assert "at least 6 prompts" in done.stderr
+
+
+def test_budget_marks_low_headroom_flips_as_conditional_safe(tmp_path: Path) -> None:
+    _write_record(tmp_path / "p4b-code-nf4-f16.json", prompt="code",
+                  passed=False, relay=3.0, base=3.7)
+    _write_record(tmp_path / "p4b-natural-short-nf4-f16.json",
+                  prompt="natural-short", passed=True, relay=6.1, base=6.0)
+    done = _run("--records", str(tmp_path / "p4b-*.json"), "--min-prompts", "2")
+    assert done.returncode == 0, done.stderr
+    assert "safe-headroom-only" in done.stdout
+
+
+def test_budget_rejects_duplicate_prompt_records(tmp_path: Path) -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("budget_under_test", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    row = {
+        "upstream": "fp16", "hidden": "f16", "prompt": "natural-short",
+        "record": "one.json", "relay_margin": 6.1, "baseline_margin": 6.0,
+        "wire_bytes_per_token": 3584, "upstream_resident_bytes": 510_000_000,
+    }
+    with pytest.raises(ValueError, match="duplicate prompt record"):
+        module._validate_prompt_coverage([row, dict(row, record="two.json")], 1)
 
 
 def test_budget_fails_loud_on_empty_records(tmp_path: Path) -> None:

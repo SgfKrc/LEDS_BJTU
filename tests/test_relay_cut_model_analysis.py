@@ -63,6 +63,43 @@ def test_ci95_single_and_multi_point() -> None:
     assert median == 2.0 and half == 1.0
 
 
+def test_total_median_is_additive_stage_median(tmp_path: Path) -> None:
+    module = _load_module()
+    for round_no, (up, down) in enumerate(((1.0, 100.0), (2.0, 100.0),
+                                            (100.0, 1.0)), 1):
+        _write(tmp_path / f"r{round_no}-k4.json", up, down)
+    rows = [module._extract(tmp_path / f"r{round_no}-k4.json")
+            for round_no in (1, 2, 3)]
+    assert all(row is not None for row in rows)
+
+    done = _run("--records", str(tmp_path / "r*-k*.json"),
+                "--total-layers", "24", "--out", str(tmp_path / "report.json"))
+    assert done.returncode == 0, done.stderr
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    entry = report["by_cut"][0]
+    assert entry["total_median_ms"] == 102.0
+    assert entry["median_of_totals_ms"] == 101.0
+
+
+def test_repeated_scan_requires_balanced_three_rounds(tmp_path: Path) -> None:
+    for round_no in (1, 2):
+        _write(tmp_path / f"r{round_no}-k4.json", 10.0, 20.0)
+        _write(tmp_path / f"r{round_no}-k20.json", 20.0, 10.0)
+    done = _run("--records", str(tmp_path / "r*-k*.json"), "--total-layers", "24")
+    assert done.returncode == 2
+    assert "at least 3" in done.stderr
+
+
+def test_repeated_scan_rejects_correctness_failure(tmp_path: Path) -> None:
+    for round_no in (1, 2, 3):
+        _write(tmp_path / f"r{round_no}-k4.json", 10.0, 20.0,
+               passed=(round_no != 2))
+        _write(tmp_path / f"r{round_no}-k20.json", 20.0, 10.0)
+    done = _run("--records", str(tmp_path / "r*-k*.json"), "--total-layers", "24")
+    assert done.returncode == 2
+    assert "correctness verdict failed" in done.stderr
+
+
 def test_linear_fit_perfect_and_noisy() -> None:
     module = _load_module()
     perfect = module._linear_fit([1.0, 2.0, 3.0], [3.0, 5.0, 7.0])
@@ -97,7 +134,8 @@ def test_significant_interior_optimum_is_detected(tmp_path: Path) -> None:
 def test_skips_records_without_metrics(tmp_path: Path) -> None:
     _write(tmp_path / "r1-k4.json", 10.0, 20.0)
     _write(tmp_path / "r2-k4.json", None, None)      # 缺指标 ⇒ 不参与
-    done = _run("--records", str(tmp_path / "r*-k*.json"), "--total-layers", "24")
+    done = _run("--records", str(tmp_path / "r*-k*.json"), "--total-layers", "24",
+                "--min-rounds", "1")
     assert done.returncode == 0, done.stderr
     assert "无法解析或缺少指标" in (done.stdout + done.stderr)
 

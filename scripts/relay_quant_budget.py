@@ -85,6 +85,37 @@ def _load_records(patterns: list[str]) -> list[dict[str, object]]:
     return rows
 
 
+def _validate_prompt_coverage(rows: list[dict[str, object]], min_prompts: int) -> None:
+    if min_prompts < 1:
+        raise ValueError("--min-prompts must be >= 1")
+    buckets: dict[tuple[str, str], set[str]] = {}
+    seen: set[tuple[str, str, str]] = set()
+    for row in rows:
+        key = (str(row["upstream"]), str(row["hidden"]))
+        prompt = str(row["prompt"])
+        identity = (*key, prompt)
+        if identity in seen:
+            raise ValueError(f"duplicate prompt record in quantization bucket: {identity}")
+        seen.add(identity)
+        required = ("relay_margin", "baseline_margin",
+                    "wire_bytes_per_token", "upstream_resident_bytes")
+        if any(row[field] is None for field in required):
+            raise ValueError(f"missing required metric in record: {row['record']}")
+        buckets.setdefault(key, set()).add(prompt)
+    sizes = {key: len(prompts) for key, prompts in buckets.items()}
+    if any(size < min_prompts for size in sizes.values()):
+        raise ValueError(
+            f"each quantization bucket needs at least {min_prompts} prompts; "
+            f"got {sizes}"
+        )
+    prompt_sets = {frozenset(prompts) for prompts in buckets.values()}
+    if len(prompt_sets) > 1:
+        raise ValueError(
+            "quantization buckets must use the same prompt set; "
+            f"got {sizes}"
+        )
+
+
 def _aggregate(rows: list[dict[str, object]], gate: float) -> list[dict[str, object]]:
     buckets: dict[tuple[str, str], list[dict[str, object]]] = {}
     for row in rows:
@@ -102,6 +133,7 @@ def _aggregate(rows: list[dict[str, object]], gate: float) -> list[dict[str, obj
         #   否则对照档（fp16×f16）也会被判 unsafe，闸门就失去意义。
         headroom = [r for r in items
                     if r["baseline_margin"] is not None and float(r["baseline_margin"]) >= gate]
+        headroom_flipped = [r for r in headroom if not r["passed"]]
         margins_h = [float(r["relay_margin"]) for r in headroom
                      if r["relay_margin"] is not None]
         table.append({
@@ -112,6 +144,8 @@ def _aggregate(rows: list[dict[str, object]], gate: float) -> list[dict[str, obj
             "flip_rate": round(len(flipped) / max(1, len(items)), 4),
             "flipped_prompts": sorted(str(r["prompt"]) for r in flipped),
             "n_baseline_no_headroom": len(items) - len(headroom),
+            "n_headroom_flipped": len(headroom_flipped),
+            "headroom_flipped_prompts": sorted(str(r["prompt"]) for r in headroom_flipped),
             "margin_min": min(margins) if margins else None,
             "margin_min_headroom": min(margins_h) if margins_h else None,
             "margin_median": (round(statistics.median(margins), 4) if margins else None),
@@ -139,12 +173,20 @@ def main() -> int:
                     help="margin 翻转分界（实测落点 4.0~4.8，默认取中点 4.5）")
     ap.add_argument("--safety-margin", type=float, default=0.5,
                     help="安全余量：要求 margin_min ≥ threshold + safety_margin")
+    ap.add_argument("--min-prompts", type=int, default=6,
+                    help="每个量化档至少覆盖的 prompt 数；默认 6")
     ap.add_argument("--out", default=None, help="汇总 JSON 落盘路径")
     args = ap.parse_args()
 
     rows = _load_records(args.records)
     if not rows:
         print("FAIL: 没有可解析的记录", file=sys.stderr)
+        return 2
+
+    try:
+        _validate_prompt_coverage(rows, args.min_prompts)
+    except ValueError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
         return 2
 
     gate = args.flip_threshold + args.safety_margin
@@ -156,10 +198,15 @@ def main() -> int:
         # 把它们算进来会让对照档也判 unsafe（实测：fp16×f16 因为 code 的基线只有 3.76 被判 tight）。
         if worst is None:
             entry["verdict"] = "no-headroom"      # 这一档遇到的全是无余量 prompt
-        elif float(worst) >= gate:
-            entry["verdict"] = "safe"
-        else:
+        elif entry["n_headroom_flipped"]:
+            entry["verdict"] = "unsafe"
+        elif float(worst) < gate:
             entry["verdict"] = "tight"
+        elif entry["n_flipped"]:
+            # Low-baseline prompts must be routed to full precision first.
+            entry["verdict"] = "safe-headroom-only"
+        else:
+            entry["verdict"] = "safe"
 
     header = (f"{'upstream':<7} {'hidden':<15} {'n':>3} {'flip':>5} {'no_hd':>6} "
               f"{'min(hd)':>9} {'median':>8} {'Δmin%':>7} {'wire B':>7} {'up MB':>7}  verdict")
@@ -178,14 +225,14 @@ def main() -> int:
     print("说明：`no_hd` = 基线本身低于闸门的 prompt 数（这类 prompt 无预算空间，单独计数不计入判定）")
 
     # 选档建议：在 safe 档里选"线路字节 + 上游驻留"最小者（容量优先，质量已由闸门保证）
-    safe = [e for e in table if e["verdict"] == "safe"]
+    safe = [e for e in table if e["verdict"] in {"safe", "safe-headroom-only"}]
     if safe:
         def _cost(e: dict[str, object]) -> float:
             wire = float(e["wire_bytes_per_token"] or 0)
             up = float(e["upstream_resident_bytes"] or 0) / 1e6
             return wire + up * 10          # 上游驻留按 10 B 权重折算，仅为排序口径
         best = min(safe, key=_cost)
-        print(f"[建议] 在 {len(safe)} 个 safe 档中按容最优先推荐："
+        print(f"[建议] 在 {len(safe)} 个候选档中按容最优先推荐："
               f"{best['upstream']} x {best['hidden']}"
               f"（margin_min(有余量子集)={best['margin_min_headroom']}，"
               f"线路 {best['wire_bytes_per_token']} B/token，"
@@ -201,6 +248,7 @@ def main() -> int:
             "flip_threshold": args.flip_threshold,
             "safety_margin": args.safety_margin,
             "gate": gate,
+            "min_prompts": args.min_prompts,
             "table": table,
             "records": rows,
         }, ensure_ascii=False, indent=2), encoding="utf-8")

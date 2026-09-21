@@ -98,6 +98,8 @@ def main() -> int:
     ap.add_argument("--records", action="append", required=True,
                     help="多轮扫描记录的 glob，可重复（如 .../p0-repeat/r*-k*.json）")
     ap.add_argument("--total-layers", type=int, required=True)
+    ap.add_argument("--min-rounds", type=int, default=3,
+                    help="每个切点的最少重复轮数；默认 3，避免单轮噪声进入决策")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -113,9 +115,32 @@ def main() -> int:
         print("FAIL: 没有可解析的记录", file=sys.stderr)
         return 2
 
+    if args.min_rounds < 1:
+        print("FAIL: --min-rounds must be >= 1", file=sys.stderr)
+        return 2
+
     by_cut: dict[int, list[dict[str, object]]] = {}
     for row in rows:
         by_cut.setdefault(int(row["cut"]), []).append(row)
+
+    round_counts = {cut: len(items) for cut, items in by_cut.items()}
+    if len(set(round_counts.values())) != 1 or any(
+        count < args.min_rounds for count in round_counts.values()
+    ):
+        print(
+            "FAIL: every measured cut must have the same number of rounds "
+            f"and at least {args.min_rounds}; got {round_counts}",
+            file=sys.stderr,
+        )
+        return 2
+    failed = [str(row["record"]) for row in rows if not bool(row["passed"])]
+    if failed:
+        print(
+            "FAIL: correctness verdict failed in repeated scan: "
+            + ", ".join(failed),
+            file=sys.stderr,
+        )
+        return 2
 
     table: list[dict[str, object]] = []
     for cut in sorted(by_cut):
@@ -123,18 +148,26 @@ def main() -> int:
         totals = [float(i["total_ms"]) for i in items]
         ups = [float(i["upstream_ms"]) for i in items]
         downs = [float(i["downstream_ms"]) for i in items]
-        median, half = _ci95(totals)
+        _median_of_totals, half = _ci95(totals)
+        upstream_median = statistics.median(ups)
+        downstream_median = statistics.median(downs)
         table.append({
             "cut": cut,
             "rounds": len(items),
             "all_passed": all(bool(i["passed"]) for i in items),
-            "upstream_median_ms": round(statistics.median(ups), 4),
-            "downstream_median_ms": round(statistics.median(downs), 4),
-            "total_median_ms": round(median, 4),
+            "upstream_median_ms": round(upstream_median, 4),
+            "downstream_median_ms": round(downstream_median, 4),
+            # The synthetic records consumed by relay_cut_plan.py use the
+            # median of each segment. Keep this value additive and expose the
+            # median of per-run totals separately because medians do not add.
+            "total_median_ms": round(upstream_median + downstream_median, 4),
+            "median_of_totals_ms": round(_median_of_totals, 4),
             "total_min_ms": round(min(totals), 4),
             "total_max_ms": round(max(totals), 4),
             "total_halfwidth_ms": round(half, 4),
-            "spread_pct": round(100.0 * (max(totals) - min(totals)) / median, 2) if median else None,
+            "spread_pct": round(100.0 * (max(totals) - min(totals)) /
+                                   (upstream_median + downstream_median), 2)
+            if upstream_median + downstream_median else None,
         })
 
     cuts = [int(e["cut"]) for e in table]
@@ -159,6 +192,8 @@ def main() -> int:
     report = {
         "schema_version": "qlh.relay_cut_model_analysis.v1",
         "total_layers": args.total_layers,
+        "min_rounds": args.min_rounds,
+        "rounds_per_cut": round_counts,
         "records": [str(i["record"]) for i in rows],
         "by_cut": table,
         "linear_fit_total_median": fit,
@@ -168,6 +203,7 @@ def main() -> int:
         "interior_optimum_evidence": evidence,
         "max_spread_pct": median_spread,
         "verdict": {
+            "input_valid": True,
             "has_significant_interior_optimum": significant,
             "noise_dominates": (median_spread > 10.0) and not significant,
             "note": ("内部最优不显著 ⇒ 切点搜索应转向容量可行性"
