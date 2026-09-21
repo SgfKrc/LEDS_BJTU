@@ -691,7 +691,8 @@ class TestStructuredLogFormat:
 
         _request_id_ctx.set("abc123def456")
         logger = logging.getLogger("test.structured")
-        logger.info("event=test_request_id message=hello")
+        with caplog.at_level(logging.INFO, logger="test.structured"):
+            logger.info("event=test_request_id message=hello")
 
         # request_id 由 RequestIdFilter 注入到 LogRecord，caplog 会保留
         record = caplog.records[-1]

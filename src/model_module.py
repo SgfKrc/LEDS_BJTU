@@ -721,26 +721,28 @@ def _ensure_compile_limits_in_current_thread() -> None:
     """★ A6：把 `recompile_limit`/`cache_size_limit` 在当前线程内**幂等**补设到配置值。
 
     `torch._dynamo.config` 是 thread-local ⇒ 仅在 `_apply_compile()`（加载线程）里设是不够的。
-    本函数每个线程只真正执行一次；只在「当前值小于配置值」时才写，避免覆盖用户显式调大的值。
+    本函数对每个线程记住「开关 + 目标值」状态；配置开关或目标值变化后会重新应用。
+    只在「当前值小于配置值」时才写，避免覆盖用户显式调大的值。
     """
-    if getattr(_compile_limit_tls, "done", False):
-        return
-    if not globals().get("USE_COMPILE"):
-        _compile_limit_tls.done = True
-        return
+    compile_enabled = bool(globals().get("USE_COMPILE"))
     limit = globals().get("COMPILE_RECOMPILE_LIMIT")
     if not limit:
-        _compile_limit_tls.done = True
+        return
+    want = int(limit)
+    state = (compile_enabled, want)
+    if getattr(_compile_limit_tls, "state", None) == state:
+        return
+    if not compile_enabled:
+        _compile_limit_tls.state = state
         return
     try:
         import torch._dynamo as _dynamo
-        want = int(limit)
         if int(_dynamo.config.recompile_limit or 0) < want:
             _dynamo.config.recompile_limit = want
         current_cache = getattr(_dynamo.config, "cache_size_limit", None)
         if current_cache is not None and int(current_cache or 0) < want:
             _dynamo.config.cache_size_limit = want
-        _compile_limit_tls.done = True
+        _compile_limit_tls.state = state
         logger.debug("A6：已在本线程内补设 recompile_limit/cache_size_limit = %s", want)
     except Exception as exc:  # noqa: BLE001 - 补设失败不应影响前向
         logger.debug("A6：线程内补设 recompile_limit 失败（忽略）: %s", exc)

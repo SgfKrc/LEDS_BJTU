@@ -24,8 +24,10 @@ import model_module  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def _restore_and_reset_tls():
+def _restore_and_reset_tls(monkeypatch):
     """保存/恢复 dynamo config，并清掉本线程的幂等标记（避免测试间互相影响）。"""
+    monkeypatch.setattr(model_module, "USE_COMPILE", True)
+    model_module._compile_limit_tls.__dict__.clear()
     saved = (int(dynamo.config.recompile_limit),
              int(getattr(dynamo.config, "cache_size_limit", 0) or 0))
     yield
@@ -78,6 +80,18 @@ def test_idempotent_per_thread():
     dynamo.config.recompile_limit = _cfg_limit() + 100
     model_module._ensure_compile_limits_in_current_thread()
     assert dynamo.config.recompile_limit == _cfg_limit() + 100
+
+
+def test_reapplies_after_compile_is_reenabled(monkeypatch):
+    """关闭后重新开启 compile，线程内补设不能被旧状态短路。"""
+    monkeypatch.setattr(model_module, "USE_COMPILE", False)
+    dynamo.config.recompile_limit = 8
+    model_module._ensure_compile_limits_in_current_thread()
+    assert dynamo.config.recompile_limit == 8
+
+    monkeypatch.setattr(model_module, "USE_COMPILE", True)
+    model_module._ensure_compile_limits_in_current_thread()
+    assert dynamo.config.recompile_limit == _cfg_limit()
 
 
 def test_does_not_lower_larger_existing_value():
