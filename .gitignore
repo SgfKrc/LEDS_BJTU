@@ -209,6 +209,7 @@ scripts/*
 !scripts/relay_cut_plan.py
 !scripts/relay_mid_service.py
 !scripts/relay_bitwise_probe.py
+!scripts/relay_quant_budget.py
 
 # 根目录：过时日志 / 备份（2026-09-20 剔除）
 # ⚠️ `bjtu.bat` / `bjtu.sh` **保留** —— 它们仍是活跃入口：
