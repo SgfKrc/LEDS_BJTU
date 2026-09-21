@@ -158,6 +158,9 @@ class StageRequest:
     root_input: dict
     model_identity: Optional[ModelIdentity] = None
     runtime_context: dict = field(default_factory=dict, compare=False, repr=False)
+    # Protocol fields that belong to the selected stage, rather than its root
+    # input.  Layer-forward requests use this to carry the hidden contract.
+    stage_fields: dict = field(default_factory=dict, compare=False, repr=False)
 
 
 @dataclass(frozen=True)

@@ -779,9 +779,7 @@ class RemoteFullWorkerProvider:
 
         sent_at_ms = int(time.time() * 1000)
         lease_expires_at_ms = int(attempt.lease_expires_at * 1000)
-        offer = build_message(
-                "stage_offer",
-                {
+        offer_payload = {
                     "workflow_id": attempt.request.workflow_id,
                     "request_id": attempt.request.request_id,
                     "stage_id": attempt.request.stage_id,
@@ -798,7 +796,18 @@ class RemoteFullWorkerProvider:
                         attempt.request.dependencies,
                     ),
                     "model_identity": attempt.request.model_identity.snapshot(),
-                },
+                }
+        if attempt.request.stage_type == "layer_forward":
+            offer_payload.update(attempt.request.stage_fields)
+        elif attempt.request.stage_fields:
+            raise ProviderExecutionError(
+                "non-layer stage contains specialized stage fields",
+                code="invalid_stage_fields",
+                provider_id=self.provider_id,
+            )
+        offer = build_message(
+                "stage_offer",
+                offer_payload,
                 message_id=_message_id("offer_"),
                 sent_at_ms=sent_at_ms,
                 version=PROTOCOL_VERSION,

@@ -107,6 +107,12 @@ def _manifest(identity: dict, k: int, dst: Path, kept: int, dropped: int) -> dic
         "generator": "scripts/cut_layers.py",
         "generator_version": 1,
         "source": identity["source"],
+        # Android workers use this logical-model digest to reject a crop from
+        # another GGUF family. Keep the artifact digest separate below.
+        "source_model_sha256": (
+            _sha256(Path(identity["source"]))
+            if Path(identity["source"]).is_file() else ""
+        ),
         "artifact": str(dst),
         "architecture": identity["architecture"],
         "block_count": identity["block_count"],

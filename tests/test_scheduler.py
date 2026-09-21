@@ -20,6 +20,7 @@ import pytest
 import api_server  # noqa: F401,E402
 import node_runtime as node_runtime_mod
 from scheduler import Scheduler, PipelineQueue, NodeInfo, NodeState, NodeRole
+from koakuma_engine import Capability
 
 
 # ================================================================
@@ -821,6 +822,20 @@ class TestComputeLayerAssignment:
         node_ids = {a["node_id"] for a in result}
         assert "android-live" not in node_ids
         assert node_ids == {"master", "pc-worker"}
+
+    def test_android_forward_layers_capability_is_assigned(self, sched):
+        """Android with an explicit llama.cpp layer capability can receive a segment."""
+        nodes = [
+            {"node_id": "master", "role": "master", "node_type": "pc", "device_info": PROFILE_WORKSTATION},
+            {"node_id": "android-worker", "role": "client", "node_type": "android", "device_info": {
+                **PROFILE_MOBILE,
+                "backend_id": "llama_cpp",
+                "capabilities": [Capability.FORWARD_LAYERS],
+            }},
+        ]
+        result = sched.compute_layer_assignment(nodes)
+        node_ids = {assignment["node_id"] for assignment in result}
+        assert node_ids == {"master", "android-worker"}
 
     def test_offline_pc_nodes_are_excluded_from_runtime_assignment(self):
         """数据库恢复的历史 PC 节点离线时不能继续占用模型层。"""

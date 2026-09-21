@@ -137,6 +137,12 @@ class StageSpec:
     )
     # When omitted, the workflow identity is used for backwards compatibility.
     model_identity: Optional[ModelIdentity] = None
+    # Explicit wire fields for specialized stage types such as layer_forward.
+    stage_fields: dict[str, Any] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass
@@ -262,6 +268,7 @@ class StageRecord:
                 }
                 for target, source in self.spec.input_bindings.items()
             },
+            "stage_fields": dict(self.spec.stage_fields),
             "max_same_provider_retries": self.spec.max_same_provider_retries,
             "retry_safe": self.spec.retry_safe,
             "lease_epoch": self.lease_epoch,
@@ -1636,6 +1643,14 @@ class TaskGraphCoordinator:
                 raise TaskGraphError(
                     f"stage {spec.stage_id} input bindings must be an object"
                 )
+            if not isinstance(spec.stage_fields, dict):
+                raise TaskGraphError(
+                    f"stage {spec.stage_id} stage fields must be an object"
+                )
+            if spec.stage_type != "layer_forward" and spec.stage_fields:
+                raise TaskGraphError(
+                    f"stage {spec.stage_id} stage fields are only valid for layer_forward"
+                )
             for target_key, source in spec.input_bindings.items():
                 if (
                     not isinstance(target_key, str)
@@ -2335,6 +2350,7 @@ class TaskGraphCoordinator:
             root_input=stage_root_input,
             model_identity=workflow.effective_model_identity(stage.spec),
             runtime_context=workflow.runtime_context,
+            stage_fields=dict(stage.spec.stage_fields),
         )
         try:
             reservation = provider_registry.reserve(

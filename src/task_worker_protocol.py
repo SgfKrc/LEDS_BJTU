@@ -345,6 +345,8 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     # the scheduler performs that role-specific check after hello validation.
     if "resource_gate" in capabilities:
         expected_fields.add("resource_gate")
+    if "layer_ranges" in capabilities:
+        expected_fields.add("layer_ranges")
     _require_exact_fields(
         capabilities,
         expected_fields,
@@ -366,6 +368,23 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
             "invalid_capabilities", "payload.capabilities.stage_types",
             "stage_types must not contain duplicates",
         )
+    if "layer_ranges" in capabilities:
+        ranges = capabilities["layer_ranges"]
+        if not isinstance(ranges, list) or any(
+            not isinstance(item, list) or len(item) != 2
+            or any(isinstance(value, bool) or not isinstance(value, int) for value in item)
+            or item[0] < 0 or item[1] <= item[0]
+            for item in ranges
+        ):
+            raise _error(
+                "invalid_capabilities", "payload.capabilities.layer_ranges",
+                "layer_ranges must contain non-empty [start, end) integer ranges",
+            )
+        if len(ranges) != len({tuple(item) for item in ranges}):
+            raise _error(
+                "invalid_capabilities", "payload.capabilities.layer_ranges",
+                "layer_ranges must not contain duplicates",
+            )
     engines = capabilities["engines"]
     if not isinstance(engines, list) or not engines or any(
         value not in _SUPPORTED_ENGINES
