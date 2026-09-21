@@ -31,6 +31,71 @@ def test_test_channel_guard_accepts_virtual_environment(monkeypatch):
     ) is True
 
 
+def test_test_channel_console_writer_replaces_unrepresentable_characters(capsys):
+    run_test_channels._write_console("test\u036c\n")
+
+    assert "test" in capsys.readouterr().out
+
+
+def test_test_channel_cli_defaults_to_stable_scope_distribution():
+    args = run_test_channels._parse_args(["--channel", "unit"])
+
+    assert args.dist == "loadscope"
+    assert args.repeat == 1
+    assert args.order_seed is None
+    assert args.artifacts_dir == run_test_channels.ROOT / "build" / "audit"
+
+
+def test_test_channel_unit_args_can_enable_true_concurrency(tmp_path):
+    args = run_test_channels._unit_args(
+        4,
+        dist="load",
+        junitxml=tmp_path / "unit.xml",
+        order_seed=123,
+    )
+
+    assert args[4:8] == ["-n", "4", "--dist", "load"]
+    assert args[-6:] == [
+        "--junitxml",
+        str(tmp_path / "unit.xml"),
+        "--maxfail=0",
+        "--tb=long",
+        "--qlh-order-seed",
+        "123",
+    ]
+
+
+def test_test_channel_repeat_keeps_all_runs_and_failure_evidence(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(arguments, _env, *, log_path):
+        log_path.write_text("captured\n", encoding="utf-8")
+        calls.append((list(arguments), log_path.name))
+        return (1 if len(calls) == 1 else 0), 0.01
+
+    monkeypatch.setattr(run_test_channels, "_check_python_environment", lambda **_: True)
+    monkeypatch.setattr(run_test_channels, "_run_pytest", fake_run)
+
+    assert run_test_channels.main([
+        "--channel", "unit",
+        "--repeat", "2",
+        "--order-seed", "7",
+        "--artifacts-dir", str(tmp_path),
+        "--allow-system-python",
+    ]) == 1
+
+    session_dirs = [path for path in tmp_path.iterdir() if path.is_dir()]
+    assert len(session_dirs) == 1
+    manifest = (session_dirs[0] / "manifest.json").read_text(encoding="utf-8")
+    data = __import__("json").loads(manifest)
+    assert data["order_seed"] == 7
+    assert [run["returncode"] for run in data["runs"]] == [1, 0]
+    assert [run["order_seed"] for run in data["runs"]] == [7, 8]
+    assert [run["order_seed"] for run in data["runs"]] == [7, 8]
+    assert [run["log"] for run in data["runs"]] == ["unit-001.log", "unit-002.log"]
+    assert all("--junitxml" in run["command"] for run in data["runs"])
+
+
 def test_install_command_keeps_proxy_and_requirements_in_venv(monkeypatch):
     test_python = Path("G:/qlh/.venv-test/Scripts/python.exe")
     monkeypatch.setattr(setup_test_env, "_python_path", lambda: test_python)
