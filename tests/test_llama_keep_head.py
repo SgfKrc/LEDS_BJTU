@@ -135,3 +135,63 @@ def test_rejects_wrong_hidden_width():
     with _upstream_or_skip(mode="nextn") as up:
         with pytest.raises(ValueError, match="hidden 形状"):
             up.forward_hidden_to_hidden([[0.0] * max(1, up.n_embd // 2)])
+
+
+# --------------------------------------------------- P3：多序列数据流契约
+def test_token_list_validates_length_without_a_model():
+    """`seq_ids` / `positions` 与 n_tokens 必须等长（纯校验，不需要模型）。"""
+    assert KeepHeadUpstream._token_list(None, 3, "seq_ids") is None
+    assert KeepHeadUpstream._token_list([0, 1, 2], 3, "seq_ids") == [0, 1, 2]
+    with pytest.raises(ValueError, match="长度 2 != n_tokens 3"):
+        KeepHeadUpstream._token_list([0, 1], 3, "positions")
+
+
+def test_multi_sequence_binding_is_accepted():
+    """P3：2 序列 × 2 token 的显式绑定（seq_ids + positions）必须与单序列同形返回。"""
+    import numpy as np
+
+    with _upstream_or_skip(mode="nextn", n_seq_max=2) as up:
+        hidden = np.zeros((4, up.n_embd), dtype=np.float32)
+        out = up.forward_hidden_to_hidden(hidden, seq_ids=[0, 0, 1, 1],
+                                          positions=[0, 1, 0, 1])
+        assert out.shape == hidden.shape
+        assert np.isfinite(out).all()
+
+
+def test_seq_id_beyond_n_seq_max_is_rejected():
+    """seq_id ≥ n_seq_max 必须 fail-loud（否则 llama.cpp 直接 rc=-1，错误难定位）。"""
+    import numpy as np
+
+    with _upstream_or_skip(mode="nextn", n_seq_max=1) as up:
+        hidden = np.zeros((2, up.n_embd), dtype=np.float32)
+        with pytest.raises(ValueError, match="n_seq_max"):
+            up.forward_hidden_to_hidden(hidden, seq_ids=[0, 3], positions=[0, 0])
+
+
+def test_single_sequence_positions_stay_consecutive_across_steps():
+    """★ 回归：单序列增量必须延续位置（曾因多序列改造丢掉 n_past 而第二步 decode 失败）。"""
+    import numpy as np
+
+    with _upstream_or_skip(mode="nextn", n_seq_max=1) as up:
+        first = up.forward_hidden_to_hidden(np.zeros((2, up.n_embd), dtype=np.float32),
+                                            n_past=0)
+        second = up.forward_hidden_to_hidden(np.zeros((1, up.n_embd), dtype=np.float32),
+                                             n_past=2)
+        assert first.shape[0] == 2 and second.shape[0] == 1
+
+
+# --------------------------------------------------- P3：hidden 压缩字节口径
+def test_hidden_quant_bytes_accounting():
+    """压缩档位的**每 token 有效线上字节**（int8 块量化含每 128 维 1 个 f32 scale）。"""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "relay_experiment_cli", ROOT / "scripts" / "relay_experiment.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    assert module._hidden_bytes(896, "none") == 896 * 4
+    assert module._hidden_bytes(896, "f16") == 896 * 2
+    assert module._hidden_bytes(896, "int8_block128") == 896 + 7 * 4   # 7 个 128 块
+    assert module._hidden_bytes(0, "f16") is None

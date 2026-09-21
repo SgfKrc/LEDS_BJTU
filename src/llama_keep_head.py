@@ -48,7 +48,8 @@ EXTRA_DLL_DIRS_ENV = "QLH_KEEP_HEAD_DLL_DIRS"
 
 #: shim 必须导出的符号（缺任何一个都说明编译产物不对）。
 SHIM_SYMBOLS = ("qlh_kh_load", "qlh_kh_forward", "qlh_kh_forward_embd",
-                "qlh_kh_n_embd", "qlh_kh_n_layer", "qlh_kh_close")
+                "qlh_kh_forward_embd_seq", "qlh_kh_n_embd", "qlh_kh_n_layer",
+                "qlh_kh_close")
 
 #: `qlh_kh_forward*` 的错误码 → 说明。
 FORWARD_ERRORS = {
@@ -106,6 +107,7 @@ class KeepHeadUpstream:
         n_ctx: int = 4096,
         n_threads: int = 8,
         n_batch: int = 512,
+        n_seq_max: int = 1,
         extra_dll_dirs: Sequence[str] = (),
     ) -> None:
         if mode not in MODE_CODES:
@@ -124,9 +126,11 @@ class KeepHeadUpstream:
             raise KeepHeadUnavailable(f"找不到模型：{self.model_path}")
 
         self._worker = None
+        self.n_seq_max = max(1, int(n_seq_max))
         if _llama_cpp_loaded():
             self._init_isolated_worker(
                 n_ctx=n_ctx, n_threads=n_threads, n_batch=n_batch,
+                n_seq_max=self.n_seq_max,
                 extra_dll_dirs=extra_dll_dirs)
             return
 
@@ -146,7 +150,7 @@ class KeepHeadUpstream:
         lib = self._lib
         lib.qlh_kh_load.argtypes = [
             ctypes.c_char_p, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
-            ctypes.c_int32, ctypes.c_int32,
+            ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
             ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
             ctypes.c_char_p, ctypes.c_size_t,
         ]
@@ -156,6 +160,13 @@ class KeepHeadUpstream:
             ctypes.c_int32, ctypes.POINTER(ctypes.c_float),
         ]
         lib.qlh_kh_forward.restype = ctypes.c_int32
+        lib.qlh_kh_forward_embd_seq.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
+            ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float),
+        ]
+        lib.qlh_kh_forward_embd_seq.restype = ctypes.c_int32
         lib.qlh_kh_forward_embd.argtypes = [
             ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32,
             ctypes.c_int32, ctypes.POINTER(ctypes.c_float),
@@ -173,6 +184,7 @@ class KeepHeadUpstream:
         err = ctypes.create_string_buffer(512)
         handle = lib.qlh_kh_load(
             str(self.model_path).encode("utf-8"), int(n_ctx), int(n_threads), int(n_batch),
+            int(self.n_seq_max),
             MODE_CODES[mode], int(cut_layer or 0),
             ctypes.byref(n_embd_out), ctypes.byref(n_layer_out), err, len(err))
         if not handle:
@@ -188,7 +200,7 @@ class KeepHeadUpstream:
 
     # ------------------------------------------------------------------ 前向
     def _init_isolated_worker(self, *, n_ctx: int, n_threads: int, n_batch: int,
-                              extra_dll_dirs: Sequence[str]) -> None:
+                              n_seq_max: int, extra_dll_dirs: Sequence[str]) -> None:
         """Keep the patched llama.cpp ABI out of the pip llama.cpp process."""
         worker = Path(__file__).with_name("llama_keep_head_worker.py")
         if not worker.is_file():
@@ -198,6 +210,7 @@ class KeepHeadUpstream:
             "--shim", str(self.shim_path), "--model", str(self.model_path),
             "--mode", self.mode, "--n-ctx", str(int(n_ctx)),
             "--n-threads", str(int(n_threads)), "--n-batch", str(int(n_batch)),
+            "--n-seq-max", str(int(n_seq_max)),
         ]
         if self.cut_layer is not None:
             command.extend(["--cut-layer", str(self.cut_layer)])
@@ -206,18 +219,30 @@ class KeepHeadUpstream:
         popen_kwargs: dict[str, object] = {}
         if os.name == "nt":
             popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        # worker 的 stderr 必须落盘：llama.cpp 的日志量很大，用 PIPE 会填满缓冲而死锁，
+        # 用 DEVNULL 则失败时无信息。落盘后可随时 tail 诊断。
+        log_path = Path(os.environ.get("QLH_KEEP_HEAD_WORKER_LOG")
+                        or (Path.cwd() / "build" / "relay-records" / "_keephead_worker.err"))
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            stderr_target: object = open(log_path, "w", encoding="utf-8", errors="replace")
+        except OSError:
+            stderr_target = subprocess.DEVNULL
         try:
             process = subprocess.Popen(
                 command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+                stderr=stderr_target, text=True, encoding="utf-8",
                 bufsize=1, **popen_kwargs)
         except OSError as exc:
             raise KeepHeadUnavailable(f"keep-head worker start failed: {exc}") from exc
         self._worker = process
+        self._worker_log = log_path
         try:
             response = self._read_worker_response()
             if not response.get("ok"):
-                raise KeepHeadUnavailable(str(response.get("error") or "worker init failed"))
+                raise KeepHeadUnavailable(
+                    f"{response.get('error') or 'worker init failed'}"
+                    f"（worker stderr: {log_path}）")
             self.n_embd = int(response["n_embd"])
             self.n_layer = int(response["n_layer"])
         except Exception:
@@ -290,12 +315,18 @@ class KeepHeadUpstream:
                 f"keep-head 前向失败 rc={rc}：{FORWARD_ERRORS.get(rc, '未知错误码')}")
         return out
 
-    def forward_hidden_to_hidden(self, hidden, *, n_past: int = 0):
+    def forward_hidden_to_hidden(self, hidden, *, n_past: int = 0,
+                                 seq_ids: Sequence[int] | None = None,
+                                 positions: Sequence[int] | None = None):
         """★ **中间段能力**：吃上游 hidden（`embd` 注入）→ 吐本段的 hidden。
 
         这是「1 个 torch 上游 + n 个 llama 下游」链式拼接的关键：中间的 llama 段必须能
-        既接受上游 hidden 又交出 hidden。当前只支持**单序列、位置连续**（`[n_past, ...)`）；
-        多序列交错需要显式 positions，尚未接（写进文档的未覆盖项）。
+        既接受上游 hidden 又交出 hidden。
+
+        ★ P3 多序列数据流：`seq_ids` / `positions` 与
+        `llama_engine.forward_layers_from_hidden()` **同一契约** —— 都给则逐 token 显式绑定
+        （多序列交错推进时必须显式给）；都省则退化为单序列、位置自 `n_past` 起递增。
+        多序列要求本实例以 `n_seq_max >= 序列数` 构造（见 `KeepHeadUpstream.__init__`）。
         """
         import numpy as np
 
@@ -307,21 +338,48 @@ class KeepHeadUpstream:
         n_tokens = int(arr.shape[0])
         if n_tokens == 0:
             raise ValueError("hidden 的 token 数不能为 0")
+        seq_list = self._token_list(seq_ids, n_tokens, "seq_ids")
+        pos_list = self._token_list(positions, n_tokens, "positions")
+        if seq_list is not None:
+            distinct = {value for value in seq_list}
+            if max(distinct) >= self.n_seq_max:
+                raise ValueError(
+                    f"seq_ids 最大 {max(distinct)} ≥ n_seq_max {self.n_seq_max}；"
+                    "多序列必须用 n_seq_max 构造 KeepHeadUpstream")
 
         if self._worker is not None:
-            return self._worker_array(self._worker_request({
+            payload = {
                 "op": "hidden", "shape": list(arr.shape),
                 "data": base64.b64encode(arr.tobytes()).decode("ascii"),
-                "n_past": int(n_past)}))
+                "n_past": int(n_past)}
+            if seq_list is not None:
+                payload["seq_ids"] = seq_list
+            if pos_list is not None:
+                payload["positions"] = pos_list
+            return self._worker_array(self._worker_request(payload))
 
         out = np.zeros((n_tokens, self.n_embd), dtype=np.float32)
-        rc = self._lib.qlh_kh_forward_embd(
+        rc = self._lib.qlh_kh_forward_embd_seq(
             self._handle, arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            n_tokens, int(n_past), out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+            n_tokens, int(n_past),
+            None,
+            (ctypes.c_int32 * n_tokens)(*seq_list) if seq_list is not None else None,
+            (ctypes.c_int32 * n_tokens)(*pos_list) if pos_list is not None else None,
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
         if rc != 0:
             raise KeepHeadUnavailable(
                 f"keep-head embd 前向失败 rc={rc}：{FORWARD_ERRORS.get(rc, '未知错误码')}")
         return out
+
+    @staticmethod
+    def _token_list(values: Sequence[int] | None, n_tokens: int,
+                    field: str) -> list[int] | None:
+        if values is None:
+            return None
+        result = [int(value) for value in values]
+        if len(result) != n_tokens:
+            raise ValueError(f"{field} 长度 {len(result)} != n_tokens {n_tokens}")
+        return result
 
     # ------------------------------------------------------------------ 资源
     def close(self) -> None:

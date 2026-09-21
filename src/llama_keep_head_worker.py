@@ -31,6 +31,8 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--n-ctx", type=int, default=4096)
     parser.add_argument("--n-threads", type=int, default=8)
     parser.add_argument("--n-batch", type=int, default=512)
+    parser.add_argument("--n-seq-max", type=int, default=1,
+                        help="P3 多序列：context 的并行序列上限（>=batch 才允许 seq_id>0）")
     parser.add_argument("--dll-dir", action="append", default=[])
     return parser.parse_args()
 
@@ -41,6 +43,7 @@ def main() -> int:
         upstream = KeepHeadUpstream(
             args.shim, args.model, mode=args.mode, cut_layer=args.cut_layer,
             n_ctx=args.n_ctx, n_threads=args.n_threads, n_batch=args.n_batch,
+            n_seq_max=args.n_seq_max,
             extra_dll_dirs=args.dll_dir)
     except Exception as exc:  # noqa: BLE001 - serialized worker boundary
         _response(ok=False, error=f"{type(exc).__name__}: {exc}")
@@ -65,7 +68,8 @@ def main() -> int:
                 hidden = np.frombuffer(
                     base64.b64decode(str(request["data"])), dtype=np.float32).reshape(shape)
                 _array_response(upstream.forward_hidden_to_hidden(
-                    hidden, n_past=int(request.get("n_past", 0))))
+                    hidden, n_past=int(request.get("n_past", 0)),
+                    seq_ids=request.get("seq_ids"), positions=request.get("positions")))
                 continue
             raise ValueError(f"unknown operation: {operation!r}")
     except Exception as exc:  # noqa: BLE001 - serialized worker boundary

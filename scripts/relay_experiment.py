@@ -281,6 +281,11 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--n-ctx", type=int, default=4096)
     ap.add_argument("--warmup", type=int, default=2)
+    ap.add_argument("--hidden-quant", default="none",
+                    choices=["none", "f16", "bf16", "int8_block128"],
+                    help="★ P3：线上 hidden 压缩（每跳注入前量化、使用前反量化）。"
+                         "判据仍是 **per-token argmax** —— 不得用 cosine 代替；"
+                         "分叉即如实标 FAIL，不得当作「可接受的近似」")
     ap.add_argument("--upstream-quant", default="fp16",
                     choices=["fp16", "int8", "int4", "f32", "nf4"])
     ap.add_argument("--downstream-dtype", default=None, help="记录用：下游工件量化（f16/q4_k_m…）")
@@ -388,6 +393,47 @@ class _RemoteMiddleSegment:
             pass
 
 
+def _hidden_bytes(n_embd: int | None, hidden_quant: str) -> int | None:
+    """★ P3：每 token 的**有效线上字节**（含 int8 块量化的 scale 开销）。"""
+    width = int(n_embd or 0)
+    if width <= 0:
+        return None
+    if hidden_quant in (None, "none"):
+        return width * 4
+    if hidden_quant in ("f16", "bf16"):
+        return width * 2
+    if hidden_quant == "int8_block128":
+        blocks = (width + 127) // 128
+        return width * 1 + blocks * 4
+    return None
+
+
+def _quantize_hidden(hidden, mode: str):
+    """★ P3：模拟「线上一跳」的 hidden 压缩（量化 → 反量化），返回 f32 数组。
+
+    只在这一个函数里做往返，保证**同一份 hidden 在本地链路与跨机链路的语义一致**。
+    可用 `QLH_HIDDEN_QUANT=...` 覆盖；判据仍是 per-token argmax（不得用 cosine 代替）。
+    """
+    if mode in (None, "none"):
+        return hidden
+    import numpy as np  # noqa: PLC0415
+
+    arr = np.asarray(hidden, dtype=np.float32)
+    if mode == "f16":
+        return arr.astype(np.float16).astype(np.float32)
+    if mode == "bf16":
+        import torch  # noqa: PLC0415
+
+        return torch.from_numpy(arr).to(torch.bfloat16).to(torch.float32).numpy()
+    if mode == "int8_block128":
+        flat = arr.reshape(-1, 128)
+        scale = np.abs(flat).max(axis=1, keepdims=True)
+        scale[scale == 0] = 1.0
+        quantized = np.round(flat / scale * 127.0).clip(-127, 127)
+        return (quantized / 127.0 * scale).astype(np.float32).reshape(arr.shape)
+    raise ValueError(f"未知 hidden-quant 模式：{mode!r}")
+
+
 def _load_keep_head_segment(args: argparse.Namespace, model_path: str, *,
                             role: str) -> dict[str, Any]:
     """用补丁版 keep-head 通道加载一个段（`role` 仅用于记录）。"""
@@ -397,6 +443,7 @@ def _load_keep_head_segment(args: argparse.Namespace, model_path: str, *,
     started = time.perf_counter()
     upstream = KeepHeadUpstream(args.keep_head_shim, model_path, mode="nextn",
                                 n_ctx=args.n_ctx, n_threads=args.threads,
+                                n_seq_max=max(1, int(args.batch)),
                                 extra_dll_dirs=extra)
     return {
         "keep_head": upstream,
@@ -538,6 +585,8 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
                 hidden = hidden[None, :]
             n_tok = int(hidden.shape[0])
             hidden = np.ascontiguousarray(hidden.reshape(-1, hidden.shape[-1]), dtype=np.float32)
+            # ★ P3：上游 → 下游这一跳的线上压缩
+            hidden = _quantize_hidden(hidden, args.hidden_quant)
             logits, dn_ms = downstream["forward"](hidden, is_prefill, pos)
             if logits is None:
                 failure = f"下游未返回 logits（step {len(upstream_tokens[0])}）"
@@ -583,10 +632,26 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
             hidden = np.ascontiguousarray(
                 hidden_t.reshape(batch_n * n_tok, -1).to(torch.float32).cpu().numpy(),
                 dtype=np.float32)
+            # ★ P3：这一跳的线上压缩（上游 → 中段/下游）
+            hidden = _quantize_hidden(hidden, args.hidden_quant)
             if middle is not None:
                 # 三段：把上游 hidden 交给 keep-head 中段，吃 hidden 吐 hidden
                 started = time.perf_counter()
-                hidden = middle.forward_hidden_to_hidden(hidden, n_past=mid_pos)
+                if batch_n > 1:
+                    # ★ P3 多序列：与 llama_engine.forward_layers_from_hidden 同一契约 ——
+                    # 逐 token 显式绑定 seq/pos（交错推进时位置由调用方决定）。
+                    if is_prefill:
+                        mid_seq_ids = [b for b in range(batch_n) for _ in range(n_tok)]
+                        mid_positions = [i for _ in range(batch_n) for i in range(n_tok)]
+                    else:
+                        mid_seq_ids = list(range(batch_n))
+                        mid_positions = [mid_pos] * batch_n
+                    hidden = middle.forward_hidden_to_hidden(
+                        hidden, seq_ids=mid_seq_ids, positions=mid_positions)
+                else:
+                    hidden = middle.forward_hidden_to_hidden(hidden, n_past=mid_pos)
+                # ★ P3：中段 → 末段这一跳的线上压缩
+                hidden = _quantize_hidden(hidden, args.hidden_quant)
                 mid_ms = (time.perf_counter() - started) * 1000
                 if not is_prefill:
                     mid_decode.append(mid_ms)
@@ -687,7 +752,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     upstream_iface, downstream_iface, middle_iface = _IFACES_BY_PATH[args.path]
     _check_l2l_upstream_channel(args.path, args.allow_normed_upstream, args.keep_head_shim)
     if args.path in (PATH_L2L, PATH_L2L_KEEP_HEAD) and args.batch != 1:
-        raise SystemExit("FAIL: L→L（含 keep_head）目前只支持 --batch 1")
+        raise SystemExit("FAIL: L→L（含 keep_head）目前只支持 --batch 1"
+                         "（shim 的 tokens 版前向暂无多序列入口；三段与 D→L 已支持）")
     if args.path == PATH_D2L2L_KEEP_HEAD and (not args.mid_model or args.mid_layers is None):
         raise SystemExit("FAIL: --path d2l2l_keep_head 需要 --mid-model 与 --mid-layers")
     if args.path == PATH_D2L2L_KEEP_HEAD_NET:
@@ -696,6 +762,11 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                              "（远端用 scripts/relay_mid_service.py --role middle 起服务）")
         if args.mid_layers is None:
             raise SystemExit("FAIL: --path d2l2l_keep_head_net 需要 --mid-layers（K2，仅用于记录）")
+        if args.batch != 1:
+            # P3：Relay HIDDEN 帧还没带 seq_ids/positions ⇒ 多序列跨机必须在协议上加字段
+            # 之前 fail-loud（否则远端会按单序列隐式位置算，结果静默错）。
+            raise SystemExit("FAIL: --path d2l2l_keep_head_net 目前只支持 --batch 1"
+                             "（多序列跨机需要先扩展 HIDDEN 帧的 seq/pos 字段）")
     if not args.model_dir:
         raise SystemExit(
             "FAIL: 需要 --model-dir（HF 模型目录）—— 它同时是 tokenizer 来源；"
@@ -890,7 +961,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     device_profile.update({"gpu": _gpu_name(), "vram_gb": _vram_gb(),
                            "upstream_device": upstream["device"],
                            "upstream_dtype_effective": upstream["dtype"],
-                           "upstream_compiled": upstream["compiled"]})
+                           "upstream_compiled": upstream["compiled"],
+                           "hidden_quant": args.hidden_quant,
+                           "hidden_bytes_per_token_effective": _hidden_bytes(
+                               n_embd, args.hidden_quant)})
     evidence = RelayXFrameEvidence(
         correctness_verified=bool(tokens_match),
         correctness_cases=matched,
@@ -908,7 +982,11 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         middle_iface=middle_iface, path=args.path,
         models=models, layer_layout=layer_layout, handoff=_handoff(n_embd, args.path),
         load={"prompt": str(prompt_path), "prefill_tokens": len(prompt),
-              "gen_tokens": args.gen, "batch": args.batch},
+              "gen_tokens": args.gen, "batch": args.batch,
+              # ★ P3 激活数据流策略（引用性能/带宽数字前必须核对该字段）：
+              #   prefill 传**整段** hidden（让下游一次建立本地 KV/recurrent state），
+              #   decode 只传**末位**激活。
+              "activation_policy": "prefill:full_sequence+decode:last_position"},
         verdict=verdict, metrics=metrics, device_profile=device_profile, evidence=evidence,
         artifacts={"log_path": None})
 
