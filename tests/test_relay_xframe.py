@@ -1,4 +1,9 @@
-"""Fail-closed policy tests for CORE-RELAY-XFRAME-01."""
+"""Fail-closed policy tests for CORE-RELAY-XFRAME-01.
+
+★ 2026-09-21（用户裁定 `dec-6d91cd100fecc798`）：准入判据由「性能（=速度）不占优 ⇒
+永不允许」改为「**正确性已验证即准入**」—— 速度与容量同属性能，速度不占优只影响
+**默认路由倾向**，不构成否决。下列用例已按新口径更新。
+"""
 
 from src.relay_contract import (
     RelayXFrameRequest,
@@ -40,10 +45,15 @@ def test_sampling_and_invalid_length_are_separate_gates():
 
 
 # ---------------------------------------------------------------- 收口：证据范围
-# 2026-09-19 收口：把「还没验证」与「已验证但性能不具优势（终态）」区分开。
-# **两者 admitted 都是 False** —— 准入判据是性能，不是正确性。
+# 2026-09-19 收口：把「还没验证」与「已验证」区分开。
+# ★ 2026-09-21：两者含义**相反** —— 已验证 ⇒ **准入**；未验证 ⇒ 待验证（fail-closed）。
 
-def test_verified_evidence_narrows_reason_but_never_admits():
+def test_verified_evidence_admits_production_and_disengages_fallback():
+    """正确性证据齐备 ⇒ **准入**，且 fallback **不启用**（handoff 才是预期路径）。
+
+    ⚠️ 注意 `performance_verdict="not_advantageous"`（速度比整模 GPU 慢约 20×）
+    **不影响准入** —— 速度与容量同属性能，不能只取速度作否决。
+    """
     from src.relay_contract import RelayXFrameEvidence
 
     evidence = RelayXFrameEvidence(
@@ -58,13 +68,15 @@ def test_verified_evidence_narrows_reason_but_never_admits():
     )
     decision = admit_relay_xframe(_request(), evidence)
 
-    assert decision.admitted is False, "正确性已验证也不得准入：判据是性能"
-    assert decision.reason == "xframe_correctness_verified_performance_not_advantageous"
-    assert decision.fallback.engaged is True
-    # 证据对象本身也不允许被当成准入许可
-    assert evidence.admits_production() is False
-    assert evidence.to_dict()["admits_production"] is False
+    assert decision.admitted is True
+    assert decision.reason == "admitted"
+    assert decision.fallback.engaged is False, "准入时不应回退到单进程路径"
+    # 证据对象自身也反映准入
+    assert evidence.admits_production() is True
+    assert evidence.to_dict()["admits_production"] is True
     assert evidence.to_dict()["correctness_cases"] == 8
+    # 速度结论仍被**如实记录**，只是不参与准入
+    assert evidence.to_dict()["performance_verdict"] == "not_advantageous"
 
 
 def test_evidence_without_correctness_keeps_the_pending_reason():

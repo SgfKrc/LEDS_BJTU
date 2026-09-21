@@ -1,0 +1,251 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "qlh-relay-experiment-record-schema-v1",
+ "title": "QLH 跨框架接力实验记录（relay experiment record v1，2026-09-21）",
+ "description": "P1 统一实验驱动的强制记录格式。目的：把「两端都走主仓引擎」的端到端数字与「裸绑定探针」「容量专项」严格分开，避免不同层级的数字被混进同一张表。kind 与运行链路（path / engines）的一致性由本 schema 的条件规则强制，错标会被拒绝。",
+ "type": "object",
+ "additionalProperties": true,
+ "required": [
+  "schema_version",
+  "experiment_id",
+  "kind",
+  "path",
+  "timestamp",
+  "commit",
+  "env",
+  "device_profile",
+  "models",
+  "layer_layout",
+  "engines",
+  "handoff",
+  "load",
+  "criterion",
+  "verdict",
+  "metrics",
+  "artifacts"
+ ],
+ "properties": {
+  "schema_version": {
+   "const": "qlh.relay_experiment.v1"
+  },
+  "experiment_id": {
+   "type": "string",
+   "minLength": 1
+  },
+  "kind": {
+   "description": "★ 三类互斥；报告必须按此分表。",
+   "enum": [
+    "mainrepo_end_to_end",
+    "raw_binding_probe",
+    "capacity_only"
+   ]
+  },
+  "path": {
+   "description": "实际运行链路。L→L 对照与裸绑定探针同属探针族，但必须在这里区分；keep_head 后缀表示上游/中间段走补丁版 keep-head 通道（P2 路线 C）。",
+   "enum": [
+    "d2l_mainrepo",
+    "d2l_raw_binding",
+    "l2l_llama",
+    "l2l_keep_head",
+    "d2l2l_keep_head",
+    "capacity_scan"
+   ]
+  },
+  "timestamp": {
+   "type": "string"
+  },
+  "commit": {
+   "type": "string"
+  },
+  "env": {
+   "type": "object",
+   "properties": {
+    "os": {"type": "string"},
+    "python": {"type": ["string", "null"]},
+    "torch": {"type": ["string", "null"]},
+    "llama_cpp_python": {"type": ["string", "null"]},
+    "cuda": {"type": ["string", "null"]},
+    "dependency_lock": {
+     "type": ["object", "null"],
+     "additionalProperties": true
+    }
+   }
+  },
+  "device_profile": {
+   "type": "object",
+   "properties": {
+    "host": {"type": ["string", "null"]},
+    "gpu": {"type": ["string", "null"]},
+    "vram_gb": {"type": ["number", "null"]},
+    "threads": {"type": ["integer", "null"]},
+    "upstream_device": {"type": ["string", "null"]},
+    "upstream_dtype_effective": {"type": ["string", "null"]},
+    "upstream_compiled": {"type": ["boolean", "null"]}
+   }
+  },
+  "models": {
+   "type": "object",
+   "properties": {
+    "upstream": {
+     "type": "object",
+     "properties": {
+      "id": {"type": ["string", "null"]},
+      "path": {"type": ["string", "null"]},
+      "quant_requested": {"type": ["string", "null"]},
+      "dtype_effective": {"type": ["string", "null"]},
+      "param_bytes": {"type": ["integer", "null"]},
+      "load_mode": {"type": ["string", "null"]},
+      "nf4_replaced_linears": {"type": ["integer", "null"]}
+     }
+    },
+    "downstream": {
+     "type": "object",
+     "properties": {
+      "id": {"type": ["string", "null"]},
+      "path": {"type": ["string", "null"]},
+      "quant": {"type": ["string", "null"]},
+      "artifact_sha256": {"type": ["string", "null"]},
+      "model_bytes": {"type": ["integer", "null"]},
+      "layers": {"type": ["integer", "null"]},
+      "n_embd": {"type": ["integer", "null"]}
+     }
+    },
+    "whole": {
+     "type": "object",
+     "properties": {
+      "artifact_sha256": {"type": ["string", "null"]},
+      "model_bytes": {"type": ["integer", "null"]},
+      "quant": {"type": ["string", "null"]}
+     }
+    }
+   }
+  },
+  "layer_layout": {
+   "type": "object",
+   "properties": {
+    "source_block_count": {"type": ["integer", "null"]},
+    "upstream_layers": {"type": ["integer", "null"]},
+    "downstream_layers": {"type": ["integer", "null"]},
+    "trim_layers": {"type": ["integer", "null"]},
+    "kept_block_count": {"type": ["integer", "null"]}
+   }
+  },
+  "engines": {
+   "type": "object",
+   "properties": {
+    "upstream_iface": {"type": ["string", "null"]},
+    "middle_iface": {"type": ["string", "null"]},
+    "downstream_iface": {"type": ["string", "null"]}
+   }
+  },
+  "handoff": {
+   "type": "object",
+   "properties": {
+    "dtype": {"type": ["string", "null"]},
+    "n_embd": {"type": ["integer", "null"]},
+    "bytes_per_token": {"type": ["integer", "null"]},
+    "supported": {"type": ["boolean", "null"]}
+   }
+  },
+  "load": {
+   "type": "object",
+   "properties": {
+    "prompt": {"type": ["string", "null"]},
+    "prefill_tokens": {"type": ["integer", "null"]},
+    "gen_tokens": {"type": ["integer", "null"]},
+    "batch": {"type": ["integer", "null"]}
+   }
+  },
+  "criterion": {
+   "description": "引用 src/relay_contract.RELAY_ACCEPTANCE，不得自定义同义串。",
+   "type": "string"
+  },
+  "verdict": {
+   "type": "object",
+   "required": ["passed"],
+   "properties": {
+    "passed": {"type": "boolean"},
+    "tokens_match": {"type": ["boolean", "null"]},
+    "criterion": {"type": ["string", "null"]},
+    "matched_runs": {"type": ["integer", "null"]},
+    "total_runs": {"type": ["integer", "null"]},
+    "failure": {"type": ["string", "null"]}
+   }
+  },
+  "metrics": {
+   "type": "object",
+   "properties": {
+    "upstream_prefill_ms": {"type": ["number", "null"]},
+    "downstream_prefill_ms": {"type": ["number", "null"]},
+    "upstream_decode_ms": {"$ref": "#/$defs/stat"},
+    "downstream_decode_ms": {"$ref": "#/$defs/stat"},
+    "baseline_ms_per_step": {"$ref": "#/$defs/stat"},
+    "capacity_gain_x": {"type": ["number", "null"]},
+    "resident_weight_bytes": {
+     "type": ["object", "null"],
+     "properties": {
+      "whole": {"type": ["integer", "null"]},
+      "upstream": {"type": ["integer", "null"]},
+      "downstream": {"type": ["integer", "null"]},
+      "max_segment": {"type": ["integer", "null"]}
+     }
+    },
+    "peak_vram_gb": {"type": ["number", "null"]},
+    "rss_gb": {"type": ["number", "null"]}
+   }
+  },
+  "evidence": {
+   "description": "RelayXFrameEvidence.to_dict()（正确性证据与准入判据，速度不参与准入）。",
+   "type": ["object", "null"],
+   "additionalProperties": true
+  },
+  "artifacts": {
+   "type": "object",
+   "properties": {
+    "record_path": {"type": ["string", "null"]},
+    "log_path": {"type": ["string", "null"]}
+   }
+  }
+ },
+ "allOf": [
+  {
+   "if": {"properties": {"kind": {"const": "mainrepo_end_to_end"}}},
+   "then": {
+    "properties": {
+     "path": {"enum": ["d2l_mainrepo", "d2l2l_keep_head"]},
+     "engines": {
+      "properties": {
+       "downstream_iface": {"const": "llama_engine.forward_layers_from_hidden"}
+      }
+     }
+    }
+   }
+  },
+  {
+   "if": {"properties": {"kind": {"const": "raw_binding_probe"}}},
+   "then": {
+    "properties": {
+     "path": {"enum": ["d2l_raw_binding", "l2l_llama", "l2l_keep_head"]}
+    }
+   }
+  },
+  {
+   "if": {"properties": {"kind": {"const": "capacity_only"}}},
+   "then": {
+    "properties": {
+     "path": {"const": "capacity_scan"}
+    }
+   }
+  }
+ ],
+ "$defs": {
+  "stat": {
+   "type": ["object", "null"],
+   "properties": {
+    "n": {"type": ["integer", "null"]},
+    "mean": {"type": ["number", "null"]},
+    "std": {"type": ["number", "null"]}
+   }
+  }
+ }
+}
