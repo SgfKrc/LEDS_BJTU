@@ -132,10 +132,11 @@
   },
   "engines": {
    "type": "object",
+   "required": ["upstream_iface", "downstream_iface"],
    "properties": {
-    "upstream_iface": {"type": ["string", "null"]},
+    "upstream_iface": {"type": "string", "minLength": 1},
     "middle_iface": {"type": ["string", "null"]},
-    "downstream_iface": {"type": ["string", "null"]}
+    "downstream_iface": {"type": "string", "minLength": 1}
    }
   },
   "handoff": {

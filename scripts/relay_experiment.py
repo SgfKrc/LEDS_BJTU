@@ -195,6 +195,8 @@ def _n_pos_per_embd(gguf_path: Path) -> int:
 def _build_prompt_tokens(tok: Any, prompt_path: Path, prefill: int) -> list[int]:
     text = prompt_path.read_text(encoding="utf-8").strip()
     ids = tok(text, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
+    if not ids:
+        raise SystemExit("FAIL: prompt tokenization produced no tokens")
     if prefill <= 0:
         return ids
     if len(ids) >= prefill:
@@ -280,7 +282,18 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--json-out", default=None, help="记录输出路径；`-` 表示打到 stdout")
     ap.add_argument("--dry-run", action="store_true",
                     help="不加载任何模型，只产出并校验记录骨架（链路/字段预检）")
-    return ap.parse_args(argv)
+    args = ap.parse_args(argv)
+    if args.prefill < 0:
+        ap.error("--prefill must be >= 0")
+    if args.gen < 1:
+        ap.error("--gen must be >= 1")
+    if args.batch < 1:
+        ap.error("--batch must be >= 1")
+    if args.layers < 1:
+        ap.error("--layers must be >= 1")
+    if args.n_ctx < 1 or args.threads < 1:
+        ap.error("--n-ctx and --threads must be >= 1")
+    return args
 
 
 # --------------------------------------------------------------------------- run
@@ -364,8 +377,9 @@ def _baseline_tokens(args: argparse.Namespace, prompt: list[int]) -> tuple[list[
         raise SystemExit(f"FAIL: 加载整模 {whole} 失败")
     ctx_params = M.llama_context_default_params()
     ctx_params.n_ctx = args.n_ctx
-    ctx_params.n_batch = 512
-    ctx_params.n_ubatch = 512
+    batch_capacity = max(512, len(prompt))
+    ctx_params.n_batch = batch_capacity
+    ctx_params.n_ubatch = batch_capacity
     ctx_params.n_threads = args.threads
     ctx = M.llama_init_from_model(model, ctx_params)
     if not ctx:
@@ -373,7 +387,7 @@ def _baseline_tokens(args: argparse.Namespace, prompt: list[int]) -> tuple[list[
 
     model_bytes = int(M.llama_model_size(model))
     n_vocab = int(M.llama_vocab_n_tokens(M.llama_model_get_vocab(model)))
-    batch = M.llama_batch_init(512, 0, 1)
+    batch = M.llama_batch_init(batch_capacity, 0, 1)
     tokens: list[int] = []
     step_ms: list[float] = []
     pos = 0
@@ -510,7 +524,8 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
             with torch.no_grad():
                 out = mgr.forward_layers(input_ids=ids_t, past_key_values=past, use_cache=True)
             # ★ hybrid（Qwen3.5）必须回传 cache 对象：tuple 只带 KV，recurrent state 会丢。
-            past = out.get("cache") or out.get("past_key_values", past)
+            cache = out.get("cache")
+            past = cache if cache is not None else out.get("past_key_values", past)
             up_ms = (time.perf_counter() - started) * 1000
             up_prefill_ms = up_ms if is_prefill else up_prefill_ms
             if not is_prefill:
@@ -735,8 +750,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             raise SystemExit(f"FAIL: 加载 {cut_path} 失败")
         ctx_params = M.llama_context_default_params()
         ctx_params.n_ctx = args.n_ctx
-        ctx_params.n_batch = 512
-        ctx_params.n_ubatch = 512
+        batch_capacity = max(512, args.prefill * max(1, args.batch))
+        ctx_params.n_batch = batch_capacity
+        ctx_params.n_ubatch = batch_capacity
         ctx_params.n_threads = args.threads
         raw_ctx = M.llama_init_from_model(native, ctx_params)
         if not raw_ctx:

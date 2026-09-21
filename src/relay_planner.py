@@ -62,7 +62,6 @@ class RelayDownstreamProfile:
         ram = _mapping(data.get("ram"))
         cpu = _mapping(data.get("cpu"))
         available = _number(ram.get("available_gb", data.get("ram_available_gb")), 0.0)
-        total = _number(ram.get("total_gb", data.get("ram_total_gb")), 0.0)
         profile_available = bool(
             any(key in ram for key in ("available_gb", "total_gb"))
             or any(key in data for key in ("ram_available_gb", "ram_total_gb"))
@@ -72,7 +71,9 @@ class RelayDownstreamProfile:
             node_id=str(node_id),
             execution_device=str(execution_device or "CPU").upper(),
             profile_available=profile_available,
-            ram_available_gb=round(max(0.0, available or total), 2),
+            # Total RAM is not usable headroom. Without an available-memory
+            # measurement, refuse automatic admission rather than over-admit.
+            ram_available_gb=round(max(0.0, available), 2),
             rtt_ms=round(max(0.0, _number(rtt_ms)), 2),
             bandwidth_mbps=round(max(0.0, _number(bandwidth_mbps)), 2),
         )

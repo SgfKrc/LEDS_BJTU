@@ -107,6 +107,7 @@ def load_schema(root: Path | None = None) -> dict[str, Any]:
 
 def validate_record(record: Mapping[str, Any], root: Path | None = None) -> None:
     """按 schema 校验记录；不合法抛 `ValueError`，缺 `jsonschema` 抛 `RuntimeError`。"""
+    _validate_engine_identity(record)
     try:
         import jsonschema
     except ImportError as exc:  # pragma: no cover - 依赖缺失时 fail-loud，不静默放行
@@ -120,6 +121,29 @@ def validate_record(record: Mapping[str, Any], root: Path | None = None) -> None
         location = "/".join(str(p) for p in first.path) or "<root>"
         detail = "; ".join(f"{location}: {e.message}" for e in errors[:5])
         raise ValueError(f"接力实验记录不合法（{len(errors)} 处）：{detail}")
+
+
+# The JSON schema checks the shape. Keep the interface registry as the
+# authoritative semantic check so callers cannot write a relabeled record by
+# bypassing build_record().
+def _validate_engine_identity(record: Mapping[str, Any]) -> None:
+    engines = record.get("engines")
+    if not isinstance(engines, Mapping):
+        raise ValueError("record.engines must be an object")
+    upstream_iface = engines.get("upstream_iface")
+    downstream_iface = engines.get("downstream_iface")
+    middle_iface = engines.get("middle_iface")
+    if not isinstance(upstream_iface, str) or not isinstance(downstream_iface, str):
+        raise ValueError("record engines must contain string upstream_iface/downstream_iface")
+    if middle_iface is not None and not isinstance(middle_iface, str):
+        raise ValueError("record engines.middle_iface must be a string or null")
+    inferred_kind, inferred_path = classify_path(upstream_iface, downstream_iface, middle_iface)
+    if record.get("kind") != inferred_kind or record.get("path") != inferred_path:
+        raise ValueError(
+            "\u4e0d\u5408\u6cd5 record kind/path does not match engines: "
+            f"declared {record.get('kind')!r}/{record.get('path')!r}, "
+            f"expected {inferred_kind!r}/{inferred_path!r}"
+        )
 
 
 def git_head(root: Path | None = None) -> str | None:

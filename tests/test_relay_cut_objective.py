@@ -67,6 +67,47 @@ def test_symmetric_devices_pick_the_middle_cut():
     assert plan.capacity_gain_x and plan.capacity_gain_x > 1.0
 
 
+def test_capacity_gain_counts_non_split_weights_on_both_endpoint_segments():
+    plan = plan_relay_cut_n_segments(
+        total_layers=4,
+        layer_bytes=[10, 10, 10, 10],
+        n_embd=4,
+        segments=_sym_segments(),
+        non_split_bytes=5,
+        weights={"capacity": 1.0, "latency": 0.0, "risk": 0.0},
+    )
+    assert plan.admitted
+    assert plan.cuts == (2,)
+    assert plan.segment_bytes == (25, 25)
+    assert plan.capacity_gain_x == pytest.approx(2.0)
+
+
+def test_candidate_space_overflow_fails_closed_instead_of_truncating():
+    layer_bytes, extra = _layers()
+    plan = plan_relay_cut_n_segments(
+        total_layers=24,
+        layer_bytes=layer_bytes,
+        n_embd=896,
+        segments=_sym_segments(4),
+        non_split_bytes=extra,
+        max_candidates=1,
+    )
+    assert plan.admitted is False
+    assert plan.reason == "candidate_space_too_large"
+    assert plan.candidates == ()
+
+
+def test_device_profile_does_not_promote_total_ram_to_available_capacity():
+    profile = SegmentProfile.from_device_profile({
+        "ram": {"total_gb": 16},
+        "thermal_throttled": "false",
+        "artifacts_ready": "false",
+    })
+    assert profile.capacity_bytes == 0
+    assert profile.thermal_throttled is False
+    assert profile.artifacts_ready is False
+
+
 def test_fast_segment_takes_more_layers():
     """纯延迟目标下，更快的段应拿更多层（容量项会被显式关掉）。"""
     layer_bytes, extra = _layers()

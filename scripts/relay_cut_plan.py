@@ -54,7 +54,8 @@ def _mean(value: Any) -> float | None:
 
 def _extract(record: dict[str, Any]) -> dict[str, Any] | None:
     """兼容两种记录：P1 relay experiment record 与 P0 时期 runner 输出。"""
-    layers = record.get("layers")
+    layout = record.get("layer_layout") or {}
+    layers = record.get("layers") or layout.get("upstream_layers")
     metrics = record.get("metrics") or {}
     timing = record.get("timing_ms") or {}
     upstream = _mean(metrics.get("upstream_decode_ms")) or _mean(timing.get("upstream_decode"))
@@ -69,8 +70,15 @@ def _extract(record: dict[str, Any]) -> dict[str, Any] | None:
         whole = resident.get("whole")
     whole = whole or (record.get("models") or {}).get("whole", {}).get("model_bytes") \
         or record.get("whole_model_bytes")
+    models = record.get("models") or {}
+    upstream_model = models.get("upstream") or {}
     return {
         "source": record.get("experiment_id") or record.get("model"),
+        "model": record.get("model") or upstream_model.get("id"),
+        "kind": record.get("kind"),
+        "path": record.get("path"),
+        "commit": record.get("commit") or record.get("git_head"),
+        "prefill": record.get("prefill") or (record.get("load") or {}).get("prefill_tokens"),
         "upstream_layers": int(layers),
         "upstream_decode_ms": upstream,
         "downstream_decode_ms": downstream,
@@ -108,6 +116,16 @@ def main(argv: list[str] | None = None) -> int:
     if len(samples) < 2:
         print(f"FAIL: 需要至少 2 条同切点扫描记录，实得 {len(samples)}（glob={args.records}）")
         return 2
+    identity_fields = ("model", "kind", "path", "commit", "prefill", "gen", "batch")
+    identity_errors = []
+    for field in identity_fields:
+        values = {sample.get(field) for sample in samples}
+        if len(values) > 1:
+            identity_errors.append(f"{field}={sorted(map(str, values))}")
+    if identity_errors:
+        print("FAIL: records mix multiple experiment identities: " + "; ".join(identity_errors))
+        return 2
+
     samples.sort(key=lambda item: item["upstream_layers"])
     print(f"[records] {len(samples)} 条：cuts={[s['upstream_layers'] for s in samples]}")
 
@@ -124,10 +142,20 @@ def main(argv: list[str] | None = None) -> int:
     whole_bytes = next((s["whole_model_bytes"] for s in samples if s["whole_model_bytes"]), None)
     if args.layer_bytes_mib is not None:
         layer_bytes = int(max(0.0, args.layer_bytes_mib) * MIB)
+        layer_bytes_source = "explicit_layer_bytes_mib"
+        non_split_bytes = int(max(0.0, args.non_split_mib) * MIB)
     elif whole_bytes:
         layer_bytes = int(whole_bytes / args.total_layers)
+        layer_bytes_source = "uniform_whole_model_approximation"
+        # The whole-model byte count already includes embedding/lm_head and
+        # other non-layer weights. Adding them again would double count them.
+        non_split_bytes = 0
+        print("[capacity] warning: inferred layer bytes already include non-split weights; "
+              "using non_split_bytes=0. Pass --layer-bytes-mib for explicit accounting.")
     else:
         layer_bytes = 0
+        layer_bytes_source = "unavailable"
+        non_split_bytes = 0
     if layer_bytes <= 0:
         print("FAIL: 无法确定每层字节（给 --layer-bytes-mib，或让记录带整模字节）")
         return 2
@@ -137,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
         layer_bytes=[layer_bytes] * args.total_layers,
         n_embd=args.n_embd,
         segments=[fitted["upstream"], fitted["downstream"]],
-        non_split_bytes=int(max(0.0, args.non_split_mib) * MIB),
+        non_split_bytes=non_split_bytes,
         cut_multiple=args.cut_multiple,
         weights={"capacity": 0.0, "latency": 1.0, "risk": 0.0},
     )
@@ -156,13 +184,19 @@ def main(argv: list[str] | None = None) -> int:
     predicted_best_measured = scored[0]["upstream_layers"]
     predicted_cut = plan.cuts[0] if plan.cuts else None
     measured_cuts = [s["upstream_layers"] for s in samples]
+    predicted_cut_in_measured_range = predicted_cut in measured_cuts
+    fitted_matches_measured = predicted_best_measured == measured_optimum["upstream_layers"]
     verdict = {
-        "passed": bool(predicted_best_measured == measured_optimum["upstream_layers"]),
+        # Matching only the measured subset does not validate an unmeasured
+        # global optimum. Keep the acceptance criterion fail-closed.
+        "passed": bool(plan.admitted and predicted_cut_in_measured_range and fitted_matches_measured),
         "reason": ("fitted_model_reproduces_measured_optimum"
-                   if predicted_best_measured == measured_optimum["upstream_layers"]
+                   if predicted_cut_in_measured_range and fitted_matches_measured
+                   else "predicted_cut_not_measured"
+                   if not predicted_cut_in_measured_range
                    else "fitted_model_disagrees_with_measured_optimum"),
         "predicted_cut": predicted_cut,
-        "predicted_cut_in_measured_range": predicted_cut in measured_cuts,
+        "predicted_cut_in_measured_range": predicted_cut_in_measured_range,
         "predicted_best_measured_cut": predicted_best_measured,
         "measured_optimum_cut": measured_optimum["upstream_layers"],
         "predicted_ms_by_measured_cut": [
@@ -177,6 +211,8 @@ def main(argv: list[str] | None = None) -> int:
         "cut_multiple": args.cut_multiple,
         "capacity_gb": args.capacity_gb,
         "layer_bytes": layer_bytes,
+        "layer_bytes_source": layer_bytes_source,
+        "non_split_bytes": non_split_bytes,
         "fitted": {"upstream": fitted["upstream"].to_dict(),
                    "downstream": fitted["downstream"].to_dict(), "fit": fitted["fit"]},
         "plan": plan.to_dict(),

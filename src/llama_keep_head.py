@@ -34,9 +34,13 @@ Python 侧**不直接 ctypes 调 libllama**：`llama_context_params` 是按值�
 
 from __future__ import annotations
 
+import base64
 import ctypes
+import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 from typing import Sequence
 
 #: 允许额外 DLL 搜索目录（例如 `C:\msys64\ucrt64\bin`），`os.pathsep` 分隔。
@@ -62,20 +66,27 @@ class KeepHeadUnavailable(RuntimeError):
     """shim 缺失、符号不对或加载/初始化失败（都属于「不能用」，绝不降级成 embeddings 通道）。"""
 
 
-def _add_dll_dirs(shim_dir: Path, extra: Sequence[str] = ()) -> list[str]:
+def _add_dll_dirs(shim_dir: Path, extra: Sequence[str] = ()) -> tuple[list[str], list[object]]:
     dirs: list[str] = [str(shim_dir)]
     dirs.extend(extra)
     dirs.extend(d for d in os.environ.get(EXTRA_DLL_DIRS_ENV, "").split(os.pathsep) if d)
     added: list[str] = []
+    handles: list[object] = []
     for candidate in dirs:
         if not candidate or candidate in added or not Path(candidate).is_dir():
             continue
         try:
-            os.add_dll_directory(candidate)
+            handle = os.add_dll_directory(candidate)
         except (AttributeError, OSError):
             continue
         added.append(candidate)
-    return added
+        handles.append(handle)
+    return added, handles
+
+
+def _llama_cpp_loaded() -> bool:
+    return any(name == "llama_cpp" or name.startswith("llama_cpp.")
+               for name in sys.modules)
 
 
 class KeepHeadUpstream:
@@ -102,6 +113,7 @@ class KeepHeadUpstream:
         if mode == "layer_inp" and cut_layer is None:
             raise KeepHeadUnavailable("layer_inp 模式必须给 cut_layer")
         self.mode = mode
+        self.cut_layer = None if cut_layer is None else int(cut_layer)
         self.shim_path = Path(shim_path)
         self.model_path = Path(model_path)
         if not self.shim_path.is_file():
@@ -111,7 +123,15 @@ class KeepHeadUpstream:
         if not self.model_path.is_file():
             raise KeepHeadUnavailable(f"找不到模型：{self.model_path}")
 
-        self._dll_dirs = _add_dll_dirs(self.shim_path.parent, extra_dll_dirs)
+        self._worker = None
+        if _llama_cpp_loaded():
+            self._init_isolated_worker(
+                n_ctx=n_ctx, n_threads=n_threads, n_batch=n_batch,
+                extra_dll_dirs=extra_dll_dirs)
+            return
+
+        self._dll_dirs, self._dll_dir_handles = _add_dll_dirs(
+            self.shim_path.parent, extra_dll_dirs)
         try:
             self._lib = ctypes.CDLL(str(self.shim_path))
         except OSError as exc:  # noqa: PERF203
@@ -167,6 +187,88 @@ class KeepHeadUpstream:
             raise KeepHeadUnavailable("shim 报告 n_embd <= 0")
 
     # ------------------------------------------------------------------ 前向
+    def _init_isolated_worker(self, *, n_ctx: int, n_threads: int, n_batch: int,
+                              extra_dll_dirs: Sequence[str]) -> None:
+        """Keep the patched llama.cpp ABI out of the pip llama.cpp process."""
+        worker = Path(__file__).with_name("llama_keep_head_worker.py")
+        if not worker.is_file():
+            raise KeepHeadUnavailable(f"keep-head worker missing: {worker}")
+        command = [
+            sys.executable, str(worker),
+            "--shim", str(self.shim_path), "--model", str(self.model_path),
+            "--mode", self.mode, "--n-ctx", str(int(n_ctx)),
+            "--n-threads", str(int(n_threads)), "--n-batch", str(int(n_batch)),
+        ]
+        if self.cut_layer is not None:
+            command.extend(["--cut-layer", str(self.cut_layer)])
+        for dll_dir in extra_dll_dirs:
+            command.extend(["--dll-dir", str(dll_dir)])
+        popen_kwargs: dict[str, object] = {}
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            process = subprocess.Popen(
+                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+                bufsize=1, **popen_kwargs)
+        except OSError as exc:
+            raise KeepHeadUnavailable(f"keep-head worker start failed: {exc}") from exc
+        self._worker = process
+        try:
+            response = self._read_worker_response()
+            if not response.get("ok"):
+                raise KeepHeadUnavailable(str(response.get("error") or "worker init failed"))
+            self.n_embd = int(response["n_embd"])
+            self.n_layer = int(response["n_layer"])
+        except Exception:
+            self.close()
+            raise
+        self._dll_dirs = []
+        self._dll_dir_handles = []
+        self._lib = None
+        self._handle = None
+
+    def _read_worker_response(self) -> dict[str, object]:
+        process = self._worker
+        if process is None or process.poll() is not None or process.stdout is None:
+            raise KeepHeadUnavailable("keep-head worker unavailable")
+        line = process.stdout.readline()
+        if not line:
+            raise KeepHeadUnavailable("keep-head worker exited before response")
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise KeepHeadUnavailable("keep-head worker returned invalid response") from exc
+        if not isinstance(value, dict):
+            raise KeepHeadUnavailable("keep-head worker response is not an object")
+        return value
+
+    def _worker_request(self, payload: dict[str, object]) -> dict[str, object]:
+        process = self._worker
+        if process is None or process.poll() is not None or process.stdin is None:
+            raise KeepHeadUnavailable("keep-head worker unavailable")
+        try:
+            process.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            process.stdin.flush()
+            response = self._read_worker_response()
+        except (OSError, BrokenPipeError) as exc:
+            raise KeepHeadUnavailable(f"keep-head worker communication failed: {exc}") from exc
+        if not response.get("ok"):
+            raise KeepHeadUnavailable(str(response.get("error") or "worker request failed"))
+        return response
+
+    @staticmethod
+    def _worker_array(response: dict[str, object]):
+        import numpy as np
+
+        try:
+            shape = tuple(int(value) for value in response["shape"])
+            raw = base64.b64decode(str(response["data"]))
+            array = np.frombuffer(raw, dtype=np.float32)
+            return array.reshape(shape).copy()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise KeepHeadUnavailable("keep-head worker returned invalid hidden") from exc
+
     def forward_tokens_to_hidden(self, tokens: Sequence[int], *, n_past: int = 0):
         """跑模型（`nextn` 模式即前 K 层），返回 `[n_tokens, n_embd]` 的 f32 hidden。"""
         import numpy as np
@@ -175,6 +277,9 @@ class KeepHeadUpstream:
         n_tokens = len(toks)
         if n_tokens == 0:
             raise ValueError("tokens 不能为空")
+        if self._worker is not None:
+            return self._worker_array(self._worker_request({
+                "op": "tokens", "tokens": toks, "n_past": int(n_past)}))
         tokens_arr = (ctypes.c_int32 * n_tokens)(*toks)
         out = np.zeros((n_tokens, self.n_embd), dtype=np.float32)
         rc = self._lib.qlh_kh_forward(
@@ -203,6 +308,12 @@ class KeepHeadUpstream:
         if n_tokens == 0:
             raise ValueError("hidden 的 token 数不能为 0")
 
+        if self._worker is not None:
+            return self._worker_array(self._worker_request({
+                "op": "hidden", "shape": list(arr.shape),
+                "data": base64.b64encode(arr.tobytes()).decode("ascii"),
+                "n_past": int(n_past)}))
+
         out = np.zeros((n_tokens, self.n_embd), dtype=np.float32)
         rc = self._lib.qlh_kh_forward_embd(
             self._handle, arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
@@ -214,10 +325,42 @@ class KeepHeadUpstream:
 
     # ------------------------------------------------------------------ 资源
     def close(self) -> None:
+        process = getattr(self, "_worker", None)
+        if process is not None:
+            try:
+                if process.poll() is None and process.stdin is not None:
+                    process.stdin.write('{"op":"close"}\n')
+                    process.stdin.flush()
+                    self._read_worker_response()
+            except (OSError, BrokenPipeError, KeepHeadUnavailable):
+                pass
+            finally:
+                try:
+                    if process.stdin is not None:
+                        process.stdin.close()
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                self._worker = None
         handle = getattr(self, "_handle", None)
         if handle and getattr(self, "_lib", None) is not None:
             self._lib.qlh_kh_close(handle)
             self._handle = None
+        for dll_handle in reversed(getattr(self, "_dll_dir_handles", ())):
+            try:
+                dll_handle.close()
+            except (AttributeError, OSError):
+                pass
+        if hasattr(self, "_dll_dir_handles"):
+            self._dll_dir_handles.clear()
 
     def __enter__(self) -> "KeepHeadUpstream":
         return self

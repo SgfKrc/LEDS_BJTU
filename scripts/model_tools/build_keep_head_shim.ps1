@@ -47,10 +47,16 @@ Write-Host "[build] $OutPath"
 if ($LASTEXITCODE -ne 0) { Write-Host "[FAIL] gcc exit=$LASTEXITCODE"; exit $LASTEXITCODE }
 
 # MinGW runtime DLLs must sit next to the shim (Windows searches the module directory).
+# ⚠️ `libgomp-1.dll` is easy to miss (it comes from ggml-base's OpenMP usage) — without it
+# `ctypes.CDLL(shim)` fails with "Could not find module ... or one of its dependencies".
+# To re-audit the closure after a rebuild:
+#   objdump -p <dll> | findstr "DLL Name"   # recursively over libllama/ggml*/shim
 $mingwBin = Split-Path -Parent $Gcc
-foreach ($name in @("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll")) {
+foreach ($name in @("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll",
+                    "libgomp-1.dll")) {
     $from = Join-Path $mingwBin $name
     if (Test-Path $from) { Copy-Item $from (Join-Path (Split-Path -Parent $OutPath) $name) -Force }
+    else { Write-Host "[warn] runtime DLL not found: $from" }
 }
 
 Write-Host "[done] $OutPath"

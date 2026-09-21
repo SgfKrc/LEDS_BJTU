@@ -29,15 +29,19 @@ from src.llama_keep_head import (  # noqa: E402
     SHIM_SYMBOLS,
     KeepHeadUnavailable,
     KeepHeadUpstream,
+    _add_dll_dirs,
 )
 
 SHIM = ROOT / "build" / "keephead" / "build-cpu" / "bin" / "qlh_keep_head.dll"
 HEAD12 = ROOT / "build" / "cross-framework-layer-poc" / "out" / "qwen25-05b-f16-head12.gguf"
 EXTRA_DLL_DIRS = [d for d in (os.environ.get("QLH_KEEP_HEAD_DLL_DIRS") or
                               r"C:\msys64\ucrt64\bin").split(os.pathsep) if d]
+NATIVE_WORKER_ENV = "QLH_KEEP_HEAD_NATIVE_WORKER"
 
 
 def _upstream_or_skip(**kwargs):
+    if os.environ.get(NATIVE_WORKER_ENV) != "1":
+        pytest.skip("keep-head native ABI tests run in an isolated subprocess")
     if not SHIM.is_file():
         pytest.skip(f"需要 keep-head shim（{SHIM.relative_to(ROOT)}）；"
                     "用 scripts/model_tools/build_keep_head_shim.ps1 生成")
@@ -48,6 +52,20 @@ def _upstream_or_skip(**kwargs):
                                 n_ctx=512, n_threads=4, **kwargs)
     except KeepHeadUnavailable as exc:
         pytest.skip(f"keep-head 不可用：{exc}")
+
+
+def test_dll_directory_handles_are_retained(monkeypatch, tmp_path):
+    dll_dir = tmp_path / "dll"
+    dll_dir.mkdir()
+    handle = object()
+    monkeypatch.setattr(os, "add_dll_directory", lambda path: handle)
+    # 环境变量会追加额外目录，测试必须隔离环境（否则断言依赖开发机配置）
+    monkeypatch.delenv("QLH_KEEP_HEAD_DLL_DIRS", raising=False)
+
+    dirs, handles = _add_dll_dirs(dll_dir)
+
+    assert dirs == [str(dll_dir)]
+    assert handles == [handle]
 
 
 # ------------------------------------------------------------------ 失败路径（不需要模型）
