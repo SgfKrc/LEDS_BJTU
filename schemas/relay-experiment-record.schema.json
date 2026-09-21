@@ -183,6 +183,12 @@
     "downstream_decode_ms": {"$ref": "#/$defs/stat"},
     "baseline_ms_per_step": {"$ref": "#/$defs/stat"},
     "capacity_gain_x": {"type": ["number", "null"]},
+    "mid_uplink_bytes": {"type": ["integer", "null"]},
+    "mid_downlink_bytes": {"type": ["integer", "null"]},
+    "hidden_wire_dtype": {"type": ["string", "null"]},
+    "hidden_wire_compression": {"type": ["boolean", "null"]},
+    "hidden_wire_bytes_per_token": {"type": ["integer", "null"]},
+    "hidden_quant_error": {"type": ["object", "null"]},
     "resident_weight_bytes": {
      "type": ["object", "null"],
      "properties": {

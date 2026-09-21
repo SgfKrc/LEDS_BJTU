@@ -41,6 +41,8 @@ def _sha256(path: Path) -> str:
 def cmd_gen_input(args: argparse.Namespace) -> int:
     import numpy as np
 
+    if int(args.n_tokens) < 1 or int(args.n_embd) < 1:
+        raise SystemExit("FAIL: --n-tokens 与 --n-embd 必须为正数")
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(SEED)
@@ -65,9 +67,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             break
     from llama_keep_head import KeepHeadUpstream
 
-    hidden = np.load(args.input)
+    hidden = np.load(args.input, allow_pickle=False)
     if hidden.dtype != np.float32:
         raise SystemExit(f"FAIL: 输入 dtype 必须是 float32，实得 {hidden.dtype}")
+    if hidden.ndim != 2 or min(hidden.shape) < 1:
+        raise SystemExit(f"FAIL: 输入形状必须是非空二维数组，实得 {hidden.shape}")
 
     up = KeepHeadUpstream(args.shim, args.model, mode=args.mode, cut_layer=args.cut_layer,
                           n_ctx=int(hidden.shape[0]) + 8, n_threads=args.threads,
@@ -98,7 +102,14 @@ def cmd_compare(args: argparse.Namespace) -> int:
         name, _, path = item.partition("=")
         if not name or not path:
             raise SystemExit(f"FAIL: --case 需要 name=path，实得 {item!r}")
-        cases[name] = np.load(path)
+        if name in cases:
+            raise SystemExit(f"FAIL: --case 名称重复：{name!r}")
+        value = np.load(path, allow_pickle=False)
+        if value.dtype != np.float32:
+            raise SystemExit(f"FAIL: {name!r} dtype 必须是 float32，实得 {value.dtype}")
+        if value.ndim == 0 or value.size == 0:
+            raise SystemExit(f"FAIL: {name!r} 必须是非空数组")
+        cases[name] = np.ascontiguousarray(value)
     names = list(cases)
     if len(names) < 2:
         raise SystemExit("FAIL: 至少给两个 --case 才能比较")
@@ -112,7 +123,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         a, b = cases[base], cases[other]
         eps = np.abs(a.astype(np.float64) - b.astype(np.float64))
         ref = float(np.abs(a.astype(np.float64)).mean()) or 1.0
-        bits_equal = bool(np.array_equal(a, b))
+        bits_equal = bool(np.array_equal(a.view(np.uint32), b.view(np.uint32)))
         diff_bits = int(np.count_nonzero(a.view(np.uint32) != b.view(np.uint32)))
         row = {
             "base": base, "other": other, "bitwise_equal": bits_equal,

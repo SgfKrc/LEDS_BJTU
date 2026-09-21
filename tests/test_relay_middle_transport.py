@@ -24,6 +24,7 @@ if str(ROOT) not in sys.path:
 from src.relay_transport import (  # noqa: E402
     RelayProtocolError,
     RelayTcpClient,
+    encode_hidden_seq,
     expected_hidden_bytes,
     open_loopback_listener,
     serve_relay_middle_connection,
@@ -44,6 +45,14 @@ class _FakeMiddleRunner:
 
     def close(self) -> None:
         self.closed = True
+
+
+class _FakeSeqMiddleRunner(_FakeMiddleRunner):
+    def request_hidden_seq(self, hidden: bytes, *, n_tokens: int,
+                           meta: dict[str, object]) -> bytes:
+        self.requests.append((n_tokens, hidden))
+        self.meta = meta
+        return bytes((value + 1) % 256 for value in hidden)
 
 
 def _serve_once(listener: socket.socket, runner, n_embd: int):
@@ -98,6 +107,67 @@ def test_middle_handles_multiple_rounds_in_one_session():
         assert first == b"\x01" * expected_hidden_bytes(n_tokens, n_embd)
         assert second == b"\x02" * expected_hidden_bytes(n_tokens, n_embd)
         assert result["bridge"].frames == 2
+    finally:
+        listener.close()
+
+
+def test_middle_accepts_hidden_seq_metadata_with_frame_overhead():
+    n_embd, n_tokens = 8, 4
+    runner = _FakeSeqMiddleRunner()
+    listener = open_loopback_listener("127.0.0.1", 0)
+    port = listener.getsockname()[1]
+    payload = bytes(range(expected_hidden_bytes(n_tokens, n_embd)))
+    meta = {"seq_ids": [0, 0, 1, 1], "positions": [0, 1, 0, 1]}
+    try:
+        thread, result = _serve_once(listener, runner, n_embd)
+        with RelayTcpClient("127.0.0.1", port, n_embd=n_embd) as client:
+            produced = client.request_hidden_seq(payload, n_tokens=n_tokens, meta=meta)
+        thread.join(timeout=10)
+        assert produced == bytes((value + 1) % 256 for value in payload)
+        assert runner.meta == meta
+        assert result["bridge"].payload_bytes == len(
+            encode_hidden_seq(payload, n_tokens=n_tokens, meta=meta))
+    finally:
+        listener.close()
+
+
+@pytest.mark.parametrize(
+    ("meta", "reason"),
+    [
+        ({"seq_ids": [0]}, "hidden_seq_meta_shape_invalid"),
+        ({"positions": [0, -1]}, "hidden_seq_meta_shape_invalid"),
+        ({"seq_ids": [0, 1], "extra": [0, 1]}, "hidden_seq_meta_unknown"),
+    ],
+)
+def test_hidden_seq_metadata_is_fail_closed(meta, reason):
+    from src.relay_transport import encode_hidden_seq
+
+    with pytest.raises(RelayProtocolError, match=reason):
+        encode_hidden_seq(b"\x00" * 16, n_tokens=2, meta=meta)
+
+
+def test_middle_rejects_outer_hidden_seq_token_count_mismatch():
+    from src.relay_transport import RelayFrame, RelayFrameKind, recv_frame, send_frame
+
+    n_embd = 4
+    runner = _FakeSeqMiddleRunner()
+    listener = open_loopback_listener("127.0.0.1", 0)
+    port = listener.getsockname()[1]
+    try:
+        thread, result = _serve_once(listener, runner, n_embd)
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+        try:
+            payload = encode_hidden_seq(b"\x00" * expected_hidden_bytes(2, n_embd),
+                                        n_tokens=2, meta={"seq_ids": [0, 0]})
+            send_frame(sock, RelayFrame(RelayFrameKind.HIDDEN_SEQ, 0, n_tokens=1,
+                                        payload=payload))
+            response = recv_frame(sock)
+        finally:
+            sock.close()
+        thread.join(timeout=10)
+        assert response.kind == RelayFrameKind.ERROR
+        assert response.payload == b"hidden_seq_token_count_mismatch"
+        assert result["bridge"].closed_cleanly is False
     finally:
         listener.close()
 

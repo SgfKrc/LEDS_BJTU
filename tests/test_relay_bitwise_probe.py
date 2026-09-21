@@ -89,3 +89,20 @@ def test_compare_needs_two_cases(tmp_path: Path) -> None:
     done = _run("compare", "--case", f"a={p1}")
     assert done.returncode != 0
     assert "至少给两个" in (done.stdout + done.stderr)
+
+
+def test_compare_rejects_dtype_mismatch(tmp_path: Path) -> None:
+    np = pytest.importorskip("numpy")
+    p1, p2 = tmp_path / "p1.npy", tmp_path / "p2.npy"
+    np.save(p1, np.zeros((2, 4), dtype=np.float32))
+    np.save(p2, np.zeros((2, 4), dtype=np.float64))
+    done = _run("compare", "--case", f"a={p1}", "--case", f"b={p2}")
+    assert done.returncode != 0
+    assert "dtype" in (done.stdout + done.stderr)
+
+
+def test_gen_input_rejects_non_positive_shape(tmp_path: Path) -> None:
+    done = _run("gen-input", "--n-tokens", "0", "--n-embd", "4",
+                "--out", str(tmp_path / "input.npy"))
+    assert done.returncode != 0
+    assert "必须为正数" in (done.stdout + done.stderr)

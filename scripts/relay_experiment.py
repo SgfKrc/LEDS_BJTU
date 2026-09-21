@@ -296,7 +296,7 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
                          "**不改变任何数值**（量化本身与不开启时逐位一致）")
     ap.add_argument("--hidden-quant", default="none",
                     choices=["none", "f16", "bf16", "int8_block128"],
-                    help="★ P3：线上 hidden 压缩（每跳注入前量化、使用前反量化）。"
+                    help="★ P3：hidden 数值量化往返模拟（当前 Relay wire 仍为 float32）。"
                          "判据仍是 **per-token argmax** —— 不得用 cosine 代替；"
                          "分叉即如实标 FAIL，不得当作「可接受的近似」")
     ap.add_argument("--upstream-quant", default="fp16",
@@ -369,16 +369,6 @@ def _load_upstream(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _seq_meta_bytes(seq_ids, positions) -> int:
-    """`HIDDEN_SEQ` 帧里 `seq_ids`/`positions` 元数据的字节数（线路字节口径用）。"""
-    count = 0
-    if seq_ids is not None:
-        count += 4 * len(seq_ids)
-    if positions is not None:
-        count += 4 * len(positions)
-    return count
-
-
 class _RemoteMiddleSegment:
     """跨机中间段代理：接口与 `KeepHeadUpstream.forward_hidden_to_hidden` 一致。
 
@@ -399,10 +389,10 @@ class _RemoteMiddleSegment:
         self.n_embd = int(n_embd)
         self.bandwidth_mbps = max(0.0, float(bandwidth_mbps))
         self.extra_latency_ms = max(0.0, float(extra_latency_ms))
-        # ★ P3 弱网：**线路上的** hidden 压缩（进出远端的两个方向都压）。
-        # 只压"中段→末段"那一跳对本机内存无意义 —— 跨机的瓶颈在线上。
+        # The numerical quantization round-trip is separate from wire encoding.
+        # The current Relay protocol still transports float32 hidden payloads.
         self.hidden_quant = str(hidden_quant or "none")
-        self.uplink_bytes = 0        # ★ P3 弱网：线路口径（压缩后的真实上行字节）
+        self.uplink_bytes = 0        # Actual bytes passed to the Relay wire.
         self.downlink_bytes = 0
         self._client = RelayTcpClient(host, int(port), n_embd=self.n_embd, timeout=timeout)
 
@@ -432,30 +422,28 @@ class _RemoteMiddleSegment:
         if arr.ndim != 2 or arr.shape[1] != self.n_embd:
             raise ValueError(f"hidden 形状应为 [n_tokens, {self.n_embd}]，实得 {arr.shape}")
         n_tokens = int(arr.shape[0])
-        # ★ P3 弱网：进出远端都按线路精度量化（f32/f16/bf16/int8）。
-        # ⚠️ 线路字节必须按**目标精度**算 —— `_quantize_hidden` 量化后会转回 f32，
-        # 拿它的 `nbytes` 会把 f16/int8 的收益全吃掉（实测踩到：压缩档字节数与 f32 相同）。
-        per_token = _hidden_bytes(self.n_embd, self.hidden_quant)
-        if per_token is None:
-            per_token = self.n_embd * 4
         uplink = _quantize_hidden(arr, self.hidden_quant, tag="mid_uplink")
-        uplink_line = per_token * n_tokens + _seq_meta_bytes(seq_ids, positions)
-        self.uplink_bytes += uplink_line
-        self._simulate_link(uplink_line)           # 上行（按压缩后的线路字节计时）
-        if seq_ids is None and positions is None:
-            payload = self._client.request_hidden(np.ascontiguousarray(uplink).tobytes(),
-                                                  n_tokens=n_tokens)
+        uplink_bytes = np.ascontiguousarray(uplink).tobytes()
+        meta: dict[str, object] = {}
+        if seq_ids is not None:
+            meta["seq_ids"] = [int(value) for value in seq_ids]
+        if positions is not None:
+            meta["positions"] = [int(value) for value in positions]
+        if meta:
+            from src.relay_transport import encode_hidden_seq  # noqa: PLC0415
+
+            uplink_line = len(encode_hidden_seq(uplink_bytes, n_tokens=n_tokens, meta=meta))
         else:
-            meta: dict[str, object] = {}
-            if seq_ids is not None:
-                meta["seq_ids"] = [int(value) for value in seq_ids]
-            if positions is not None:
-                meta["positions"] = [int(value) for value in positions]
-            payload = self._client.request_hidden_seq(
-                np.ascontiguousarray(uplink).tobytes(), n_tokens=n_tokens, meta=meta)
-        # 响应也是同精度的 hidden（协议里 `HIDDEN` 帧字段固定 f32，这里按线路精度口径计时）
-        downlink_line = per_token * n_tokens
-        self._simulate_link(downlink_line)         # 下行
+            uplink_line = len(uplink_bytes)
+        self.uplink_bytes += uplink_line
+        self._simulate_link(uplink_line)
+        if seq_ids is None and positions is None:
+            payload = self._client.request_hidden(uplink_bytes, n_tokens=n_tokens)
+        else:
+            payload = self._client.request_hidden_seq(uplink_bytes, n_tokens=n_tokens, meta=meta)
+        # Responses are HIDDEN frames and therefore float32 on the wire.
+        downlink_line = len(payload)
+        self._simulate_link(downlink_line)
         self.downlink_bytes += downlink_line
         out = np.frombuffer(payload, dtype=np.float32).reshape(arr.shape).copy()
         return _quantize_hidden(out, self.hidden_quant, tag="mid_downlink")
@@ -513,6 +501,13 @@ def _hidden_bytes(n_embd: int | None, hidden_quant: str) -> int | None:
         blocks = (width + 127) // 128
         return width * 1 + blocks * 4
     return None
+
+
+def _wire_hidden_bytes(n_embd: int | None) -> int | None:
+    """Bytes actually carried by the current float32 Relay wire contract."""
+
+    width = int(n_embd or 0)
+    return width * 4 if width > 0 else None
 
 
 class _QuantErrorTracker:
@@ -586,16 +581,23 @@ def _quantize_hidden(hidden, mode: str, tag: str = ""):
 
         out = torch.from_numpy(arr).to(torch.bfloat16).to(torch.float32).numpy()
     elif mode == "int8_block128":
-        flat = arr.reshape(-1, 128)
+        width = int(arr.shape[-1])
+        blocks = (width + 127) // 128
+        padded_width = blocks * 128
+        if padded_width != width:
+            padded = np.zeros((*arr.shape[:-1], padded_width), dtype=np.float32)
+            padded[..., :width] = arr
+        else:
+            padded = arr
+        flat = padded.reshape(-1, 128)
         scale = np.abs(flat).max(axis=1, keepdims=True)
         scale[scale == 0] = 1.0
         quantized = np.round(flat / scale * 127.0).clip(-127, 127)
-        out = (quantized / 127.0 * scale).astype(np.float32).reshape(arr.shape)
+        out = (quantized / 127.0 * scale).astype(np.float32).reshape(padded.shape)[..., :width]
     else:
-        return arr
+        raise ValueError(f"未知 hidden-quant 模式：{mode!r}")
     _QUANT_TRACKER.record(arr, out, mode=mode, tag=tag)
     return out
-    raise ValueError(f"未知 hidden-quant 模式：{mode!r}")
 
 
 def _load_keep_head_segment(args: argparse.Namespace, model_path: str, *,
@@ -756,8 +758,10 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
                 hidden = hidden[None, :]
             n_tok = int(hidden.shape[0])
             hidden = np.ascontiguousarray(hidden.reshape(-1, hidden.shape[-1]), dtype=np.float32)
-            # ★ P3：上游 → 下游这一跳的线上压缩
-            hidden = _quantize_hidden(hidden, args.hidden_quant, tag="up_to_down")
+            # The network middle segment owns its round-trip; avoid a second
+            # quantization before the request reaches that segment.
+            if args.path != PATH_D2L2L_KEEP_HEAD_NET:
+                hidden = _quantize_hidden(hidden, args.hidden_quant, tag="up_to_down")
             logits, dn_ms = downstream["forward"](hidden, is_prefill, pos)
             if logits is None:
                 failure = f"下游未返回 logits（step {len(upstream_tokens[0])}）"
@@ -803,8 +807,10 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
             hidden = np.ascontiguousarray(
                 hidden_t.reshape(batch_n * n_tok, -1).to(torch.float32).cpu().numpy(),
                 dtype=np.float32)
-            # ★ P3：这一跳的线上压缩（上游 → 中段/下游）
-            hidden = _quantize_hidden(hidden, args.hidden_quant, tag="up_to_mid")
+            # Local paths simulate the numerical round-trip here. Network
+            # paths let _RemoteMiddleSegment own it so it happens once.
+            if args.path != PATH_D2L2L_KEEP_HEAD_NET:
+                hidden = _quantize_hidden(hidden, args.hidden_quant, tag="up_to_mid")
             if middle is not None:
                 # 三段：把上游 hidden 交给 keep-head 中段，吃 hidden 吐 hidden
                 started = time.perf_counter()
@@ -1131,9 +1137,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "downstream_decode_ms": relay["downstream_decode_ms"],
         # 中段耗时：本机三段与**跨机三段**都要记（跨机的中段耗时正是"值不值得跨机"的关键数据）
         "middle_decode_ms": (relay.get("middle_decode_ms") if middle_iface else None),
-        # ★ P3 弱网：线路口径字节（压缩后的真实上下行），用于算"压缩到底省了多少"
+        # Current wire accounting: Relay v1 carries float32 payloads.
         "mid_uplink_bytes": relay.get("mid_uplink_bytes"),
         "mid_downlink_bytes": relay.get("mid_downlink_bytes"),
+        "hidden_wire_dtype": "float32_le",
+        "hidden_wire_compression": False,
+        "hidden_wire_bytes_per_token": _wire_hidden_bytes(n_embd),
         # ★ P3 误差测量（--track-quant-error）：量化往返误差的分布与"前后半段"对照
         "hidden_quant_error": _QUANT_TRACKER.summary(),
         "baseline_ms_per_step": baseline["decode_ms"],
@@ -1160,7 +1169,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                            "upstream_compiled": upstream["compiled"],
                            "hidden_quant": args.hidden_quant,
                            "hidden_bytes_per_token_effective": _hidden_bytes(
-                               n_embd, args.hidden_quant)})
+                               n_embd, args.hidden_quant),
+                           "hidden_wire_dtype": "float32_le",
+                           "hidden_wire_compression": False,
+                           "hidden_wire_bytes_per_token": _wire_hidden_bytes(n_embd)})
     evidence = RelayXFrameEvidence(
         correctness_verified=bool(tokens_match),
         correctness_cases=matched,

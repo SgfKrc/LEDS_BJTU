@@ -23,6 +23,7 @@ RELAY_WIRE_VERSION = 1
 RELAY_DTYPE = "float32_le"
 RELAY_DTYPE_BYTES = 4
 RELAY_DEFAULT_MAX_TOKENS = 4096
+_UINT32_MAX = (1 << 32) - 1
 RELAY_DEFAULT_MAX_PAYLOAD = 256 * 1024 * 1024
 #: ★ P3：`HIDDEN_SEQ` 帧的元数据（seq/pos）上限 —— 帧校验按 hidden 字节 + 该上限放宽。
 RELAY_SEQ_META_LIMIT = 64 * 1024
@@ -51,10 +52,12 @@ _RELAY_ERROR_CODES = frozenset({
     "hidden_payload_size_mismatch",
     "hidden_seq_frame_required",
     "hidden_seq_meta_invalid",
+    "hidden_seq_meta_shape_invalid",
     "hidden_seq_meta_too_large",
     "hidden_seq_meta_truncated",
     "hidden_seq_meta_unknown",
     "hidden_seq_payload_too_small",
+    "hidden_seq_token_count_mismatch",
     "hidden_seq_unsupported",
     "invalid_close_ack",
     "invalid_close_frame",
@@ -134,20 +137,46 @@ def expected_hidden_bytes(n_tokens: int, n_embd: int) -> int:
     return tokens * width * RELAY_DTYPE_BYTES
 
 
+def _validate_hidden_seq_meta(meta: object, n_tokens: int) -> None:
+    """Validate the bounded, per-token metadata carried by ``HIDDEN_SEQ``."""
+
+    if not isinstance(meta, dict):
+        raise RelayProtocolError("hidden_seq_meta_invalid")
+    allowed = {"n_seq_id", "seq_ids", "positions"}
+    unknown = [key for key in meta if key not in allowed]
+    if unknown:
+        raise RelayProtocolError(f"hidden_seq_meta_unknown:{unknown[0]}")
+
+    for key in ("n_seq_id", "seq_ids", "positions"):
+        if key not in meta:
+            continue
+        values = meta[key]
+        if not isinstance(values, (list, tuple)) or len(values) != n_tokens:
+            raise RelayProtocolError("hidden_seq_meta_shape_invalid")
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RelayProtocolError("hidden_seq_meta_shape_invalid")
+        if key == "n_seq_id" and any(value < 1 for value in values):
+            raise RelayProtocolError("hidden_seq_meta_shape_invalid")
+
+
 def encode_hidden_seq(hidden: bytes, *, n_tokens: int, meta: dict[str, object]) -> bytes:
     """★ P3：把 `hidden` + 元数据打包成 `HIDDEN_SEQ` 的 payload。
 
     布局：`<n_tokens:u32><n_meta_bytes:u32><meta JSON><f32 hidden>`。
     元数据只允许 `n_seq_id` / `seq_ids` / `positions`（其余键一律拒绝，避免协议被当通用通道）。
     """
-    allowed = {"n_seq_id", "seq_ids", "positions"}
-    unknown = set(meta) - allowed
-    if unknown:
-        raise RelayProtocolError(f"hidden_seq_meta_unknown:{sorted(unknown)[0]}")
-    meta_bytes = json.dumps(meta, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    count = int(n_tokens)
+    if isinstance(n_tokens, bool) or count < 1 or count > _UINT32_MAX:
+        raise RelayProtocolError("invalid_hidden_shape")
+    _validate_hidden_seq_meta(meta, count)
+    try:
+        meta_bytes = json.dumps(meta, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    except (TypeError, ValueError) as exc:
+        raise RelayProtocolError("hidden_seq_meta_invalid") from exc
     if len(meta_bytes) > RELAY_SEQ_META_LIMIT:
         raise RelayProtocolError("hidden_seq_meta_too_large")
-    return _SEQ_HEADER.pack(int(n_tokens), len(meta_bytes)) + meta_bytes + bytes(hidden)
+    return _SEQ_HEADER.pack(count, len(meta_bytes)) + meta_bytes + bytes(hidden)
 
 
 def decode_hidden_seq(payload: bytes, *, n_embd: int) -> tuple[bytes, int, dict[str, object]]:
@@ -165,8 +194,7 @@ def decode_hidden_seq(payload: bytes, *, n_embd: int) -> tuple[bytes, int, dict[
         meta = json.loads(payload[start:end].decode("ascii"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RelayProtocolError("hidden_seq_meta_invalid") from exc
-    if not isinstance(meta, dict):
-        raise RelayProtocolError("hidden_seq_meta_invalid")
+    _validate_hidden_seq_meta(meta, int(n_tokens))
     hidden = payload[end:]
     if len(hidden) != expected_hidden_bytes(int(n_tokens), int(n_embd)):
         raise RelayProtocolError("hidden_payload_size_mismatch")
@@ -566,7 +594,8 @@ def serve_relay_middle_connection(
 
     width = int(n_embd)
     limit = int(max_tokens)
-    max_payload = expected_hidden_bytes(limit, width)
+    max_payload = (expected_hidden_bytes(limit, width)
+                   + RELAY_SEQ_META_LIMIT + _SEQ_HEADER.size)
     sequence = 0
     frames = 0
     tokens = 0
@@ -595,6 +624,8 @@ def serve_relay_middle_connection(
                 # ★ P3 多序列：payload 自带 seq/pos；远端 runner 必须支持显式绑定，
                 # 否则 fail-loud（绝不退回"远端按隐式位置猜"——那会静默算错）。
                 hidden, n_tokens, meta = decode_hidden_seq(frame.payload, n_embd=width)
+                if n_tokens != frame.n_tokens:
+                    raise RelayProtocolError("hidden_seq_token_count_mismatch")
                 if n_tokens < 1 or n_tokens > limit:
                     raise RelayProtocolError("token_count_exceeds_limit")
                 if not hasattr(runner, "request_hidden_seq"):
@@ -617,7 +648,7 @@ def serve_relay_middle_connection(
                 )
                 frames += 1
                 tokens += n_tokens
-                payload_bytes += len(hidden)
+                payload_bytes += len(frame.payload)
                 sequence += 1
                 continue
             if frame.kind != RelayFrameKind.HIDDEN:

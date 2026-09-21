@@ -195,3 +195,20 @@ def test_hidden_quant_bytes_accounting():
     assert module._hidden_bytes(896, "f16") == 896 * 2
     assert module._hidden_bytes(896, "int8_block128") == 896 + 7 * 4   # 7 个 128 块
     assert module._hidden_bytes(0, "f16") is None
+
+
+def test_int8_hidden_quant_supports_non_block_aligned_width():
+    import importlib.util
+    import numpy as np
+
+    spec = importlib.util.spec_from_file_location(
+        "relay_experiment_cli_non_aligned", ROOT / "scripts" / "relay_experiment.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    hidden = np.arange(3 * 130, dtype=np.float32).reshape(3, 130) - 100.0
+    out = module._quantize_hidden(hidden, "int8_block128")
+    assert out.shape == hidden.shape
+    assert out.dtype == np.float32
+    assert np.isfinite(out).all()
