@@ -155,7 +155,7 @@ The upstream PyTorch layer segment computes up to layer N and hands the hidden s
 | Cut-point solver | `scripts/relay_cut_plan.py` + `src/relay_cut_objective.py`: fits segment profiles (fixed cost + per-layer cost) from **measured** records, then solves for the cut with `capacity_feasible` / `latency_estimate` / `risk_penalty` outputs; n-segment capable, with the Qwen3.5 4-layer-multiple hard constraint. The 2-segment loop passes on both Qwen2.5 (r2 0.96/0.99) and Qwen3.5 (0.79/0.96) |
 | Current positioning | **Architecture-compatibility track**; off by default, does not replace RPC, does not enter the Edge default route; optimization items are registered in [acceptance list D29](验收清单与资源限制登记.md) |
 
-**Corrected conclusion**: the earlier judgement "IPC is the main cost" has been overturned - that was an illusion masked while both sides were slow. **The leverage is in the compute on both sides (cut point, kernel, batching), not in the transport layer.** See [Same-Process Dual-Backend Relay Implementation and Performance](同进程双后端接力实现与性能-2026-09-16.md) sections 12-14.
+**Corrected conclusion**: the earlier judgement "IPC is the main cost" has been overturned - that was an illusion masked while both sides were slow. **The leverage is in the compute on both sides (cut point, kernel, batching), not in the transport layer.** See [Same-Process Dual-Backend Relay Implementation and Performance](archive/同进程双后端接力实现与性能-2026-09-16.md) sections 12-14.
 
 ### Cut-Point Sweep Results (P0, measured 2026-09-18)
 
@@ -483,7 +483,7 @@ Real hardware, cross-machine networking, Android ARM64, performance and long-run
 - [Overall Architecture](整体架构.md)
 - [Layer-Segment Protocol Proposal (2026-09-17)](层段协议立项-2026-09-17.md)
 - [Layer Pipeline Node Kinds and Top-Level Transparency](层流水线节点类型与顶层透明性-可行性确认-2026-09-17.md)
-- [Same-Process Dual-Backend Relay Implementation and Performance](同进程双后端接力实现与性能-2026-09-16.md)
+- [Same-Process Dual-Backend Relay Implementation and Performance](archive/同进程双后端接力实现与性能-2026-09-16.md)
 - [Engine Single-Sequence and Concurrency Comparison](引擎单序列与并发性能对比-2026-09-16.md)
 - [Distributed Inference Parallelism and Cross-Framework Route Survey](分布式推理并行与跨框架路线调研汇总-2026-09-15.md)
 - [TUI User Guide](TUI使用指南.md)
@@ -491,7 +491,7 @@ Real hardware, cross-machine networking, Android ARM64, performance and long-run
 - [TUI Command Set](TUI指令集.md)
 - [Edge Device Simulation Environment Plan](边缘设备模拟环境计划-2026-09-15.md)
 - [Android Validation Alternative Paths](../android/Android验证替代路径-2026-09-18.md)
-- [Baseline Rewrite Plan](基线重写方案-2026-09-16.md)
+- [Baseline Rewrite Plan](archive/基线重写方案-2026-09-16.md)
 - [Module Interfaces](模块接口说明.md)
 - [Testing and Evaluation Criteria](测试与评判标准.md)
 - [Document Status and Cleanup List](文档状态与清理清单.md)
