@@ -165,9 +165,20 @@ def _cuda_gb() -> float | None:
 
 
 def _param_bytes(param: Any) -> int:
-    """参数字节数；bitsandbytes `Params4bit` 按 4-bit 打包估算。"""
-    if type(param).__name__ == "Params4bit":
+    """参数字节数 —— 打包参数按**实际驻留**估算，而不是按 fp16。
+
+    - `Params4bit`（bitsandbytes 4bit）：按 4-bit 打包
+    - `Int8Params`（`has_fp16_weights=False`，LLM.int8）：权重驻留 int8（1 B/元素）
+      外加行级 fp32 scale（bnb 的 LLM.int8 按行存 scale）
+    ⚠️ 若不显式处理 `Int8Params`，`element_size()` 会按 CPU 上的 fp16 副本算，
+    导致 int8 档的上游驻留字节被报成 fp16 的同款大小（上一轮实测的遗留问题）。
+    """
+    name = type(param).__name__
+    if name == "Params4bit":
         return int(param.numel() // 2)
+    if name == "Int8Params":
+        rows = int(param.shape[0]) if int(param.dim()) >= 1 else 1
+        return int(param.numel()) + rows * 4      # int8 权重 + 行级 fp32 scale
     return int(param.numel() * param.element_size())
 
 

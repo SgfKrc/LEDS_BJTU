@@ -101,3 +101,25 @@ def test_replace_linear_helpers_exist(rx) -> None:
     for name in ("_replace_linear_4bit", "_replace_linear_nf4",
                  "_replace_linear_fp4", "_replace_linear_int8"):
         assert callable(getattr(rx, name)), name
+
+
+def test_param_bytes_counts_packed_params_by_residency(rx) -> None:
+    """打包参数必须按**实际驻留**估算。
+
+    上一轮遗留：`Int8Params` 没被显式处理 ⇒ `element_size()` 按 CPU 上的 fp16 副本算，
+    int8 档的上游驻留字节被报成与 fp16 相同（实测 511 MB）。
+    """
+    torch = pytest.importorskip("torch")
+    bnb = pytest.importorskip("bitsandbytes")
+
+    p4 = bnb.nn.Params4bit(torch.zeros(64, 128, dtype=torch.float16),
+                           requires_grad=False, quant_type="nf4")
+    pi8 = bnb.nn.Int8Params(torch.zeros(64, 128, dtype=torch.float16),
+                            requires_grad=False, has_fp16_weights=False)
+    fp16 = torch.zeros(64, 128, dtype=torch.float16)
+
+    assert rx._param_bytes(p4) == 64 * 128 // 2            # 4bit 打包
+    assert rx._param_bytes(pi8) == 64 * 128 + 64 * 4        # int8 权重 + 行级 fp32 scale
+    assert rx._param_bytes(fp16) == 64 * 128 * 2            # 未打包：按 dtype
+    # int8 必须明显小于 fp16（这正是修复要保证的方向）
+    assert rx._param_bytes(pi8) < rx._param_bytes(fp16)
