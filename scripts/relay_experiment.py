@@ -267,9 +267,14 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
                     help="d2l2l_keep_head 的中间段工件（保留 blk.K1..K2-1 的裁层 GGUF）")
     ap.add_argument("--mid-layers", type=int, default=None,
                     help="d2l2l_keep_head 的第二个切点 K2（中间段覆盖 blk.K1..K2-1）")
-    ap.add_argument("--mid-endpoint", default=None,
+    ap.add_argument("--mid-endpoint", action="append", default=None,
                     help="跨机三段（--path d2l2l_keep_head_net）：远端中间段的 host:port"
-                         "（本机 loopback，跨机时先用 ssh -L 建立隧道）")
+                         "（本机 loopback，跨机时先用 ssh -L 建立隧道）。"
+                         "★ P3 多跳：可重复给出，按顺序串成中段链"
+                         "（如 torch → Surface(8..15) → y700(16..23) → 本机 head）")
+    ap.add_argument("--mid-stop", action="append", type=int, default=None,
+                    help="★ P3 多跳：每个中段的**结束层号**，与 --mid-endpoint 一一对应"
+                         "（如 `--mid-stop 16 --mid-stop 24`）")
     ap.add_argument("--mid-bandwidth-mbps", type=float, default=0.0,
                     help="★ P3 弱网模拟：远端段的链路带宽上限（0 = 不限制）")
     ap.add_argument("--mid-extra-latency-ms", type=float, default=0.0,
@@ -285,6 +290,10 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--n-ctx", type=int, default=4096)
     ap.add_argument("--warmup", type=int, default=2)
+    ap.add_argument("--track-quant-error", action="store_true",
+                    help="★ P3 误差测量（\"先只测量，不改链路\"）：记录每次量化往返的"
+                         "绝对/相对误差，用于看 int8 误差是否随序列长度与步数累积。"
+                         "**不改变任何数值**（量化本身与不开启时逐位一致）")
     ap.add_argument("--hidden-quant", default="none",
                     choices=["none", "f16", "bf16", "int8_block128"],
                     help="★ P3：线上 hidden 压缩（每跳注入前量化、使用前反量化）。"
@@ -429,7 +438,7 @@ class _RemoteMiddleSegment:
         per_token = _hidden_bytes(self.n_embd, self.hidden_quant)
         if per_token is None:
             per_token = self.n_embd * 4
-        uplink = _quantize_hidden(arr, self.hidden_quant)
+        uplink = _quantize_hidden(arr, self.hidden_quant, tag="mid_uplink")
         uplink_line = per_token * n_tokens + _seq_meta_bytes(seq_ids, positions)
         self.uplink_bytes += uplink_line
         self._simulate_link(uplink_line)           # 上行（按压缩后的线路字节计时）
@@ -449,13 +458,46 @@ class _RemoteMiddleSegment:
         self._simulate_link(downlink_line)         # 下行
         self.downlink_bytes += downlink_line
         out = np.frombuffer(payload, dtype=np.float32).reshape(arr.shape).copy()
-        return _quantize_hidden(out, self.hidden_quant)
+        return _quantize_hidden(out, self.hidden_quant, tag="mid_downlink")
 
     def close(self) -> None:
         try:
             self._client.close()
         except Exception:  # noqa: BLE001 - 关闭失败不影响结论记录
             pass
+
+
+class _MiddleChain:
+    """★ P3 多跳：把多个中段（远端 `_RemoteMiddleSegment` 或本机段）串成一条链。
+
+    对外暴露与单个中段**完全相同**的接口（`forward_hidden_to_hidden` / `n_embd` /
+    `close`），因此驱动主循环不需要为多跳改任何调用点 —— hidden 依次穿过每一段。
+    线路字节按**各段之和**汇总（每段各自压/计时，口径互不干扰）。
+    """
+
+    def __init__(self, segments: list[Any]) -> None:
+        if not segments:
+            raise ValueError("_MiddleChain 至少需要一段")
+        self.segments = list(segments)
+        self.n_embd = self.segments[0].n_embd
+        self.uplink_bytes = 0
+        self.downlink_bytes = 0
+
+    def forward_hidden_to_hidden(self, hidden, *, n_past: int = 0,
+                                 seq_ids=None, positions=None):
+        out = hidden
+        for segment in self.segments:
+            out = segment.forward_hidden_to_hidden(out, n_past=n_past, seq_ids=seq_ids,
+                                                   positions=positions)
+        self.uplink_bytes = sum(int(getattr(s, "uplink_bytes", 0)) for s in self.segments)
+        self.downlink_bytes = sum(int(getattr(s, "downlink_bytes", 0)) for s in self.segments)
+        return out
+
+    def close(self) -> None:
+        for segment in self.segments:
+            closer = getattr(segment, "close", None)
+            if closer is not None:
+                closer()
 
 
 def _hidden_bytes(n_embd: int | None, hidden_quant: str) -> int | None:
@@ -473,7 +515,60 @@ def _hidden_bytes(n_embd: int | None, hidden_quant: str) -> int | None:
     return None
 
 
-def _quantize_hidden(hidden, mode: str):
+class _QuantErrorTracker:
+    """★ P3 误差测量（按用户裁定的"**先只测量，不改链路**"）：记录每次量化往返的误差量级。
+
+    回答的问题：int8 的误差有多大、是否随**序列长度/步数**累积。
+    只在 `--track-quant-error` 时启用，且**不改变链路上任何数值** —— 量化本身与未追踪时
+    逐位一致（只多读一次数组做统计）。
+    """
+
+    def __init__(self) -> None:
+        self.enabled = False
+        self.records: list[dict[str, Any]] = []
+
+    def record(self, original, quantized, *, mode: str, tag: str) -> None:
+        if not self.enabled:
+            return
+        import numpy as np  # noqa: PLC0415
+
+        src = np.asarray(original, dtype=np.float32)
+        dst = np.asarray(quantized, dtype=np.float32)
+        eps = np.abs(dst - src)
+        ref = float(np.abs(src).mean()) or 1.0
+        width = int(src.shape[-1]) if src.ndim else 1
+        self.records.append({
+            "i": len(self.records),
+            "tag": tag or "hidden",
+            "mode": mode,
+            "n_tokens": int(src.size // max(1, width)),
+            "mean_abs": float(eps.mean()),
+            "max_abs": float(eps.max()),
+            "rel": float(eps.mean()) / ref,
+        })
+
+    def summary(self) -> dict[str, Any] | None:
+        if not self.enabled or not self.records:
+            return None
+        import numpy as np  # noqa: PLC0415
+
+        rels = np.asarray([r["rel"] for r in self.records], dtype=np.float64)
+        half = len(rels) // 2 or 1
+        return {
+            "n_quantized_calls": len(self.records),
+            "rel_mean": float(rels.mean()),
+            "rel_max": float(rels.max()),
+            # ★ 是否"累积"的最直接判据：后半段平均相对误差 vs 前半段
+            "rel_first_half": float(rels[:half].mean()),
+            "rel_second_half": float(rels[half:].mean()),
+            "per_call": self.records,
+        }
+
+
+_QUANT_TRACKER = _QuantErrorTracker()
+
+
+def _quantize_hidden(hidden, mode: str, tag: str = ""):
     """★ P3：模拟「线上一跳」的 hidden 压缩（量化 → 反量化），返回 f32 数组。
 
     只在这一个函数里做往返，保证**同一份 hidden 在本地链路与跨机链路的语义一致**。
@@ -485,17 +580,21 @@ def _quantize_hidden(hidden, mode: str):
 
     arr = np.asarray(hidden, dtype=np.float32)
     if mode == "f16":
-        return arr.astype(np.float16).astype(np.float32)
-    if mode == "bf16":
+        out = arr.astype(np.float16).astype(np.float32)
+    elif mode == "bf16":
         import torch  # noqa: PLC0415
 
-        return torch.from_numpy(arr).to(torch.bfloat16).to(torch.float32).numpy()
-    if mode == "int8_block128":
+        out = torch.from_numpy(arr).to(torch.bfloat16).to(torch.float32).numpy()
+    elif mode == "int8_block128":
         flat = arr.reshape(-1, 128)
         scale = np.abs(flat).max(axis=1, keepdims=True)
         scale[scale == 0] = 1.0
         quantized = np.round(flat / scale * 127.0).clip(-127, 127)
-        return (quantized / 127.0 * scale).astype(np.float32).reshape(arr.shape)
+        out = (quantized / 127.0 * scale).astype(np.float32).reshape(arr.shape)
+    else:
+        return arr
+    _QUANT_TRACKER.record(arr, out, mode=mode, tag=tag)
+    return out
     raise ValueError(f"未知 hidden-quant 模式：{mode!r}")
 
 
@@ -658,7 +757,7 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
             n_tok = int(hidden.shape[0])
             hidden = np.ascontiguousarray(hidden.reshape(-1, hidden.shape[-1]), dtype=np.float32)
             # ★ P3：上游 → 下游这一跳的线上压缩
-            hidden = _quantize_hidden(hidden, args.hidden_quant)
+            hidden = _quantize_hidden(hidden, args.hidden_quant, tag="up_to_down")
             logits, dn_ms = downstream["forward"](hidden, is_prefill, pos)
             if logits is None:
                 failure = f"下游未返回 logits（step {len(upstream_tokens[0])}）"
@@ -705,7 +804,7 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
                 hidden_t.reshape(batch_n * n_tok, -1).to(torch.float32).cpu().numpy(),
                 dtype=np.float32)
             # ★ P3：这一跳的线上压缩（上游 → 中段/下游）
-            hidden = _quantize_hidden(hidden, args.hidden_quant)
+            hidden = _quantize_hidden(hidden, args.hidden_quant, tag="up_to_mid")
             if middle is not None:
                 # 三段：把上游 hidden 交给 keep-head 中段，吃 hidden 吐 hidden
                 started = time.perf_counter()
@@ -726,7 +825,7 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
                 # 那条链路的量化由 `_RemoteMiddleSegment` 在进出远端的两个方向上做，
                 # 否则 int8 会被叠两次（双重量化放大误差，口径也乱）。
                 if args.path != PATH_D2L2L_KEEP_HEAD_NET:
-                    hidden = _quantize_hidden(hidden, args.hidden_quant)
+                    hidden = _quantize_hidden(hidden, args.hidden_quant, tag="mid_to_down")
                 mid_ms = (time.perf_counter() - started) * 1000
                 if not is_prefill:
                     mid_decode.append(mid_ms)
@@ -825,6 +924,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     import llama_cpp.llama_cpp as M  # noqa: PLC0415
 
     from transformers import AutoTokenizer  # noqa: PLC0415
+
+    # ★ P3 误差测量开关（"先只测量，不改链路"）：只影响统计，不影响链路上任何数值
+    _QUANT_TRACKER.enabled = bool(getattr(args, "track_quant_error", False))
+    _QUANT_TRACKER.records = []
 
     cut_path = Path(args.cut_model)
     whole_path = Path(args.whole_model)
@@ -946,14 +1049,22 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             args, args.mid_model, role="middle")["keep_head"]
         layer_layout["middle_layers"] = int(args.mid_layers) - int(args.layers)
     elif args.path == PATH_D2L2L_KEEP_HEAD_NET:
-        # 跨机三段：中段在远端，经 Relay TCP 往返 hidden（ssh -L 隧道 → 本机 loopback）
-        upstream["keep_head_middle"] = _RemoteMiddleSegment(
-            args.mid_endpoint, n_embd=int(upstream["n_embd"]),
-            bandwidth_mbps=args.mid_bandwidth_mbps,
-            extra_latency_ms=args.mid_extra_latency_ms,
-            hidden_quant=args.hidden_quant)
-        layer_layout["middle_layers"] = int(args.mid_layers) - int(args.layers)
-        device_profile["mid_endpoint"] = args.mid_endpoint
+        # 跨机三段/多跳：中段在远端，经 Relay TCP 往返 hidden（ssh -L 隧道 → 本机 loopback）。
+        # ★ P3 多跳：`--mid-endpoint` 可重复给出，按顺序串成链，每一跳的工件由该端服务自选。
+        stops = [int(v) for v in (args.mid_stop or [])]
+        segments = [_RemoteMiddleSegment(ep, n_embd=int(upstream["n_embd"]),
+                                         bandwidth_mbps=args.mid_bandwidth_mbps,
+                                         extra_latency_ms=args.mid_extra_latency_ms,
+                                         hidden_quant=args.hidden_quant)
+                    for ep in args.mid_endpoint]
+        upstream["keep_head_middle"] = (segments[0] if len(segments) == 1
+                                        else _MiddleChain(segments))
+        # 中段链的结束层号：多跳时取最后一个 --mid-stop，否则沿用单段口径
+        layers_after_middle = int(stops[-1] if stops else int(args.mid_layers))
+        layer_layout["middle_layers"] = layers_after_middle - int(args.layers)
+        device_profile["mid_endpoint"] = args.mid_endpoint[0]
+        device_profile["mid_endpoints"] = [str(ep) for ep in args.mid_endpoint]
+        device_profile["mid_stops"] = stops or None
         device_profile["mid_bandwidth_mbps"] = float(args.mid_bandwidth_mbps)
         device_profile["mid_extra_latency_ms"] = float(args.mid_extra_latency_ms)
 
@@ -1023,6 +1134,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         # ★ P3 弱网：线路口径字节（压缩后的真实上下行），用于算"压缩到底省了多少"
         "mid_uplink_bytes": relay.get("mid_uplink_bytes"),
         "mid_downlink_bytes": relay.get("mid_downlink_bytes"),
+        # ★ P3 误差测量（--track-quant-error）：量化往返误差的分布与"前后半段"对照
+        "hidden_quant_error": _QUANT_TRACKER.summary(),
         "baseline_ms_per_step": baseline["decode_ms"],
         "capacity_gain_x": (round(baseline["model_bytes"] / max_segment, 4)
                             if max_segment else None),
