@@ -101,9 +101,13 @@ KEEP_HEAD_PATHS = (PATH_L2L_KEEP_HEAD, PATH_D2L2L_KEEP_HEAD)
 _QUANT_TYPE_BY_UPSTREAM = {
     "fp16": None,      # 沿用主仓 profile / ckpt 的 fp16
     "f32": None,       # 加载后 post-load cast
-    "int8": "int8",
-    "int4": "int4",    # ⚠️ 主仓层流水线实测回退 fp16（见记录里的 dtype_effective）
-    "nf4": None,       # 加载后显式替换 nn.Linear -> Linear4bit
+    # ⚠️ int8 / int4 **不再**走 HF 的 `quant_type`（`load_layer_range()` 手工物化权重，
+    #    实测会静默回退 fp16）⇒ 改为加载后显式替换为 bitsandbytes 层：
+    #      int8 → Linear8bitLt（LLM.int8）
+    #      int4 → Linear4bit(quant_type="fp4")（对称 4bit）
+    "int8": None,
+    "int4": None,
+    "nf4": None,       # 加载后显式替换 nn.Linear -> Linear4bit(nf4)
 }
 
 
@@ -167,8 +171,8 @@ def _param_bytes(param: Any) -> int:
     return int(param.numel() * param.element_size())
 
 
-def _replace_linear_nf4(model: Any, device: Any) -> int:
-    """把 `nn.Linear` 递归替换为 bitsandbytes `Linear4bit`（NF4）。返回替换个数。
+def _replace_linear_4bit(model: Any, device: Any, *, quant_type: str) -> int:
+    """把 `nn.Linear` 递归替换为 bitsandbytes `Linear4bit`（`quant_type` = nf4 / fp4）。返回替换个数。
 
     为什么必须显式替换：`model_module.load_layer_range()` 按 key 手工物化权重，
     **不走** `BitsAndBytesConfig` ⇒ 传 `quant_type="int4"` 实测回退 fp16。
@@ -184,11 +188,53 @@ def _replace_linear_nf4(model: Any, device: Any) -> int:
             if isinstance(child, torch.nn.Linear) and not isinstance(child, bnb.nn.Linear4bit):
                 new = bnb.nn.Linear4bit(child.in_features, child.out_features,
                                         bias=child.bias is not None,
-                                        compute_dtype=torch.float16, quant_type="nf4",
+                                        compute_dtype=torch.float16, quant_type=quant_type,
                                         compress_statistics=True)
                 new.weight = bnb.nn.Params4bit(child.weight.detach().clone(),
-                                               requires_grad=False, quant_type="nf4",
+                                               requires_grad=False, quant_type=quant_type,
                                                compress_statistics=True)
+                if child.bias is not None:
+                    new.bias = torch.nn.Parameter(child.bias.detach().clone())
+                setattr(parent, name, new.to(device))
+                replaced += 1
+            else:
+                _walk(child)
+
+    _walk(model)
+    return replaced
+
+
+def _replace_linear_nf4(model: Any, device: Any) -> int:
+    """NF4 档（4bit，非对称量化表）——`_replace_linear_4bit` 的薄包装。"""
+    return _replace_linear_4bit(model, device, quant_type="nf4")
+
+
+def _replace_linear_fp4(model: Any, device: Any) -> int:
+    """★ P4：FP4 档（4bit，对称量化表）。与 NF4 只需换 `quant_type`，便于把差异
+    归因到**量化表**本身而不是别的实现细节。"""
+    return _replace_linear_4bit(model, device, quant_type="fp4")
+
+
+def _replace_linear_int8(model: Any, device: Any) -> int:
+    """★ P4：INT8 档（bitsandbytes `Linear8bitLt`，LLM.int8 混合精度分解）。返回替换个数。
+
+    同样必须显式替换（`load_layer_range()` 手工物化权重，不走 `BitsAndBytesConfig`）。
+    `has_fp16_weights=False` ⇒ 权重驻留 int8，首次 forward 时触发量化（需要 CUDA）。
+    """
+    import bitsandbytes as bnb  # noqa: PLC0415
+    import torch  # noqa: PLC0415
+
+    replaced = 0
+
+    def _walk(parent: Any) -> None:
+        nonlocal replaced
+        for name, child in list(parent.named_children()):
+            if isinstance(child, torch.nn.Linear) and not isinstance(child, bnb.nn.Linear8bitLt):
+                new = bnb.nn.Linear8bitLt(child.in_features, child.out_features,
+                                          bias=child.bias is not None,
+                                          has_fp16_weights=False, threshold=6.0)
+                new.weight = bnb.nn.Int8Params(child.weight.detach().clone(),
+                                               requires_grad=False, has_fp16_weights=False)
                 if child.bias is not None:
                     new.bias = torch.nn.Parameter(child.bias.detach().clone())
                 setattr(parent, name, new.to(device))
@@ -365,10 +411,20 @@ def _load_upstream(args: argparse.Namespace) -> dict[str, Any]:
     nf4_replaced = 0
     if args.upstream_quant == "nf4":
         nf4_replaced = _replace_linear_nf4(mgr.model, device)
+    elif args.upstream_quant == "int4":
+        # ★ P4：fp4（对称 4bit 量化表）—— 与 nf4 只差量化表，便于把差异归因到量化表本身
+        nf4_replaced = _replace_linear_fp4(mgr.model, device)
+    elif args.upstream_quant == "int8":
+        # ★ P4：LLM.int8（Linear8bitLt；首帧 forward 时完成 int8 量化）
+        nf4_replaced = _replace_linear_int8(mgr.model, device)
+    if args.upstream_quant in ("nf4", "int4", "int8"):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         if nf4_replaced == 0:
-            raise SystemExit("FAIL: nf4 档未替换任何 Linear（上游仍是 fp16？）")
+            raise SystemExit(
+                f"FAIL: {args.upstream_quant} 档未替换任何 Linear（上游仍是 fp16？）")
+    # 量化档的真实生效证据：替换数 + 参数张量的 dtype/打包类型
+    quant_probe = sorted({type(p).__name__ for p in mgr.model.parameters()})
 
     dtype = next(mgr.model.parameters()).dtype
     return {
@@ -377,6 +433,8 @@ def _load_upstream(args: argparse.Namespace) -> dict[str, Any]:
         "device": str(device),
         "dtype": str(dtype),
         "nf4_replaced": nf4_replaced,
+        # ★ P4：量化档真实生效的证据（参数张量包装类型，如 Params4bit / Int8Params / Parameter）
+        "quant_probe": quant_probe,
         "param_bytes": int(sum(_param_bytes(p) for p in mgr.model.parameters())),
         "load_mode": (getattr(mgr, "_layer_load_metrics", {}) or {}).get("mode"),
         "compiled": getattr(mgr, "_compiled_transformer", None) is not None,

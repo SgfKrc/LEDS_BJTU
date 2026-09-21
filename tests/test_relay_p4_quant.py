@@ -84,3 +84,20 @@ def test_margin_degenerate_inputs(rx) -> None:
     assert math.isnan(rx._margin(np.array([1.0], dtype=np.float32)))
     # 并列最大时边距为 0（最容易翻的情形）
     assert rx._margin(np.array([2.0, 2.0], dtype=np.float32)) == pytest.approx(0.0)
+
+
+def test_upstream_int8_int4_do_not_use_hf_quant_type(rx) -> None:
+    """`int8`/`int4` 必须走 bitsandbytes 显式替换。
+
+    `load_layer_range()` 手工物化权重、不走 `BitsAndBytesConfig` ⇒ 只要把 quant_type 交给 HF，
+    就会**静默回退 fp16**（本轮实测：三档 margin 连小数位都一样）。这条测试把该结论钉住。
+    """
+    for quant in ("int8", "int4", "nf4"):
+        assert rx._QUANT_TYPE_BY_UPSTREAM[quant] is None
+
+
+def test_replace_linear_helpers_exist(rx) -> None:
+    """4bit 通用实现 + 三个薄包装（nf4 / fp4 / int8）都要在。"""
+    for name in ("_replace_linear_4bit", "_replace_linear_nf4",
+                 "_replace_linear_fp4", "_replace_linear_int8"):
+        assert callable(getattr(rx, name)), name
