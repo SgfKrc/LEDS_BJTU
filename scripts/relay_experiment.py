@@ -270,6 +270,10 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--mid-endpoint", default=None,
                     help="跨机三段（--path d2l2l_keep_head_net）：远端中间段的 host:port"
                          "（本机 loopback，跨机时先用 ssh -L 建立隧道）")
+    ap.add_argument("--mid-bandwidth-mbps", type=float, default=0.0,
+                    help="★ P3 弱网模拟：远端段的链路带宽上限（0 = 不限制）")
+    ap.add_argument("--mid-extra-latency-ms", type=float, default=0.0,
+                    help="★ P3 弱网模拟：每跳额外单程延迟（毫秒，0 = 不加）")
     ap.add_argument("--layers", type=int, default=12, help="切点 K：上游层数")
     ap.add_argument("--cut-model", required=True, help="下游裁层 GGUF（保留后 N-K 层）")
     ap.add_argument("--whole-model", required=True, help="对照整模 GGUF（同精度）")
@@ -356,6 +360,16 @@ def _load_upstream(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _seq_meta_bytes(seq_ids, positions) -> int:
+    """`HIDDEN_SEQ` 帧里 `seq_ids`/`positions` 元数据的字节数（线路字节口径用）。"""
+    count = 0
+    if seq_ids is not None:
+        count += 4 * len(seq_ids)
+    if positions is not None:
+        count += 4 * len(positions)
+    return count
+
+
 class _RemoteMiddleSegment:
     """跨机中间段代理：接口与 `KeepHeadUpstream.forward_hidden_to_hidden` 一致。
 
@@ -364,7 +378,9 @@ class _RemoteMiddleSegment:
     跨机时用 SSH 隧道把远端端口映射到本机 loopback（`RelayTcpClient` 只接受 loopback）。
     """
 
-    def __init__(self, endpoint: str, *, n_embd: int, timeout: float = 120.0) -> None:
+    def __init__(self, endpoint: str, *, n_embd: int, timeout: float = 120.0,
+                 bandwidth_mbps: float = 0.0, extra_latency_ms: float = 0.0,
+                 hidden_quant: str = "none") -> None:
         from src.relay_transport import RelayTcpClient  # noqa: PLC0415
 
         host, _, port = str(endpoint).rpartition(":")
@@ -372,7 +388,28 @@ class _RemoteMiddleSegment:
             raise SystemExit(f"FAIL: --mid-endpoint 需要 host:port，实得 {endpoint!r}")
         self.endpoint = f"{host}:{int(port)}"
         self.n_embd = int(n_embd)
+        self.bandwidth_mbps = max(0.0, float(bandwidth_mbps))
+        self.extra_latency_ms = max(0.0, float(extra_latency_ms))
+        # ★ P3 弱网：**线路上的** hidden 压缩（进出远端的两个方向都压）。
+        # 只压"中段→末段"那一跳对本机内存无意义 —— 跨机的瓶颈在线上。
+        self.hidden_quant = str(hidden_quant or "none")
+        self.uplink_bytes = 0        # ★ P3 弱网：线路口径（压缩后的真实上行字节）
+        self.downlink_bytes = 0
         self._client = RelayTcpClient(host, int(port), n_embd=self.n_embd, timeout=timeout)
+
+    def _simulate_link(self, n_bytes: int) -> None:
+        """★ P3 弱网模拟：按带宽算**串行化时间** + 再加固定额外延迟（单程）。
+
+        在客户端侧注入（不改远端），用来量"带宽/RTT 受限时压缩与重叠还有多少收益"。
+        判据仍是 per-token argmax —— 弱网不允许改变数值（只会更慢或超时）。
+        """
+        import time as _time  # noqa: PLC0415
+
+        delay_s = self.extra_latency_ms / 1000.0
+        if self.bandwidth_mbps > 0:
+            delay_s += (int(n_bytes) * 8) / (self.bandwidth_mbps * 1e6)
+        if delay_s > 0:
+            _time.sleep(delay_s)
 
     def forward_hidden_to_hidden(self, hidden, *, n_past: int = 0,
                                  seq_ids=None, positions=None):
@@ -386,17 +423,33 @@ class _RemoteMiddleSegment:
         if arr.ndim != 2 or arr.shape[1] != self.n_embd:
             raise ValueError(f"hidden 形状应为 [n_tokens, {self.n_embd}]，实得 {arr.shape}")
         n_tokens = int(arr.shape[0])
+        # ★ P3 弱网：进出远端都按线路精度量化（f32/f16/bf16/int8）。
+        # ⚠️ 线路字节必须按**目标精度**算 —— `_quantize_hidden` 量化后会转回 f32，
+        # 拿它的 `nbytes` 会把 f16/int8 的收益全吃掉（实测踩到：压缩档字节数与 f32 相同）。
+        per_token = _hidden_bytes(self.n_embd, self.hidden_quant)
+        if per_token is None:
+            per_token = self.n_embd * 4
+        uplink = _quantize_hidden(arr, self.hidden_quant)
+        uplink_line = per_token * n_tokens + _seq_meta_bytes(seq_ids, positions)
+        self.uplink_bytes += uplink_line
+        self._simulate_link(uplink_line)           # 上行（按压缩后的线路字节计时）
         if seq_ids is None and positions is None:
-            payload = self._client.request_hidden(arr.tobytes(), n_tokens=n_tokens)
+            payload = self._client.request_hidden(np.ascontiguousarray(uplink).tobytes(),
+                                                  n_tokens=n_tokens)
         else:
             meta: dict[str, object] = {}
             if seq_ids is not None:
                 meta["seq_ids"] = [int(value) for value in seq_ids]
             if positions is not None:
                 meta["positions"] = [int(value) for value in positions]
-            payload = self._client.request_hidden_seq(arr.tobytes(), n_tokens=n_tokens,
-                                                      meta=meta)
-        return np.frombuffer(payload, dtype=np.float32).reshape(arr.shape).copy()
+            payload = self._client.request_hidden_seq(
+                np.ascontiguousarray(uplink).tobytes(), n_tokens=n_tokens, meta=meta)
+        # 响应也是同精度的 hidden（协议里 `HIDDEN` 帧字段固定 f32，这里按线路精度口径计时）
+        downlink_line = per_token * n_tokens
+        self._simulate_link(downlink_line)         # 下行
+        self.downlink_bytes += downlink_line
+        out = np.frombuffer(payload, dtype=np.float32).reshape(arr.shape).copy()
+        return _quantize_hidden(out, self.hidden_quant)
 
     def close(self) -> None:
         try:
@@ -669,8 +722,11 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
                         hidden, seq_ids=mid_seq_ids, positions=mid_positions)
                 else:
                     hidden = middle.forward_hidden_to_hidden(hidden, n_past=mid_pos)
-                # ★ P3：中段 → 末段这一跳的线上压缩
-                hidden = _quantize_hidden(hidden, args.hidden_quant)
+                # ★ P3：中段 → 末段这一跳的压缩。**跨机（net）路径不在这里压** ——
+                # 那条链路的量化由 `_RemoteMiddleSegment` 在进出远端的两个方向上做，
+                # 否则 int8 会被叠两次（双重量化放大误差，口径也乱）。
+                if args.path != PATH_D2L2L_KEEP_HEAD_NET:
+                    hidden = _quantize_hidden(hidden, args.hidden_quant)
                 mid_ms = (time.perf_counter() - started) * 1000
                 if not is_prefill:
                     mid_decode.append(mid_ms)
@@ -701,6 +757,11 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
         "upstream_decode_ms": _stat(up_decode),
         "downstream_decode_ms": _stat(dn_decode),
         "middle_decode_ms": _stat(mid_decode),
+        # ★ P3 弱网：跨机中间段的线路口径字节（压缩后）
+        "mid_uplink_bytes": (int(getattr(middle, "uplink_bytes", 0))
+                             if middle is not None else None),
+        "mid_downlink_bytes": (int(getattr(middle, "downlink_bytes", 0))
+                               if middle is not None else None),
     }
 
 
@@ -887,9 +948,14 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     elif args.path == PATH_D2L2L_KEEP_HEAD_NET:
         # 跨机三段：中段在远端，经 Relay TCP 往返 hidden（ssh -L 隧道 → 本机 loopback）
         upstream["keep_head_middle"] = _RemoteMiddleSegment(
-            args.mid_endpoint, n_embd=int(upstream["n_embd"]))
+            args.mid_endpoint, n_embd=int(upstream["n_embd"]),
+            bandwidth_mbps=args.mid_bandwidth_mbps,
+            extra_latency_ms=args.mid_extra_latency_ms,
+            hidden_quant=args.hidden_quant)
         layer_layout["middle_layers"] = int(args.mid_layers) - int(args.layers)
         device_profile["mid_endpoint"] = args.mid_endpoint
+        device_profile["mid_bandwidth_mbps"] = float(args.mid_bandwidth_mbps)
+        device_profile["mid_extra_latency_ms"] = float(args.mid_extra_latency_ms)
 
     downstream: dict[str, Any] = {}
     if args.path == PATH_D2L_RAW:
@@ -954,6 +1020,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "downstream_decode_ms": relay["downstream_decode_ms"],
         # 中段耗时：本机三段与**跨机三段**都要记（跨机的中段耗时正是"值不值得跨机"的关键数据）
         "middle_decode_ms": (relay.get("middle_decode_ms") if middle_iface else None),
+        # ★ P3 弱网：线路口径字节（压缩后的真实上下行），用于算"压缩到底省了多少"
+        "mid_uplink_bytes": relay.get("mid_uplink_bytes"),
+        "mid_downlink_bytes": relay.get("mid_downlink_bytes"),
         "baseline_ms_per_step": baseline["decode_ms"],
         "capacity_gain_x": (round(baseline["model_bytes"] / max_segment, 4)
                             if max_segment else None),
