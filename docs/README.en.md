@@ -479,6 +479,7 @@ Real hardware, cross-machine networking, Android ARM64, performance and long-run
 
 - [Current D-to-L Baseline and Optimization Plan (2026-09-21)](跨框架接力-当前有效基线与后续优化计划-2026-09-21.md)
 - [Test Quality Audit (2026-09-21): Parallel Flakiness and Race-Coverage Gaps](测试质量审计-2026-09-21.md)
+- [P4.5 Proposal: Dynamic Master Election and Distributed Management](主节点动态选举与分布式管理-P4.5立项-2026-09-21.md)
 - [Mainline Development Plan: Distributed Inference and Edge Optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md)
 - [Overall Architecture](整体架构.md)
 - [Layer-Segment Protocol Proposal (2026-09-17)](层段协议立项-2026-09-17.md)
