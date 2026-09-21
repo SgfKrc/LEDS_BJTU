@@ -2,7 +2,7 @@
 
 QLH is a distributed inference core for heterogeneous edge devices. The mainline is the lightweight GGUF/llama.cpp engine; the repository also owns a PyTorch layered-distribution engine plus a **layer pipeline** (including cross-framework layer relay), and the user-facing entry point is a cross-platform TUI.
 
-> Status: the main-repository baseline is being reorganized (2026-09-18)
+> Status: the main-repository baseline is being reorganized (2026-09-21, baseline `610f4b3`)
 >
 > This README describes only the current boundary of the main repository and its reproducible entry points. Experiment logs, historical implementations and external sub-projects are **not** equivalent to production capability.
 >
@@ -58,7 +58,9 @@ The upstream PyTorch layer segment computes up to layer N and hands the hidden s
 3. **It is the precondition for customizability** - cut-point assignment, mixed precision, operator substitution and batch overlap all build on "hidden states are transferable between layers";
 4. **There is no direct academic precedent** - Petals is same-framework, KTransformers is operator-level, distributed-llama is TP; on this path we also filed a defect upstream and independently verified the fix (issue #28963).
 
-**Cumulative measurements (gen=64, every token identical)**:
+**Current validity note (2026-09-21)**: the cumulative table below is historical process data, not the current dual-main-repository performance baseline. The dual-engine sample is Qwen2.5-0.5B, 12+12 layers, gen=32: upstream `ModelManager.forward_layers` plus downstream `LlamaCppEngine.forward_layers_from_hidden`, **47.501 ms/step**, token-identical to the pure llama.cpp control. **A same-day rerun completed the full matrix**: two models x cut points / loads (prefill 32/128/512, decode 32/64/256) / batch (2/4) / mixed precision (upstream fp16-f32-NF4 x downstream Q4_K_M) - **27 runs, all token-identical** - with Qwen3.5 hybrid **K=8/12/16/20 all 32/32**. The 2026-09-21 capacity scan still used raw `llama_cpp` downstream, so it remains `capacity_only`/`raw_binding_probe`, not a dual-engine speed baseline. Before quoting a tier, verify what actually took effect: `quant_type="int4"` **silently falls back to fp16** in the main-repository layer pipeline, and upstream compile is disabled by the size gate below 1.5B params.
+
+**Historical cumulative measurements (gen=64, every token identical)**:
 
 | Configuration | Wall clock | vs. first version |
 | --- | ---: | ---: |
@@ -78,8 +80,8 @@ The upstream PyTorch layer segment computes up to layer N and hands the hidden s
 | Largest single win | The upstream was **idling through 20 layers** (running all 24 but using only the first 4); switching to a manual 4-layer forward made the upstream **10.7x** faster (407.6 -> 38.1 ms/step) |
 | Layer pipeline | The upstream loads only `embed_tokens + L0-3`: **1.47 GB (f16)** vs. 4.55 GB for the full model - **3.1x smaller**, end-to-end 64/64 identical |
 | Falsified | Removing the process boundary (only 8%, and only an artifact of "both sides slow"), reusing `llama_batch` (0.09%), naive upstream layer truncation (numerically broken), `--override-tensor` as a speed-up (actually a capacity knob) |
-| Production readiness | The current best is still **about 25x slower** (`333 ms/step / 13.5 ms/step = 24.7`; that reference comes from the 09-16 report's `native llama.cpp full-model GPU`, which is **not the same reference** as `26.6 ms/token` in the P2 table below - under the latter it is 12.5x; see summary section H). Down from an original **61x** (`828 / 13.5`); **production admission stays fail-closed** |
-| Operator environment | Missing operators can be bypassed: WSL2 (Ubuntu-22.04) GPU passthrough and `triton`/fla have been measured working |
+| Production readiness | Historical speed comparisons remain for audit. Current Relay admission is based on correctness evidence; an unverified or hard-gated path remains fail-closed, while speed affects default routing. Capacity and long-run/remote-asset evidence are tracked separately |
+| Operator environment | Native Windows `triton-windows==3.8.0.post28` has been measured working with `PYTHONUTF8=1`; WSL2 Ubuntu-22.04 with CUDA/fla is a parallel path, not the only Triton route. There is no CI-level native Triton compile guarantee |
 | Current positioning | **Architecture-compatibility track**; off by default, does not replace RPC, does not enter the Edge default route; optimization items are registered in [acceptance list D29](验收清单与资源限制登记.md) |
 
 **Corrected conclusion**: the earlier judgement "IPC is the main cost" has been overturned - that was an illusion masked while both sides were slow. **The leverage is in the compute on both sides (cut point, kernel, batching), not in the transport layer.** See [Same-Process Dual-Backend Relay Implementation and Performance](同进程双后端接力实现与性能-2026-09-16.md) sections 12-14.
@@ -174,7 +176,7 @@ Hybrid models (Qwen3.5's 18 `linear_attention` + 6 `full_attention` layers) need
 2. **Scenarios with a "per-token identical" acceptance criterion must not enable compile** (e.g. the cross-framework relay admission criterion).
 3. **Windows needs two things**: `PYTHONUTF8=1` (otherwise torch/inductor decodes internally as GBK, fails, and **silently falls back to eager**) and [`triton-windows`](../requirements-compile.txt) (optional acceleration, declared in `requirements-compile.txt`; **verified working** - PyPI has no official Windows wheel, so use the community build `triton-windows-3.8.0.post28`). Missing either is non-fatal - you just do not get the gain.
 
-Current **serial full-suite** baseline: `2807 passed / 11 skipped / 0 failed` (`-n 0`; xdist concurrency occasionally flakes - judge by the serial run).
+Current **serial full-suite** baseline: `2991 passed / 13 skipped / 0 failed` (`-n 0`; recorded after `610f4b3`; xdist concurrency occasionally flakes - judge by the serial run).
 
 Reports: `local_docs/CORE-RELAY-XFRAME-02-a4-layer-loop-2026-09-18.json`, `...-b14-hybrid-layer-loop-2026-09-18.json`, `...-compile-numerics-2026-09-18.json`.
 
@@ -189,9 +191,9 @@ The TUI and API top layer only needs to know the **aggregate resources** (GPU/CP
 | Textual TUI | Wired into the unified `qlh` entry point; chat, 9 feature screens and 1 debug fallback screen share one process and can start the local backend on demand; write operations such as model download/search/preflight/registration, cluster config, node management, log filtering/stats/export, device config and user settings go through a confirmation gate; the old hand-drawn ANSI TUI is archived |
 | Edge <=1B single machine | Model profiling, the GGUF/llama.cpp path and edge preflight exist; torch is not loaded by default |
 | Same-machine two-process RPC | A llama host + `ggml-rpc-server` simulation and contract tests exist; not equivalent to cross-machine production admission |
-| PC RPC | Device scoring, automatic layer planning, lease/disconnect fallback and asset-sync contracts exist; real large-model capacity gains remain fail-closed |
+| PC RPC | Device scoring, automatic layer planning, lease/disconnect fallback and asset-sync contracts exist; real large-model throughput is not claimed, while capacity evidence is tracked separately |
 | Layer-segment contract and auto-reshard | The contract, fail-closed layout validation, capacity re-solve and atomic epoch commit development gate are done; real PC/Android fault injection, long-run and performance acceptance remain |
-| Cross-framework layer relay (D to L) | Correctness verified along multiple paths (cross-process/same-process/cross-machine SSH/f32 all token-identical; upstream manual 4 layers bit-exact); cumulative **8.5x** (21.3 s / 64 steps), the current best is still about **25x slower** (`333 ms/step / 13.5 ms/step`; CPU-upstream basis). Note the reference is not unique - under this README's P2 `26.6 ms/token` it is **12.5x**, and GPU-upstream N=20 (`129.1`) against that reference is **4.85x** (summary section H); **production admission fail-closed**; optimization ticket D29 |
+| Cross-framework layer relay (D to L) | Correctness evidence is admitted separately from routing speed. Dual-engine sample: Qwen2.5-0.5B, 12+12 layers, **47.501 ms/step, 32 steps identical**, plus the **2026-09-21 full matrix of 27/27 token-identical runs** (Qwen3.5-2B K=8/12/16/20 all 32/32, load tiers, batch 2/4, mixed-precision tiers). Capacity evidence is 1.568x / 1.547x under a controlled budget; long-run, cross-machine, multi-segment and remote-asset acceptance remain |
 | PyTorch D track | The actual implementer of layer splitting / inter-layer pipeline / multi-node layer-segment hosting, doubling as the control experiment; not part of the Edge default dependency |
 | Relay R | L to L, D to L, the f32/sampling matrix and SSH cross-machine evidence have completed correctness verification; no performance advantage, off by default, does not replace RPC |
 | Android | `qlh-android` P0 cross-compilation/JNI is done; P1's on-device run, RPC worker, disconnect, thermal/power and security evidence is not |
@@ -404,6 +406,7 @@ Real hardware, cross-machine networking, Android ARM64, performance and long-run
 
 ## Documentation Index
 
+- [Current D-to-L Baseline and Optimization Plan (2026-09-21)](跨框架接力-当前有效基线与后续优化计划-2026-09-21.md)
 - [Mainline Development Plan: Distributed Inference and Edge Optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md)
 - [Overall Architecture](整体架构.md)
 - [Layer-Segment Protocol Proposal (2026-09-17)](层段协议立项-2026-09-17.md)
