@@ -235,6 +235,39 @@ class RelayTcpClient:
         self._sequence += 1
         return token
 
+    def request_hidden(self, hidden: bytes, *, n_tokens: int) -> bytes:
+        """★ 中间段往返：发 HIDDEN，收 HIDDEN（远端段交出它自己的 hidden）。
+
+        与 `request_token`（末段，收 token）配对 —— 这正是「1 个 torch 上游 + n 个
+        llama 下游」链式拼接所需的**两种远端角色**：中间段吐 hidden、末段吐 token。
+
+        远端实现的语义必须与本地 keep-head 一致（末层输出，`output_norm` 之前）；
+        Android 侧由 `nativeLayerForwardHiddenKeepHead` 提供同一语义。
+        """
+        if self._closed:
+            raise RelayProtocolError("client_closed")
+        count = int(n_tokens)
+        if count > self.max_tokens:
+            raise RelayProtocolError("token_count_exceeds_limit")
+        if len(hidden) != expected_hidden_bytes(count, self.n_embd):
+            raise RelayProtocolError("hidden_payload_size_mismatch")
+        sequence = self._sequence
+        send_frame(
+            self._sock,
+            RelayFrame(RelayFrameKind.HIDDEN, sequence, n_tokens=count, payload=hidden),
+        )
+        response = recv_frame(self._sock, max_payload_bytes=self.max_payload_bytes)
+        if response.sequence != sequence:
+            raise RelayProtocolError("response_sequence_mismatch")
+        if response.kind != RelayFrameKind.HIDDEN:
+            raise RelayProtocolError("hidden_response_required")
+        if response.n_tokens != count:
+            raise RelayProtocolError("hidden_token_count_mismatch")
+        if len(response.payload) != expected_hidden_bytes(count, self.n_embd):
+            raise RelayProtocolError("hidden_payload_size_mismatch")
+        self._sequence += 1
+        return bytes(response.payload)
+
     def close(self) -> None:
         if self._closed:
             return
@@ -427,3 +460,96 @@ def open_loopback_listener(host: str, port: int, *, backlog: int = 1) -> socket.
     listener.bind((bind_host, int(port)))
     listener.listen(max(1, int(backlog)))
     return listener
+
+
+def serve_relay_middle_connection(
+    sock: socket.socket,
+    runner,
+    *,
+    n_embd: int,
+    max_tokens: int = RELAY_DEFAULT_MAX_TOKENS,
+) -> RelayBridgeResult:
+    """★ 中间段服务：HIDDEN → `runner.request_hidden()` → HIDDEN（末位 argmax 不传）。
+
+    与 `serve_relay_connection`（末段，回 TOKEN）配对。`runner` 必须提供
+    `request_hidden(hidden_bytes, n_tokens=...) -> bytes` 与 `close()`；
+    主仓的 `llama_keep_head.KeepHeadUpstream`（经 `forward_hidden_to_hidden`）与
+    Android 的 `nativeLayerForwardHiddenKeepHead` 语义一致。
+    """
+
+    width = int(n_embd)
+    limit = int(max_tokens)
+    max_payload = expected_hidden_bytes(limit, width)
+    sequence = 0
+    frames = 0
+    tokens = 0
+    payload_bytes = 0
+    try:
+        while True:
+            frame = recv_frame(sock, max_payload_bytes=max_payload)
+            if frame.sequence != sequence:
+                raise RelayProtocolError("request_sequence_mismatch")
+            if frame.kind == RelayFrameKind.CLOSE:
+                if frame.n_tokens != 0 or frame.payload:
+                    raise RelayProtocolError("invalid_close_frame")
+                try:
+                    runner.close()
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Relay middle runner close failed: code=%s",
+                                     RELAY_RUNNER_ERROR)
+                    raise RelayProtocolError(RELAY_RUNNER_ERROR) from exc
+                send_frame(
+                    sock,
+                    RelayFrame(RelayFrameKind.TOKEN, sequence, n_tokens=1,
+                               payload=_TOKEN.pack(-1)),
+                )
+                return RelayBridgeResult(frames, tokens, payload_bytes, True)
+            if frame.kind != RelayFrameKind.HIDDEN:
+                raise RelayProtocolError("hidden_frame_required")
+            if frame.n_tokens < 1 or frame.n_tokens > limit:
+                raise RelayProtocolError("token_count_exceeds_limit")
+            if len(frame.payload) != expected_hidden_bytes(frame.n_tokens, width):
+                raise RelayProtocolError("hidden_payload_size_mismatch")
+
+            try:
+                produced = bytes(runner.request_hidden(frame.payload, n_tokens=frame.n_tokens))
+            except RelayProtocolError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Relay middle runner failed: code=%s", RELAY_RUNNER_ERROR)
+                raise RelayProtocolError(RELAY_RUNNER_ERROR) from exc
+            if len(produced) != expected_hidden_bytes(frame.n_tokens, width):
+                raise RelayProtocolError("hidden_payload_size_mismatch")
+            send_frame(
+                sock,
+                RelayFrame(RelayFrameKind.HIDDEN, sequence, n_tokens=frame.n_tokens,
+                           payload=produced),
+            )
+            frames += 1
+            tokens += frame.n_tokens
+            payload_bytes += len(frame.payload)
+            sequence += 1
+    except RelayProtocolError as exc:
+        code = _safe_error_code(exc, RELAY_PROTOCOL_ERROR)
+        logger.warning("Relay middle protocol failure: code=%s detail=%s", code, str(exc))
+        try:
+            _send_error(sock, sequence, code)
+        except OSError:
+            pass
+        return RelayBridgeResult(frames, tokens, payload_bytes, False, code)
+    except OSError as exc:
+        logger.warning("Relay middle transport failure: code=%s detail=%s",
+                       RELAY_TRANSPORT_ERROR, exc)
+        try:
+            _send_error(sock, sequence, RELAY_TRANSPORT_ERROR)
+        except OSError:
+            pass
+        return RelayBridgeResult(frames, tokens, payload_bytes, False, RELAY_TRANSPORT_ERROR)
+    except Exception as exc:  # noqa: BLE001
+        # Never put exception class names or messages on the Relay wire.
+        logger.exception("Relay middle internal failure: code=%s", RELAY_INTERNAL_ERROR)
+        try:
+            _send_error(sock, sequence, RELAY_INTERNAL_ERROR)
+        except OSError:
+            pass
+        return RelayBridgeResult(frames, tokens, payload_bytes, False, RELAY_INTERNAL_ERROR)

@@ -42,9 +42,10 @@ PATH_D2L_RAW = "d2l_raw_binding"
 PATH_L2L = "l2l_llama"
 PATH_L2L_KEEP_HEAD = "l2l_keep_head"
 PATH_D2L2L_KEEP_HEAD = "d2l2l_keep_head"
+PATH_D2L2L_KEEP_HEAD_NET = "d2l2l_keep_head_net"
 PATH_CAPACITY = "capacity_scan"
 EXPERIMENT_PATHS = (PATH_D2L_MAINREPO, PATH_D2L_RAW, PATH_L2L, PATH_L2L_KEEP_HEAD,
-                    PATH_D2L2L_KEEP_HEAD, PATH_CAPACITY)
+                    PATH_D2L2L_KEEP_HEAD, PATH_D2L2L_KEEP_HEAD_NET, PATH_CAPACITY)
 
 #: 引擎接口标识串（必须与实际调用的入口一一对应，不允许同义改写）。
 IFACE_MODEL_MODULE_UPSTREAM = "model_module.forward_layers"
@@ -52,6 +53,8 @@ IFACE_LLAMA_UPSTREAM = "llama_engine.forward_layers_to_hidden"
 IFACE_KEEP_HEAD_UPSTREAM = "llama_keep_head.KeepHeadUpstream.forward_tokens_to_hidden"
 IFACE_LLAMA_ENGINE_DOWNSTREAM = "llama_engine.forward_layers_from_hidden"
 IFACE_RAW_LLAMA_DOWNSTREAM = "llama_cpp.llama_decode"
+#: 跨机中间段：hidden 经 Relay TCP 交给远端段（远端用同一 keep-head 语义）。
+IFACE_RELAY_MIDDLE = "relay_transport.RelayTcpClient.request_hidden"
 #: 容量专项只加载、不生成 ⇒ 接口是两侧的加载入口。
 IFACE_MODEL_MODULE_LOADER = "model_module.load_layer_range"
 IFACE_LLAMA_MODEL_LOADER = "llama_cpp.llama_model_load_from_file"
@@ -72,6 +75,9 @@ _PATH_BY_IFACES: dict[tuple[str, str, str], tuple[str, str]] = {
         KIND_RAW_BINDING_PROBE, PATH_L2L_KEEP_HEAD),
     (IFACE_MODEL_MODULE_UPSTREAM, IFACE_LLAMA_ENGINE_DOWNSTREAM, IFACE_KEEP_HEAD_UPSTREAM): (
         KIND_MAINREPO_END_TO_END, PATH_D2L2L_KEEP_HEAD),
+    # 跨机三段：中间段在远端，经 Relay TCP（loopback + SSH 隧道）往返 hidden。
+    (IFACE_MODEL_MODULE_UPSTREAM, IFACE_LLAMA_ENGINE_DOWNSTREAM, IFACE_RELAY_MIDDLE): (
+        KIND_MAINREPO_END_TO_END, PATH_D2L2L_KEEP_HEAD_NET),
     (IFACE_MODEL_MODULE_LOADER, IFACE_LLAMA_MODEL_LOADER, ""): (
         KIND_CAPACITY_ONLY, PATH_CAPACITY),
 }

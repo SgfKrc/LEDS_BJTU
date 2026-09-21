@@ -1,0 +1,205 @@
+#!/usr/bin/env python
+"""relay_mid_service.py — 跨机接力的**远端段**服务（P2 多段拓扑的网络侧）。
+
+链路：`torch 上游 → [网络] → 远端段 → [网络] → 下一段/末段`。
+本服务提供两种远端角色，正好是 `src/relay_transport.py` 的两种往返：
+
+| `--role` | 语义 | 协议 | 本地等价物 |
+|---|---|---|---|
+| `middle` | 吃 hidden → 吐 **hidden**（末层输出，`output_norm` 之前） | HIDDEN → HIDDEN | `llama_keep_head.KeepHeadUpstream.forward_hidden_to_hidden` |
+| `tail` | 吃 hidden → 吐 **token**（末位 argmax） | HIDDEN → TOKEN | `llama_engine.LlamaCppEngine.forward_layers_from_hidden` |
+
+⚠️ 语义纪律：`middle` 必须用 **keep-head 通道**（补丁导出的 nextn / 层输入），
+不能用 `llama_get_embeddings_ith`（那是 `output_norm(H)`，多一次归一化 ⇒ 下游分叉）。
+Android 段用同一语义的 JNI 入口：`nativeLayerForwardHiddenKeepHead`。
+
+本服务只允许 **loopback 绑定**（`open_loopback_listener` 强制）—— 跨机时用 SSH 隧道把
+远端端口映射到本机 loopback（与本仓既有 relay 纪律一致），不直接把端口暴露到 LAN/tailnet。
+
+用法::
+
+    # 远端（或本机另一进程）：中间段
+    python scripts/relay_mid_service.py --role middle --listen 127.0.0.1:50161 \
+        --keep-head-shim build/keephead/build-cpu/bin/qlh_keep_head.dll \
+        --model build/cross-framework-layer-poc/out/qwen25-05b-f16-mid8-16.gguf \
+        --threads 8 --ready-file build/relay-records/mid.ready
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+for _path in (str(ROOT), str(ROOT / "src")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
+from src.relay_transport import (  # noqa: E402
+    RELAY_DEFAULT_MAX_TOKENS,
+    open_loopback_listener,
+    serve_relay_connection,
+    serve_relay_middle_connection,
+)
+
+
+class KeepHeadMiddleRunner:
+    """中间段：吃 hidden → 吐 hidden（keep-head 语义）。模型只加载一次，多次连接复用。"""
+
+    def __init__(self, *, shim: str, model: str, n_ctx: int, n_threads: int,
+                 extra_dll_dirs: list[str]) -> None:
+        import os  # noqa: PLC0415
+
+        from llama_keep_head import KeepHeadUpstream  # noqa: PLC0415
+
+        dirs = list(extra_dll_dirs)
+        dirs.extend(d for d in (os.environ.get("QLH_KEEP_HEAD_DLL_DIRS") or "")
+                    .split(os.pathsep) if d)
+        self._upstream = KeepHeadUpstream(shim, model, mode="nextn", n_ctx=n_ctx,
+                                          n_threads=n_threads, extra_dll_dirs=dirs)
+        self.n_embd = self._upstream.n_embd
+        self.n_layer = self._upstream.n_layer
+        self._pos = 0
+        print(json.dumps({"role": "middle", "n_embd": self.n_embd,
+                          "n_layer": self.n_layer,
+                          "channel": "keep_head_nextn"}), flush=True)
+
+    def reset(self) -> None:
+        """每条连接从位置 0 开始（KV 位置由本段自己维护）。"""
+        self._pos = 0
+
+    def request_hidden(self, hidden_bytes: bytes, *, n_tokens: int) -> bytes:
+        import numpy as np  # noqa: PLC0415
+
+        count = int(n_tokens)
+        incoming = np.frombuffer(hidden_bytes, dtype=np.float32).reshape(count, self.n_embd)
+        produced = self._upstream.forward_hidden_to_hidden(incoming, n_past=self._pos)
+        self._pos += count
+        return produced.astype(np.float32).tobytes()
+
+    def close(self) -> None:
+        """连接级清理：**不卸载模型**（下一个连接继续复用）。"""
+        self.reset()
+
+
+class TailRunner:
+    """末段：吃 hidden → 吐 token（主仓 llama_engine）。"""
+
+    def __init__(self, *, model: str, n_ctx: int, n_threads: int) -> None:
+        from llama_engine import LlamaCppEngine  # noqa: PLC0415
+
+        self._engine = LlamaCppEngine()
+        self._engine.load_model(model_path=str(model), n_ctx=n_ctx, n_threads=n_threads,
+                               n_seq_max=1)
+        if not self._engine.is_loaded:
+            raise RuntimeError(f"下游模型加载失败：{model}")
+        import llama_cpp.llama_cpp as M  # noqa: PLC0415
+
+        native = self._engine._model._model.model
+        self.n_embd = int(M.llama_model_n_embd_inp(native))
+        self.n_layer = int(M.llama_model_n_layer(native))
+        self._pos = 0
+        print(json.dumps({"role": "tail", "n_embd": self.n_embd, "n_layer": self.n_layer,
+                          "channel": "llama_engine.forward_layers_from_hidden"}), flush=True)
+
+    def reset(self) -> None:
+        self._pos = 0
+
+    def request_token(self, hidden_bytes: bytes, *, n_tokens: int) -> int:
+        import numpy as np  # noqa: PLC0415
+
+        count = int(n_tokens)
+        incoming = np.frombuffer(hidden_bytes, dtype=np.float32).reshape(count, self.n_embd)
+        logits = self._engine.forward_layers_from_hidden(incoming, n_past=self._pos,
+                                                         all_logits=True)
+        if logits is None:
+            return -1
+        self._pos += count
+        return int(np.asarray(logits)[-1].argmax())
+
+    def close(self) -> None:
+        self.reset()
+
+
+def _parse(argv: list[str] | None = None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="跨机接力的远端段服务（keep-head / 末段）")
+    ap.add_argument("--role", choices=("middle", "tail"), default="middle")
+    ap.add_argument("--listen", required=True, help="loopback 端点，host:port（跨机用 SSH 隧道）")
+    ap.add_argument("--keep-head-shim", default=None, help="--role middle 必需")
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--n-embd", type=int, default=None, help="可选：与本地期望宽度核对")
+    ap.add_argument("--n-ctx", type=int, default=4096)
+    ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--max-tokens", type=int, default=RELAY_DEFAULT_MAX_TOKENS)
+    ap.add_argument("--dll-dir", action="append", default=[])
+    ap.add_argument("--ready-file", default=None, help="写就绪标记（含实际端点），供驱动等待")
+    ap.add_argument("--max-connections", type=int, default=0, help="0 = 不限制")
+    return ap.parse_args(argv)
+
+
+def _split_endpoint(endpoint: str) -> tuple[str, int]:
+    host, _, port = str(endpoint).rpartition(":")
+    if not host or not port.isdigit():
+        raise SystemExit(f"FAIL: --listen 需要 host:port，实得 {endpoint!r}")
+    return host, int(port)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse(argv)
+    host, port = _split_endpoint(args.listen)
+
+    if args.role == "middle":
+        if not args.keep_head_shim:
+            raise SystemExit("FAIL: --role middle 需要 --keep-head-shim")
+        runner: Any = KeepHeadMiddleRunner(shim=args.keep_head_shim, model=args.model,
+                                           n_ctx=args.n_ctx, n_threads=args.threads,
+                                           extra_dll_dirs=list(args.dll_dir))
+        serve = serve_relay_middle_connection
+    else:
+        runner = TailRunner(model=args.model, n_ctx=args.n_ctx, n_threads=args.threads)
+        serve = serve_relay_connection
+
+    if args.n_embd is not None and int(args.n_embd) != int(runner.n_embd):
+        raise SystemExit(f"FAIL: 模型 n_embd={runner.n_embd} 与期望 {args.n_embd} 不一致")
+
+    listener = open_loopback_listener(host, port)
+    ready = {"role": args.role, "host": host, "port": port, "n_embd": runner.n_embd,
+             "ready_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    if args.ready_file:
+        target = Path(args.ready_file)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(ready, ensure_ascii=False), encoding="utf-8")
+    print(f"[ready] role={args.role} listening {host}:{port} n_embd={runner.n_embd}", flush=True)
+
+    served = 0
+    try:
+        while True:
+            if args.max_connections and served >= int(args.max_connections):
+                break
+            sock, _addr = listener.accept()
+            try:
+                runner.reset()
+                result = serve(sock, runner, n_embd=int(runner.n_embd),
+                               max_tokens=int(args.max_tokens))
+                print(f"[session] frames={result.frames} tokens={result.tokens} "
+                      f"closed_cleanly={result.closed_cleanly} error={result.error or '-'}",
+                      flush=True)
+            finally:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            served += 1
+    except KeyboardInterrupt:
+        print("[stop] interrupted", flush=True)
+    finally:
+        listener.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

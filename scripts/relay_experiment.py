@@ -72,6 +72,8 @@ from src.relay_experiment_record import (  # noqa: E402
     PATH_D2L_RAW,
     PATH_L2L,
     PATH_L2L_KEEP_HEAD,
+    PATH_D2L2L_KEEP_HEAD_NET,
+    IFACE_RELAY_MIDDLE,
     build_record,
     write_record,
 )
@@ -85,10 +87,15 @@ _IFACES_BY_PATH: dict[str, tuple[str, str, str]] = {
     PATH_L2L_KEEP_HEAD: (IFACE_KEEP_HEAD_UPSTREAM, IFACE_LLAMA_ENGINE_DOWNSTREAM, ""),
     PATH_D2L2L_KEEP_HEAD: (IFACE_MODEL_MODULE_UPSTREAM, IFACE_LLAMA_ENGINE_DOWNSTREAM,
                            IFACE_KEEP_HEAD_UPSTREAM),
+    # 跨机三段：中间段在远端（Relay TCP，loopback + SSH 隧道）
+    PATH_D2L2L_KEEP_HEAD_NET: (IFACE_MODEL_MODULE_UPSTREAM, IFACE_LLAMA_ENGINE_DOWNSTREAM,
+                               IFACE_RELAY_MIDDLE),
     PATH_CAPACITY: (IFACE_MODEL_MODULE_LOADER, IFACE_LLAMA_MODEL_LOADER, ""),
 }
 
-#: 用 keep-head 通道当上游/中间段的链路（需要 `--keep-head-shim`）。
+#: 用**本地** keep-head 通道当上游/中间段的链路（需要 `--keep-head-shim`）。
+#: ⚠️ 跨机的 `d2l2l_keep_head_net` 不在此列：它的中间段在远端（由 relay_mid_service.py
+#: 自己加载 shim/模型），本进程只需要 `--mid-endpoint`。
 KEEP_HEAD_PATHS = (PATH_L2L_KEEP_HEAD, PATH_D2L2L_KEEP_HEAD)
 
 _QUANT_TYPE_BY_UPSTREAM = {
@@ -260,6 +267,9 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
                     help="d2l2l_keep_head 的中间段工件（保留 blk.K1..K2-1 的裁层 GGUF）")
     ap.add_argument("--mid-layers", type=int, default=None,
                     help="d2l2l_keep_head 的第二个切点 K2（中间段覆盖 blk.K1..K2-1）")
+    ap.add_argument("--mid-endpoint", default=None,
+                    help="跨机三段（--path d2l2l_keep_head_net）：远端中间段的 host:port"
+                         "（本机 loopback，跨机时先用 ssh -L 建立隧道）")
     ap.add_argument("--layers", type=int, default=12, help="切点 K：上游层数")
     ap.add_argument("--cut-model", required=True, help="下游裁层 GGUF（保留后 N-K 层）")
     ap.add_argument("--whole-model", required=True, help="对照整模 GGUF（同精度）")
@@ -339,6 +349,43 @@ def _load_upstream(args: argparse.Namespace) -> dict[str, Any]:
         "compiled": getattr(mgr, "_compiled_transformer", None) is not None,
         "n_embd": int(mgr.model.config.hidden_size),
     }
+
+
+class _RemoteMiddleSegment:
+    """跨机中间段代理：接口与 `KeepHeadUpstream.forward_hidden_to_hidden` 一致。
+
+    协议：`relay_transport.RelayTcpClient.request_hidden`（HIDDEN → HIDDEN）。
+    远端由 `scripts/relay_mid_service.py --role middle` 提供（keep-head 语义），
+    跨机时用 SSH 隧道把远端端口映射到本机 loopback（`RelayTcpClient` 只接受 loopback）。
+    """
+
+    def __init__(self, endpoint: str, *, n_embd: int, timeout: float = 120.0) -> None:
+        from src.relay_transport import RelayTcpClient  # noqa: PLC0415
+
+        host, _, port = str(endpoint).rpartition(":")
+        if not host or not port.isdigit():
+            raise SystemExit(f"FAIL: --mid-endpoint 需要 host:port，实得 {endpoint!r}")
+        self.endpoint = f"{host}:{int(port)}"
+        self.n_embd = int(n_embd)
+        self._client = RelayTcpClient(host, int(port), n_embd=self.n_embd, timeout=timeout)
+
+    def forward_hidden_to_hidden(self, hidden, *, n_past: int = 0):
+        """`n_past` 由**远端**自己维护（每连接从 0 起），这里只做形状校验与往返。"""
+        import numpy as np  # noqa: PLC0415
+
+        arr = np.ascontiguousarray(np.asarray(hidden, dtype=np.float32))
+        if arr.ndim == 1:
+            arr = arr[None, :]
+        if arr.ndim != 2 or arr.shape[1] != self.n_embd:
+            raise ValueError(f"hidden 形状应为 [n_tokens, {self.n_embd}]，实得 {arr.shape}")
+        payload = self._client.request_hidden(arr.tobytes(), n_tokens=int(arr.shape[0]))
+        return np.frombuffer(payload, dtype=np.float32).reshape(arr.shape).copy()
+
+    def close(self) -> None:
+        try:
+            self._client.close()
+        except Exception:  # noqa: BLE001 - 关闭失败不影响结论记录
+            pass
 
 
 def _load_keep_head_segment(args: argparse.Namespace, model_path: str, *,
@@ -557,6 +604,11 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
                                  dtype=torch.long, device=device)
             pos += n_tok
 
+        if middle is not None and hasattr(middle, "close"):
+            # 跨机中段必须发 CLOSE 帧，否则远端会话以 connection_closed_mid_frame 收场
+            # （不影响数值判定，但会让远端留下"非干净关闭"的记录）。
+            middle.close()
+
     return {
         "tokens": upstream_tokens,
         "failure": failure,
@@ -638,6 +690,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         raise SystemExit("FAIL: L→L（含 keep_head）目前只支持 --batch 1")
     if args.path == PATH_D2L2L_KEEP_HEAD and (not args.mid_model or args.mid_layers is None):
         raise SystemExit("FAIL: --path d2l2l_keep_head 需要 --mid-model 与 --mid-layers")
+    if args.path == PATH_D2L2L_KEEP_HEAD_NET:
+        if not args.mid_endpoint:
+            raise SystemExit("FAIL: --path d2l2l_keep_head_net 需要 --mid-endpoint host:port"
+                             "（远端用 scripts/relay_mid_service.py --role middle 起服务）")
+        if args.mid_layers is None:
+            raise SystemExit("FAIL: --path d2l2l_keep_head_net 需要 --mid-layers（K2，仅用于记录）")
     if not args.model_dir:
         raise SystemExit(
             "FAIL: 需要 --model-dir（HF 模型目录）—— 它同时是 tokenizer 来源；"
@@ -741,6 +799,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         upstream["keep_head_middle"] = _load_keep_head_segment(
             args, args.mid_model, role="middle")["keep_head"]
         layer_layout["middle_layers"] = int(args.mid_layers) - int(args.layers)
+    elif args.path == PATH_D2L2L_KEEP_HEAD_NET:
+        # 跨机三段：中段在远端，经 Relay TCP 往返 hidden（ssh -L 隧道 → 本机 loopback）
+        upstream["keep_head_middle"] = _RemoteMiddleSegment(
+            args.mid_endpoint, n_embd=int(upstream["n_embd"]))
+        layer_layout["middle_layers"] = int(args.mid_layers) - int(args.layers)
+        device_profile["mid_endpoint"] = args.mid_endpoint
 
     downstream: dict[str, Any] = {}
     if args.path == PATH_D2L_RAW:

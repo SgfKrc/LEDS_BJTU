@@ -48,6 +48,7 @@
     "l2l_llama",
     "l2l_keep_head",
     "d2l2l_keep_head",
+    "d2l2l_keep_head_net",
     "capacity_scan"
    ]
   },
@@ -213,7 +214,7 @@
    "if": {"properties": {"kind": {"const": "mainrepo_end_to_end"}}},
    "then": {
     "properties": {
-     "path": {"enum": ["d2l_mainrepo", "d2l2l_keep_head"]},
+     "path": {"enum": ["d2l_mainrepo", "d2l2l_keep_head", "d2l2l_keep_head_net"]},
      "engines": {
       "properties": {
        "downstream_iface": {"const": "llama_engine.forward_layers_from_hidden"}
