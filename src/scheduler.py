@@ -311,7 +311,12 @@ def _node_supports_forward_layers(node: "NodeInfo") -> bool:
     3. **两者都未提供** ⇒ 退回旧行为：**仅 `node_type == "pc"` 允许** ⇒
        **未声明能力的 Android 仍被拒绝**（不会因为本改动被无意放行）。
     """
-    info = getattr(node, "device_info", None)
+    if isinstance(node, dict):
+        node_type = node.get("node_type", "pc")
+        info = node.get("device_info")
+    else:
+        node_type = getattr(node, "node_type", "pc")
+        info = getattr(node, "device_info", None)
     if not isinstance(info, dict):
         info = {}
 
@@ -330,7 +335,7 @@ def _node_supports_forward_layers(node: "NodeInfo") -> bool:
             return True
 
     # 兜底：保持旧语义（pc 可、android 不可），避免未上报能力的节点被无意放行。
-    return getattr(node, "node_type", "pc") == "pc"
+    return node_type == "pc"
 
 
 @dataclass
@@ -2162,7 +2167,7 @@ class Scheduler:
             return [n.to_dict() for n in self.nodes.values() if n.is_available()]
 
     def check_nodes_ready(self) -> bool:
-        """检查 PC worker 是否就绪（Android HTTP 薄客户端不参与分布式计算）。"""
+        """检查旧版 PyTorch LAYER_CONFIG worker 是否就绪。"""
         if RUN_MODE == "single":
             return True
         self._refresh_http_client_states()
@@ -2511,7 +2516,7 @@ class Scheduler:
         with self._nodes_lock:
             nodes = []
             for node_id, info in self.nodes.items():
-                if info.node_type != "pc":
+                if not _node_supports_forward_layers(info):
                     continue
                 if node_id in opted_out:
                     continue
@@ -2664,8 +2669,8 @@ class Scheduler:
 
         total_layers = self._get_total_model_layers()
 
-        # 收集节点数据（仅 PC 节点参与层拆分，Android 节点跳过；
-        # TP 孤岛网关承担整请求推理，与 llama_cpp 节点一样排除在层拆分之外）
+        # 收集明确声明 forward_layers 能力的节点；未声明能力的 Android
+        # 继续按旧行为排除，避免把 HTTP 客户端误当成层工作器。
         with self._layer_config_lock:
             opted_out = set(self._pipeline_worker_opt_out)
         if nodes is None:
@@ -2677,7 +2682,7 @@ class Scheduler:
                  "node_type": info.node_type,
                  "device_info": info.device_info}
                 for nid, info in nodes_snapshot
-                if info.node_type == "pc"
+                if _node_supports_forward_layers(info)
                 and nid not in opted_out
                 and not self._node_is_island_gateway(info.device_info)
                 and (
@@ -2689,13 +2694,13 @@ class Scheduler:
         else:
             node_list = [
                 n for n in nodes
-                if n.get("node_type", "pc") == "pc"
+                if _node_supports_forward_layers(n)
                 and n.get("node_id") not in opted_out
                 and not self._node_is_island_gateway(n.get("device_info", {}))
             ]
 
         if not node_list:
-            logger.warning("没有可用的 PC 节点参与流水线层拆分")
+            logger.warning("没有可用的层前向节点参与流水线层拆分")
             return []
 
         # 单节点：全部层给该节点。多节点时 master 也参与首段层计算，
@@ -3194,11 +3199,12 @@ class Scheduler:
         # 动态计算
         assignments = self.compute_layer_assignment()
 
-        # 判断实际使用的策略：当前运行时由 PC worker 覆盖 Transformer 层，
-        # master/Android 不计入 graph_orchestrator 触发条件。
+        # 判断实际使用的策略：参与层前向的 worker 才计入图编排阈值；
+        # Android llama.cpp worker 与 PC worker 在这里具有同等语义。
         worker_nodes_count = sum(
             1 for info in self.nodes.values()
-            if info.node_type == "pc" and info.node_id != "master" and info.role != "master"
+            if _node_supports_forward_layers(info)
+            and info.node_id != "master" and info.role != "master"
             and info.is_available()
         )
         actual_strategy = (
@@ -3220,7 +3226,7 @@ class Scheduler:
     def _get_pipeline_capacity_nodes(
         self, eligible_node_ids: Optional[set[str]] = None,
     ) -> list[dict]:
-        """Project live PC profiles into explicit free-memory budgets."""
+        """Project live layer-worker profiles into explicit free-memory budgets."""
         from config import PIPELINE_CAPACITY_RESERVE_MB
 
         reserve_bytes = int(PIPELINE_CAPACITY_RESERVE_MB * 1024 * 1024)
@@ -3233,7 +3239,7 @@ class Scheduler:
         effective_id = self.get_effective_node_id()
         for node_id, node in snapshot:
             if (
-                getattr(node, "node_type", "pc") != "pc"
+                not _node_supports_forward_layers(node)
                 or (eligible_node_ids is not None and node_id not in eligible_node_ids)
                 or node_id in opted_out
                 or self._node_is_island_gateway(node.device_info)
@@ -3888,7 +3894,18 @@ class Scheduler:
             ):
                 continue
             capabilities = worker.get("capabilities") or {}
-            if isinstance(capabilities, dict) and capabilities.get("models"):
+            if not isinstance(capabilities, dict):
+                continue
+            # A worker that advertises an exact layer range is eligible for the
+            # layer pipeline even when it also exposes a full-model identity.
+            # Only full-model-only workers keep the legacy opt-out priority.
+            stage_types = capabilities.get("stage_types", [])
+            has_layer_stage = (
+                isinstance(stage_types, list)
+                and "layer_forward" in stage_types
+                and bool(capabilities.get("layer_ranges"))
+            )
+            if capabilities.get("models") and not has_layer_stage:
                 node_id = str(worker.get("node_id", "") or "")
                 if node_id:
                     worker_ids.add(node_id)
@@ -3942,7 +3959,9 @@ class Scheduler:
             return
 
         with self._nodes_lock:
-            releasable_pc_ids = {
+            # 这是旧版 PyTorch LAYER_CONFIG 线路。Android 的 llama.cpp
+            # worker 只能走 v3 task_worker stage offer，不能收到这份配置。
+            releasable_legacy_ids = {
                 node_id for node_id, node in self.nodes.items()
                 if node_id in connected_ids
                 and node_id != self.get_effective_node_id()
@@ -3953,9 +3972,9 @@ class Scheduler:
         # layer assignment. Keep its local model intact and release any stale
         # layer reservation instead of reassigning a subset of layers.
         full_worker_release_ids = (
-            releasable_pc_ids & self._task_worker_full_model_ids()
+            releasable_legacy_ids & self._task_worker_full_model_ids()
         )
-        layer_releasable_pc_ids = releasable_pc_ids - full_worker_release_ids
+        layer_releasable_worker_ids = releasable_legacy_ids - full_worker_release_ids
 
         with self._layer_config_lock:
             if full_worker_release_ids:
@@ -3964,7 +3983,7 @@ class Scheduler:
                 self._authoritative_layer_sync_requests
             )
             reenabled_nodes = (
-                self._pipeline_worker_opt_out & layer_releasable_pc_ids
+                self._pipeline_worker_opt_out & layer_releasable_worker_ids
                 if authoritative_sync else set()
             )
             if reenabled_nodes:
@@ -3995,7 +4014,7 @@ class Scheduler:
                     "generation": generation,
                     "release": True,
                 }
-                for node_id in releasable_pc_ids
+                for node_id in releasable_legacy_ids
             }
             self._publish_layer_configs(releases)
             logger.warning("主节点尚未加载可校验的 PyTorch 模型，暂不推送层配置")
@@ -4018,7 +4037,7 @@ class Scheduler:
                     logger.info(
                         "分布式请求忽略单机手动分层覆盖，改用多节点容量求解"
                     )
-                eligible_node_ids = set(layer_releasable_pc_ids)
+                eligible_node_ids = set(layer_releasable_worker_ids)
                 eligible_node_ids.update({"master", self.get_effective_node_id()})
                 capacity_plan = self.get_pipeline_capacity_plan(
                     eligible_node_ids,
@@ -4036,7 +4055,7 @@ class Scheduler:
                             "reason_code", "pipeline_capacity_rejected"
                         ),
                     }
-                    for node_id in releasable_pc_ids
+                for node_id in releasable_legacy_ids
                 }
                 with self._layer_config_lock:
                     self._pipeline_load_transaction = {
@@ -4066,7 +4085,7 @@ class Scheduler:
             nid = a["node_id"]
             if (
                 nid in {"master", self.get_effective_node_id()}
-                or nid not in layer_releasable_pc_ids
+                or nid not in layer_releasable_worker_ids
             ):
                 continue
 
@@ -4111,7 +4130,7 @@ class Scheduler:
                     "generation": generation,
                     "release": True,
             }
-            for node_id in (layer_releasable_pc_ids | full_worker_release_ids)
+            for node_id in (layer_releasable_worker_ids | full_worker_release_ids)
             if node_id not in assignments
         }
         configs = {**assignments, **releases}
