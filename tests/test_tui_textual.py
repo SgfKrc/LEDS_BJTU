@@ -12,6 +12,7 @@
 import asyncio
 import os
 import sys
+import threading
 import time
 
 import pytest
@@ -291,6 +292,62 @@ def test_health_failure_short_circuits_optional_refreshes():
             await pilot.pause(0.5)
             assert api.calls == ["/health"], api.calls
             assert app.screen.health_text == "[red]不可达[/]"
+
+    _run(_main())
+
+
+def test_pages_refresh_lock_allows_only_one_inflight_worker(monkeypatch):
+    """Two redraw-triggered refreshes must collapse into one page fetch."""
+    from tui_textual import KoakumaApp, MainScreen
+
+    async def _main():
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.1))
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.show_main()
+            await pilot.pause()
+            screen = app.screen
+            screen.backend_available = True
+            screen.runtime_ready = True
+
+            start = threading.Barrier(3)
+            first_fetch = threading.Event()
+            release = threading.Event()
+            calls = []
+            calls_lock = threading.Lock()
+
+            def fetch_json(path, **_kwargs):
+                with calls_lock:
+                    calls.append(path)
+                    is_first = len(calls) == 1
+                if is_first:
+                    first_fetch.set()
+                    assert release.wait(2)
+                return {}
+
+            monkeypatch.setattr(screen, "fetch_json", fetch_json)
+            monkeypatch.setattr(screen, "fetch_json_params", lambda *args, **kwargs: {})
+            monkeypatch.setattr(app, "call_from_thread", lambda *args, **kwargs: None)
+
+            def run_loader():
+                start.wait(timeout=2)
+                MainScreen.load_pages.__wrapped__(screen)
+
+            threads = [threading.Thread(target=run_loader) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            start.wait(timeout=2)
+            assert first_fetch.wait(2)
+            release.set()
+            for thread in threads:
+                thread.join(timeout=2)
+                assert not thread.is_alive()
+
+            assert calls == [
+                "/cluster/nodes",
+                "/cluster/queue",
+                "/cluster/nodes/log-aggregate",
+            ]
+            assert screen._pages_inflight is False
 
     _run(_main())
 

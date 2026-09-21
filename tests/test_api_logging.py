@@ -47,8 +47,7 @@ def log_dir_temp():
             yield tmpdir
             # ★ teardown: 关闭 RotatingFileHandler 释放文件句柄，避免 Windows PermissionError
             api_server._close_logging_handlers()
-            import time
-            time.sleep(0.1)
+            threading.Event().wait(0.1)
 
 
 @pytest.fixture
@@ -835,12 +834,13 @@ class TestLogAggregate:
 
         state = {"active": 0, "maximum": 0}
         state_lock = threading.Lock()
+        workers_ready = threading.Barrier(4)
 
         def request_node_logs(self, node_id, limit, level="", name="", timeout=3.0):
             with state_lock:
                 state["active"] += 1
                 state["maximum"] = max(state["maximum"], state["active"])
-            time.sleep(0.05)
+            workers_ready.wait(timeout=2)
             with state_lock:
                 state["active"] -= 1
             return {"node_id": node_id, "logs": [node_id], "count": 1}
@@ -873,7 +873,7 @@ class TestLogAggregate:
             state = sched_mod.NodeState.ONLINE
 
         def request_node_logs(self, node_id, limit, level="", name="", timeout=3.0):
-            time.sleep(0.2)
+            threading.Event().wait(0.2)
             return {"node_id": node_id, "logs": [node_id], "count": 1}
 
         fake_sched = type("FakeScheduler", (), {
