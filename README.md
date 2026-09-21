@@ -68,6 +68,7 @@ QLH 是一个面向异构边缘设备的分布式推理核心：主线是 GGUF/l
 | --- | --- |
 | 正确性 | 主仓双引擎 D→L 矩阵 **27/27 逐 token 一致**（qwen2.5-0.5B K=4/8/12/16/20、qwen3.5-2B K=8/12/16/20；负载 prefill 32/128/512、decode 32/64/256；batch 2/4；混合精度 fp16·f32·NF4 × Q4_K_M）；逐 token 判据与速度、容量分开记录 |
 | 混合精度 | 上游 PyTorch 全精度、下游 GGUF 量化是有意的“不完整量化”策略；必须与同精度下游整模对拍 |
+| L→L 上游通道 | pip 绑定的 `llama_get_embeddings_ith` 返回 `output_norm(H)`（实测 cos 0.999998）⇒ **不能**当层接力上游；统一驱动 `scripts/relay_experiment.py` 对 `l2l_llama` 默认 fail-loud，L→L 上游需自建 llama.cpp 的 keep-head 通道 |
 | Windows 算子 | Windows 原生 `triton-windows==3.8.0.post28` 已实测可用；`PYTHONUTF8=1` 是编译路径前置条件；WSL2/fla 是并行路径，不是唯一方案 |
 | 生产定位 | 正确性证据满足 Relay 合同准入；速度只影响默认路由倾向，长时、远端资产自动分发和多段故障验收仍待完成 |
 | 当前文档 | 以[当前有效基线与后续优化计划](docs/跨框架接力-当前有效基线与后续优化计划-2026-09-21.md)为索引，旧报告中的矛盾数字按其有效性分级处理 |

@@ -67,3 +67,15 @@ payload schema，不替代六个文件的字段校验。
 `fetcher-sequence-valid*.json` / `fetcher-sequence-invalid-<reason>.json`，除 JSON Schema
 外还验证 job_id 一致性、合法迁移、终止态封闭和进度单调性。新增 schema 或状态边界时必须成对添加
 fixture，并在 Python/TS 同一变更中更新。
+
+## 跨框架接力实验记录（P1，2026-09-21）
+
+`relay-experiment-record.schema.json` **不属于上面的 M0 冻结契约族**，它是 P1 统一实验驱动
+（`scripts/relay_experiment.py`）的强制记录格式：
+
+- `kind` 三类互斥：`mainrepo_end_to_end` / `raw_binding_probe` / `capacity_only`；
+- `kind` 与 `path` / `engines.*_iface` 的一致性由 schema 条件规则（`allOf` + `if/then`）强制 ——
+  **错标会被拒绝**，这是"不同层级的数字不得混进同一张表"的机器判据；
+- 构建/校验在 `src/relay_experiment_record.py`，守卫用例在
+  `tests/test_relay_experiment_record.py`（25 用例，不需要模型工件）；
+- 纯实验记录，**没有 TS 侧对应物**，不进入控制面契约。
