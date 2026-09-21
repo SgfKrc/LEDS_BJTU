@@ -3752,26 +3752,40 @@ class ModelManager:
 
                 if use_cache:
                     if past_key_values is not None:
-                        # Decode: tuple of (k,v) → DynamicCache（本地索引 0..N-1）
-                        # Phase 4.3: 验证缓存层数与本地层数一致
-                        n_local = len(transformer.layers)
-                        if len(past_key_values) != n_local:
-                            raise RuntimeError(
-                                f"Qwen2 KV cache 层数不匹配: "
-                                f"cache={len(past_key_values)}, local={n_local}"
-                            )
-                        # ★ A3：传 config —— hybrid（如 Qwen3.5）需要按 layer_types 建出
-                        #   linear/full 混合层；空 DynamicCache() 会让 `cache.layers[layer_idx]`
-                        #   越界（IndexError）。旧版 transformers 无该关键字 ⇒ 辅助函数已兼容。
-                        cache = _new_dynamic_cache(transformer.config)
-                        for layer_idx, item in enumerate(past_key_values):
-                            if item is None:
-                                # ★ B14（修 A3 遗留）：hybrid 的 linear_attention 层**没有 KV**
-                                #   （用 recurrent state）⇒ 收集侧留下了 None 占位以保持下标对齐，
-                                #   这里跳过它们即可（它们由模型内部的递归状态自行维护）。
-                                continue
-                            k, v = item
-                            cache.update(k, v, layer_idx)
+                        # ★ 2026-09-21（修 hybrid 增量解码）：若调用方回传的是**cache 对象**
+                        #   （上一步 `result["cache"]`），**直接复用** —— 它带着 hybrid
+                        #   （Qwen3.5）linear_attention 层的 recurrent state。转成 (k,v)
+                        #   tuple 会把这类状态丢成 None ⇒ decode 第 2 步起退化为复读
+                        #   （实测：`Paris of of of of …`，共享前缀 1/16）。
+                        if not isinstance(past_key_values, (tuple, list)):
+                            cache = past_key_values
+                            n_local = len(transformer.layers)
+                            if len(getattr(cache, "layers", [])) < n_local:
+                                raise RuntimeError(
+                                    f"cache 对象层槽不足: {len(getattr(cache, 'layers', []))} "
+                                    f"< local={n_local}"
+                                )
+                        else:
+                            # Decode: tuple of (k,v) → DynamicCache（本地索引 0..N-1）
+                            # Phase 4.3: 验证缓存层数与本地层数一致
+                            n_local = len(transformer.layers)
+                            if len(past_key_values) != n_local:
+                                raise RuntimeError(
+                                    f"Qwen2 KV cache 层数不匹配: "
+                                    f"cache={len(past_key_values)}, local={n_local}"
+                                )
+                            # ★ A3：传 config —— hybrid（如 Qwen3.5）需要按 layer_types 建出
+                            #   linear/full 混合层；空 DynamicCache() 会让 `cache.layers[layer_idx]`
+                            #   越界（IndexError）。旧版 transformers 无该关键字 ⇒ 辅助函数已兼容。
+                            cache = _new_dynamic_cache(transformer.config)
+                            for layer_idx, item in enumerate(past_key_values):
+                                if item is None:
+                                    # ★ B14（修 A3 遗留）：hybrid 的 linear_attention 层**没有 KV**
+                                    #   （用 recurrent state）⇒ 收集侧留下了 None 占位以保持下标对齐，
+                                    #   这里跳过它们即可（它们由模型内部的递归状态自行维护）。
+                                    continue
+                                k, v = item
+                                cache.update(k, v, layer_idx)
                     else:
                         # Prefill: 创建空 DynamicCache（★ A3：传 config，理由同上）
                         cache = _new_dynamic_cache(transformer.config)
@@ -4030,6 +4044,15 @@ class ModelManager:
                             )
                     if cache_items:
                         result["past_key_values"] = tuple(cache_items)
+                    # ★ 2026-09-21（修 hybrid 增量解码）：**必须**同时给出 cache 对象本身。
+                    #   上面的 (k,v) tuple **只承载 KV** —— hybrid（Qwen3.5）的
+                    #   linear_attention 层用 **recurrent state**，其 `layer_cache` 没有
+                    #   `.keys`/`.values` ⇒ 在 tuple 里只能是 `None` ⇒ **状态被丢弃**，
+                    #   下一步 decode 等于从零开始（实测整模上游退化成 `Paris of of of of …`，
+                    #   共享前缀 1/16）。调用方应优先用本键，并在下一步**原样回传**。
+                    #   ⚠️ 对 hybrid 而言 `past_key_values`（tuple）是**有损**的兼容通道，
+                    #   仅适用于纯 attention 模型。
+                    result["cache"] = cache
 
                 return result
             finally:

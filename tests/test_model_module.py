@@ -2730,3 +2730,74 @@ class TestEmptyCacheNormalization:
             self.mgr.forward_layers(
                 input_ids=torch.tensor([[7]]), past_key_values=bad, use_cache=True
             )
+
+    # ---------- hybrid 增量解码：cache 对象通道（2026-09-21） ----------
+    # 原缺陷：缓存契约是 `tuple of (k, v)`，**只承载 KV**。hybrid（Qwen3.5）的
+    # linear_attention 层用 **recurrent state**（其 cache 层没有 `.keys`/`.values`）
+    # ⇒ 在 tuple 里只能落到 `None` ⇒ **跨步状态丢失** ⇒ decode 第 2 步起退化为复读。
+    # 实测（qwen3.5-2b 整模上游）：`Paris of of of of …`，与 llama.cpp 仅共享 1/16 前缀；
+    # 改用 cache 对象通道后 **16/16 完全一致**，D→L 端到端 **32/32 一致**。
+
+    def test_forward_layers_exposes_cache_object(self):
+        """★ 修复：结果必须**同时**给出 `cache` 对象（recurrent state 只在这里）。"""
+        result = self.mgr.forward_layers(
+            input_ids=torch.tensor([[1, 2, 3]]), past_key_values=None, use_cache=True
+        )
+        assert "cache" in result, "cache 对象通道缺失 ⇒ hybrid 的 recurrent state 传不出去"
+        assert hasattr(result["cache"], "layers")
+
+    def test_cache_object_roundtrip_is_reused_not_rebuilt(self):
+        """★ 修复：把上一步的 cache 对象原样回传 ⇒ **直接复用**（不是按 tuple 重建）。"""
+        first = self.mgr.forward_layers(
+            input_ids=torch.tensor([[1, 2, 3]]), past_key_values=None, use_cache=True
+        )
+        cache = first["cache"]
+        second = self.mgr.forward_layers(
+            input_ids=torch.tensor([[4]]), past_key_values=cache, use_cache=True
+        )
+        assert ("hidden_states" in second) or ("logits" in second)
+        assert second["cache"] is cache, "cache 对象被重建 ⇒ hybrid 状态会丢"
+
+    def test_cache_object_with_insufficient_layer_slots_rejected(self):
+        """★ 回归保护：cache 对象**非空但层槽不足**时 fail-loud（不得静默走错索引）。
+
+        注意 `layers=[]` 属于「空 cache」⇒ 由 `_normalize_past_key_values` 视同 None
+        （见上方的空缓存测试），不适用于本用例；这里构造的是**非空但槽偏少**的对象。
+        """
+        cache_utils = pytest.importorskip("transformers.cache_utils")
+        c = cache_utils.DynamicCache()
+        k = torch.zeros(1, 2, 3, 8)
+        for i in range(len(self.mgr.model.model.layers)):
+            c.update(k, k, i)
+        assert _normalize_past_key_values(c) is c, "非空 cache 不应被规范化掉"
+        c.layers = c.layers[:1]  # 非空，但槽数 < 本地层数
+        with pytest.raises(RuntimeError, match="cache 对象层槽不足"):
+            self.mgr.forward_layers(
+                input_ids=torch.tensor([[7]]), past_key_values=c, use_cache=True
+            )
+
+    def test_tuple_channel_is_lossy_for_non_kv_layers(self):
+        """★ 机理回归：非 KV 层在 **tuple 通道**必然落到 `None` —— 这正是原 bug 的机理，
+        也是「必须用 cache 对象通道」的证据（保留此断言以防有人"优化"掉 cache 对象）。"""
+        cache_utils = pytest.importorskip("transformers.cache_utils")
+
+        class _RecurrentOnlyLayer:
+            """模拟 hybrid 的 linear_attention cache 层：有状态，**没有** keys/values。"""
+
+            def __init__(self):
+                self.recurrent_state = torch.ones(1, 4)
+
+        cache = cache_utils.DynamicCache()
+        n_local = len(self.mgr.model.model.layers)
+        cache.layers = [_RecurrentOnlyLayer() for _ in range(n_local)]
+        items = []
+        for layer_cache in cache.layers[:n_local]:
+            keys = getattr(layer_cache, "keys", None)
+            values = getattr(layer_cache, "values", None)
+            items.append((keys, values) if keys is not None and values is not None else None)
+        assert items == [None] * n_local, (
+            "非 KV 层居然能从 tuple 通道带出状态 —— 请重新核对 hybrid cache 契约"
+        )
+        assert getattr(cache.layers[0], "recurrent_state", None) is not None, (
+            "状态本身存在于 cache 对象里 ⇒ 只要传 cache 对象就不会丢"
+        )
