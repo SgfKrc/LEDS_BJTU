@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qlh.dev/schemas/cluster-state-catalog-v1.schema.json",
+  "title": "QLH cluster state catalog v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "document_type", "entries"],
+  "properties": {
+    "schema_version": { "const": "qlh.cluster.state_catalog.v1" },
+    "document_type": { "const": "cluster_state_catalog" },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/entry" }
+    }
+  },
+  "$defs": {
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state_id", "owner", "source", "state_class", "authority",
+        "current_boundary", "recovery_strategy", "handoff_policy",
+        "sensitive", "notes"
+      ],
+      "properties": {
+        "state_id": { "type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9._:-]+$" },
+        "owner": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 },
+        "state_class": { "enum": ["must_replicate", "rebuildable", "audit_only", "must_not_migrate"] },
+        "authority": { "enum": ["cluster", "node", "user"] },
+        "current_boundary": { "enum": ["durable_local", "memory_only", "derived", "external_asset", "mixed", "not_yet_durable"] },
+        "recovery_strategy": { "enum": ["journal_replay_before_write", "reissue_from_quorum", "rebuild_from_local_state", "rebuild_from_local_assets", "reconcile_then_retry", "preserve_append_only", "invalidate_and_reacquire", "never_copy", "user_owned_local_only"] },
+        "handoff_policy": { "enum": ["required_before_new_leader_write", "rebuild_after_new_leader", "retain_as_audit_evidence", "invalidate_on_term_change", "explicit_user_export_only"] },
+        "sensitive": { "type": "boolean" },
+        "notes": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}
