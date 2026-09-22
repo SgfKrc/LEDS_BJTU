@@ -1,6 +1,10 @@
-# QLH
+# Kllama
 
-QLH is a distributed inference core for heterogeneous edge devices. The mainline is the lightweight GGUF/llama.cpp engine; the repository also owns a PyTorch layered-distribution engine plus a **layer pipeline** (including cross-framework layer relay), and the user-facing entry point is a cross-platform TUI.
+Kllama (Llama for Koakuma) is a distributed inference core for heterogeneous edge devices. The mainline is the lightweight GGUF/llama.cpp engine; the repository also owns a PyTorch layered-distribution engine plus a **layer pipeline** (including cross-framework layer relay), and the user-facing entry point is a cross-platform TUI.
+
+> **Independent project · not official**: Kllama is an **independent** student innovation project (Beijing Jiaotong University, 2026) with **no affiliation, sponsorship or endorsement from the llama.cpp project**, and it does not represent that project's position. It is **built on llama.cpp** (a **descriptive reference** only — no ownership of or trademark claim to "llama.cpp", "llama" or any upstream name is asserted). Upstream components keep their own licenses and version pins, unchanged by this project's use of them.
+>
+> Naming history: the project was previously called `QLH`, with the program abbreviation `LEDS_BJTU` (Lightweight Edge Distributed Inference System) and the alias `Koakuma`. Documentation and user-facing surfaces now use **Kllama** uniformly. **Code-level names are kept** (`qlh.py` entry, `QLH_*` environment variables, `qlh-*` repository and package paths) so that compatibility and existing configuration are not broken.
 
 > Status: the main-repository baseline is being reorganized (2026-09-21, baseline `610f4b3`)
 >
@@ -28,7 +32,7 @@ The engine is **dual-track**, and both tracks live in the main repository - this
 
 ## Architecture Overview
 
-QLH is **two layers in one process**: a control plane aimed at people, and an engine layer aimed at
+Kllama is **two layers in one process**: a control plane aimed at people, and an engine layer aimed at
 machines and protocols. There is exactly one boundary between them — the layer-range contract
 `(layer_range, engine, location)`.
 
@@ -69,7 +73,7 @@ approximation".
 
 ## Is This System Software or User Software?
 
-**Layered answer**: QLH ships as **a system-software core plus a user-software shell**.
+**Layered answer**: Kllama ships as **a system-software core plus a user-software shell**.
 
 - **Control plane ≈ user software**: TUI, model assets, node/layout/queue/log/settings pages, HTTP API.
   Its users are **people**; the failure mode is degraded experience (retry, switch model, switch
@@ -300,7 +304,7 @@ The main project keeps no image-generation runtime or assets; image generation b
 
 | Path | Content |
 | --- | --- |
-| `src/` | QLH main code: control plane, engines, layer-segment/layer-pipeline contracts, TUI (grouped below) |
+| `src/` | Kllama main code: control plane, engines, layer-segment/layer-pipeline contracts, TUI (grouped below) |
 | `tests/` | pytest suite (TUI, RPC/layer-segment, scheduling, contracts, doc gates) |
 | `scripts/` | Verification, experiment, environment and documentation tools (`edge_preflight.py`, `android_validation.py`, `llama_rpc_*.py`, `doc_maintenance_audit.py`, ...) |
 | `docs/` | Current documents; historical and migrated content lives in `docs/archive/` |
@@ -309,7 +313,7 @@ The main project keeps no image-generation runtime or assets; image generation b
 | `local_docs/` | Local experiment and acceptance raw records; not a public source interface |
 | `runtime/` | Runtime logs and the llama.cpp runtime directory |
 | `qlh.py` / `qlh_edge.py` | Interactive TUI/CLI entry point and Edge entry point |
-| `qlh.bat` / `qlh.sh` / `bjtu.*` / `koakuma.*` | Launchers; `bjtu` and `koakuma` are compatibility aliases, the unified entry point is still `qlh` |
+| `qlh.bat` / `qlh.sh` / `kllama.*` / `bjtu.*` / `koakuma.*` | Launchers; `kllama` is the **recommended alias**, `bjtu`/`koakuma` are compatibility aliases, and the canonical entry script is still `qlh.py` |
 | `start_tui.*` / `start_backend.bat` / `setup_all_envs.*` | One-click start and multi-environment install scripts |
 | `requirements*.txt` / `pytest.ini` / `pyrightconfig.json` / `reasonix.toml` | Dependency lists and tool configuration |
 | `models/`, `chat_history/`, `dist/`, `build/`, `test-results/`, `logs/`, `_to_delete/` | Local artifacts or archive areas, not in Git (`logs/`, `_to_delete/` are gitignored) |
@@ -419,7 +423,7 @@ When the local backend is not running, `qlh chat` starts it in a daemon thread o
 
 Write operations are initiated from the shell: the models screen uses `L` to load / `U` to unload, the queue screen uses `P` pause-resume / `S` policy / `C` clear queued, and the chat screen supports `/model`, `/queue`, `/new`, `/resume`, `/rename`, `/sessions`, `/delete-session`, `/reset`; destructive and long-running operations first show a confirmation box. Model control endpoints are allowed by default on loopback; to control a main node remotely the main node must configure `QLH_MODEL_API_TRUSTED_CIDRS`.
 
-On Windows you can use `qlh.bat` directly; on Linux/macOS use `qlh.sh`. `bjtu`/`koakuma` are compatibility launchers, and the unified repository entry point is still `qlh`.
+On Windows you can use `qlh.bat` (or `kllama.bat`) directly; on Linux/macOS use `qlh.sh` (or `kllama.sh`). `kllama` is the recommended alias and `bjtu`/`koakuma` are compatibility launchers; all of them forward to the same entry script `qlh.py`. The unified repository entry point is still `qlh`.
 
 The TUI's 9 feature screens are the main interaction and acceptance boundary:
 
