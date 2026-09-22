@@ -44,6 +44,7 @@ def test_catalog_covers_all_four_recovery_classes_and_sensitive_boundaries():
         "must_replicate", "rebuildable", "audit_only", "must_not_migrate",
     }
     assert entries["control.quorum_ledger"].state_class == "must_replicate"
+    assert entries["control.quorum_ledger"].current_boundary == "durable_local"
     assert entries["task_graph.snapshots"].state_class == "rebuildable"
     assert entries["audit.control_events"].state_class == "audit_only"
     assert entries["cluster.node_private_keys"].recovery_strategy == "never_copy"

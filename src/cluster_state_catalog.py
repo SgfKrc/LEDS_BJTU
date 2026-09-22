@@ -176,8 +176,8 @@ def build_state_catalog() -> StateCatalog:
     """Return the reviewed P4.5 whitelist in deterministic order."""
     entries: Sequence[StateCatalogEntry] = (
         StateCatalogEntry(
-            "control.quorum_ledger", "control-plane", "src/cluster_control_contract.py",
-            "must_replicate", "cluster", "not_yet_durable",
+            "control.quorum_ledger", "control-plane", "src/cluster_quorum.py:SQLiteVoterLedger",
+            "must_replicate", "cluster", "durable_local",
             "journal_replay_before_write", "required_before_new_leader_write", False,
             "Durable voter-set, term and one-vote records are required before quorum election.",
         ),
