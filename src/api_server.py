@@ -136,6 +136,7 @@ from cluster_join import (
     verify_and_consume_join_grant,
 )
 from cluster_fence import ControlFence, ControlFenceError
+from cluster_score import build_management_score_snapshot
 from node_config import load_node_config, write_node_config
 
 _request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
@@ -7678,6 +7679,25 @@ class ControlCertificateRequest(BaseModel):
 async def get_control_plane_status():
     """Read-only fencing status; it remains available while writes are fenced."""
     return control_fence.snapshot()
+
+
+@app.get("/api/cluster/management-score")
+async def get_cluster_management_score():
+    """Return the versioned, read-only management-capability score snapshot."""
+
+    def _build_snapshot() -> dict[str, Any]:
+        try:
+            import config as _config
+
+            secret = str(getattr(_config, "CLUSTER_SECRET", "") or "")
+        except Exception:
+            secret = os.environ.get("QLH_CLUSTER_SECRET", "")
+        return build_management_score_snapshot(
+            scheduler.get_nodes(),
+            signing_secret=secret,
+        )
+
+    return await run_in_threadpool(_build_snapshot)
 
 
 @app.post("/api/cluster/control-plane/certificate")

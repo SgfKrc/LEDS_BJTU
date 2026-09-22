@@ -170,6 +170,7 @@ class TestApiPaths:
 
     def test_ha_observation_paths(self):
         assert API_PATHS["cluster_control_plane"] == "/cluster/control-plane"
+        assert API_PATHS["cluster_management_score"] == "/cluster/management-score"
         assert API_PATHS["cluster_transfer_logs"] == "/cluster/transfer-logs"
 
     def test_pipeline_observation_paths(self):

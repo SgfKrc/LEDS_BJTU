@@ -210,7 +210,12 @@ CPU 却与 GPU 数据混比**（同脚本同口径实测同 4 层：cpu 34.9 ms 
 
 加速 **1.291×**，且两条序列的 token 与单序列基线**完全一致**；理论天花板约 1.79×（完全重叠时取上游 72.3 / 下游 56.8 之较大者），实测达到约 72%。
 
-**结论与定位**：上面 P0 那个 1.45× 只是「CPU llama.cpp → GPU **torch**」的局部收益；更好的做法是「CPU llama.cpp → GPU **llama.cpp**」（`-ngl`）。所以 **跨框架接力不是更快的推理路径**，而是「**只能用 torch 跑的层**」（hybrid/自定义算子）与「**容量合并 / 层流水线**（单机装不下）」的机制，外加实验平台。**集群里有 CUDA 节点时，最佳实践是把它作为 llama.cpp 的 CUDA worker（RPC/分片），而不是接力上游**；P2 交叠只在「不得不接力」的场景内把损失补回一部分（78.3 ms/token 仍慢于 26.6 约 3×）。
+**结论与定位**：
+
+- 上面 P0 那个 1.45× 只是「CPU llama.cpp → GPU **torch**」的局部收益；更好的做法是「CPU llama.cpp → GPU **llama.cpp**」（`-ngl`）；
+- 所以**跨框架接力不是更快的推理路径**，而是两个机制加一个平台：「**只能用 torch 跑的层**」（hybrid / 自定义算子）、「**容量合并 / 层流水线**」（单机装不下），以及实验平台；
+- **集群里有 CUDA 节点时**，最佳实践是把它当作 llama.cpp 的 CUDA worker（RPC / 分片），**而不是接力上游**；
+- P2 交叠只在「不得不接力」的场景内把损失补回一部分（78.3 ms/token 仍慢于 26.6 约 **3×**）。
 
 报告：`local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-p2-2026-09-18.json`。⚠️ 以上均为**同机**数据；**跨机（GPU 节点 + 无 CUDA 边缘节点）的 RPC vs 接力对照仍未测**。
 
@@ -223,7 +228,12 @@ CPU 却与 GPU 数据混比**（同脚本同口径实测同 4 层：cpu 34.9 ms 
 | `USE_COMPILE` | `True` | 启用编译。编译不可用时**告警并回退 eager**，不影响启动（Windows 未装 [`triton-windows`](requirements-compile.txt) 时即走此路径；**装了就可用** —— 2026-09-19 起 Windows 原生已实测编译成功，不再是「死开关」） |
 | `USE_MONOLITHIC_FORWARD` | `False` | 打开后额外编译**「层循环」**（`_LayerLoop`），供 `forward_layers()` 使用；默认关 |
 
-**为什么只编译「层循环」而不编译整个模型**：`Qwen2Model.forward()` 的返回值要经过 `self.norm`（完整模型语义），而分布式分段前向在 `has_lm_head=False` 时必须返回**未过 norm** 的 raw hidden。所以只包住层循环，前置/后置仍由 `forward_layers()` 负责，语义才与逐层版一致。（第一版直接编译整段 `Qwen2Model` 得到 2.325×，但**多算了一次 `self.norm`**，argmax 从 decode 第 1 步就分叉 —— ）
+**为什么只编译「层循环」而不编译整个模型**：
+
+- `Qwen2Model.forward()` 的返回值要经过 `self.norm`（完整模型语义）；
+- 而分布式分段前向在 `has_lm_head=False` 时必须返回**未过 norm** 的 raw hidden；
+- 所以只包住层循环，前置 / 后置仍由 `forward_layers()` 负责，语义才与逐层版一致；
+- ⚠️ 反例：第一版直接编译整段 `Qwen2Model` 得到 2.325×，但**多算了一次 `self.norm`** ⇒ argmax 从 decode 第 1 步就分叉。
 
 **实测收益**（`USE_MONOLITHIC_FORWARD=True`；见[图 3](docs/figures/cross-frame-relay/fig3-compile-gains.png)）：
 
@@ -400,7 +410,16 @@ python qlh.py models
 
 Windows 可直接使用 `qlh.bat`，Linux/macOS 可使用 `qlh.sh`。`bjtu`/`koakuma` 是兼容启动器，主仓统一入口仍是 `qlh`。
 
-TUI 的 9 个功能屏是主交互和验收边界：模型屏负责本地资产/预设/下载任务、搜索、预检、登记、加载和卸载；分布式/节点屏负责开关、容量、最大节点、邀请、连接、入群请求码/授权消费和注销；日志屏负责筛选、统计、导出和清理；设备屏负责自动配置和 GPU 选择；设置屏负责读取和写入用户设置。最后的「调试」屏从运行中后端 `/openapi.json` 动态读取路由，仅作为尚未形成专用交互的 JSON 兜底，不计作产品功能覆盖。当前主后端 OpenAPI 快照为 152 个操作，实际数量以目标后端返回为准；流式聊天和文件上传仍由聊天页专用处理。
+TUI 的 9 个功能屏是主交互和验收边界：
+
+- **模型屏**：本地资产 / 预设 / 下载任务、搜索、预检、登记、加载和卸载；
+- **分布式 / 节点屏**：开关、容量、最大节点、邀请、连接、入群请求码 / 授权消费和注销；
+- **日志屏**：筛选、统计、导出和清理；
+- **设备屏**：自动配置和 GPU 选择；
+- **设置屏**：读取和写入用户设置；
+- **「调试」屏**：从运行中后端 `/openapi.json` 动态读取路由，仅作尚未形成专用交互的 JSON 兜底，**不计作产品功能覆盖**。
+
+当前主后端 OpenAPI 快照为 152 个操作，实际数量以目标后端返回为准；流式聊天和文件上传仍由聊天页专用处理。
 
 ## 模型与分布式
 
@@ -458,7 +477,9 @@ python -m venv .venv-test
 
 真实硬件、跨机网络、Android ARM64、性能和长时 soak 必须另外保存原始命令、环境、模型摘要、拓扑、输出和失败边界，测试绿灯本身不替代这些证据。
 
-**文档检查**（纯静态、只需标准库）：`python scripts/run_doc_checks.py` 跑相对链接死链检查与 README 双语结构同步检查。同一套检查在 CI（[`.github/workflows/checks.yml`](.github/workflows/checks.yml)）与本地 pre-push 钩子（[`.githooks/`](.githooks/README.md)，用 `git config core.hooksPath .githooks` 启用）各跑一遍——**一处定义、两处复用**。加它的直接原因：仓库原先没有任何自动化检查，而文档一经归档就容易留下"引用没跟着改"的死链，实测一次就攒到 20 处。
+**文档检查**（纯静态、只需标准库）：`python scripts/run_doc_checks.py` 跑两条检查 —— 相对链接死链、README 双语结构同步。
+
+同一套检查在 **CI**（[`.github/workflows/checks.yml`](.github/workflows/checks.yml)）与**本地 pre-push 钩子**（[`.githooks/`](.githooks/README.md)，用 `git config core.hooksPath .githooks` 启用）各跑一遍 —— **一处定义、两处复用**。加它的直接原因：仓库原先没有任何自动化检查，文档一经归档就容易留下"引用没跟着改"的死链，实测一次就攒到 20 处。
 
 ## 文档入口
 

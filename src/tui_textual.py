@@ -2106,6 +2106,7 @@ class MainScreen(Screen):
                 ("config", "/cluster/config"),
                 ("role", "/cluster/my-role"),
                 ("fence", API_PATHS["cluster_control_plane"]),
+                ("score", API_PATHS["cluster_management_score"]),
                 ("transfer_logs", API_PATHS["cluster_transfer_logs"]),
                 ("distributed", "/cluster/config/distributed-inference"),
                 ("capacity", "/cluster/pipeline-capacity"),
@@ -2156,22 +2157,9 @@ class MainScreen(Screen):
         else:
             majority = "unknown (not exposed)"
 
-        versions: set[str] = set()
-        nodes = self.node_aux.get("nodes") if isinstance(self.node_aux, dict) else None
-        if isinstance(nodes, dict):
-            nodes = list(nodes.values())
-        for node in nodes if isinstance(nodes, list) else []:
-            if not isinstance(node, dict):
-                continue
-            info = node.get("device_info") if isinstance(node.get("device_info"), dict) else {}
-            version = node.get("master_score_version") or info.get("master_score_version")
-            if version:
-                versions.add(str(version))
-        if len(versions) == 1:
-            score_version = next(iter(versions))
-        elif versions:
-            score_version = "conflict: " + ", ".join(sorted(versions))
-        else:
+        score_payload = payload.get("score") if isinstance(payload.get("score"), dict) else {}
+        score_version = str(score_payload.get("algorithm_version") or "").strip()
+        if not score_version:
             score_version = "not reported"
 
         transfer = payload.get("transfer_logs")

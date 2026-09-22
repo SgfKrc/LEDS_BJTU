@@ -177,6 +177,12 @@ LIVE_SHAPES = {
         "voter_set_epoch": 4, "committed_term": 12, "leader_id": "master",
         "certificate_digest": "a" * 64, "read_only_reason": "",
     },
+    "/cluster/management-score": {
+        "schema_version": "qlh.ha.management-score.v1",
+        "algorithm_version": "management-v1",
+        "nodes": [{"node_id": "master", "score": 70.0, "rank": 1}],
+        "signature_status": "unsigned_no_cluster_secret",
+    },
     "/cluster/transfer-logs": {
         "logs": [{"event_type": "handoff_committed", "reason": "maintenance"}],
         "count": 1,
@@ -302,13 +308,34 @@ def test_ha_projection_is_read_only_and_fail_closed_for_missing_quorum():
                     "read_only_reason": "control_certificate_missing",
                 },
                 "transfer_logs": {"logs": []},
+                "score": {"algorithm_version": "management-v1", "nodes": []},
             })
             assert "leader: master" in rendered
             assert "term/epoch: 12/4" in rendered
             assert "majority: unavailable" in rendered
             assert "read-only reason: control_certificate_missing" in rendered
-            assert "score version: v1" in rendered
+            assert "score version: management-v1" in rendered
             assert "last handoff: none" in rendered
+
+    _run(_main())
+
+
+def test_ha_projection_uses_versioned_score_snapshot():
+    from tui_textual import KoakumaApp
+
+    async def _main():
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.5), interval=30)
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.show_main()
+            await pilot.pause()
+            screen = app.screen
+            rendered = screen.render_ha_status({
+                "score": {
+                    "algorithm_version": "management-v1",
+                    "nodes": [{"node_id": "master", "score": 70.0}],
+                },
+            })
+            assert "score version: management-v1" in rendered
 
     _run(_main())
 

@@ -216,7 +216,12 @@ The `-ngl` curve is monotonic (ms/token): `0->91.1`, `4->71.0`, `8->60.5`, `12->
 
 A **1.291x** speed-up, and both sequences are **identical** to the single-sequence baseline; the theoretical ceiling is about 1.79x (taking the larger of upstream 72.3 / downstream 56.8 when fully overlapped), and the measurement reaches about 72% of it.
 
-**Conclusion and positioning**: the 1.45x from P0 above is only the local gain of "CPU llama.cpp -> GPU **torch**"; the better move is "CPU llama.cpp -> GPU **llama.cpp**" (`-ngl`). So **cross-framework relay is not a faster inference path** - it is the mechanism for "**layers that can only run under torch**" (hybrid/custom operators) and for "**capacity merging / layer pipeline** (too large for a single machine)", plus an experiment platform. **When the cluster has a CUDA node, the best practice is to use it as a llama.cpp CUDA worker (RPC/sharding), not as a relay upstream**; P2 overlap only recovers part of the loss inside the "relay is unavoidable" scenario (78.3 ms/token is still about 3x slower than 26.6).
+**Conclusion and positioning**:
+
+- The 1.45x from P0 above is only the local gain of "CPU llama.cpp -> GPU **torch**"; the better move is "CPU llama.cpp -> GPU **llama.cpp**" (`-ngl`);
+- So **cross-framework relay is not a faster inference path** - it is two mechanisms plus one platform: "**layers that can only run under torch**" (hybrid / custom operators), "**capacity merging / layer pipeline**" (too large for a single machine), and an experiment platform;
+- **When the cluster has a CUDA node**, the best practice is to use it as a llama.cpp CUDA worker (RPC / sharding), **not** as a relay upstream;
+- P2 overlap only recovers part of the loss inside the "relay is unavoidable" scenario (78.3 ms/token is still about **3x** slower than 26.6).
 
 Report: `local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-p2-2026-09-18.json`. All of the above is **same-machine** data; the **cross-machine (GPU node + CUDA-less edge node) RPC vs. relay comparison is still unmeasured**.
 
@@ -229,7 +234,12 @@ Getting `torch.compile` gains out of segmented forward takes two switches (both 
 | `USE_COMPILE` | `True` | Enables compilation. When compilation is unavailable it **warns and falls back to eager** without blocking startup (this is the path taken on Windows without `triton-windows`; **installing it is enough** - native Windows compilation has been verified working since 2026-09-19, so it is no longer a 'dead switch'). |
 | `USE_MONOLITHIC_FORWARD` | `False` | Additionally compiles the **"layer loop"** (`_LayerLoop`) used by `forward_layers()`; off by default. |
 
-**Why only the layer loop is compiled, not the whole model**: `Qwen2Model.forward()`'s return value passes through `self.norm` (full-model semantics), while a distributed segmented forward must return the **pre-norm** raw hidden when `has_lm_head=False`. So only the loop is wrapped; the pre/post steps stay in `forward_layers()`, which is what keeps the semantics identical to the per-layer version.
+**Why only the layer loop is compiled, not the whole model**:
+
+- `Qwen2Model.forward()`'s return value passes through `self.norm` (full-model semantics);
+- while a distributed segmented forward must return the **pre-norm** raw hidden when `has_lm_head=False`;
+- so only the loop is wrapped; the pre/post steps stay in `forward_layers()`, which is what keeps the semantics identical to the per-layer version;
+- ⚠️ Counter-example: compiling the whole `Qwen2Model` in the first attempt gave 2.325x, but it **computed `self.norm` one extra time** => argmax diverged from decode step 1.
 
 **Measured gains** (`USE_MONOLITHIC_FORWARD=True`; see [Figure 3](figures/cross-frame-relay/fig3-compile-gains.png)):
 
@@ -410,7 +420,16 @@ Write operations are initiated from the shell: the models screen uses `L` to loa
 
 On Windows you can use `qlh.bat` directly; on Linux/macOS use `qlh.sh`. `bjtu`/`koakuma` are compatibility launchers, and the unified repository entry point is still `qlh`.
 
-The TUI's 9 feature screens are the main interaction and acceptance boundary: the models screen covers local assets/presets/download jobs, search, preflight, registration, load and unload; the distributed/nodes screen covers toggles, capacity, max nodes, invite, connect, join-request code/authorization consumption and deregistration; the logs screen covers filtering, statistics, export and clearing; the device screen covers auto-configuration and GPU selection; the settings screen reads and writes user settings. The final "debug" screen reads routes dynamically from `/openapi.json` of the running backend and serves only as a JSON fallback for operations that have no dedicated interaction yet; it does not count as product feature coverage. The current main backend OpenAPI snapshot is 152 operations; the actual number is whatever the target backend returns. Streaming chat and file upload are still handled by the chat page specifically.
+The TUI's 9 feature screens are the main interaction and acceptance boundary:
+
+- **models screen**: local assets / presets / download jobs, search, preflight, registration, load and unload;
+- **distributed / nodes screen**: toggles, capacity, max nodes, invite, connect, join-request code / authorization consumption and deregistration;
+- **logs screen**: filtering, statistics, export and clearing;
+- **device screen**: auto-configuration and GPU selection;
+- **settings screen**: reads and writes user settings;
+- **"debug" screen**: reads routes dynamically from `/openapi.json` of the running backend; it is only a JSON fallback for operations without a dedicated interaction, and does **not** count as product feature coverage.
+
+The current main backend OpenAPI snapshot is 152 operations; the actual number is whatever the target backend returns. Streaming chat and file upload are still handled by the chat page specifically.
 
 ## Models and Distribution
 
@@ -466,7 +485,9 @@ Targeted checks for high-risk mainlines:
 
 Real hardware, cross-machine networking, Android ARM64, performance and long-run soak must additionally preserve the raw commands, environment, model digests, topology, output and failure boundaries; a green test run alone does not replace that evidence.
 
-**Documentation checks** (purely static, standard library only): `python scripts/run_doc_checks.py` runs the relative-link check and the README bilingual-structure check. The very same suite runs twice — in CI ([`.github/workflows/checks.yml`](../.github/workflows/checks.yml)) and in a local pre-push hook ([`.githooks/`](../.githooks/README.md), enabled with `git config core.hooksPath .githooks`) — i.e. **defined once, reused in both places**. The immediate reason for adding it: the repository had no automated checks at all, and archived documents easily leave behind "reference not updated" dead links — a single pass turned up 20 of them.
+**Documentation checks** (purely static, standard library only): `python scripts/run_doc_checks.py` runs two checks — relative-link dead links, and README bilingual-structure sync.
+
+The very same suite runs twice — in **CI** ([`.github/workflows/checks.yml`](../.github/workflows/checks.yml)) and in a **local pre-push hook** ([`.githooks/`](../.githooks/README.md), enabled with `git config core.hooksPath .githooks`) — i.e. **defined once, reused in both places**. The immediate reason for adding it: the repository had no automated checks at all, and archived documents easily leave behind "reference not updated" dead links — a single pass turned up 20 of them.
 
 ## Documentation Index
 
