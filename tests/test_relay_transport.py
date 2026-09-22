@@ -26,10 +26,14 @@ class _FakeRunner:
     def __init__(self) -> None:
         self.requests: list[tuple[int, bytes]] = []
         self.closed = False
+        self.resets = 0
 
     def request_token(self, hidden: bytes, *, n_tokens: int) -> int:
         self.requests.append((n_tokens, hidden))
         return 1000 + n_tokens
+
+    def reset(self) -> None:
+        self.resets += 1
 
     def close(self) -> None:
         self.closed = True
@@ -80,7 +84,7 @@ def test_truncated_payload_is_rejected():
         right.close()
 
 
-def test_loopback_client_bridge_preserves_order_and_closes_runner():
+def test_loopback_client_bridge_preserves_order_and_resets_runner():
     listener = open_loopback_listener("127.0.0.1", 0)
     port = listener.getsockname()[1]
     runner = _FakeRunner()
@@ -103,10 +107,50 @@ def test_loopback_client_bridge_preserves_order_and_closes_runner():
 
     assert not thread.is_alive()
     assert [request[0] for request in runner.requests] == [1, 3]
-    assert runner.closed is True
+    # ★ `CLOSE` 只 reset、**不 close**：引擎属于服务进程，要跨连接复用（见下面的双会话回归测试）
+    assert runner.closed is False
+    assert runner.resets >= 1
     assert results[0].closed_cleanly is True
     assert results[0].frames == 2
     assert results[0].tokens == 4
+
+
+def test_close_frame_does_not_destroy_runner_across_sessions():
+    """★ 回归守卫：`CLOSE` 只 reset、**不 close** —— 否则服务端只能成功服务**一次**。
+
+    真实故障（2026-09-22 实测）：探针每次实验结束都会发 `CLOSE`；旧实现里服务端调
+    `runner.close()` 销毁底层 handle，于是**该服务的第二个连接必然失败** ——
+    帧完全正确（32 tokens / 114688 字节）却报 `rc=-5 参数非法`，现象与"模型算错"难以区分，
+    只能靠重启服务恢复。本测试用**两个连续会话**把该行为钉死。
+    """
+    listener = open_loopback_listener("127.0.0.1", 0)
+    port = listener.getsockname()[1]
+    runner = _FakeRunner()
+    sessions = []
+
+    def serve() -> None:
+        for _ in range(2):  # 连续两次会话（模拟"先跑 A 组，紧接着跑 B 组"）
+            connection, _ = listener.accept()
+            with connection:
+                sessions.append(
+                    serve_relay_connection(connection, runner, n_embd=2, max_tokens=4))
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        for _ in range(2):
+            with RelayTcpClient("127.0.0.1", port, n_embd=2, max_tokens=4) as client:
+                assert client.request_token(
+                    b"\x00" * expected_hidden_bytes(1, 2), n_tokens=1) == 1001
+    finally:
+        thread.join(timeout=3)
+        listener.close()
+
+    assert not thread.is_alive()
+    assert runner.closed is False        # ★ 引擎必须活着（旧实现这里是 True）
+    assert runner.resets >= 2            # ★ 两次会话各 reset 一次
+    assert [session.closed_cleanly for session in sessions] == [True, True]
+    assert [session.frames for session in sessions] == [1, 1]
 
 
 def test_bridge_rejects_shape_mismatch_and_returns_error_frame():

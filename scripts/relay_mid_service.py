@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -253,6 +255,18 @@ class ShimTailRunner:
         import numpy as np  # noqa: PLC0415
 
         count = int(n_tokens)
+        expected = count * int(self.n_embd) * 4
+        if os.environ.get("QLH_TAIL_DIAG") == "1":
+            # 诊断用（默认关闭）：定位 A 组（上游在 y700）通、B 组（上游在本机）报 rc=-5 的差异。
+            # rc=-5 的语义是"embd/n_tokens 到了非法值"，所以要看的是**帧的字节数**而不是数值。
+            print(json.dumps({"diag": "tail_frame", "n_tokens": count, "n_embd": self.n_embd,
+                              "got_bytes": len(hidden_bytes), "expected_bytes": expected,
+                              "n_past": self._pos, "ok": len(hidden_bytes) == expected}),
+                  flush=True)
+        if len(hidden_bytes) != expected:
+            raise ValueError(
+                f"tail 段收到 {len(hidden_bytes)} 字节，但 n_tokens={count} × n_embd={self.n_embd}"
+                f" × 4 应为 {expected} 字节（帧与段划分不匹配）")
         incoming = np.frombuffer(hidden_bytes, dtype=np.float32).reshape(count, self.n_embd)
         token = self._upstream.forward_hidden_to_token(incoming, n_past=self._pos)
         self._pos += count
@@ -286,6 +300,10 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--dll-dir", action="append", default=[])
     ap.add_argument("--ready-file", default=None, help="写就绪标记（含实际端点），供驱动等待")
     ap.add_argument("--max-connections", type=int, default=0, help="0 = 不限制")
+    ap.add_argument("--heartbeat-interval", type=float, default=5.0,
+                    help="★ P4.5 健康检查：定期刷新 ready 文件的时间戳（秒；0 = 关闭）。"
+                         "外部据此判断服务是否还活着 —— 服务跑在 ssh 会话里时会被网络抖动静默带走，"
+                         "没有心跳就分不清'服务已退出'与'模型算错'")
     return ap.parse_args(argv)
 
 
@@ -343,8 +361,30 @@ def main(argv: list[str] | None = None) -> int:
     if args.ready_file:
         target = Path(args.ready_file)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(ready, ensure_ascii=False), encoding="utf-8")
-    print(f"[ready] role={args.role} listening {host}:{port} n_embd={runner.n_embd}", flush=True)
+
+        def _write_ready() -> None:
+            payload = dict(ready)
+            payload["alive_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            payload["pid"] = os.getpid()
+            target.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+        _write_ready()
+        if args.heartbeat_interval and float(args.heartbeat_interval) > 0:
+            # ★ P4.5 健康检查：定期刷新 ready 文件的时间戳，外部据此判断"服务是否还活着"。
+            # 教训：服务跑在 ssh 会话里时，一次网络抖动就会把它**静默带走**，而客户端只会
+            # 看到一个与"模型层错误"难以区分的连接错误（实测踩到，见文档 §8.4）。
+            # 有了心跳，"服务已退出"与"模型算错"就能被分开。
+            def _beat() -> None:
+                while True:
+                    time.sleep(float(args.heartbeat_interval))
+                    try:
+                        _write_ready()
+                    except Exception:  # noqa: BLE001 - 心跳写失败不应终止服务
+                        pass
+
+            threading.Thread(target=_beat, daemon=True).start()
+    print(f"[ready] role={args.role} listening {host}:{port} n_embd={runner.n_embd} "
+          f"(heartbeat={args.heartbeat_interval}s)", flush=True)
 
     served = 0
     try:

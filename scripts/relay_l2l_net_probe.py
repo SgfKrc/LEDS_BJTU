@@ -94,6 +94,17 @@ def _whole_tokens(whole: Path, prompt: list[int], gen: int, threads: int) -> lis
     return tokens
 
 
+def _stat(values: list[float]) -> dict[str, object]:
+    """均值/标准差/样本数（分段计时的口径统一在这里）。"""
+    import statistics
+
+    if not values:
+        return {"n": 0, "mean": None, "std": None, "min": None, "max": None}
+    return {"n": len(values), "mean": round(statistics.fmean(values), 3),
+            "std": round(statistics.pstdev(values), 3) if len(values) > 1 else 0.0,
+            "min": round(min(values), 3), "max": round(max(values), 3)}
+
+
 def main() -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -121,6 +132,14 @@ def main() -> int:
     ap.add_argument("--shim", default="build/keephead/build-cpu/bin/qlh_keep_head.dll")
     ap.add_argument("--json-out", default=None)
     args = ap.parse_args()
+
+    # ★ P4.5 健康检查：**先探活** —— 放在最前面，避免为一次注定失败的运行白跑整模对照；
+    # 也把"远端段已退出"与"模型算错"分开（见 `_preflight` docstring）。
+    if args.head_endpoint:
+        _preflight(args.head_endpoint, role="上游(head)")
+    if args.middle_endpoint:
+        _preflight(args.middle_endpoint, role="中间(middle)")
+    _preflight(args.tail_endpoint, role="末段(tail)")
 
     import numpy as np
 
@@ -160,9 +179,13 @@ def main() -> int:
     used_middle = 0
     tokens: list[int] = []
     pos = 0
+    # ★ P4.5 ①：**分段计时** —— 正确性之外还要有性能数字（各段各步耗时 + 端到端）
+    seg_ms: dict[str, list[float]] = {"head": [], "middle": [], "tail": []}
+    e2e_ms: list[float] = []
     started = time.perf_counter()
     try:
         for step in range(int(args.gen)):
+            t_step = time.perf_counter()
             toks = prompt if step == 0 else [tokens[-1]]
             if head_client is not None:
                 # ★ P4.5：上游在远端（吃 token 吐 hidden）—— 本机不跑任何模型
@@ -172,10 +195,18 @@ def main() -> int:
                 hidden = upstream.forward_tokens_to_hidden(toks, n_past=pos)
                 payload = np.ascontiguousarray(hidden, dtype=np.float32).tobytes()
                 n_tok = int(hidden.shape[0])
+            t_head = time.perf_counter()
             if middle is not None:
                 payload = middle.request_hidden(payload, n_tokens=n_tok)
                 used_middle += 1
+            t_mid = time.perf_counter()
             token = tail.request_token(payload, n_tokens=n_tok)
+            t_tail = time.perf_counter()
+            seg_ms["head"].append((t_head - t_step) * 1000.0)
+            if middle is not None:
+                seg_ms["middle"].append((t_mid - t_head) * 1000.0)
+            seg_ms["tail"].append((t_tail - t_mid) * 1000.0)
+            e2e_ms.append((t_tail - t_step) * 1000.0)
             tokens.append(int(token))
             pos += n_tok
     finally:
@@ -214,8 +245,13 @@ def main() -> int:
         "verdict": {"criterion": "per_token_argmax", "passed": passed,
                     "tokens_match": passed, "matched": matched, "total": len(baseline),
                     "first_mismatch_index": first_bad},
-        "timing": {"baseline_s": baseline_s, "relay_s": relay_s,
-                   "middle_hops": used_middle},
+        "timing": {
+            "baseline_s": baseline_s, "relay_s": relay_s, "middle_hops": used_middle,
+            # ★ P4.5 ①：分段耗时与端到端（`head` 段在远端时含其往返；每步一个样本）
+            "segments_ms": {name: _stat(values) for name, values in seg_ms.items() if values},
+            "end_to_end_ms": _stat(e2e_ms),
+            "per_step_e2e_ms": [round(value, 3) for value in e2e_ms],
+        },
         "host_total_layers_note": "本机只跑 head 段（llama.cpp/CPU）；中段/末段在远端设备上",
     }
     print(json.dumps(report, ensure_ascii=False))
@@ -235,6 +271,29 @@ def _split(endpoint: str) -> tuple[str, int]:
     if not host or not port.isdigit():
         raise SystemExit(f"FAIL: endpoint 需要 host:port，实得 {endpoint!r}")
     return host, int(port)
+
+
+def _preflight(endpoint: str, *, role: str, timeout: float = 5.0) -> None:
+    """★ P4.5 健康检查（客户端侧）：收发之前先做一次 **TCP 探活**。
+
+    为什么必须单独做这一步：远端段若已退出（典型情形是它跑在 ssh 会话里、被一次网络抖动
+    **静默带走**），**隧道端口仍在本机监听** ⇒ 第一次收发才会失败，且错误形如连接被 reset，
+    **与"模型算错"几乎无法区分**（实测踩到，见文档 §8.4）。探活让这种失败在"开始推理之前"
+    就以明确诊断终止，并指向正确的排查方向。
+    """
+    import socket  # noqa: PLC0415
+
+    host, port = _split(endpoint)
+    try:
+        with socket.create_connection((host, port), timeout=float(timeout)):
+            return
+    except OSError as exc:
+        raise SystemExit(
+            f"FAIL: {role} 段不可达（{endpoint}）：{exc}\n"
+            "  ⇒ 常见原因：**远端服务已退出**（例如跑在 ssh 会话里、被网络抖动静默带走），"
+            "或 SSH 隧道已断。\n"
+            "  ⇒ 检查该端 ready 文件的 `alive_at` 是否还在更新（服务端默认每 5s 心跳一次），"
+            "以及远端进程是否还在。")
 
 
 if __name__ == "__main__":

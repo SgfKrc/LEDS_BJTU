@@ -563,10 +563,15 @@ def serve_relay_connection(
             if frame.kind == RelayFrameKind.CLOSE:
                 if frame.n_tokens != 0 or frame.payload:
                     raise RelayProtocolError("invalid_close_frame")
+                # ★ 只 `reset()`，**绝不 `close()`** —— 这是服务端引擎的生存期守卫。
+                # `CLOSE` 的语义是"结束**本次会话**"，不是"销毁服务端引擎"：runner 属于**服务进程**、
+                # 要跨连接复用，`close()` 会把底层 handle 置空 ⇒ 该服务此后**每个连接**都失败
+                # （实测：帧完全正确却报 `rc=-5 参数非法`，现象与"模型算错"难以区分，只能靠重启恢复）。
+                # 引擎的真正释放发生在进程退出时（见 `run_service` 的 finally）。
                 try:
-                    runner.close()
+                    runner.reset()
                 except Exception as exc:  # noqa: BLE001
-                    logger.exception("Relay runner close failed: code=%s", RELAY_RUNNER_ERROR)
+                    logger.exception("Relay runner reset failed: code=%s", RELAY_RUNNER_ERROR)
                     raise RelayProtocolError(RELAY_RUNNER_ERROR) from exc
                 send_frame(
                     sock,
@@ -667,10 +672,11 @@ def serve_relay_middle_connection(
             if frame.kind == RelayFrameKind.CLOSE:
                 if frame.n_tokens != 0 or frame.payload:
                     raise RelayProtocolError("invalid_close_frame")
+                # ★ 同 `serve_relay_connection`：只 reset，不 close（见那里的详细说明）。
                 try:
-                    runner.close()
+                    runner.reset()
                 except Exception as exc:  # noqa: BLE001
-                    logger.exception("Relay middle runner close failed: code=%s",
+                    logger.exception("Relay middle runner reset failed: code=%s",
                                      RELAY_RUNNER_ERROR)
                     raise RelayProtocolError(RELAY_RUNNER_ERROR) from exc
                 send_frame(
