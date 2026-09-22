@@ -50,6 +50,17 @@ def check_file(md_path):
                     continue
                 # 相对路径解析（相对当前文件所在目录）
                 abs_target = os.path.normpath(os.path.join(base, target))
+                # 仓库外的相对路径（如 `../../qlh-release/docs/…`）是**本地工作区路径说明**，
+                # 不是可校验的仓库内链接：它们指向与主仓并列的独立仓库/工作区目录，
+                # 换一台机器或 CI 上必然不存在。这类引用不计入链接质量门。
+                try:
+                    inside_repo = not os.path.relpath(abs_target, ROOT).startswith('..')
+                except ValueError:
+                    # Windows 上跨盘符时 relpath 会抛 ValueError ⇒ 目标必然在仓库外。
+                    # 不接住它，检查工具自己就会崩（比漏报一条链接更糟）。
+                    inside_repo = False
+                if not inside_repo:
+                    continue
                 if not os.path.exists(abs_target):
                     problems.append((lineno, raw, '目标不存在'))
                 elif os.path.isdir(abs_target):

@@ -31,6 +31,12 @@ jobs:
           # 文档检查不需要 LFS 大文件，跳过 smudge 以加快速度
           lfs: false
 
+      # `docs/` 里有若干引用指向 `android/` 子模块内的文档（如 Android 验证替代路径）。
+      # actions/checkout 默认不检出子模块，缺了它那些链接会全部误报为死链。
+      # 只按需拉这一个子模块（浅克隆）——拉全部子模块会明显拖慢这个秒级检查。
+      - name: Fetch android submodule (referenced by docs)
+        run: git submodule update --init --depth 1 android
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
