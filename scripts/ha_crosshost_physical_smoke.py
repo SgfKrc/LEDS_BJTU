@@ -1,8 +1,10 @@
 """Run the HA-CROSSHOST-01 physical Surface/y700 smoke gate.
 
 The Surface worker is streamed over SSH stdin and never written to the remote
-disk.  The control frames travel through an SSH reverse TCP tunnel; this is a
-physical process/network check, not a production availability claim.
+disk.  The control frames travel through an SSH reverse TCP tunnel.  The y700
+probe uses Android wireless debugging through an explicitly supplied or
+currently online ``adb`` serial; it never assumes a fixed Android port.  This
+is a physical process/network check, not a production availability claim.
 """
 
 from __future__ import annotations
@@ -10,6 +12,8 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -170,7 +174,7 @@ def _stop_ssh(process: subprocess.Popen[bytes]) -> None:
             process.wait(timeout=8)
 
 
-def _run_surface(target: str, remote_root: str) -> dict[str, Any]:
+def _run_surface(target: str, remote_root: str, *, long_steps: int = 1) -> dict[str, Any]:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", 0))
@@ -206,6 +210,28 @@ def _run_surface(target: str, remote_root: str) -> dict[str, Any]:
                 "now_ms": now_ms,
             })
             events.append({"event": "surface_control_frame_accepted", "generation": accepted["generation"]})
+            requested_frames = max(1, int(long_steps))
+            for sequence in range(1, requested_frames):
+                long_frame = TransportEnvelope.from_payload(
+                    payload,
+                    request_id=f"physical-long-{sequence}",
+                    connection_generation=1,
+                    attempt_id="physical-1",
+                    channel="control",
+                    sequence=sequence,
+                    deadline_ms=int(time.time() * 1000) + max(20_000, requested_frames * 100),
+                )
+                _expect_ok(connection, {
+                    "op": "receive",
+                    "envelope": long_frame.to_dict(),
+                    "payload_b64": base64.b64encode(payload).decode("ascii"),
+                    "now_ms": int(time.time() * 1000),
+                })
+            long_running = {
+                "requested_frames": requested_frames,
+                "accepted_frames": requested_frames,
+                "transport": "ssh_reverse_tcp",
+            }
             old = TransportEnvelope.from_payload(
                 payload,
                 request_id="physical-stale",
@@ -263,25 +289,94 @@ def _run_surface(target: str, remote_root: str) -> dict[str, Any]:
             "events": events,
             "rto_ms": max(0, int((time.perf_counter() - failure_started) * 1000)),
             "rpo": {"last_durable_sequence": 0, "lost_events": 0, "scope": "transport_only"},
+            "long_running": long_running,
         }
     finally:
         _stop_ssh(first_process)
         listener.close()
 
 
-def _run_y700(target: str) -> dict[str, Any]:
+def _find_adb(explicit: str | None = None) -> str | None:
+    if explicit:
+        return explicit
+    discovered = shutil.which("adb")
+    if discovered:
+        return discovered
+    sdk_candidates = [os.environ.get("ANDROID_HOME"), os.environ.get("ANDROID_SDK_ROOT")]
+    if os.name == "nt":
+        sdk_candidates.extend([
+            str(Path.home() / "AppData" / "Local" / "Android" / "Sdk"),
+            str(Path.home() / "Android" / "Sdk"),
+        ])
+    for sdk in sdk_candidates:
+        if sdk:
+            candidate = Path(sdk) / "platform-tools" / ("adb.exe" if os.name == "nt" else "adb")
+            if candidate.is_file():
+                return str(candidate)
+    return None
+
+
+def _discover_y700_serial(adb: str, host: str) -> str | None:
+    completed = subprocess.run(
+        [adb, "devices", "-l"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    online: list[str] = []
+    for line in completed.stdout.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 2 and fields[1] == "device":
+            online.append(fields[0])
+    matching = [item for item in online if item == host or item.startswith(f"{host}:")]
+    if len(matching) == 1:
+        return matching[0]
+    if not matching and len(online) == 1:
+        return online[0]
+    return None
+
+
+def _run_y700(
+    serial: str | None = None,
+    *,
+    adb: str | None = None,
+    host: str = "100.99.211.13",
+) -> dict[str, Any]:
+    adb_path = _find_adb(adb)
+    if not adb_path:
+        return {
+            "status": "failed",
+            "target": "y700",
+            "physical_nodes": True,
+            "transport": "adb_wireless_debugging",
+            "error_code": "adb_not_found",
+            "model_gate": "blocked_no_gguf",
+        }
+    serial = serial or _discover_y700_serial(adb_path, host)
+    if not serial:
+        return {
+            "status": "failed",
+            "target": "y700",
+            "physical_nodes": True,
+            "transport": "adb_wireless_debugging",
+            "error_code": "dynamic_adb_serial_required",
+            "model_gate": "blocked_no_gguf",
+            "hint": f"run adb connect {host}:<dynamic_port>, then pass --y700-serial",
+        }
     command = (
-        "printf 'model='; getprop ro.product.model; "
-        "printf 'sdk='; getprop ro.build.version.sdk; "
-        "printf 'abi='; getprop ro.product.cpu.abilist; "
-        "printf 'nproc='; nproc; "
-        "printf 'available_mem_kb='; awk '/MemAvailable/ {print $2}' /proc/meminfo; "
-        "printf 'model_root=%s\\n' ~/storage/shared/Download/QLH/models; "
-        "printf 'model_root_exists='; test -d ~/storage/shared/Download/QLH/models && echo true || echo false; "
-        "printf 'gguf_count='; find ~/storage/shared/Download/QLH/models -maxdepth 1 -type f -name '*.gguf' 2>/dev/null | wc -l"
+        "printf 'model=%s\\n' \"$(getprop ro.product.model)\"; "
+        "printf 'sdk=%s\\n' \"$(getprop ro.build.version.sdk)\"; "
+        "printf 'abi=%s\\n' \"$(getprop ro.product.cpu.abilist)\"; "
+        "printf 'nproc=%s\\n' \"$(nproc)\"; "
+        "printf 'available_mem_kb=%s\\n' \"$(awk '/MemAvailable/ {print $2}' /proc/meminfo)\"; "
+        "printf 'model_root=/sdcard/Download/QLH/models\\n'; "
+        "if test -d /sdcard/Download/QLH/models; then printf 'model_root_exists=true\\n'; "
+        "else printf 'model_root_exists=false\\n'; fi; "
+        "printf 'gguf_count=%s\\n' \"$(find /sdcard/Download/QLH/models -maxdepth 1 -type f -name '*.gguf' 2>/dev/null | wc -l | tr -d ' ')\""
     )
     completed = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", target, command],
+        [adb_path, "-s", serial, "shell", command],
         capture_output=True,
         text=True,
         timeout=20,
@@ -292,19 +387,37 @@ def _run_y700(target: str) -> dict[str, Any]:
         if "=" in line:
             key, value = line.split("=", 1)
             observations[key.strip()] = value.strip()
-    online = completed.returncode == 0 and observations.get("abi") == "arm64-v8a"
+    online = completed.returncode == 0 and "arm64-v8a" in {
+        item.strip() for item in observations.get("abi", "").split(",")
+    }
+    try:
+        gguf_count = int(observations.get("gguf_count", "0"))
+    except ValueError:
+        gguf_count = 0
     return {
         "status": "passed" if online else "failed",
         "target": "y700",
         "physical_nodes": True,
+        "transport": "adb_wireless_debugging",
+        "serial": serial,
         "observations": observations,
         "model_gate": (
             "ready_for_arm64_model_smoke"
-            if observations.get("gguf_count", "0").isdigit()
-            and int(observations["gguf_count"]) > 0
+            if gguf_count > 0
             else "blocked_no_gguf"
         ),
+        "error_code": "adb_failed" if completed.returncode else "",
         "stderr_tail": completed.stderr[-500:] if completed.returncode else "",
+    }
+
+
+def _failed_result(target: str, error: Exception) -> dict[str, Any]:
+    return {
+        "status": "failed",
+        "target": target,
+        "physical_nodes": True,
+        "error_type": type(error).__name__,
+        "error": str(error)[:500],
     }
 
 
@@ -312,14 +425,28 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--surface-target", default="surface@100.100.52.106")
     parser.add_argument("--surface-root", default=r"C:\Users\surface\Documents\LEDS_BJTU")
-    parser.add_argument("--y700-target", default="y700")
+    parser.add_argument("--y700-serial", help="adb wireless serial, for example IP:<dynamic_port>")
+    parser.add_argument("--y700-host", default="100.99.211.13")
+    parser.add_argument("--adb", help="path to adb; defaults to PATH or the local Android SDK")
+    parser.add_argument("--long-steps", type=int, default=1,
+                        help="Surface control frames before restart (default: 1)")
     parser.add_argument("--evidence", type=Path)
     args = parser.parse_args()
+    long_steps = max(1, min(int(args.long_steps), 10_000))
+    try:
+        surface = _run_surface(args.surface_target, args.surface_root, long_steps=long_steps)
+    except Exception as exc:
+        surface = _failed_result("surface", exc)
+    try:
+        y700 = _run_y700(args.y700_serial, adb=args.adb, host=args.y700_host)
+    except Exception as exc:
+        y700 = _failed_result("y700", exc)
     report = {
         "schema_version": "qlh.cluster.crosshost.physical.v1",
         "scenario": "physical_surface_y700_smoke",
-        "surface": _run_surface(args.surface_target, args.surface_root),
-        "y700": _run_y700(args.y700_target),
+        "surface": surface,
+        "y700": y700,
+        "long_steps": long_steps,
         "production_availability_claim": False,
     }
     rendered = json.dumps(report, ensure_ascii=True, sort_keys=True, indent=2) + "\n"
