@@ -43,6 +43,9 @@ class _FakeMiddleRunner:
         self.requests.append((n_tokens, hidden))
         return bytes((value + 1) % 256 for value in hidden)
 
+    def reset(self) -> None:
+        self.reset_calls += 1
+
     def close(self) -> None:
         self.closed = True
 
@@ -84,7 +87,7 @@ def test_middle_round_trip_returns_hidden_and_closes_cleanly():
         thread.join(timeout=10)
         assert produced == bytes((value + 1) % 256 for value in payload)
         assert runner.requests == [(n_tokens, payload)]
-        assert runner.closed is True
+        assert runner.closed is False        # ★ CLOSE 只 reset、不 close（引擎跨连接复用）
         bridge = result["bridge"]
         assert bridge.frames == 1 and bridge.tokens == n_tokens and bridge.closed_cleanly
     finally:
