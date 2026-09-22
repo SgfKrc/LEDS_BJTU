@@ -211,6 +211,7 @@ Screen { background: $surface; }
 #models-table, #resources-table, #nodes-table, #queue-table,
 #status-table, #logs-log { height: 1fr; }
 #status-pane, #queue-pane, #logs-pane { height: auto; color: $text-muted; }
+#ha-pane { height: auto; min-height: 7; border: round $primary 20%; padding: 0 1; margin-bottom: 1; }
 #device-pane, #settings-pane { height: auto; }
 #gpu-table { height: auto; max-height: 14; }
 
@@ -1384,6 +1385,7 @@ class MainScreen(Screen):
                 with Vertical(id="page-nodes", classes="page"):
                     yield Static("节点 · 成员与角色", classes="page-title")
                     yield Static(PAGES[4][2], classes="page-hint")
+                    yield Static("加载中…", id="ha-pane")
                     yield Static("选择节点后可执行邀请、连接和注销。", id="nodes-pane")
                     yield DataTable(id="nodes-table")
                 with Vertical(id="page-queue", classes="page"):
@@ -1505,6 +1507,7 @@ class MainScreen(Screen):
         self.query_one("#api-table", DataTable).add_columns(
             "方法", "路径", "领域", "模式", "说明")
         self.query_one("#models-pane", Static).update("加载中…")
+        self.query_one("#ha-pane", Static).update("加载中…")
         self.query_one("#cluster-pane", Static).update("加载中…")
         self.query_one("#settings-pane", Static).update(self.settings_text())
         self.refresh_topbar()
@@ -2102,6 +2105,8 @@ class MainScreen(Screen):
             for name, path in (
                 ("config", "/cluster/config"),
                 ("role", "/cluster/my-role"),
+                ("fence", API_PATHS["cluster_control_plane"]),
+                ("transfer_logs", API_PATHS["cluster_transfer_logs"]),
                 ("distributed", "/cluster/config/distributed-inference"),
                 ("capacity", "/cluster/pipeline-capacity"),
                 ("reshard", "/cluster/pipeline-reshard"),
@@ -2113,8 +2118,89 @@ class MainScreen(Screen):
             with self._refresh_state_lock:
                 self._cluster_aux_inflight = False
 
+    def render_ha_status(self, payload: Dict[str, Any]) -> str:
+        """Render the read-only HA projection without inventing missing state."""
+
+        fence = payload.get("fence") if isinstance(payload.get("fence"), dict) else {}
+        role = payload.get("role") if isinstance(payload.get("role"), dict) else {}
+        auto = role.get("auto_role") if isinstance(role.get("auto_role"), dict) else {}
+        role_name = str(role.get("node_role") or role.get("runtime_node_role") or "").lower()
+        leader = (
+            fence.get("leader_id")
+            or role.get("master_node_id")
+            or role.get("leader_id")
+            or (role.get("node_id") if role_name == "master" else None)
+            or "unknown"
+        )
+        term = fence.get("committed_term")
+        if term is None:
+            term = auto.get("term")
+        epoch = fence.get("voter_set_epoch")
+        certificate = str(fence.get("certificate_digest") or "none")
+        if len(certificate) > 16:
+            certificate = certificate[:16] + "..."
+
+        outcome = auto.get("last_outcome") if isinstance(auto.get("last_outcome"), dict) else {}
+        if fence.get("enabled") is False:
+            majority = "not enabled"
+        elif outcome.get("accepted") is True:
+            majority = "available"
+        elif auto.get("state") == "read_only" or str(outcome.get("reason")) in {
+            "quorum_unavailable", "quorum_requires_witness",
+        }:
+            majority = "unavailable"
+        elif fence.get("available") is False:
+            majority = "unavailable"
+        elif fence.get("read_only_reason"):
+            majority = "unavailable"
+        else:
+            majority = "unknown (not exposed)"
+
+        versions: set[str] = set()
+        nodes = self.node_aux.get("nodes") if isinstance(self.node_aux, dict) else None
+        if isinstance(nodes, dict):
+            nodes = list(nodes.values())
+        for node in nodes if isinstance(nodes, list) else []:
+            if not isinstance(node, dict):
+                continue
+            info = node.get("device_info") if isinstance(node.get("device_info"), dict) else {}
+            version = node.get("master_score_version") or info.get("master_score_version")
+            if version:
+                versions.add(str(version))
+        if len(versions) == 1:
+            score_version = next(iter(versions))
+        elif versions:
+            score_version = "conflict: " + ", ".join(sorted(versions))
+        else:
+            score_version = "not reported"
+
+        transfer = payload.get("transfer_logs")
+        logs = transfer.get("logs") if isinstance(transfer, dict) else []
+        latest = logs[-1] if isinstance(logs, list) and logs and isinstance(logs[-1], dict) else {}
+        handoff_reason = (
+            latest.get("reason") or latest.get("result") or latest.get("event_type") or "none"
+        )
+        read_only = (
+            fence.get("read_only_reason")
+            or auto.get("reason")
+            or "none"
+        )
+        if fence.get("_error"):
+            read_only = str(fence["_error"])
+            majority = "unavailable"
+
+        return "\n".join((
+            "[b $accent]HA control (read-only)[/]",
+            f"leader: {leader}    term/epoch: {term if term is not None else 'unknown'}/{epoch if epoch is not None else 'unknown'}",
+            f"certificate: {certificate}    majority: {majority}",
+            f"score version: {score_version}",
+            f"last handoff: {handoff_reason}",
+            f"read-only reason: {read_only}",
+        ))
+
     def fill_cluster_aux(self, payload: Dict[str, Any]) -> None:
         self.cluster_aux = payload
+        self.query_one("#ha-pane", Static).update(self.render_ha_status(payload))
         pane = self.query_one("#cluster-pane", Static)
         config = payload.get("config") or {}
         distributed = payload.get("distributed") or {}
@@ -2394,6 +2480,9 @@ class MainScreen(Screen):
         self.fill_logs(logs)
 
     def fill_nodes(self, nodes: Dict[str, Any]) -> None:
+        self.node_aux = nodes
+        if self.cluster_aux:
+            self.query_one("#ha-pane", Static).update(self.render_ha_status(self.cluster_aux))
         table = self.query_one("#nodes-table", DataTable)
         table.clear()
         if "_error" in nodes:
