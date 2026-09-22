@@ -179,11 +179,19 @@ def main() -> int:
             tokens.append(int(token))
             pos += n_tok
     finally:
+        # ⚠️ 关闭失败**不得掩盖原始异常**（实测踩到：close 抛 ConnectionAbortedError，
+        #    把循环里真正的错误盖掉了，只能看到"关闭失败"这个假象）。
         for client in (tail, middle, head_client):
             if client is not None:
-                client.close()
+                try:
+                    client.close()
+                except Exception:  # noqa: BLE001
+                    pass
         if upstream is not None:
-            upstream.close()
+            try:
+                upstream.close()
+            except Exception:  # noqa: BLE001
+                pass
     relay_s = round(time.perf_counter() - started, 2)
 
     matched = sum(1 for a, b in zip(tokens, baseline) if a == b)
