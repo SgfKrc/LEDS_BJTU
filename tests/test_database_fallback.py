@@ -7,6 +7,12 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _scheduler_sources() -> list[Path]:
+    sources = [ROOT / "src" / "scheduler.py"]
+    sources.extend(sorted((ROOT / "src").glob("scheduler_*.py")))
+    return sources
+
+
 def test_python_runtime_has_no_postgresql_entrypoint():
     assert not (ROOT / "src" / "db.py").exists()
     assert not (ROOT / "scripts" / "setup_test_db.py").exists()
@@ -32,7 +38,8 @@ def test_python_runtime_has_no_postgresql_entrypoint():
 
 
 def test_scheduler_and_model_host_expose_no_database_compatibility_flags():
-    scheduler_source = (ROOT / "src" / "scheduler.py").read_text(encoding="utf-8")
+    scheduler_sources = _scheduler_sources()
+    assert scheduler_sources
     model_host_source = (ROOT / "src" / "model_host.py").read_text(encoding="utf-8")
     for token in (
         "_get_db",
@@ -42,7 +49,7 @@ def test_scheduler_and_model_host_expose_no_database_compatibility_flags():
         "_start_master_db_heartbeat",
         "_start_database_reconnect_monitor",
     ):
-        assert token not in scheduler_source
+        assert all(token not in path.read_text(encoding="utf-8") for path in scheduler_sources)
         assert token not in model_host_source
 
 

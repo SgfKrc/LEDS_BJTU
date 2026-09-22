@@ -35,10 +35,12 @@ import sys
 from pathlib import Path
 
 NAME_RE = re.compile(r"r(\d+)-k(\d+)$")
+ANALYSIS_SCHEMA_VERSION = "qlh.relay_cut_model_analysis.v2"
+RAW_RECORD_ORIGIN = "raw_repeated_measurements"
 
 
 def _extract(path: Path) -> dict[str, object] | None:
-    match = NAME_RE.search(path.stem)
+    match = NAME_RE.fullmatch(path.stem)
     if match is None:
         return None
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -52,14 +54,32 @@ def _extract(path: Path) -> dict[str, object] | None:
     up, down = _mean("upstream_decode_ms"), _mean("downstream_decode_ms")
     if up is None or down is None:
         return None
+    load = data.get("load") or {}
+    models = data.get("models") or {}
+    upstream_model = models.get("upstream") or {}
+    whole_model = models.get("whole") or {}
+    origin = data.get("record_origin")
+    origin_kind = origin.get("kind") if isinstance(origin, dict) else None
     return {
         "record": path.name,
+        "record_path": str(path.resolve()),
+        "experiment_id": data.get("experiment_id"),
         "round": int(match.group(1)),
         "cut": int(match.group(2)),
         "passed": bool(verdict.get("passed")),
         "upstream_ms": up,
         "downstream_ms": down,
         "total_ms": up + down,
+        "model": upstream_model.get("id") or data.get("model"),
+        "kind": data.get("kind"),
+        "path": data.get("path"),
+        "commit": data.get("commit") or data.get("git_head"),
+        "prefill": load.get("prefill_tokens", data.get("prefill")),
+        "gen": load.get("gen_tokens", data.get("gen")),
+        "batch": load.get("batch", data.get("batch")),
+        "warmup": load.get("warmup"),
+        "origin_kind": origin_kind,
+        "whole_model_bytes": whole_model.get("model_bytes") or data.get("whole_model_bytes"),
     }
 
 
@@ -104,8 +124,13 @@ def main() -> int:
     args = ap.parse_args()
 
     rows: list[dict[str, object]] = []
+    seen_paths: set[str] = set()
     for pattern in args.records:
         for path in sorted(Path(p) for p in glob.glob(pattern)):
+            resolved_path = str(path.resolve())
+            if resolved_path in seen_paths:
+                continue
+            seen_paths.add(resolved_path)
             item = _extract(path)
             if item is None:
                 print(f"[skip] 无法解析或缺少指标：{path.name}", file=sys.stderr)
@@ -119,14 +144,44 @@ def main() -> int:
         print("FAIL: --min-rounds must be >= 1", file=sys.stderr)
         return 2
 
+    input_errors: list[str] = []
+    record_keys: set[tuple[int, int]] = set()
+    identity_fields = ("model", "kind", "path", "commit", "prefill", "gen", "batch", "warmup")
+    identities = {
+        tuple(row.get(field) for field in identity_fields)
+        for row in rows
+    }
+    if len(identities) != 1:
+        input_errors.append("records mix multiple experiment identities")
+    for row in rows:
+        origin_kind = row.get("origin_kind")
+        if origin_kind != "raw_measurement":
+            input_errors.append(
+                f"{row['record']}: record_origin.kind={origin_kind!r} is not raw input"
+            )
+        if not row.get("experiment_id"):
+            input_errors.append(f"{row['record']}: experiment_id is required")
+        if row.get("warmup") is None:
+            input_errors.append(f"{row['record']}: load.warmup is required")
+        elif isinstance(row.get("warmup"), bool) or not isinstance(row.get("warmup"), int) or row["warmup"] < 0:
+            input_errors.append(f"{row['record']}: load.warmup must be a non-negative integer")
+        key = (int(row["round"]), int(row["cut"]))
+        if key in record_keys:
+            input_errors.append(f"duplicate experiment record: {key}")
+        record_keys.add(key)
+    if input_errors:
+        print("FAIL: invalid repeated-scan input: " + "; ".join(dict.fromkeys(input_errors)), file=sys.stderr)
+        return 2
+
     by_cut: dict[int, list[dict[str, object]]] = {}
     for row in rows:
         by_cut.setdefault(int(row["cut"]), []).append(row)
 
     round_counts = {cut: len(items) for cut, items in by_cut.items()}
+    round_sets = {cut: {int(item["round"]) for item in items} for cut, items in by_cut.items()}
     if len(set(round_counts.values())) != 1 or any(
         count < args.min_rounds for count in round_counts.values()
-    ):
+    ) or len({frozenset(rounds) for rounds in round_sets.values()}) != 1:
         print(
             "FAIL: every measured cut must have the same number of rounds "
             f"and at least {args.min_rounds}; got {round_counts}",
@@ -157,9 +212,8 @@ def main() -> int:
             "all_passed": all(bool(i["passed"]) for i in items),
             "upstream_median_ms": round(upstream_median, 4),
             "downstream_median_ms": round(downstream_median, 4),
-            # The synthetic records consumed by relay_cut_plan.py use the
-            # median of each segment. Keep this value additive and expose the
-            # median of per-run totals separately because medians do not add.
+            # Keep this value additive for the downstream planner and expose
+            # the median of per-run totals separately because medians do not add.
             "total_median_ms": round(upstream_median + downstream_median, 4),
             "median_of_totals_ms": round(_median_of_totals, 4),
             "total_min_ms": round(min(totals), 4),
@@ -190,11 +244,26 @@ def main() -> int:
 
     median_spread = max((float(e["spread_pct"] or 0.0)) for e in table)
     report = {
-        "schema_version": "qlh.relay_cut_model_analysis.v1",
+        "schema_version": ANALYSIS_SCHEMA_VERSION,
         "total_layers": args.total_layers,
         "min_rounds": args.min_rounds,
         "rounds_per_cut": round_counts,
         "records": [str(i["record"]) for i in rows],
+        "experiment_identity": {
+            field: next(iter(identities))[index]
+            for index, field in enumerate(identity_fields)
+        },
+        "warmup": {"steps": next(iter(identities))[-1], "consistent": True},
+        "whole_model_bytes": next(
+            (int(row["whole_model_bytes"]) for row in rows if row.get("whole_model_bytes")),
+            None,
+        ),
+        "record_origin": {
+            "kind": RAW_RECORD_ORIGIN,
+            "source_globs": list(args.records),
+            "source_records": [str(i["record_path"]) for i in rows],
+            "rounds": min(round_counts.values()),
+        },
         "by_cut": table,
         "linear_fit_total_median": fit,
         "best_cut_by_median": best["cut"],
@@ -206,7 +275,7 @@ def main() -> int:
             "input_valid": True,
             "has_significant_interior_optimum": significant,
             "noise_dominates": (median_spread > 10.0) and not significant,
-            "note": ("内部最优不显著 ⇒ 切点搜索应转向容量可行性"
+            "note": ("当前切点与噪声水平下未检出显著内部最优；切点搜索应转向容量可行性"
                      if not significant else
                      "内部最优显著 ⇒ 需要给成本模型补非线性项"),
         },

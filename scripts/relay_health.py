@@ -38,12 +38,27 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import re
+import shlex
 import socket
 import subprocess
 import sys
 from typing import Any
 
 STALE_DEFAULT = 30.0
+_SAFE_REMOTE_PATH = re.compile(r"^[A-Za-z0-9_./:\\-]+$")
+
+
+def _remote_cat_command(path: str) -> str:
+    """Build a shell-safe read command for the configured SSH endpoint."""
+    if not isinstance(path, str) or not path:
+        raise ValueError("ready path must be non-empty")
+    # SSH executes the final argument through the remote user's shell.  The
+    # target may be POSIX or Windows, so a shell-specific quote alone is not
+    # sufficient; reject metacharacters before applying POSIX quoting.
+    if not _SAFE_REMOTE_PATH.fullmatch(path):
+        raise ValueError("ready path contains shell metacharacters")
+    return f"cat -- {shlex.quote(path)}"
 
 
 def _enable_utf8_stdout() -> None:
@@ -81,10 +96,11 @@ def _check_ready(alias: str, path: str, *, timeout: float, stale_seconds: float)
     """
     target = f"{alias}:{path}"
     try:
+        command = _remote_cat_command(path)
         done = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={int(timeout)}",
-                               alias, f"cat {path}"],
+                               alias, command],
                               capture_output=True, text=True, timeout=timeout + 10, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         return {"ok": False, "reason": "ssh_failed", "target": target, "detail": str(exc)}
     if done.returncode != 0 or not done.stdout.strip():
         return {"ok": False, "reason": "no_ready_file", "target": target,
@@ -98,12 +114,15 @@ def _check_ready(alias: str, path: str, *, timeout: float, stale_seconds: float)
     age: float | None = None
     if alive_at:
         try:
-            stamp = dt.datetime.strptime(alive_at, "%Y-%m-%dT%H:%M:%S")
-            age = (dt.datetime.now() - stamp).total_seconds()
+            stamp = dt.datetime.fromisoformat(alive_at.replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                raise ValueError("heartbeat timestamp has no timezone")
+            age = (dt.datetime.now(dt.timezone.utc) - stamp.astimezone(dt.timezone.utc)).total_seconds()
         except ValueError:
             age = None
     fresh = age is not None and age <= stale_seconds
-    return {"ok": bool(fresh), "reason": "heartbeat_ok" if fresh else "heartbeat_stale",
+    reason = "heartbeat_ok" if fresh else "heartbeat_stale" if age is not None else "heartbeat_invalid"
+    return {"ok": bool(fresh), "reason": reason,
             "target": target, "role": payload.get("role"), "pid": payload.get("pid"),
             "alive_at": alive_at, "age_s": None if age is None else round(age, 1),
             "stale_seconds": stale_seconds,

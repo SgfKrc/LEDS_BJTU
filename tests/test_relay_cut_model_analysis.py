@@ -20,6 +20,15 @@ SCRIPT = ROOT / "scripts" / "relay_cut_model_analysis.py"
 
 def _write(path: Path, up: float | None, down: float | None, *, passed: bool = True) -> None:
     path.write_text(json.dumps({
+        "schema_version": "qlh.relay_experiment.v1",
+        "experiment_id": "exp-model-a",
+        "kind": "mainrepo_end_to_end",
+        "path": "d2l_mainrepo",
+        "commit": "same-head",
+        "models": {"upstream": {"id": "model-a"},
+                   "whole": {"model_bytes": 240 * 1024 * 1024}},
+        "load": {"prefill_tokens": 32, "gen_tokens": 32, "batch": 1, "warmup": 3},
+        "record_origin": {"kind": "raw_measurement", "rounds": 1},
         "metrics": {
             "upstream_decode_ms": {"mean": up},
             "downstream_decode_ms": {"mean": down},
@@ -144,3 +153,36 @@ def test_fails_loud_without_records(tmp_path: Path) -> None:
     done = _run("--records", str(tmp_path / "nothing-*.json"), "--total-layers", "24")
     assert done.returncode != 0
     assert "没有可解析的记录" in (done.stdout + done.stderr)
+
+
+def test_repeated_scan_rejects_duplicate_round_cut(tmp_path: Path) -> None:
+    _write(tmp_path / "r1-k4.json", 10.0, 20.0)
+    duplicate_dir = tmp_path / "alias"
+    duplicate_dir.mkdir()
+    duplicate = duplicate_dir / "r1-k4.json"
+    duplicate.write_text((tmp_path / "r1-k4.json").read_text(encoding="utf-8"), encoding="utf-8")
+    done = _run("--records", str(tmp_path / "r*-k*.json"),
+                "--records", str(duplicate_dir / "r*-k*.json"),
+                "--total-layers", "24", "--min-rounds", "1")
+    assert done.returncode == 2
+    assert "duplicate experiment record" in done.stderr
+
+
+def test_repeated_scan_rejects_median_input(tmp_path: Path) -> None:
+    _write(tmp_path / "r1-k4.json", 10.0, 20.0)
+    data = json.loads((tmp_path / "r1-k4.json").read_text(encoding="utf-8"))
+    data["record_origin"] = {"kind": "median_of_repeats", "rounds": 5}
+    (tmp_path / "r1-k4.json").write_text(json.dumps(data), encoding="utf-8")
+    done = _run("--records", str(tmp_path / "r*-k*.json"), "--total-layers", "24", "--min-rounds", "1")
+    assert done.returncode == 2
+    assert "not raw input" in done.stderr
+
+
+def test_repeated_scan_rejects_missing_origin(tmp_path: Path) -> None:
+    _write(tmp_path / "r1-k4.json", 10.0, 20.0)
+    data = json.loads((tmp_path / "r1-k4.json").read_text(encoding="utf-8"))
+    data.pop("record_origin", None)
+    (tmp_path / "r1-k4.json").write_text(json.dumps(data), encoding="utf-8")
+    done = _run("--records", str(tmp_path / "r*-k*.json"), "--total-layers", "24", "--min-rounds", "1")
+    assert done.returncode == 2
+    assert "not raw input" in done.stderr

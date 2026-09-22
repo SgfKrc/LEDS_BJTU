@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qlh.dev/schemas/cluster-control-v1.schema.json",
+  "title": "QLH cluster control contract v1",
+  "oneOf": [
+    { "$ref": "#/$defs/voterSet" },
+    { "$ref": "#/$defs/quorumCertificate" }
+  ],
+  "$defs": {
+    "base64url": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "voterIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["voter_id", "public_key"],
+      "properties": {
+        "voter_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+        "public_key": { "$ref": "#/$defs/base64url", "minLength": 43, "maxLength": 43 }
+      }
+    },
+    "voterSet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "document_type", "cluster_id", "voter_set_epoch", "voters"],
+      "properties": {
+        "schema_version": { "const": "qlh.cluster.control.v1" },
+        "document_type": { "const": "voter_set" },
+        "cluster_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+        "voter_set_epoch": { "type": "integer", "minimum": 0 },
+        "voters": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/voterIdentity" } }
+      }
+    },
+    "voterSignature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["voter_id", "algorithm", "signature"],
+      "properties": {
+        "voter_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+        "algorithm": { "const": "ed25519" },
+        "signature": { "$ref": "#/$defs/base64url", "minLength": 86, "maxLength": 86 }
+      }
+    },
+    "quorumCertificate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "document_type", "cluster_id", "voter_set_epoch", "term",
+        "leader_id", "lease_id", "expires_at_ms", "signatures"
+      ],
+      "properties": {
+        "schema_version": { "const": "qlh.cluster.control.v1" },
+        "document_type": { "const": "quorum_certificate" },
+        "cluster_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+        "voter_set_epoch": { "type": "integer", "minimum": 0 },
+        "term": { "type": "integer", "minimum": 1 },
+        "leader_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+        "lease_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+        "expires_at_ms": { "type": "integer", "minimum": 1 },
+        "signatures": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/voterSignature" } }
+      }
+    }
+  }
+}

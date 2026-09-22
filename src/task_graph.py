@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional, cast
 
 from task_journal import JournalEvent, TaskJournal, TaskJournalError
+from cluster_recovery import RecoveryError, decide_recovery
 from task_provider import (
     CallbackExecutionProvider,
     DEPENDENCY_FAILURES_KEY,
@@ -1228,8 +1229,20 @@ class TaskGraphCoordinator:
             return None
         decorated = dict(snapshot)
         if decorated.get("state") not in TERMINAL_WORKFLOW_STATES:
-            decorated["recovery_pending"] = True
-            decorated["runtime_status"] = "persisted_unrecovered"
+            recovery_action = str(decorated.get("recovery_action", ""))
+            recovery_applied = bool(decorated.get("recovery_applied", False))
+            decorated["recovery_pending"] = bool(
+                not recovery_applied or recovery_action == "retry"
+            )
+            decorated["runtime_status"] = (
+                "recovery_retry_pending"
+                if recovery_action == "retry" and recovery_applied
+                else (
+                    "recovery_continued"
+                    if recovery_action == "continue" and recovery_applied
+                    else "persisted_unrecovered"
+                )
+            )
         else:
             decorated["recovery_pending"] = False
             decorated["runtime_status"] = "terminal"
@@ -1275,9 +1288,13 @@ class TaskGraphCoordinator:
         return self._provider_registry.inspect()
 
     @staticmethod
-    def _recovery_event_id(workflow_id: str, last_sequence: int) -> str:
+    def _recovery_event_id(
+        workflow_id: str,
+        last_sequence: int,
+        action: str = "restart_recovery_v1",
+    ) -> str:
         digest = hashlib.sha256(
-            f"{workflow_id}:{last_sequence}:restart_recovery_v1".encode("utf-8")
+            f"{workflow_id}:{last_sequence}:{action}".encode("utf-8")
         ).hexdigest()
         return f"evt_recovery_{digest}"
 
@@ -1295,6 +1312,7 @@ class TaskGraphCoordinator:
         cls,
         snapshot: dict,
         recovered_at: float,
+        events: Iterable[dict] = (),
     ) -> tuple[dict, dict]:
         workflow_id = str(snapshot.get("workflow_id", ""))
         if not WORKFLOW_ID_PATTERN.fullmatch(workflow_id):
@@ -1309,21 +1327,24 @@ class TaskGraphCoordinator:
             raise TaskJournalError(
                 f"invalid recovery sequence for {workflow_id}"
             )
-        previous_state = str(snapshot.get("state", ""))
-        if previous_state in TERMINAL_WORKFLOW_STATES:
+        try:
+            decision = decide_recovery(snapshot, events)
+        except RecoveryError as exc:
             raise TaskJournalError(
-                f"terminal workflow selected for recovery: {workflow_id}"
+                f"invalid recovery candidate for {workflow_id}: {exc}"
+            ) from exc
+        if decision.action == "ignore":
+            raise TaskJournalError(
+                f"recovery candidate already applied: {workflow_id}"
             )
-        recovery_reason = (
-            "coordinator_restarted_before_result_commit"
-            if previous_state == "result_ready"
-            else "coordinator_restarted_during_execution"
-        )
+        previous_state = decision.previous_state
+        recovery_reason = decision.reason
 
         recovered = json.loads(json.dumps(snapshot))
         expired_attempts = 0
         failed_stages = 0
         skipped_stages = 0
+        cancelled_stages = 0
         stages = recovered.get("stages", [])
         if not isinstance(stages, list):
             raise TaskJournalError(
@@ -1358,35 +1379,62 @@ class TaskGraphCoordinator:
                     expired_attempts += 1
 
             stage_state = str(stage.get("state", ""))
-            if stage_state not in TERMINAL_STAGE_STATES:
-                if stage_state in {"blocked", "ready", "created"}:
-                    stage["state"] = "skipped"
-                    skipped_stages += 1
-                else:
-                    stage["state"] = "failed"
-                    failed_stages += 1
-                stage["finished_at"] = recovered_at
-                stage["duration_seconds"] = cls._duration_seconds(
-                    stage.get("started_at"), recovered_at,
-                )
+            if stage_state in TERMINAL_STAGE_STATES:
+                continue
+            if decision.action == "retry" and stage.get("stage_id") in decision.retry_stage_ids:
+                stage["state"] = "ready"
+                stage["finished_at"] = None
+                stage["duration_seconds"] = 0.0
                 stage["error"] = ""
-                stage["error_present"] = True
+                stage["error_present"] = False
                 stage["recovery_reason"] = recovery_reason
-                stage["error_code"] = recovery_reason
+                stage["error_code"] = ""
+                continue
+            if decision.action == "continue":
+                continue
+            if decision.action == "cancel":
+                stage["state"] = "cancelled"
+                cancelled_stages += 1
+            elif stage_state in {"blocked", "ready", "created"}:
+                stage["state"] = "skipped"
+                skipped_stages += 1
+            else:
+                stage["state"] = "failed"
+                failed_stages += 1
+            stage["finished_at"] = recovered_at
+            stage["duration_seconds"] = cls._duration_seconds(
+                stage.get("started_at"), recovered_at,
+            )
+            stage["error"] = ""
+            stage["error_present"] = True
+            stage["recovery_reason"] = recovery_reason
+            stage["error_code"] = recovery_reason
 
-        recovered["state"] = "failed"
+        if decision.action == "retry" or decision.action == "continue":
+            recovered["state"] = previous_state
+            recovered["finished_at"] = snapshot.get("finished_at")
+        elif decision.action == "cancel":
+            recovered["state"] = "cancelled"
+            recovered["finished_at"] = recovered_at
+        else:
+            recovered["state"] = "failed"
+            recovered["finished_at"] = recovered_at
         recovered["last_sequence"] = previous_sequence + 1
-        recovered["finished_at"] = recovered_at
         recovered["duration_seconds"] = cls._duration_seconds(
             recovered.get("started_at"), recovered_at,
         )
         recovered["error"] = ""
         recovered["error_present"] = True
         recovered["recovery_reason"] = recovery_reason
-        recovered["error_code"] = recovery_reason
+        recovered["error_code"] = (
+            "" if decision.action in {"retry", "continue"}
+            else recovery_reason
+        )
         recovered["recovered_after_restart"] = True
         recovered["recovered_at"] = recovered_at
         recovered["cancel_requested"] = False
+        recovered["recovery_action"] = decision.action
+        recovered["recovery_applied"] = True
         recovered["completed_stage_count"] = sum(
             stage.get("state") == "completed" for stage in stages
         )
@@ -1403,9 +1451,12 @@ class TaskGraphCoordinator:
         return recovered, {
             "previous_state": previous_state,
             "recovery_reason": recovery_reason,
+            "recovery_action": decision.action,
+            "retry_stage_ids": list(decision.retry_stage_ids),
             "expired_attempts": expired_attempts,
             "failed_stages": failed_stages,
             "skipped_stages": skipped_stages,
+            "cancelled_stages": cancelled_stages,
         }
 
     def recover_persisted_workflows(self, batch_size: int = 100) -> dict:
@@ -1421,33 +1472,51 @@ class TaskGraphCoordinator:
             "skipped_stages": 0,
         }
         try:
+            processed: set[str] = set()
             while True:
                 candidates = self._journal.list_nonterminal_snapshots(
                     limit=safe_batch_size,
                 )
+                candidates = [
+                    snapshot for snapshot in candidates
+                    if str(snapshot.get("workflow_id", "")) not in processed
+                ]
                 if not candidates:
                     break
+                inserted_count = 0
                 for snapshot in candidates:
+                    workflow_id = str(snapshot.get("workflow_id", ""))
+                    processed.add(workflow_id)
+                    if bool(snapshot.get("recovery_applied", False)):
+                        continue
                     recovered_at = time.time()
+                    events = self._journal.list_events(workflow_id)
                     recovered, details = self._build_recovered_snapshot(
-                        snapshot, recovered_at,
+                        snapshot, recovered_at, events,
                     )
-                    workflow_id = str(recovered["workflow_id"])
                     previous_sequence = int(snapshot["last_sequence"])
+                    action = str(details["recovery_action"])
+                    event_type = (
+                        "workflow_recovered_after_restart"
+                        if action == "fail"
+                        else f"workflow_recovery_{action}"
+                    )
                     event = JournalEvent(
                         event_id=self._recovery_event_id(
                             workflow_id, previous_sequence,
+                            "restart_recovery_v1" if action == "fail" else action,
                         ),
                         workflow_id=workflow_id,
                         sequence=previous_sequence + 1,
                         entity_type="workflow",
                         entity_id=workflow_id,
-                        event_type="workflow_recovered_after_restart",
+                        event_type=event_type,
                         occurred_at=recovered_at,
                         payload=details,
                     )
                     inserted = self._journal.append_event(event, recovered)
                     if inserted:
+                        inserted_count += 1
                         summary["recovered_workflows"] += 1
                         summary["expired_attempts"] += int(
                             details["expired_attempts"]
@@ -1458,6 +1527,17 @@ class TaskGraphCoordinator:
                         summary["skipped_stages"] += int(
                             details["skipped_stages"]
                         )
+                        action_key = {
+                            "retry": "retried_workflows",
+                            "cancel": "cancelled_workflows",
+                            "continue": "continued_workflows",
+                            "handoff_timeout": "handoff_timeouts",
+                        }.get(action)
+                        if action_key:
+                            summary.setdefault(action_key, 0)
+                            summary[action_key] += 1
+                if inserted_count == 0:
+                    break
         except TaskJournalError as exc:
             self._journal_error = f"task journal recovery failed: {exc}"
             raise TaskGraphUnavailable(self._journal_error) from exc

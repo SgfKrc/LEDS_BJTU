@@ -1129,7 +1129,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             middle_iface=middle_iface, path=args.path,
             models=models, layer_layout=layer_layout, handoff=_handoff(n_embd),
             load={"prompt": str(prompt_path), "prefill_tokens": args.prefill,
-                  "gen_tokens": args.gen, "batch": args.batch},
+                  "gen_tokens": args.gen, "batch": args.batch,
+                  "warmup": max(0, int(args.warmup))},
             verdict=verdict, metrics=metrics, device_profile=device_profile,
             evidence=RelayXFrameEvidence(correctness_verified=False,
                                          performance_verdict="unknown").to_dict(),
@@ -1309,6 +1310,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         models=models, layer_layout=layer_layout, handoff=_handoff(n_embd, args.path),
         load={"prompt": str(prompt_path), "prefill_tokens": len(prompt),
               "gen_tokens": args.gen, "batch": args.batch,
+              "warmup": max(0, int(args.warmup)),
               # ★ P3 激活数据流策略（引用性能/带宽数字前必须核对该字段）：
               #   prefill 传**整段** hidden（让下游一次建立本地 KV/recurrent state），
               #   decode 只传**末位**激活。
@@ -1370,7 +1372,8 @@ def _dry_run_record(args: argparse.Namespace) -> dict[str, Any]:
         layer_layout={"upstream_layers": args.layers, "trim_layers": args.layers},
         handoff={"dtype": "float32", "n_embd": None, "bytes_per_token": None, "supported": None},
         load={"prompt": args.prompt, "prefill_tokens": args.prefill,
-              "gen_tokens": args.gen, "batch": args.batch},
+              "gen_tokens": args.gen, "batch": args.batch,
+              "warmup": max(0, int(args.warmup))},
         verdict={"passed": False, "tokens_match": None, "criterion": RELAY_ACCEPTANCE,
                  "failure": "dry_run"},
         metrics={},

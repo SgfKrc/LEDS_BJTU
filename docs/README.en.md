@@ -1,6 +1,8 @@
-# QLH
+# Kllama
 
-QLH is a distributed inference core for heterogeneous edge devices. The mainline is the lightweight GGUF/llama.cpp engine; the repository also owns a PyTorch layered-distribution engine plus a **layer pipeline** (including cross-framework layer relay), and the user-facing entry point is a cross-platform TUI.
+Kllama (Llama for Koakuma) is a distributed inference core for heterogeneous edge devices. The mainline is the lightweight GGUF/llama.cpp engine; the repository also owns a PyTorch layered-distribution engine plus a **layer pipeline** (including cross-framework layer relay), and the user-facing entry point is a cross-platform TUI.
+
+> **Independent project · not official**: Kllama is an **independent** student innovation project (Beijing Jiaotong University, 2026) with **no affiliation, sponsorship or endorsement from the llama.cpp project**, and it does not represent that project's position. It is **built on llama.cpp** (a **descriptive reference** only — no ownership of or trademark claim to "llama.cpp", "llama" or any upstream name is asserted). Upstream components keep their own licenses and version pins, unchanged by this project's use of them.
 
 > Status: the main-repository baseline is being reorganized (2026-09-21, baseline `610f4b3`)
 >
@@ -28,7 +30,7 @@ The engine is **dual-track**, and both tracks live in the main repository - this
 
 ## Architecture Overview
 
-QLH is **two layers in one process**: a control plane aimed at people, and an engine layer aimed at
+Kllama is **two layers in one process**: a control plane aimed at people, and an engine layer aimed at
 machines and protocols. There is exactly one boundary between them — the layer-range contract
 `(layer_range, engine, location)`.
 
@@ -69,7 +71,7 @@ approximation".
 
 ## Is This System Software or User Software?
 
-**Layered answer**: QLH ships as **a system-software core plus a user-software shell**.
+**Layered answer**: Kllama ships as **a system-software core plus a user-software shell**.
 
 - **Control plane ≈ user software**: TUI, model assets, node/layout/queue/log/settings pages, HTTP API.
   Its users are **people**; the failure mode is degraded experience (retry, switch model, switch
@@ -127,61 +129,44 @@ The upstream PyTorch layer segment computes up to layer N and hands the hidden s
 3. **It is the precondition for customizability** - cut-point assignment, mixed precision, operator substitution and batch overlap all build on "hidden states are transferable between layers";
 4. **There is no direct academic precedent** - Petals is same-framework, KTransformers is operator-level, distributed-llama is TP; on this path we also filed a defect upstream and independently verified the fix (issue #28963).
 
-**Current validity note (2026-09-21)**: the cumulative table below is historical process data, not the current dual-main-repository performance baseline. The dual-engine sample is Qwen2.5-0.5B, 12+12 layers, gen=32: upstream `ModelManager.forward_layers` plus downstream `LlamaCppEngine.forward_layers_from_hidden`, **47.501 ms/step**, token-identical to the pure llama.cpp control. **A same-day rerun completed the full matrix**: two models x cut points / loads (prefill 32/128/512, decode 32/64/256) / batch (2/4) / mixed precision (upstream fp16-f32-NF4 x downstream Q4_K_M) - **27 runs, all token-identical** - with Qwen3.5 hybrid **K=8/12/16/20 all 32/32**. The 2026-09-21 capacity scan still used raw `llama_cpp` downstream, so it remains `capacity_only`/`raw_binding_probe`, not a dual-engine speed baseline. Before quoting a tier, verify what actually took effect: `quant_type="int4"` **silently falls back to fp16** in the main-repository layer pipeline, and upstream compile is disabled by the size gate below 1.5B params.
+**Current validity note (2026-09-21)**: the dual-engine sample is Qwen2.5-0.5B, 12+12 layers, gen=32 -
+upstream `model_module.forward_layers` plus downstream `llama_engine.forward_layers_from_hidden`,
+**47.501 ms/step**, token-identical to the pure llama.cpp control.
 
-**Historical cumulative measurements (gen=64, every token identical)**:
+**Full matrix**: two models x cut points / loads (prefill 32/128/512, decode 32/64/256) / batch (2/4) /
+mixed precision (upstream fp16-f32-NF4 x downstream Q4_K_M) - **27 runs, all token-identical**;
+Qwen3.5 hybrid **K=8/12/16/20 all 32/32**.
 
-| Configuration | Wall clock | vs. first version |
-| --- | ---: | ---: |
-| Cross-process + full-segment recompute | 182 s | 1.0x |
-| Same-process + full-segment recompute | 167 s | 1.09x |
-| Same-process + both-side KV reuse | 53 s | 3.4x |
-| **Same-process + KV + upstream manual 4 layers** | **21.3 s (about 333 ms/step)** | **8.5x** |
-| Cross-process + KV + 4L + downstream GPU offload | 81 s | 2.2x (IPC-bound) |
-| *Control: native llama.cpp full-model GPU* | *about 0.9 s* | *about 200x* |
+⚠️ Before quoting a tier, verify what actually took effect: `quant_type="int4"` **silently falls back to
+fp16** in the main-repository layer pipeline, and upstream compile is disabled by the size gate below 1.5B params.
 
-**Evidence and boundaries (stated as measured; all from persisted runs)**:
+**D-to-L capacity value**: two-segment cut points give **1.568x / 1.547x** for Qwen2.5-0.5B / qwen3-5-2b;
+under the same controlled 3.0 GB CUDA budget the whole model is rejected while a 12-layer upstream passes.
+That budget is a reproducible experiment constraint, not a physical OOM. D-to-L is positioned as capacity
+merging and heterogeneous capability composition - **not** as a CUDA single-machine speed-up substitute.
 
-| Item | Result |
+**Evidence and boundaries**:
+
+| Item | Current basis |
 | --- | --- |
-| Correctness | Cross-process, same-process, cross-machine (SSH tunnel) and f32 controls are token-identical; the **upstream manual 4 layers are bit-exact** (max absolute difference = 0) |
-| Time breakdown | **99.3% is actual compute on both sides** (upstream 66.5% + downstream 32.9%); communication, synchronization and batch management total only **0.34%** |
-| Largest single win | The upstream was **idling through 20 layers** (running all 24 but using only the first 4); switching to a manual 4-layer forward made the upstream **10.7x** faster (407.6 -> 38.1 ms/step) |
-| Layer pipeline | The upstream loads only `embed_tokens + L0-3`: **1.47 GB (f16)** vs. 4.55 GB for the full model - **3.1x smaller**, end-to-end 64/64 identical |
-| Falsified | Removing the process boundary (only 8%, and only an artifact of "both sides slow"), reusing `llama_batch` (0.09%), naive upstream layer truncation (numerically broken), `--override-tensor` as a speed-up (actually a capacity knob) |
-| Production readiness | Historical speed comparisons remain for audit. Current Relay admission is based on correctness evidence; an unverified or hard-gated path remains fail-closed, while speed affects default routing. Capacity and long-run/remote-asset evidence are tracked separately |
-| Operator environment | Native Windows `triton-windows==3.8.0.post28` has been measured working with `PYTHONUTF8=1`; WSL2 Ubuntu-22.04 with CUDA/fla is a parallel path, not the only Triton route. There is no CI-level native Triton compile guarantee |
-| L-to-L upstream channel | The pip-bound `llama_get_embeddings_ith` returns `output_norm(H)` (measured cos 0.999998), so it **cannot** serve as a layer-relay upstream. The patched **keep-head channel is now live**: `--path l2l_keep_head` / `d2l2l_keep_head` measured **32/32** (including a three-segment "1 torch upstream + 2 llama downstream" chain); the old `l2l_llama` stays as the fail-loud counter-example |
+| Correctness | Main-repo dual-engine D-to-L matrix **27/27 token-identical** (Qwen2.5-0.5B K=4/8/12/16/20, Qwen3.5-2B K=8/12/16/20; loads prefill 32/128/512, decode 32/64/256; batch 2/4; mixed precision fp16-f32-NF4 x Q4_K_M); per-token criteria are recorded separately from speed and capacity |
+| Mixed precision | A full-precision PyTorch upstream with a quantized GGUF downstream is a deliberate "incomplete quantization" strategy; it must be compared against a same-precision downstream full model |
+| L-to-L upstream channel | The pip-bound `llama_get_embeddings_ith` returns `output_norm(H)` (measured cos 0.999998), so it **cannot** serve as a layer-relay upstream. The patched **keep-head channel is live**: `--path l2l_keep_head` / `d2l2l_keep_head` measured **32/32** (including a three-segment "1 torch upstream + 2 llama downstream" chain); the old `l2l_llama` stays as the fail-loud counter-example |
 | Cut-point solver | `scripts/relay_cut_plan.py` + `src/relay_cut_objective.py`: fits segment profiles (fixed cost + per-layer cost) from **measured** records, then solves for the cut with `capacity_feasible` / `latency_estimate` / `risk_penalty` outputs; n-segment capable, with the Qwen3.5 4-layer-multiple hard constraint. The 2-segment loop passes on both Qwen2.5 (r2 0.96/0.99) and Qwen3.5 (0.79/0.96) |
-| Current positioning | **Architecture-compatibility track**; off by default, does not replace RPC, does not enter the Edge default route; optimization items are registered in [acceptance list D29](验收清单与资源限制登记.md) |
+| Windows operators | Native Windows `triton-windows==3.8.0.post28` is measured working; `PYTHONUTF8=1` is a prerequisite for the compile path; WSL2/fla is a parallel path, not the only option |
+| Production positioning | Correctness evidence satisfies Relay contract admission; speed only shifts the default routing preference. Long-run, remote-artifact auto-distribution and multi-segment failure acceptance remain open |
+| Current documents | Use the [current effective baseline and optimization plan](跨框架接力-当前有效基线与后续优化计划-2026-09-21.md) as the index; conflicting numbers in older reports are triaged by validity |
+| Key quantitative results | **Compute is 99.3%** of the time on both sides (communication + sync + batching only 0.34%); the single largest win was removing the upstream's **idling through 20 layers** (**10.7x**); the layer pipeline loads only `embed_tokens + L0-3`, **1.47 GB vs 4.55 GB** (3.1x); falsified: the process boundary (only 8%), reusing `llama_batch` (0.09%), naive upstream layer truncation (numerically broken), treating `--override-tensor` as a speed-up (it is a capacity knob) |
 
-**Corrected conclusion**: the earlier judgement "IPC is the main cost" has been overturned - that was an illusion masked while both sides were slow. **The leverage is in the compute on both sides (cut point, kernel, batching), not in the transport layer.** See [Same-Process Dual-Backend Relay Implementation and Performance](archive/同进程双后端接力实现与性能-2026-09-16.md) sections 12-14.
+**Where the bottleneck is**: the earlier "IPC is the main cost" judgement does not hold - that was an illusion masked while both sides were slow. **The leverage is in the compute on both sides (cut point, kernel, batching), not in the transport layer.**
+See [Same-Process Dual-Backend Relay Implementation and Performance](archive/relay/同进程双后端接力实现与性能-2026-09-16.md) sections 12-14.
 
 ### Cut-Point Sweep Results (P0, measured 2026-09-18)
 
-A full sweep over the upstream layer count N (N=0 means **no relay** - llama.cpp runs the whole model; the downstream is the corresponding f16 layer-cut GGUF, CPU / 8 threads):
+A full sweep over the upstream layer count N (N=0 means **no relay** - llama.cpp runs the whole model; the downstream is the corresponding f16 layer-cut GGUF, CPU / 8 threads).
+**The conclusion depends on whether the upstream runs on CPU or GPU** - both were measured.
 
-| Upstream layers N | Upstream ms/step | Downstream ms/step | **Total ms/step** | 64-token sequence |
-| ---: | ---: | ---: | ---: | --- |
-| **0 (no relay)** | 1.9 | 184.8 | **186.8** | token-identical to baseline |
-| 4 (current default) | 42.7 | 171.6 | **214.3** | identical |
-| 8 | 77.9 | 145.9 | 223.8 | identical |
-| 12 | 120.8 | 103.8 | 224.6 | identical |
-| 16 | 137.2 | 84.6 | 221.9 | identical |
-| 20 | 182.9 | 66.8 | 249.7 | identical |
-
-- **Correctness does not vary with the cut point**: the greedy sequence is token-identical at every cut point;
-- **Total time is nearly insensitive to the cut point** (N in {4,8,12,16} spans only 214-225 ms/step, about +/-2.6%), **there is no intermediate valley**; the current default N=4 is already optimal under the constraint that relay must happen;
-- **Not relaying is actually fastest** (186.8 ms/step, 12.9% faster than the default N=4) => on the same machine, single-sequence, relay costs about **+15%** (relative to a pure llama.cpp CPU baseline). This is far milder than "about **25x** slower than native llama.cpp full-model GPU" (`333 / 13.5`) - **that 25x is mostly the CPU/GPU difference, not the cost of the relay mechanism**;
-- An upstream layer (torch/CUDA, 8.8-10.7 ms) is **not** cheaper than a downstream layer (llama.cpp/CPU, 7.7-8.6 ms), so "moving layers to the torch GPU" yields no speed advantage on this machine;
-- **Engineering constraint**: the cut point must be a multiple of `full_attention_interval` (Qwen3.5 = 4), otherwise the layer types of the layer-cut GGUF are misaligned and it fails to load (measured at N=2);
-- **Methodology warning**: isolated measurements detached from the end-to-end chain are not trustworthy (this sweep under-measured the upstream per-step cost by about 5.6x); cut-point conclusions must use the end-to-end basis.
-
-Report: `local_docs/CORE-RELAY-XFRAME-02-sweep-2026-09-18.json`; ticket: [acceptance list D29](验收清单与资源限制登记.md).
-
-**Same-day correction (v2) - the section above (including its table) only holds when the upstream runs on CPU**: `relay_sameproc_4L.py` never calls `.to(device)` after `from_pretrained`, so `dev = tmodel.device` is **cpu**; the isolated script `upstream_layer_cost.py` explicitly does `.to("cuda")`. Measured with the same script and the same basis for the same 4 layers: **cpu 34.9 ms / cuda 8.3 ms** => that 5.6x difference **is explained by the device** (neither by KV shape nor by idle down-clocking - both were disproved by controls: `shape_sensitivity` fixed 47.4 > growing 34.4; `idle_wakeup_and_overlap` idle 8.56 vs continuous 7.53 = 1.14x, with the SM clock steady at 780/3105 MHz throughout).
-
-After adding `--upstream-device cuda` to relay (with f16 + `--upstream-partial` loading only the first N layers, roughly N/24 x 4.3 GB of VRAM) and re-sweeping:
+**Upstream on GPU (the real deployment direction).** Adding `--upstream-device cuda` to relay (with f16 + `--upstream-partial` loading only the first N layers, roughly N/24 x 4.3 GB of VRAM):
 
 | Upstream layers N | CPU upstream total ms/step | **GPU upstream total ms/step** | Gain |
 | ---: | ---: | ---: | ---: |
@@ -190,12 +175,29 @@ After adding `--upstream-device cuda` to relay (with f16 + `--upstream-partial` 
 | 16 | 221.9 | **146.4** | 1.52x |
 | **20** | 249.7 | **129.1** | **1.93x** |
 
-- Upstream **GPU about 2.5-4.3 ms/layer**, downstream **CPU llama.cpp about 5.8-8.6 ms/layer** => **push as many layers as possible to the GPU upstream**;
-- **Corrected optimum (measured) N=20 = 129.1 ms/step**, **1.45x faster** than the 186.8 ms/step of **no relay** - **relay shows a clear benefit for the first time**;
-- The 64-token sequence at every cut point remains **token-identical** (including the GPU upstream);
-- So "no relay is fastest / cut points give no benefit" **holds only for a CPU upstream** and must not be extrapolated. In real deployments the downstream is usually a **CUDA-less edge device**, which supports the direction "put layers on the GPU upstream" - and therefore **P1 (adding a GPU to the downstream) has narrow applicability; what is actually worth doing is "GPU-izing the upstream" and P2 overlap**.
+- **Optimal N=20 = 129.1 ms/step**, **1.45x faster** than the 186.8 ms/step of **no relay** - relay has a clear benefit in this configuration;
+- Upstream **GPU about 2.5-4.3 ms/layer**, downstream **CPU llama.cpp about 5.8-8.6 ms/layer** => **push as many layers as possible to the GPU upstream** (this table's basis);
+- ⚠️ **Scope note**: refitting this table's data (`local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-p0-corrected-2026-09-18.json`) as **fixed overhead + marginal per layer** gives upstream marginal **2.48 ms/layer** (r²=0.944) and downstream marginal **6.43 ms/layer** (r²=0.991), with nearly identical fixed overhead (25.5 vs 26.4) => the marginal basis supports "push to upstream". A separate K=1..20 sweep ([current baseline](跨框架接力-当前有效基线与后续优化计划-2026-09-21.md) §P2) gives upstream 1.54 / downstream 0.91 => the **opposite direction**. The two differ in model, quantization, single-sequence basis and tooling, so they are **not comparable side by side**; do not treat either as a general conclusion until a single unified basis is measured (see that document's §P2 scope note and TODO).
+- The 64-token sequence at every cut point remains **token-identical** (including the GPU upstream).
 
-Report: `local_docs/CORE-RELAY-XFRAME-02-p0-corrected-2026-09-18.json` (v2, supersedes v1).
+**Upstream on CPU: the opposite holds** (an early basis, kept only to delimit applicability):
+
+- **No relay is fastest** (186.8 ms/step); relay costs about **+15%**;
+- **Total time is nearly insensitive to the cut point** (N in {4,8,12,16} spans 214-225 ms/step, about +/-2.6%), **there is no intermediate valley**;
+- An upstream layer (8.8-10.7 ms) is **not** cheaper than a downstream layer (7.7-8.6 ms) => in this configuration "moving layers to the torch GPU" gives no speed advantage.
+
+=> So "no relay is fastest / cut points give no benefit" **holds only for a CPU upstream and must not be extrapolated**. In real deployments the downstream is usually a
+**CUDA-less edge device**, which supports "put layers on the GPU upstream": **P1 (adding a GPU to the downstream) has narrow applicability; what is worth doing is "GPU-izing the upstream" and P2 overlap**.
+
+**Two general constraints**:
+
+- **Correctness does not vary with the cut point**: the greedy sequence is token-identical at every cut point;
+- **The cut point must be a multiple of `full_attention_interval`** (Qwen3.5 = 4), otherwise the layer types of the layer-cut GGUF are misaligned and it fails to load (measured at N=2).
+
+⚠️ **Methodology**: isolated measurements detached from the end-to-end chain are not trustworthy - an early sweep under-measured the upstream per-step cost by about 5.6x because the **upstream was actually running on CPU while being compared against GPU data** (same script, same basis, same 4 layers: cpu 34.9 ms / cuda 8.3 ms; the difference is explained by the device, not by KV shape or idle down-clocking). Cut-point conclusions must use the end-to-end basis.
+
+Report: `local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-p0-corrected-2026-09-18.json`;
+ticket: [acceptance list D29](验收清单与资源限制登记.md).
 
 ### Fair Comparison Against "All-llama + CUDA" + P2 Overlap (measured 2026-09-18)
 
@@ -217,9 +219,14 @@ The `-ngl` curve is monotonic (ms/token): `0->91.1`, `4->71.0`, `8->60.5`, `12->
 
 A **1.291x** speed-up, and both sequences are **identical** to the single-sequence baseline; the theoretical ceiling is about 1.79x (taking the larger of upstream 72.3 / downstream 56.8 when fully overlapped), and the measurement reaches about 72% of it.
 
-**Conclusion and positioning**: the 1.45x from P0 above is only the local gain of "CPU llama.cpp -> GPU **torch**"; the better move is "CPU llama.cpp -> GPU **llama.cpp**" (`-ngl`). So **cross-framework relay is not a faster inference path** - it is the mechanism for "**layers that can only run under torch**" (hybrid/custom operators) and for "**capacity merging / layer pipeline** (too large for a single machine)", plus an experiment platform. **When the cluster has a CUDA node, the best practice is to use it as a llama.cpp CUDA worker (RPC/sharding), not as a relay upstream**; P2 overlap only recovers part of the loss inside the "relay is unavoidable" scenario (78.3 ms/token is still about 3x slower than 26.6).
+**Conclusion and positioning**:
 
-Report: `local_docs/CORE-RELAY-XFRAME-02-p2-2026-09-18.json`. All of the above is **same-machine** data; the **cross-machine (GPU node + CUDA-less edge node) RPC vs. relay comparison is still unmeasured**.
+- The 1.45x from P0 above is only the local gain of "CPU llama.cpp -> GPU **torch**"; the better move is "CPU llama.cpp -> GPU **llama.cpp**" (`-ngl`);
+- So **cross-framework relay is not a faster inference path** - it is two mechanisms plus one platform: "**layers that can only run under torch**" (hybrid / custom operators), "**capacity merging / layer pipeline**" (too large for a single machine), and an experiment platform;
+- **When the cluster has a CUDA node**, the best practice is to use it as a llama.cpp CUDA worker (RPC / sharding), **not** as a relay upstream;
+- P2 overlap only recovers part of the loss inside the "relay is unavoidable" scenario (78.3 ms/token is still about **3x** slower than 26.6).
+
+Report: `local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-p2-2026-09-18.json`. All of the above is **same-machine** data; the **cross-machine (GPU node + CUDA-less edge node) RPC vs. relay comparison is still unmeasured**.
 
 ### torch.compile and the "Layer Loop" Switches (`USE_COMPILE` / `USE_MONOLITHIC_FORWARD`)
 
@@ -230,7 +237,12 @@ Getting `torch.compile` gains out of segmented forward takes two switches (both 
 | `USE_COMPILE` | `True` | Enables compilation. When compilation is unavailable it **warns and falls back to eager** without blocking startup (this is the path taken on Windows without `triton-windows`; **installing it is enough** - native Windows compilation has been verified working since 2026-09-19, so it is no longer a 'dead switch'). |
 | `USE_MONOLITHIC_FORWARD` | `False` | Additionally compiles the **"layer loop"** (`_LayerLoop`) used by `forward_layers()`; off by default. |
 
-**Why only the layer loop is compiled, not the whole model**: `Qwen2Model.forward()`'s return value passes through `self.norm` (full-model semantics), while a distributed segmented forward must return the **pre-norm** raw hidden when `has_lm_head=False`. So only the loop is wrapped; the pre/post steps stay in `forward_layers()`, which is what keeps the semantics identical to the per-layer version.
+**Why only the layer loop is compiled, not the whole model**:
+
+- `Qwen2Model.forward()`'s return value passes through `self.norm` (full-model semantics);
+- while a distributed segmented forward must return the **pre-norm** raw hidden when `has_lm_head=False`;
+- so only the loop is wrapped; the pre/post steps stay in `forward_layers()`, which is what keeps the semantics identical to the per-layer version;
+- ⚠️ Counter-example: compiling the whole `Qwen2Model` in the first attempt gave 2.325x, but it **computed `self.norm` one extra time** => argmax diverged from decode step 1.
 
 **Measured gains** (`USE_MONOLITHIC_FORWARD=True`; see [Figure 3](figures/cross-frame-relay/fig3-compile-gains.png)):
 
@@ -249,11 +261,11 @@ Hybrid models (Qwen3.5's 18 `linear_attention` + 6 `full_attention` layers) need
 
 Current **serial full-suite** baseline: `2991 passed / 13 skipped / 0 failed` (`-n 0`; recorded after `610f4b3`; xdist concurrency occasionally flakes - judge by the serial run).
 
-Reports: `local_docs/CORE-RELAY-XFRAME-02-a4-layer-loop-2026-09-18.json`, `...-b14-hybrid-layer-loop-2026-09-18.json`, `...-compile-numerics-2026-09-18.json`.
+Reports: `local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-a4-layer-loop-2026-09-18.json`, `...-b14-hybrid-layer-loop-2026-09-18.json`, `...-compile-numerics-2026-09-18.json`.
 
 ### Top-Level Transparency
 
-The TUI and API top layer only needs to know the **aggregate resources** (GPU/CPU/memory) and "whether it is distributed"; it does not need to know who is local and who is remote. Engine choice is decided by **resources + capability + goal**, not by "torch whenever there is a GPU". Optional policies (privacy, bandwidth) are not implemented yet and are left to a later policy ticket. See [Layer Pipeline Node Kinds and Top-Level Transparency](层流水线节点类型与顶层透明性-可行性确认-2026-09-17.md).
+The TUI and API top layer only needs to know the **aggregate resources** (GPU/CPU/memory) and "whether it is distributed"; it does not need to know who is local and who is remote. Engine choice is decided by **resources + capability + goal**, not by "torch whenever there is a GPU". Optional policies (privacy, bandwidth) are not implemented yet and are left to a later policy ticket. See [Layer Pipeline Node Kinds and Top-Level Transparency](archive/relay/层流水线节点类型与顶层透明性-可行性确认-2026-09-17.md).
 
 ## Current Status
 
@@ -290,7 +302,7 @@ The main project keeps no image-generation runtime or assets; image generation b
 
 | Path | Content |
 | --- | --- |
-| `src/` | QLH main code: control plane, engines, layer-segment/layer-pipeline contracts, TUI (grouped below) |
+| `src/` | Kllama main code: control plane, engines, layer-segment/layer-pipeline contracts, TUI (grouped below) |
 | `tests/` | pytest suite (TUI, RPC/layer-segment, scheduling, contracts, doc gates) |
 | `scripts/` | Verification, experiment, environment and documentation tools (`edge_preflight.py`, `android_validation.py`, `llama_rpc_*.py`, `doc_maintenance_audit.py`, ...) |
 | `docs/` | Current documents; historical and migrated content lives in `docs/archive/` |
@@ -299,7 +311,7 @@ The main project keeps no image-generation runtime or assets; image generation b
 | `local_docs/` | Local experiment and acceptance raw records; not a public source interface |
 | `runtime/` | Runtime logs and the llama.cpp runtime directory |
 | `qlh.py` / `qlh_edge.py` | Interactive TUI/CLI entry point and Edge entry point |
-| `qlh.bat` / `qlh.sh` / `bjtu.*` / `koakuma.*` | Launchers; `bjtu` and `koakuma` are compatibility aliases, the unified entry point is still `qlh` |
+| `qlh.bat` / `qlh.sh` / `kllama.*` / `bjtu.*` / `koakuma.*` | Launchers; `kllama` is the **recommended alias**, `bjtu`/`koakuma` are compatibility aliases, and the canonical entry script is still `qlh.py` |
 | `start_tui.*` / `start_backend.bat` / `setup_all_envs.*` | One-click start and multi-environment install scripts |
 | `requirements*.txt` / `pytest.ini` / `pyrightconfig.json` / `reasonix.toml` | Dependency lists and tool configuration |
 | `models/`, `chat_history/`, `dist/`, `build/`, `test-results/`, `logs/`, `_to_delete/` | Local artifacts or archive areas, not in Git (`logs/`, `_to_delete/` are gitignored) |
@@ -351,22 +363,14 @@ The main project keeps no image-generation runtime or assets; image generation b
 ```bash
 git clone https://github.com/SgfKrc/qlh.git
 cd qlh
-git submodule update --init --recursive
+git submodule update --init --recursive     # pulls only the 4 submodules (see the table above)
 ```
 
-Submodule remotes are in `.gitmodules`. Common sibling repositories:
+Submodule remotes are in `.gitmodules`. **Related repositories** (development / experiment tooling, **not**
+submodules) are cloned separately into `tools/` and `packages/` as needed:
 
-- `https://github.com/SgfKrc/qlh-android.git`
-- `https://github.com/SgfKrc/qlh-shell.git`
-- `https://github.com/SgfKrc/qlh-release.git`
-- `https://github.com/SgfKrc/qlh-toolbox.git`
-- `https://github.com/SgfKrc/qlh-docagent.git`
-- `https://github.com/SgfKrc/Koakumix.git`
-
-> **Bridges (not submodules since 2026-09-20)** — clone separately into `tools/` if you need them;
-> they are gitignored and intentionally kept out of the main repository:
-> - `https://github.com/SgfKrc/reasonix-codex-bridge.git`
-> - `https://github.com/SgfKrc/dsh-codex-bridge.git`
+- Submodules: `https://github.com/SgfKrc/qlh-android.git` · `qlh-shell.git` · `qlh-release.git` · `Koakumix.git`
+- Related repositories: `https://github.com/SgfKrc/qlh-docagent.git` · `qlh-toolbox.git` · `reasonix-codex-bridge.git` · `dsh-codex-bridge.git` · `spawnledger.git`
 
 ### 2. Choose a Runtime Environment
 
@@ -417,9 +421,18 @@ When the local backend is not running, `qlh chat` starts it in a daemon thread o
 
 Write operations are initiated from the shell: the models screen uses `L` to load / `U` to unload, the queue screen uses `P` pause-resume / `S` policy / `C` clear queued, and the chat screen supports `/model`, `/queue`, `/new`, `/resume`, `/rename`, `/sessions`, `/delete-session`, `/reset`; destructive and long-running operations first show a confirmation box. Model control endpoints are allowed by default on loopback; to control a main node remotely the main node must configure `QLH_MODEL_API_TRUSTED_CIDRS`.
 
-On Windows you can use `qlh.bat` directly; on Linux/macOS use `qlh.sh`. `bjtu`/`koakuma` are compatibility launchers, and the unified repository entry point is still `qlh`.
+On Windows you can use `qlh.bat` (or `kllama.bat`) directly; on Linux/macOS use `qlh.sh` (or `kllama.sh`). `kllama` is the recommended alias and `bjtu`/`koakuma` are compatibility launchers; all of them forward to the same entry script `qlh.py`. The unified repository entry point is still `qlh`.
 
-The TUI's 9 feature screens are the main interaction and acceptance boundary: the models screen covers local assets/presets/download jobs, search, preflight, registration, load and unload; the distributed/nodes screen covers toggles, capacity, max nodes, invite, connect, join-request code/authorization consumption and deregistration; the logs screen covers filtering, statistics, export and clearing; the device screen covers auto-configuration and GPU selection; the settings screen reads and writes user settings. The final "debug" screen reads routes dynamically from `/openapi.json` of the running backend and serves only as a JSON fallback for operations that have no dedicated interaction yet; it does not count as product feature coverage. The current main backend OpenAPI snapshot is 152 operations; the actual number is whatever the target backend returns. Streaming chat and file upload are still handled by the chat page specifically.
+The TUI's 9 feature screens are the main interaction and acceptance boundary:
+
+- **models screen**: local assets / presets / download jobs, search, preflight, registration, load and unload;
+- **distributed / nodes screen**: toggles, capacity, max nodes, invite, connect, join-request code / authorization consumption and deregistration;
+- **logs screen**: filtering, statistics, export and clearing;
+- **device screen**: auto-configuration and GPU selection;
+- **settings screen**: reads and writes user settings;
+- **"debug" screen**: reads routes dynamically from `/openapi.json` of the running backend; it is only a JSON fallback for operations without a dedicated interaction, and does **not** count as product feature coverage.
+
+The current main backend OpenAPI snapshot is 152 operations; the actual number is whatever the target backend returns. Streaming chat and file upload are still handled by the chat page specifically.
 
 ## Models and Distribution
 
@@ -475,24 +488,30 @@ Targeted checks for high-risk mainlines:
 
 Real hardware, cross-machine networking, Android ARM64, performance and long-run soak must additionally preserve the raw commands, environment, model digests, topology, output and failure boundaries; a green test run alone does not replace that evidence.
 
+**Documentation checks** (purely static, standard library only): `python scripts/run_doc_checks.py` runs two checks — relative-link dead links, and README bilingual-structure sync.
+
+The very same suite runs twice — in **CI** ([`.github/workflows/checks.yml`](../.github/workflows/checks.yml)) and in a **local pre-push hook** ([`.githooks/`](../.githooks/README.md), enabled with `git config core.hooksPath .githooks`) — i.e. **defined once, reused in both places**. The immediate reason for adding it: the repository had no automated checks at all, and archived documents easily leave behind "reference not updated" dead links — a single pass turned up 20 of them.
+
 ## Documentation Index
 
 - [Current D-to-L Baseline and Optimization Plan (2026-09-21)](跨框架接力-当前有效基线与后续优化计划-2026-09-21.md)
-- [Test Quality Audit (2026-09-21): Parallel Flakiness and Race-Coverage Gaps](测试质量审计-2026-09-21.md)
+- [KTransformers optimization-transfer research and algorithmic/data-layer directions](KTransformers优化迁移调研与算法数据层优化方向-2026-09-23.md)
+- [Large-file split plan: scheduler.py and api_server.py](大文件拆解计划-scheduler与api_server-2026-09-23.md)
+- [Test Quality Audit (2026-09-21): Parallel Flakiness and Race-Coverage Gaps](archive/misc/测试质量审计-2026-09-21.md)
 - [P4.5 Proposal: Dynamic Master Election and Distributed Management](主节点动态选举与分布式管理-P4.5立项-2026-09-21.md)
 - [Mainline Development Plan: Distributed Inference and Edge Optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md)
 - [Overall Architecture](整体架构.md)
-- [Layer-Segment Protocol Proposal (2026-09-17)](层段协议立项-2026-09-17.md)
-- [Layer Pipeline Node Kinds and Top-Level Transparency](层流水线节点类型与顶层透明性-可行性确认-2026-09-17.md)
-- [Same-Process Dual-Backend Relay Implementation and Performance](archive/同进程双后端接力实现与性能-2026-09-16.md)
-- [Engine Single-Sequence and Concurrency Comparison](引擎单序列与并发性能对比-2026-09-16.md)
+- [Layer-Segment Protocol Proposal (2026-09-17)](archive/relay/层段协议立项-2026-09-17.md)
+- [Layer Pipeline Node Kinds and Top-Level Transparency](archive/relay/层流水线节点类型与顶层透明性-可行性确认-2026-09-17.md)
+- [Same-Process Dual-Backend Relay Implementation and Performance](archive/relay/同进程双后端接力实现与性能-2026-09-16.md)
+- [Engine Single-Sequence and Concurrency Comparison](archive/relay/引擎单序列与并发性能对比-2026-09-16.md)
 - [Distributed Inference Parallelism and Cross-Framework Route Survey](分布式推理并行与跨框架路线调研汇总-2026-09-15.md)
 - [TUI User Guide](TUI使用指南.md)
 - [TUI Feature Screens and Debug Fallback](TUI使用指南.md#调试兜底非功能验收)
 - [TUI Command Set](TUI指令集.md)
-- [Edge Device Simulation Environment Plan](边缘设备模拟环境计划-2026-09-15.md)
+- [Edge Device Simulation Environment Plan](archive/edge/边缘设备模拟环境计划-2026-09-15.md)
 - [Android Validation Alternative Paths](../android/Android验证替代路径-2026-09-18.md)
-- [Baseline Rewrite Plan](archive/基线重写方案-2026-09-16.md)
+- [Baseline Rewrite Plan](archive/runtime/基线重写方案-2026-09-16.md)
 - [Module Interfaces](模块接口说明.md)
 - [Testing and Evaluation Criteria](测试与评判标准.md)
 - [Document Status and Cleanup List](文档状态与清理清单.md)

@@ -1,7 +1,7 @@
 """RPC device 接入层：把 ggml-rpc-server 的算力 device 交给本进程的 llama.cpp 使用。
 
 机理与实测证据见
-``local_docs/CORE-LLAMA-PC-RPC-01-rpc-backend-注册与-ctypes-装配-2026-09-17.md``：
+``local_docs/evidence/llama-pc-rpc/CORE-LLAMA-PC-RPC-01-rpc-backend-注册与-ctypes-装配-2026-09-17.md``：
 
 1. RPC backend **故意不参与** ``ggml_backend_dev_count()`` 枚举
    （``ggml-rpc.cpp:1958``：其自带 reg 的 ``context == NULL``，``get_device`` 直接

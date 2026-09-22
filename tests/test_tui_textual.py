@@ -172,6 +172,21 @@ LIVE_SHAPES = {
                                   "state": "online", "address": "100.90.76.108:8888",
                                   "hostname": "localhost", "avg_rtt_ms": 0}],
                        "count": 1, "online_count": 1},
+    "/cluster/control-plane": {
+        "enabled": True, "available": True, "cluster_id": "qlh-test",
+        "voter_set_epoch": 4, "committed_term": 12, "leader_id": "master",
+        "certificate_digest": "a" * 64, "read_only_reason": "",
+    },
+    "/cluster/management-score": {
+        "schema_version": "qlh.ha.management-score.v1",
+        "algorithm_version": "management-v1",
+        "nodes": [{"node_id": "master", "score": 70.0, "rank": 1}],
+        "signature_status": "unsigned_no_cluster_secret",
+    },
+    "/cluster/transfer-logs": {
+        "logs": [{"event_type": "handoff_committed", "reason": "maintenance"}],
+        "count": 1,
+    },
     "/cluster/queue": {"running": True, "paused": False, "strategy": "mlfq", "queue_size": 0,
                        "max_size": 100, "q0_depth": 0, "q1_depth": 0, "q2_depth": 0,
                        "q0": [], "q1": [], "q2": [], "completed_count": 0, "current_task": None,
@@ -267,6 +282,60 @@ def test_live_backend_shapes_render_every_page():
             status = " ".join(f"{row[0]}={row[1]}" for row in _rows(screen, "#status-table"))
             assert "运行模式=distributed" in status, status
             assert "Qwen-1.8B-Chat（未加载）" in status, status
+
+    _run(_main())
+
+
+def test_ha_projection_is_read_only_and_fail_closed_for_missing_quorum():
+    from tui_textual import KoakumaApp
+
+    async def _main():
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.5), interval=30)
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.show_main()
+            await pilot.pause()
+            screen = app.screen
+            screen.node_aux = {
+                "nodes": [{"node_id": "master", "device_info": {"master_score_version": "v1"}}]
+            }
+            rendered = screen.render_ha_status({
+                "role": {"node_role": "master", "auto_role": {
+                    "state": "read_only", "reason": "quorum_unavailable",
+                }},
+                "fence": {
+                    "enabled": True, "available": True, "committed_term": 12,
+                    "voter_set_epoch": 4, "leader_id": "master",
+                    "read_only_reason": "control_certificate_missing",
+                },
+                "transfer_logs": {"logs": []},
+                "score": {"algorithm_version": "management-v1", "nodes": []},
+            })
+            assert "leader: master" in rendered
+            assert "term/epoch: 12/4" in rendered
+            assert "majority: unavailable" in rendered
+            assert "read-only reason: control_certificate_missing" in rendered
+            assert "score version: management-v1" in rendered
+            assert "last handoff: none" in rendered
+
+    _run(_main())
+
+
+def test_ha_projection_uses_versioned_score_snapshot():
+    from tui_textual import KoakumaApp
+
+    async def _main():
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.5), interval=30)
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.show_main()
+            await pilot.pause()
+            screen = app.screen
+            rendered = screen.render_ha_status({
+                "score": {
+                    "algorithm_version": "management-v1",
+                    "nodes": [{"node_id": "master", "score": 70.0}],
+                },
+            })
+            assert "score version: management-v1" in rendered
 
     _run(_main())
 

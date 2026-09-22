@@ -168,6 +168,11 @@ class TestApiPaths:
     def test_cluster_resources_path(self):
         assert API_PATHS["cluster_resources"] == "/cluster/resources"
 
+    def test_ha_observation_paths(self):
+        assert API_PATHS["cluster_control_plane"] == "/cluster/control-plane"
+        assert API_PATHS["cluster_management_score"] == "/cluster/management-score"
+        assert API_PATHS["cluster_transfer_logs"] == "/cluster/transfer-logs"
+
     def test_pipeline_observation_paths(self):
         assert API_PATHS["cluster_layers"] == "/cluster/layers"
         assert API_PATHS["cluster_pipeline_capacity"] == "/cluster/pipeline-capacity"

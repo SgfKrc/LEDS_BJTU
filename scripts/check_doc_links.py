@@ -9,6 +9,7 @@
 """
 import os
 import re
+import subprocess
 import sys
 import urllib.parse
 
@@ -17,6 +18,27 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LINK_RE = re.compile(r'\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)')
 
 SKIP_PREFIX = ('http://', 'https://', 'mailto:', 'ftp://', '#')
+
+_IGNORED_CACHE: dict[str, bool] = {}
+
+
+def _is_gitignored(rel_path: str) -> bool:
+    """目标路径是否被 .gitignore 忽略（= 不在版本控制里 ⇒ CI 上必然不存在）。
+
+    为什么必须单独查这一点：本机会有**工作区独立目录**（`tools/`、`docs/agent_tool/` 等已被
+    主仓裁撤的路径），所以「文件存在」在本机恒真 —— 本地检查全绿、CI 却红。
+    主仓文档本就不应链接已从主仓移除的东西，因此这里**报错**而不是放过。
+    """
+    if rel_path in _IGNORED_CACHE:
+        return _IGNORED_CACHE[rel_path]
+    try:
+        done = subprocess.run(['git', 'check-ignore', '-q', rel_path], cwd=ROOT,
+                              capture_output=True, check=False)
+        result = done.returncode == 0
+    except (OSError, ValueError):
+        result = False          # 环境里没有 git ⇒ 不应用这条规则，其余检查照旧
+    _IGNORED_CACHE[rel_path] = result
+    return result
 
 
 def iter_md_files():
@@ -50,6 +72,23 @@ def check_file(md_path):
                     continue
                 # 相对路径解析（相对当前文件所在目录）
                 abs_target = os.path.normpath(os.path.join(base, target))
+                # 仓库外的相对路径（如 `../../qlh-release/docs/…`）是**本地工作区路径说明**，
+                # 不是可校验的仓库内链接：它们指向与主仓并列的独立仓库/工作区目录，
+                # 换一台机器或 CI 上必然不存在。这类引用不计入链接质量门。
+                try:
+                    inside_repo = not os.path.relpath(abs_target, ROOT).startswith('..')
+                except ValueError:
+                    # Windows 上跨盘符时 relpath 会抛 ValueError ⇒ 目标必然在仓库外。
+                    # 不接住它，检查工具自己就会崩（比漏报一条链接更糟）。
+                    inside_repo = False
+                if not inside_repo:
+                    continue
+                rel_to_root = os.path.relpath(abs_target, ROOT).replace(os.sep, '/')
+                # 仓库内但**未入库**的目标（工作区独立目录、已裁撤的工具目录）：
+                # 本机存在、CI 上不存在 ⇒ 本地会全绿而 CI 红。主仓文档不应链接这类路径。
+                if _is_gitignored(rel_to_root):
+                    problems.append((lineno, raw, '目标未入库（CI 上不存在）'))
+                    continue
                 if not os.path.exists(abs_target):
                     problems.append((lineno, raw, '目标不存在'))
                 elif os.path.isdir(abs_target):

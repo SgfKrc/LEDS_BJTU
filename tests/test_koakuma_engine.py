@@ -97,9 +97,13 @@ def test_model_host_engine_status_does_not_materialize_lazy_manager() -> None:
 
 def test_upper_layers_do_not_read_private_backend_field() -> None:
     root = Path(__file__).resolve().parents[1]
-    for relative in (
-        "src/scheduler.py",
-        "src/api_server.py",
-        "src/inference_service/engine_host.py",
-    ):
-        assert "_engine_type" not in (root / relative).read_text(encoding="utf-8")
+    scheduler_sources = [root / "src" / "scheduler.py"]
+    scheduler_sources.extend(sorted((root / "src").glob("scheduler_*.py")))
+    assert scheduler_sources
+    paths = [
+        *scheduler_sources,
+        root / "src" / "api_server.py",
+        root / "src" / "inference_service" / "engine_host.py",
+    ]
+    for path in paths:
+        assert "_engine_type" not in path.read_text(encoding="utf-8")

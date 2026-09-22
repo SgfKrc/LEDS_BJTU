@@ -24,7 +24,7 @@ import threading
 import time
 import uuid
 from enum import Enum
-from typing import Any, Mapping, Optional, Callable, TYPE_CHECKING
+from typing import Any, Mapping, Optional, Callable, Sequence, TYPE_CHECKING
 from dataclasses import dataclass, field
 
 if TYPE_CHECKING:
@@ -45,6 +45,7 @@ from pipeline_node_contract import (
     pipeline_layout_from_capacity_plan,
 )
 from pipeline_reshard import PipelineArtifactAvailability, PipelineReshardCoordinator
+from llama_rpc_contract import RpcShardLeaseBook
 from qwen3_pipeline_transaction import (
     Qwen3PipelineDryRunTransaction,
     Qwen3PipelineProtocolError,
@@ -70,6 +71,9 @@ from gemma4_pipeline_sidecar import (
     Gemma4PipelineSidecarSession,
     Gemma4SidecarError,
 )
+from cluster_fence import ControlFence
+from cluster_auto_role import AutoRoleController
+from cluster_handoff import HandoffCoordinator
 
 from task_provider import (
     ModelIdentity as TaskModelIdentity,
@@ -137,6 +141,19 @@ ANDROID_HTTP_CLIENT_HEARTBEAT_INTERVAL_SECONDS = 45
 ANDROID_HTTP_CLIENT_LEASE_SECONDS = 120
 ANDROID_HTTP_CLIENT_TIMEOUT_SECONDS = ANDROID_HTTP_CLIENT_LEASE_SECONDS
 _LAYER_ASSIGNMENT_CACHE_VERSION = 3
+
+# Keep the current scheduler import surface explicit while the implementation
+# is split into smaller modules. Private helpers listed here are compatibility
+# hooks used by bootstrap and Android capability gates.
+__all__ = [
+    "Scheduler",
+    "PipelineQueue",
+    "NodeInfo",
+    "NodeState",
+    "NodeRole",
+    "_node_supports_forward_layers",
+    "_bootstrap_api_port",
+]
 
 
 def _sample_pipeline_token_id(logits, temperature: float, top_p: float) -> int:
@@ -1093,6 +1110,9 @@ class Scheduler:
         # 推理宿主默认使用全局单例；回调由 API composition root 以具名
         # Protocol bundle 注入，避免 scheduler 反向依赖 api_server。
         self._host = host if host is not None else get_model_host()
+        self._control_fence: ControlFence | None = None
+        self._auto_role_controller: AutoRoleController | None = None
+        self._handoff_coordinator: HandoffCoordinator | None = None
         self._callbacks = callbacks if callbacks is not None else getattr(
             self._host, "scheduler_callbacks", None,
         )
@@ -1284,6 +1304,192 @@ class Scheduler:
             raise TypeError("transport runtime factory must be callable or None")
         self._transport_runtime_factory = factory
 
+    def set_control_fence(self, fence: ControlFence | None) -> None:
+        """Attach the runtime control gate without changing legacy tests."""
+        if fence is not None and not isinstance(fence, ControlFence):
+            raise TypeError("control fence must be a ControlFence or None")
+        self._control_fence = fence
+        for transport in (self._tcp_server, self._tcp_client):
+            setter = getattr(transport, "set_control_fence", None)
+            if callable(setter):
+                setter(fence)
+
+    def set_auto_role_controller(self, controller: AutoRoleController | None) -> None:
+        """Attach the explicit auto-role adapter without changing startup defaults."""
+        if controller is not None and not isinstance(controller, AutoRoleController):
+            raise TypeError("auto role controller must be an AutoRoleController or None")
+        self._auto_role_controller = controller
+
+    def get_auto_role_snapshot(self, *, now_ms: int | None = None) -> dict:
+        """Expose auto-role state for read-only control-plane/TUI status."""
+        controller = self._auto_role_controller
+        if controller is None:
+            role = self._effective_role()
+            return {
+                "enabled": False,
+                "state": "disabled",
+                "runtime_role": role,
+                "writable": role == "master",
+            }
+        snapshot = controller.snapshot(now_ms=now_ms)
+        snapshot["enabled"] = True
+        return snapshot
+
+    def start_auto_role(
+        self,
+        *,
+        available_voter_ids: Sequence[str] | None = None,
+        now_ms: int | None = None,
+    ) -> dict:
+        """Start the explicitly attached role controller and return its decision."""
+        controller = self._auto_role_controller
+        if controller is None:
+            return {
+                "accepted": False,
+                "state": "disabled",
+                "runtime_role": self._effective_role(),
+                "reason": "auto_role_disabled",
+            }
+        return controller.start(
+            available_voter_ids=available_voter_ids,
+            now_ms=now_ms,
+        ).to_dict()
+
+    def auto_role_on_disconnect(self) -> dict:
+        """Apply the auto-role write fence after a control-plane disconnect."""
+        controller = self._auto_role_controller
+        if controller is None:
+            return {
+                "accepted": False,
+                "state": "disabled",
+                "runtime_role": self._effective_role(),
+                "reason": "auto_role_disabled",
+            }
+        return controller.on_disconnect().to_dict()
+
+    def auto_role_on_reconnect(
+        self,
+        *,
+        certificate: object | None = None,
+        available_voter_ids: Sequence[str] | None = None,
+        now_ms: int | None = None,
+    ) -> dict:
+        """Rejoin through a new quorum certificate or remain read-only."""
+        controller = self._auto_role_controller
+        if controller is None:
+            return {
+                "accepted": False,
+                "state": "disabled",
+                "runtime_role": self._effective_role(),
+                "reason": "auto_role_disabled",
+            }
+        return controller.on_reconnect(
+            certificate=certificate,
+            available_voter_ids=available_voter_ids,
+            now_ms=now_ms,
+        ).to_dict()
+
+    def set_handoff_coordinator(self, coordinator: HandoffCoordinator | None) -> None:
+        """Attach the explicit certificate-first handoff coordinator."""
+        if coordinator is not None and not isinstance(coordinator, HandoffCoordinator):
+            raise TypeError("handoff coordinator must be a HandoffCoordinator or None")
+        if coordinator is not None and coordinator.event_sink is None:
+            coordinator.event_sink = self._persist_handoff_event
+        self._handoff_coordinator = coordinator
+
+    def _persist_handoff_event(self, event: dict[str, Any]) -> None:
+        """Persist handoff evidence through the existing bounded HA audit log."""
+        self._append_ha_log(
+            "transfer_logs",
+            str(event.get("event_type", "handoff_event")),
+            event,
+        )
+
+    def get_handoff_snapshot(self) -> dict:
+        """Expose handoff metadata without exposing task/model runtime state."""
+        coordinator = self._handoff_coordinator
+        if coordinator is None:
+            return {"enabled": False, "state": "disabled", "record": None, "events": []}
+        snapshot = coordinator.snapshot()
+        snapshot["enabled"] = True
+        return snapshot
+
+    def prepare_leader_handoff(
+        self,
+        new_leader_id: str,
+        manifest: Mapping[str, Any],
+        *,
+        reason: str,
+        operator: str,
+        now_ms: int | None = None,
+        handoff_id: str | None = None,
+    ) -> dict:
+        """Prepare a term-bound handoff through the explicit coordinator."""
+        coordinator = self._handoff_coordinator
+        if coordinator is None:
+            return {"status": "disabled", "reason": "handoff_disabled"}
+        return coordinator.prepare(
+            new_leader_id,
+            manifest,
+            reason=reason,
+            operator=operator,
+            now_ms=now_ms,
+            handoff_id=handoff_id,
+        ).to_dict()
+
+    def commit_leader_handoff(
+        self,
+        *,
+        available_voter_ids: Sequence[str],
+        now_ms: int | None = None,
+        lease_id: str | None = None,
+    ) -> dict:
+        """Commit a prepared handoff or return its awaiting-quorum record."""
+        coordinator = self._handoff_coordinator
+        if coordinator is None:
+            return {"status": "disabled", "reason": "handoff_disabled"}
+        return coordinator.commit(
+            available_voter_ids=available_voter_ids,
+            now_ms=now_ms,
+            lease_id=lease_id,
+        ).to_dict()
+
+    def abort_leader_handoff(
+        self,
+        *,
+        now_ms: int | None = None,
+        reason: str = "aborted",
+    ) -> dict:
+        """Abort only a prepared handoff; a fenced handoff needs recovery."""
+        coordinator = self._handoff_coordinator
+        if coordinator is None:
+            return {"status": "disabled", "reason": "handoff_disabled"}
+        return coordinator.abort(now_ms=now_ms, reason=reason).to_dict()
+
+    def recover_leader_handoff(
+        self,
+        *,
+        now_ms: int | None = None,
+        timeout_ms: int = 30_000,
+    ) -> dict:
+        """Reconcile a fenced handoff; never restore the old write permit."""
+        coordinator = self._handoff_coordinator
+        if coordinator is None:
+            return {"status": "disabled", "reason": "handoff_disabled"}
+        record = coordinator.recover_pending(
+            now_ms=now_ms,
+            timeout_ms=timeout_ms,
+        )
+        return record.to_dict() if record is not None else {
+            "status": "idle",
+            "reason": "handoff_not_active",
+        }
+
+    def _require_control_write(self, action: str) -> None:
+        fence = self._control_fence
+        if fence is not None:
+            fence.require_current_permit(action=action)
+
     def _new_transport_runtime(self, node_id: str) -> object | None:
         factory = self._transport_runtime_factory
         if not callable(factory):
@@ -1354,6 +1560,8 @@ class Scheduler:
             try:
                 server = create_server(bind_host, actual_port)
                 self._tcp_server = server
+                if self._control_fence is not None:
+                    server.set_control_fence(self._control_fence)
                 server.start(
                     on_message=self._bind_tcp_server_callback(
                         server, self._on_tcp_message,
@@ -1618,15 +1826,19 @@ class Scheduler:
         """
         返回当前节点的有效角色。
 
-        正常情况返回 config.NODE_ROLE；若 MAC 不匹配时自动切换到
-        client 模式，则返回 "client"（通过 _role_override 覆盖）。
+        正常情况返回 scheduler 模块持有的运行时 NODE_ROLE；若 MAC 不匹配
+        时自动切换到 client 模式，则返回 "client"（通过 _role_override 覆盖）。
+        node_config/bootstrap 会同步这个模块级值，不能回读启动时已经过期的
+        config.NODE_ROLE。
         """
-        try:
-            import config as cfg
-            configured_role = getattr(cfg, "NODE_ROLE", NODE_ROLE)
-        except Exception:
-            configured_role = NODE_ROLE
-        return getattr(self, '_role_override', None) or configured_role
+        configured_role = NODE_ROLE
+        override = getattr(self, '_role_override', None)
+        if override:
+            return override
+        controller = getattr(self, "_auto_role_controller", None)
+        if controller is not None:
+            return controller.runtime_role
+        return configured_role
 
     def init_nodes(self) -> None:
         """
@@ -1842,6 +2054,7 @@ class Scheduler:
         Returns:
             注销是否成功
         """
+        self._require_control_write("cluster.node.deregister")
         with self._nodes_lock:
             if node_id not in self.nodes:
                 return False
@@ -3338,7 +3551,10 @@ class Scheduler:
             layout = pipeline_layout_from_capacity_plan(
                 plan, node_metadata=self._pipeline_node_metadata(),
             )
-            coordinator = PipelineReshardCoordinator(layout)
+            coordinator = PipelineReshardCoordinator(
+                layout,
+                lease_book=RpcShardLeaseBook(control_fence=self._control_fence),
+            )
         except (PipelineNodeContractError, ValueError) as exc:
             logger.warning("未启用自动重分片合同: %s", exc)
             with self._layer_config_lock:
@@ -3775,6 +3991,7 @@ class Scheduler:
         Returns:
             {status, message, current_assignments}
         """
+        self._require_control_write("cluster.layers.override")
         total_layers = self._get_total_model_layers()
 
         def invalid(reason_code: str, reason: str) -> dict:
@@ -5201,6 +5418,7 @@ class Scheduler:
 
     def bind_model_runtime_contract(self, profile: str, model_id: str) -> dict:
         """Create an auditable, path-free contract from MODEL-FLEET capacity."""
+        self._require_control_write("cluster.model_runtime.contract.bind")
         if self._effective_role() != "master":
             raise Qwen3PipelineProtocolError(
                 "model runtime contract binding is available only on the master node"
@@ -5337,6 +5555,7 @@ class Scheduler:
         *, contract_id: Optional[str] = None,
     ) -> dict:
         """Start an explicit experimental chain only from a supplied contract."""
+        self._require_control_write("cluster.model_runtime.sidecar.begin")
         if self._effective_role() != "master":
             raise Qwen3PipelineProtocolError("model runtime Sidecar control is available only on the master node")
         persisted_contract_id = ""
@@ -5368,6 +5587,7 @@ class Scheduler:
         return {"profile": profile, **result, "production_admitted": False}
 
     def release_model_runtime_sidecar(self, profile: str) -> dict:
+        self._require_control_write("cluster.model_runtime.sidecar.release")
         if self._effective_role() != "master":
             raise Qwen3PipelineProtocolError("model runtime Sidecar control is available only on the master node")
         active_contract_id = self._model_runtime_active_contract_id(profile)
@@ -5392,6 +5612,7 @@ class Scheduler:
         return {"profile": profile, **result, "production_admitted": False}
 
     def cancel_model_runtime_sidecar(self, profile: str) -> dict:
+        self._require_control_write("cluster.model_runtime.sidecar.cancel")
         if self._effective_role() != "master":
             raise Qwen3PipelineProtocolError("model runtime Sidecar control is available only on the master node")
         active_contract_id = self._model_runtime_active_contract_id(profile)
@@ -7796,6 +8017,7 @@ class Scheduler:
         Returns:
             {status, message, transfer_id, ...}
         """
+        self._require_control_write("cluster.role.transfer")
         if self._effective_role() != "master":
             return {"status": "denied", "reason": "仅主节点可发起角色转让"}
 
@@ -8258,6 +8480,7 @@ class Scheduler:
         Returns:
             {status, message, spare_master, ...}
         """
+        self._require_control_write("cluster.spare_master.designate")
         if self._effective_role() != "master":
             return {"status": "denied", "reason": "仅主节点可指定备用主节点"}
 
@@ -8639,6 +8862,7 @@ class Scheduler:
         Returns:
             {status, message}
         """
+        self._require_control_write("cluster.spare_master.clear")
         if self._effective_role() != "master":
             return {"status": "denied", "reason": "仅主节点可清除备用主节点"}
 
@@ -9215,6 +9439,8 @@ class Scheduler:
             # connect() 返回前进入回调。提前绑定连接和最终 node_id，保证
             # 模型同步能取得主节点地址，且 ready/error ACK 能正常发回。
             self._tcp_client = client
+            if self._control_fence is not None:
+                client.set_control_fence(self._control_fence)
             _sync_runtime_node_config(node_id=node_id, node_role="client")
             # ★ 心跳回调：更新自身节点的心跳时间 + 同步 RTT 测量值
             # _sync_node_rtt 内部已有 _nodes_lock 保护
@@ -9296,6 +9522,8 @@ class Scheduler:
                         **self._transport_runtime_kwargs(node_id),
                     )
                     self._tcp_client = client
+                    if self._control_fence is not None:
+                        client.set_control_fence(self._control_fence)
                     _sync_runtime_node_config(node_id=node_id, node_role="client")
                     _bind_client_callbacks(client)
                     ok = client.connect(
@@ -9779,6 +10007,8 @@ class Scheduler:
             "my_node": my_info.to_dict() if my_info else None,
             "tcp_server_running": self._tcp_server is not None and self._tcp_server._running,
         }
+        if self._auto_role_controller is not None:
+            result["auto_role"] = self.get_auto_role_snapshot()
 
         provisional_master = effective_role == "master" and self.can_join_existing_master()
         if provisional_master:
@@ -12316,6 +12546,8 @@ class Scheduler:
                         node_type="pipeline_peer",
                         **self._transport_runtime_kwargs(target_node_id),
                     )
+                    if self._control_fence is not None:
+                        client.set_control_fence(self._control_fence)
                     if not client.connect():
                         logger.error(
                             "链式转发: 连接 %s (%s:%s) 失败",
@@ -14175,6 +14407,7 @@ class Scheduler:
 
         调用后立即把当前物理 MAC 绑定到主节点 SQLite，无需重启。
         """
+        self._require_control_write("cluster.identity.reset")
         if self._effective_role() != "master":
             return {"status": "denied", "reason": "仅主节点可重置身份标识"}
 

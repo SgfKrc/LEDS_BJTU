@@ -1,12 +1,15 @@
-# QLH
+# Kllama
 
-QLH 是一个面向异构边缘设备的分布式推理核心：主线是 GGUF/llama.cpp 轻量引擎，主仓同样拥有 PyTorch 分层分布式引擎与**层流水线**（含跨框架逐层接力），用户交互入口是跨平台 TUI。
+Kllama（Llama for Koakuma）是一个面向异构边缘设备的分布式推理核心：主线是 GGUF/llama.cpp 轻量引擎，主仓同样拥有 PyTorch 分层分布式引擎与**层流水线**（含跨框架逐层接力），用户交互入口是跨平台 TUI。
+
+> **独立项目 · 非官方**：Kllama 是一个**独立的**学生创新项目（北京交通大学 2026 大创），**与 llama.cpp 项目没有隶属、赞助或背书关系**，也不代表其官方立场。项目**基于 llama.cpp 构建**（在此作**描述性引用**，不主张对 "llama.cpp"、"llama" 或任何上游名称的所有权或商标权）。上游组件保留其自身许可证与版本锁定，不因本项目的引用而改变。
 
 > 状态：主仓基线重整中（2026-09-21）
 >
 > 本 README 只描述主仓当前边界和可复现入口。实验记录、历史实现和外置子项目不等同于主仓生产能力。
 >
 > English: [docs/README.en.md](docs/README.en.md)
+
 
 ## 主仓做什么
 
@@ -28,7 +31,7 @@ QLH 是一个面向异构边缘设备的分布式推理核心：主线是 GGUF/l
 
 ## 架构总览
 
-QLH 是**一个进程里的两层**：面向人的控制面，以及面向机器与协议的引擎层。两层之间只有一条
+Kllama 是**一个进程里的两层**：面向人的控制面，以及面向机器与协议的引擎层。两层之间只有一条
 边界 —— 层段合同 `(layer_range, engine, location)`。
 
 ```
@@ -65,7 +68,7 @@ prompt → torch(0..7) →hidden→ Surface(8..15) →hidden→ y700(16..19) →
 
 ## 这是什么软件：系统软件还是用户软件？
 
-**分层回答**：QLH 是**系统软件内核 + 用户软件外壳**的同体交付。
+**分层回答**：Kllama 是**系统软件内核 + 用户软件外壳**的同体交付。
 
 - **控制面 ≈ 用户软件**：TUI、模型资产、节点/布局/队列/日志/设置页面、HTTP API。使用者是**人**，
   失败模式是"体验退化"（重试、换模型、换布局），接口可以演进。
@@ -120,7 +123,16 @@ prompt → torch(0..7) →hidden→ Surface(8..15) →hidden→ y700(16..19) →
 3. **它是"可定制"的前提**——切点分配、混合精度、算子替换、批量交叠这些实验，都建立在"层间可传递 hidden"之上；
 4. **学术上没有对口先例**——Petals 是同框架、KTransformers 是算子级、distributed-llama 是 TP；这条路上我们还给上游提交了缺陷并独立验证了修复（issue #28963）。
 
-**当前有效数据（2026-09-21）**：旧的 182 s → 21.3 s 优化链保留为历史过程，不再作为主仓双引擎端到端性能基线。两端都走主仓引擎的样本是 qwen2.5-0.5B、12+12 层、gen=32：上游 `model_module.forward_layers` + 下游 `llama_engine.forward_layers_from_hidden`，D→L 为 **47.501 ms/步**，与纯 llama.cpp 整模逐 token 一致。**同日晚场复跑补齐了完整矩阵**：两模型 × 切点 / 负载（prefill 32/128/512、decode 32/64/256）/ batch（2/4）/ 混合精度（上游 fp16·f32·NF4 × 下游 Q4_K_M）共 **27 次全部逐 token 一致**，qwen3.5 hybrid 的 **K=8/12/16/20 全部 32/32**。⚠️ 引用档位前先核对**实际生效**项：主仓层流水线的 `quant_type="int4"` **静默回退 fp16**，上游 compile 在 <1.5B 参数时被规模门禁用。
+**当前有效数据（2026-09-21）**：两端都走主仓引擎的样本为 qwen2.5-0.5B、12+12 层、gen=32 ——
+上游 `model_module.forward_layers` + 下游 `llama_engine.forward_layers_from_hidden`，
+D→L 为 **47.501 ms/步**，与纯 llama.cpp 整模逐 token 一致。
+
+**完整矩阵**：两模型 × 切点 / 负载（prefill 32/128/512、decode 32/64/256）/ batch（2/4）/
+混合精度（上游 fp16·f32·NF4 × 下游 Q4_K_M）共 **27 次全部逐 token 一致**；
+qwen3.5 hybrid 的 **K=8/12/16/20 全部 32/32**。
+
+⚠️ 引用档位前先核对**实际生效**项：主仓层流水线的 `quant_type="int4"` **静默回退 fp16**，
+上游 compile 在 <1.5B 参数时被规模门禁用。
 
 **D→L 的容量价值**：qwen2.5-0.5B / qwen3-5-2b 两段切分的容量收益分别为 **1.568× / 1.547×**；同一受控 3.0 GB CUDA 预算下，整模拒绝而 12 层上游通过。该预算是可复现实验约束，不是物理 OOM。D→L 的定位是容量合并和异构能力组合，不是 CUDA 单机提速替代方案。
 
@@ -135,34 +147,18 @@ prompt → torch(0..7) →hidden→ Surface(8..15) →hidden→ y700(16..19) →
 | Windows 算子 | Windows 原生 `triton-windows==3.8.0.post28` 已实测可用；`PYTHONUTF8=1` 是编译路径前置条件；WSL2/fla 是并行路径，不是唯一方案 |
 | 生产定位 | 正确性证据满足 Relay 合同准入；速度只影响默认路由倾向，长时、远端资产自动分发和多段故障验收仍待完成 |
 | 当前文档 | 以[当前有效基线与后续优化计划](docs/跨框架接力-当前有效基线与后续优化计划-2026-09-21.md)为索引，旧报告中的矛盾数字按其有效性分级处理 |
+| 关键量化结论 | 两侧**计算占 99.3%**（通信 + 同步 + 批量仅 0.34%）；单项最大收益是消除上游对 20 层的**空转**（**10.7×**）；层流水线上游只载 `embed_tokens + L0-3`，**1.47 GB vs 4.55 GB**（3.1×）；已否证：进程边界（仅 8%）、复用 `llama_batch`（0.09%）、上游层朴素截断（数值错）、把 `--override-tensor` 当提速（实为容量旋钮） |
 
-**结论修正**：早期"IPC 是主要成本"的判断已被推翻——那是两侧都慢时被掩盖的假象。**杠杆在两侧的计算（切点、kernel、批量），不在传输层面**。详见 [同进程双后端接力实现与性能](docs/archive/同进程双后端接力实现与性能-2026-09-16.md) §12–§14。
+**瓶颈在哪**：早期的"IPC 是主要成本"判断不成立 —— 那是两侧都慢时被掩盖的假象。
+**杠杆在两侧的计算（切点、kernel、批量），不在传输层面**。
+详见 [同进程双后端接力实现与性能](docs/archive/relay/同进程双后端接力实现与性能-2026-09-16.md) §12–§14。
 
 ### 切点扫描结论（P0，2026-09-18 实测）
 
-对上游层数 N 做了完整扫描（N=0 表示**不接力**、只用 llama.cpp 跑整模；下游为对应的 f16 裁层 GGUF，CPU / 8 线程）：
+对上游层数 N 做完整扫描（N=0 表示**不接力**、只用 llama.cpp 跑整模；下游为对应的 f16 裁层 GGUF，CPU / 8 线程）。
+**结论取决于上游跑在 CPU 还是 GPU**，两种都测过。
 
-| 上游层数 N | 上游 ms/步 | 下游 ms/步 | **合计 ms/步** | 64-token 序列 |
-| ---: | ---: | ---: | ---: | --- |
-| **0（不接力）** | 1.9 | 184.8 | **186.8** | 与基线逐 token 一致 |
-| 4（当前默认） | 42.7 | 171.6 | **214.3** | 一致 |
-| 8 | 77.9 | 145.9 | 223.8 | 一致 |
-| 12 | 120.8 | 103.8 | 224.6 | 一致 |
-| 16 | 137.2 | 84.6 | 221.9 | 一致 |
-| 20 | 182.9 | 66.8 | 249.7 | 一致 |
-
-- **正确性不随切点变化**：所有切点的贪心序列逐 token 相同；
-- **总时间对切点几乎不敏感**（N∈{4,8,12,16} 仅在 214–225 ms/步之间，±2.6%），**不存在中间谷底**；现有默认 N=4 在"必须接力"的前提下已是最优点；
-- **不接力反而最快**（186.8 ms/步，比默认 N=4 快 12.9%）⇒ 本机同机、单序列条件下，接力开销约 **+15%**（相对纯 llama.cpp CPU 口径）。这比"对比 llama.cpp 原生整模 GPU **慢约 25×**"（`333 ÷ 13.5`，见上表口径注）温和得多 —— **那 25× 主要是 CPU/GPU 之差，不是接力机制的成本**；
-- 上游每层（torch/CUDA，8.8–10.7 ms）**不比**下游每层（llama.cpp/CPU，7.7–8.6 ms）便宜，所以"把层搬到 torch GPU"在本机不产生速度优势；
-- **工程约束**：切点必须是 `full_attention_interval`（Qwen3.5 = 4）的整数倍，否则裁层 GGUF 的层类型错位而无法加载（N=2 实测）；
-- **方法学警告**：脱离端到端链路的孤立测量不可信（本次把上游单步耗时测低了约 5.6×），切点类结论必须以端到端口径为准。
-
-报告：`local_docs/CORE-RELAY-XFRAME-02-sweep-2026-09-18.json`；票：[验收清单 D29](docs/验收清单与资源限制登记.md)。
-
-**⚠️ 同日修正（v2）—— 上面这一节（含表格）的结论仅在"上游跑在 CPU"时成立**：`relay_sameproc_4L.py` 的 `from_pretrained` 之后没有 `.to(device)`，`dev = tmodel.device` 于是是 **cpu**；而孤立脚本 `upstream_layer_cost.py` 显式 `.to("cuda")`。同一脚本同口径实测同 4 层：**cpu 34.9 ms / cuda 8.3 ms** ⇒ 那 5.6× 差异**由设备解释**（既不是 KV 形状，也不是空闲降频——两者已用对照实验否证：`shape_sensitivity` fixed 47.4 > growing 34.4；`idle_wakeup_and_overlap` idle 8.56 vs continuous 7.53 = 1.14×，SM 时钟全程 780/3105 MHz 不变）。
-
-给 relay 加 `--upstream-device cuda`（配 f16 + `--upstream-partial` 只加载前 N 层，显存约 N/24 × 4.3 GB）后重扫：
+**上游跑在 GPU（真实部署方向）**。给 relay 加 `--upstream-device cuda`（配 f16 + `--upstream-partial` 只加载前 N 层，显存约 N/24 × 4.3 GB）：
 
 | 上游层数 N | CPU 上游 合计 ms/步 | **GPU 上游 合计 ms/步** | 提升 |
 | ---: | ---: | ---: | ---: |
@@ -171,12 +167,36 @@ prompt → torch(0..7) →hidden→ Surface(8..15) →hidden→ y700(16..19) →
 | 16 | 221.9 | **146.4** | 1.52× |
 | **20** | 249.7 | **129.1** | **1.93×** |
 
-- 上游 **GPU ≈ 2.5–4.3 ms/层**，下游 **CPU llama.cpp ≈ 5.8–8.6 ms/层** ⇒ **应把层尽量推给 GPU 上游**；
-- **修正后最优（已测）N=20 = 129.1 ms/步**，比**不接力**的 186.8 ms/步快 **1.45×** —— **接力首次显示出明确收益**；
-- 全部切点的 64-token 序列仍**逐 token 一致**（含 GPU 上游）；
-- 所以"不接力最快 / 切点无收益"**只在 CPU 上游条件下成立**，不可外推。下游在真实部署里多为 **无 CUDA 的边缘设备**，恰好支持"层往 GPU 上游放"这一方向——也因此 **P1（给下游加 GPU）适用面窄，真正值得做的是「上游 GPU 化」与 P2 交叠**。
+- **最优 N=20 = 129.1 ms/步**，比**不接力**的 186.8 ms/步快 **1.45×** —— 接力在此配置下有明确收益；
+- 上游 **GPU ≈ 2.5–4.3 ms/层**，下游 **CPU llama.cpp ≈ 5.8–8.6 ms/层** ⇒ **层应尽量推给 GPU 上游**（本表的口径）；
+- ⚠️ **场景标注**：按**固定开销 + 边际每层**重新拟合本表数据（`local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-p0-corrected-2026-09-18.json`）得
+  上游边际 **2.48 ms/层**（r²=0.944）、下游边际 **6.43 ms/层**（r²=0.991），两侧固定开销几乎相同（25.5 vs 26.4）
+  ⇒ **边际口径支持"推给上游"**。另一份 K=1..20 扫描（[当前有效基线](docs/跨框架接力-当前有效基线与后续优化计划-2026-09-21.md) §P2）给出
+  上游 1.54 / 下游 0.91 ⇒ **方向相反**。两者**模型、量化、单序列口径与工具都不同**，**不可并列比较**；
+  统一口径前不要把任一方当作普适结论（见该文档 §P2 的场景标注与待办）。
+- 全部切点的 64-token 序列**逐 token 一致**（含 GPU 上游）。
 
-报告：`local_docs/CORE-RELAY-XFRAME-02-p0-corrected-2026-09-18.json`（v2，取代 v1）。
+**上游跑在 CPU 时相反**（早期口径，用来界定适用边界）：
+
+- **不接力最快**（186.8 ms/步），接力开销约 **+15%**；
+- **总时间对切点几乎不敏感**（N∈{4,8,12,16} 落在 214–225 ms/步，±2.6%），**不存在中间谷底**；
+- 上游每层（8.8–10.7 ms）**不比**下游每层（7.7–8.6 ms）便宜 ⇒ 该配置下"把层搬到 torch GPU"没有速度优势。
+
+⇒ 所以"不接力最快 / 切点无收益"**只在 CPU 上游条件下成立，不可外推**。真实部署里下游多为
+**无 CUDA 的边缘设备**，恰好支持"层往 GPU 上游放"这个方向：**P1（给下游加 GPU）适用面窄，
+值得做的是「上游 GPU 化」与 P2 交叠**。
+
+**两条通用约束**：
+
+- **正确性不随切点变化**：所有切点的贪心序列逐 token 相同；
+- **切点必须是 `full_attention_interval`（Qwen3.5 = 4）的整数倍**，否则裁层 GGUF 的层类型错位而无法加载（N=2 实测）。
+
+⚠️ **方法学**：脱离端到端链路的孤立测量不可信 —— 早期曾把上游单步耗时测低约 5.6×，根因是**上游实际跑在
+CPU 却与 GPU 数据混比**（同脚本同口径实测同 4 层：cpu 34.9 ms / cuda 8.3 ms，差异由设备解释，
+既非 KV 形状也非空闲降频）。切点类结论必须以端到端口径为准。
+
+报告：`local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-p0-corrected-2026-09-18.json`；
+票：[验收清单 D29](docs/验收清单与资源限制登记.md)。
 
 ### 与「全 llama + CUDA」的公平对照 + P2 交叠（2026-09-18 实测）
 
@@ -198,9 +218,14 @@ prompt → torch(0..7) →hidden→ Surface(8..15) →hidden→ y700(16..19) →
 
 加速 **1.291×**，且两条序列的 token 与单序列基线**完全一致**；理论天花板约 1.79×（完全重叠时取上游 72.3 / 下游 56.8 之较大者），实测达到约 72%。
 
-**结论与定位**：上面 P0 那个 1.45× 只是「CPU llama.cpp → GPU **torch**」的局部收益；更好的做法是「CPU llama.cpp → GPU **llama.cpp**」（`-ngl`）。所以 **跨框架接力不是更快的推理路径**，而是「**只能用 torch 跑的层**」（hybrid/自定义算子）与「**容量合并 / 层流水线**（单机装不下）」的机制，外加实验平台。**集群里有 CUDA 节点时，最佳实践是把它作为 llama.cpp 的 CUDA worker（RPC/分片），而不是接力上游**；P2 交叠只在「不得不接力」的场景内把损失补回一部分（78.3 ms/token 仍慢于 26.6 约 3×）。
+**结论与定位**：
 
-报告：`local_docs/CORE-RELAY-XFRAME-02-p2-2026-09-18.json`。⚠️ 以上均为**同机**数据；**跨机（GPU 节点 + 无 CUDA 边缘节点）的 RPC vs 接力对照仍未测**。
+- 上面 P0 那个 1.45× 只是「CPU llama.cpp → GPU **torch**」的局部收益；更好的做法是「CPU llama.cpp → GPU **llama.cpp**」（`-ngl`）；
+- 所以**跨框架接力不是更快的推理路径**，而是两个机制加一个平台：「**只能用 torch 跑的层**」（hybrid / 自定义算子）、「**容量合并 / 层流水线**」（单机装不下），以及实验平台；
+- **集群里有 CUDA 节点时**，最佳实践是把它当作 llama.cpp 的 CUDA worker（RPC / 分片），**而不是接力上游**；
+- P2 交叠只在「不得不接力」的场景内把损失补回一部分（78.3 ms/token 仍慢于 26.6 约 **3×**）。
+
+报告：`local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-p2-2026-09-18.json`。⚠️ 以上均为**同机**数据；**跨机（GPU 节点 + 无 CUDA 边缘节点）的 RPC vs 接力对照仍未测**。
 
 ### torch.compile 与「层循环」开关（`USE_COMPILE` / `USE_MONOLITHIC_FORWARD`）
 
@@ -211,7 +236,12 @@ prompt → torch(0..7) →hidden→ Surface(8..15) →hidden→ y700(16..19) →
 | `USE_COMPILE` | `True` | 启用编译。编译不可用时**告警并回退 eager**，不影响启动（Windows 未装 [`triton-windows`](requirements-compile.txt) 时即走此路径；**装了就可用** —— 2026-09-19 起 Windows 原生已实测编译成功，不再是「死开关」） |
 | `USE_MONOLITHIC_FORWARD` | `False` | 打开后额外编译**「层循环」**（`_LayerLoop`），供 `forward_layers()` 使用；默认关 |
 
-**为什么只编译「层循环」而不编译整个模型**：`Qwen2Model.forward()` 的返回值要经过 `self.norm`（完整模型语义），而分布式分段前向在 `has_lm_head=False` 时必须返回**未过 norm** 的 raw hidden。所以只包住层循环，前置/后置仍由 `forward_layers()` 负责，语义才与逐层版一致。（第一版直接编译整段 `Qwen2Model` 得到 2.325×，但**多算了一次 `self.norm`**，argmax 从 decode 第 1 步就分叉 —— ）
+**为什么只编译「层循环」而不编译整个模型**：
+
+- `Qwen2Model.forward()` 的返回值要经过 `self.norm`（完整模型语义）；
+- 而分布式分段前向在 `has_lm_head=False` 时必须返回**未过 norm** 的 raw hidden；
+- 所以只包住层循环，前置 / 后置仍由 `forward_layers()` 负责，语义才与逐层版一致；
+- ⚠️ 反例：第一版直接编译整段 `Qwen2Model` 得到 2.325×，但**多算了一次 `self.norm`** ⇒ argmax 从 decode 第 1 步就分叉。
 
 **实测收益**（`USE_MONOLITHIC_FORWARD=True`；见[图 3](docs/figures/cross-frame-relay/fig3-compile-gains.png)）：
 
@@ -228,11 +258,11 @@ hybrid（Qwen3.5 的 18 层 `linear_attention` + 6 层 `full_attention`）需要
 2. **有「逐 token 一致」验收判据的场景不得开启 compile**（例如跨框架接力的准入判据）。
 3. **Windows 需要两件事**：`PYTHONUTF8=1`（否则 torch/inductor 内部按 GBK 解码失败、**静默回退 eager**）与 [`triton-windows`](requirements-compile.txt)（可选加速，`requirements-compile.txt` 声明；**已实测可用**，官方 PyPI 无 Windows wheel，用社区构建 `triton-windows-3.8.0.post28`）。两者缺一都不会崩，只是拿不到收益。
 
-报告：`local_docs/CORE-RELAY-XFRAME-02-a4-layer-loop-2026-09-18.json`、`…-b14-hybrid-layer-loop-2026-09-18.json`、`…-compile-numerics-2026-09-18.json`。
+报告：`local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-a4-layer-loop-2026-09-18.json`、`…-b14-hybrid-layer-loop-2026-09-18.json`、`…-compile-numerics-2026-09-18.json`。
 
 ### 顶层透明性
 
-TUI 与 API 顶层只需知道**聚合资源**（GPU/CPU/内存）和"是否分布式"，不必知道谁在本地、谁在远端；引擎选择按**资源 + 能力 + 目标**决定，而不是"有 GPU 就用 torch"。可选策略（隐私、带宽）尚未实现，留给后续策略票。见 [层流水线的节点类型与顶层透明性](docs/层流水线节点类型与顶层透明性-可行性确认-2026-09-17.md)。
+TUI 与 API 顶层只需知道**聚合资源**（GPU/CPU/内存）和"是否分布式"，不必知道谁在本地、谁在远端；引擎选择按**资源 + 能力 + 目标**决定，而不是"有 GPU 就用 torch"。可选策略（隐私、带宽）尚未实现，留给后续策略票。见 [层流水线的节点类型与顶层透明性](docs/archive/relay/层流水线节点类型与顶层透明性-可行性确认-2026-09-17.md)。
 
 ## 当前状态
 
@@ -269,7 +299,7 @@ TUI 与 API 顶层只需知道**聚合资源**（GPU/CPU/内存）和"是否分�
 
 | 路径 | 内容 |
 | --- | --- |
-| `src/` | QLH 主代码：控制面、引擎、层段/层流水线合同、TUI（分组见下） |
+| `src/` | Kllama 主代码：控制面、引擎、层段/层流水线合同、TUI（分组见下） |
 | `tests/` | pytest 套件（TUI、RPC/层段、调度、合同、文档门） |
 | `scripts/` | 验证、实验、环境与文档工具（`edge_preflight.py`、`android_validation.py`、`llama_rpc_*.py`、`doc_maintenance_audit.py` 等） |
 | `docs/` | 现行文档；历史与已迁移内容在 `docs/archive/` |
@@ -278,7 +308,7 @@ TUI 与 API 顶层只需知道**聚合资源**（GPU/CPU/内存）和"是否分�
 | `local_docs/` | 本地实验与验收原始记录；不作为公开源码接口 |
 | `runtime/` | 运行期日志与 llama.cpp 运行时目录 |
 | `qlh.py` / `qlh_edge.py` | 交互 TUI/CLI 入口与 Edge 入口 |
-| `qlh.bat` / `qlh.sh` / `bjtu.*` / `koakuma.*` | 启动器；`bjtu`、`koakuma` 为兼容别名，统一入口仍是 `qlh` |
+| `qlh.bat` / `qlh.sh` / `kllama.*` / `bjtu.*` / `koakuma.*` | 启动器；`kllama` 为**推荐别名**，`bjtu`、`koakuma` 为兼容别名，统一入口脚本仍是 `qlh.py` |
 | `start_tui.*` / `start_backend.bat` / `setup_all_envs.*` | 一键启动与多环境安装脚本 |
 | `requirements*.txt` / `pytest.ini` / `pyrightconfig.json` / `reasonix.toml` | 依赖清单与工具配置 |
 | `models/`、`chat_history/`、`dist/`、`build/`、`test-results/`、`logs/`、`_to_delete/` | 本地产物或归档区，不入 Git（`logs/`、`_to_delete/` 已 gitignore） |
@@ -386,9 +416,18 @@ python qlh.py models
 
 写操作从外壳发起：模型屏 `L` 加载 / `U` 卸载，队列屏 `P` 暂停-恢复 / `S` 策略 / `C` 清空排队，聊天屏可用 `/model`、`/queue`、`/new`、`/resume`、`/rename`、`/sessions`、`/delete-session`、`/reset`；破坏性与长耗时操作都会先弹确认框。模型控制接口按 loopback 默认放行，远程控制主节点需主节点配置 `QLH_MODEL_API_TRUSTED_CIDRS`。
 
-Windows 可直接使用 `qlh.bat`，Linux/macOS 可使用 `qlh.sh`。`bjtu`/`koakuma` 是兼容启动器，主仓统一入口仍是 `qlh`。
+Windows 可直接使用 `qlh.bat`（或 `kllama.bat`），Linux/macOS 可使用 `qlh.sh`（或 `kllama.sh`）。`kllama` 是推荐别名，`bjtu`/`koakuma` 是兼容启动器；三者都转发到同一个入口脚本 `qlh.py`。
 
-TUI 的 9 个功能屏是主交互和验收边界：模型屏负责本地资产/预设/下载任务、搜索、预检、登记、加载和卸载；分布式/节点屏负责开关、容量、最大节点、邀请、连接、入群请求码/授权消费和注销；日志屏负责筛选、统计、导出和清理；设备屏负责自动配置和 GPU 选择；设置屏负责读取和写入用户设置。最后的「调试」屏从运行中后端 `/openapi.json` 动态读取路由，仅作为尚未形成专用交互的 JSON 兜底，不计作产品功能覆盖。当前主后端 OpenAPI 快照为 152 个操作，实际数量以目标后端返回为准；流式聊天和文件上传仍由聊天页专用处理。
+TUI 的 9 个功能屏是主交互和验收边界：
+
+- **模型屏**：本地资产 / 预设 / 下载任务、搜索、预检、登记、加载和卸载；
+- **分布式 / 节点屏**：开关、容量、最大节点、邀请、连接、入群请求码 / 授权消费和注销；
+- **日志屏**：筛选、统计、导出和清理；
+- **设备屏**：自动配置和 GPU 选择；
+- **设置屏**：读取和写入用户设置；
+- **「调试」屏**：从运行中后端 `/openapi.json` 动态读取路由，仅作尚未形成专用交互的 JSON 兜底，**不计作产品功能覆盖**。
+
+当前主后端 OpenAPI 快照为 152 个操作，实际数量以目标后端返回为准；流式聊天和文件上传仍由聊天页专用处理。
 
 ## 模型与分布式
 
@@ -446,24 +485,30 @@ python -m venv .venv-test
 
 真实硬件、跨机网络、Android ARM64、性能和长时 soak 必须另外保存原始命令、环境、模型摘要、拓扑、输出和失败边界，测试绿灯本身不替代这些证据。
 
+**文档检查**（纯静态、只需标准库）：`python scripts/run_doc_checks.py` 跑两条检查 —— 相对链接死链、README 双语结构同步。
+
+同一套检查在 **CI**（[`.github/workflows/checks.yml`](.github/workflows/checks.yml)）与**本地 pre-push 钩子**（[`.githooks/`](.githooks/README.md)，用 `git config core.hooksPath .githooks` 启用）各跑一遍 —— **一处定义、两处复用**。加它的直接原因：仓库原先没有任何自动化检查，文档一经归档就容易留下"引用没跟着改"的死链，实测一次就攒到 20 处。
+
 ## 文档入口
 
 - [主线开发计划：分布式推理与边缘优化](docs/主线开发计划-分布式推理与边缘优化-2026-09-14.md)
 - [整体架构](docs/整体架构.md)
-- [层段协议立项（2026-09-17）](docs/层段协议立项-2026-09-17.md)
-- [层流水线的节点类型与顶层透明性](docs/层流水线节点类型与顶层透明性-可行性确认-2026-09-17.md)
-- [同进程双后端接力实现与性能](docs/archive/同进程双后端接力实现与性能-2026-09-16.md)
+- [层段协议立项（2026-09-17）](docs/archive/relay/层段协议立项-2026-09-17.md)
+- [层流水线的节点类型与顶层透明性](docs/archive/relay/层流水线节点类型与顶层透明性-可行性确认-2026-09-17.md)
+- [同进程双后端接力实现与性能](docs/archive/relay/同进程双后端接力实现与性能-2026-09-16.md)
 - [跨框架接力当前有效基线与后续优化计划](docs/跨框架接力-当前有效基线与后续优化计划-2026-09-21.md)
-- [测试质量审计（2026-09-21）：并行 flaky 实测与竞态覆盖差距](docs/测试质量审计-2026-09-21.md)
+- [KTransformers 优化迁移调研与算法数据层优化方向](docs/KTransformers优化迁移调研与算法数据层优化方向-2026-09-23.md)
+- [大文件拆解计划：scheduler.py 与 api_server.py](docs/大文件拆解计划-scheduler与api_server-2026-09-23.md)
+- [测试质量审计（2026-09-21）：并行 flaky 实测与竞态覆盖差距](docs/archive/misc/测试质量审计-2026-09-21.md)
 - [P4.5 立项：主节点动态选举与配套分布式管理](docs/主节点动态选举与分布式管理-P4.5立项-2026-09-21.md)
-- [引擎单序列与并发性能对比](docs/引擎单序列与并发性能对比-2026-09-16.md)
+- [引擎单序列与并发性能对比](docs/archive/relay/引擎单序列与并发性能对比-2026-09-16.md)
 - [分布式推理并行与跨框架路线调研汇总](docs/分布式推理并行与跨框架路线调研汇总-2026-09-15.md)
 - [TUI 使用指南](docs/TUI使用指南.md)
 - [TUI 功能屏与调试兜底说明](docs/TUI使用指南.md#调试兜底非功能验收)
 - [TUI 指令集](docs/TUI指令集.md)
-- [边缘设备模拟环境计划](docs/边缘设备模拟环境计划-2026-09-15.md)
+- [边缘设备模拟环境计划](docs/archive/edge/边缘设备模拟环境计划-2026-09-15.md)
 - [Android 验证替代路径](android/Android验证替代路径-2026-09-18.md)
-- [基线重写方案](docs/archive/基线重写方案-2026-09-16.md)
+- [基线重写方案](docs/archive/runtime/基线重写方案-2026-09-16.md)
 - [模块接口说明](docs/模块接口说明.md)
 - [测试与评判标准](docs/测试与评判标准.md)
 - [文档状态与清理清单](docs/文档状态与清理清单.md)

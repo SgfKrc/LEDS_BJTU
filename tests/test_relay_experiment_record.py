@@ -206,6 +206,8 @@ def test_cli_dry_run_emits_a_valid_record_for_every_path(extra, expected_path, e
     assert payload["path"] == expected_path
     assert payload["kind"] == expected_kind
     assert payload["verdict"]["failure"] == "dry_run"
+    assert payload["load"]["warmup"] == 2
+    assert payload["record_origin"] == {"kind": "raw_measurement", "rounds": 1}
     validate_record(payload)
 
 

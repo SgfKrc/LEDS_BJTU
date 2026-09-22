@@ -33,6 +33,7 @@ import os
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -356,15 +357,16 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"FAIL: 模型 n_embd={runner.n_embd} 与期望 {args.n_embd} 不一致")
 
     listener = open_loopback_listener(host, port)
+    utc_now = lambda: datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     ready = {"role": args.role, "host": host, "port": port, "n_embd": runner.n_embd,
-             "ready_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+             "ready_at": utc_now()}
     if args.ready_file:
         target = Path(args.ready_file)
         target.parent.mkdir(parents=True, exist_ok=True)
 
         def _write_ready() -> None:
             payload = dict(ready)
-            payload["alive_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            payload["alive_at"] = utc_now()
             payload["pid"] = os.getpid()
             target.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 

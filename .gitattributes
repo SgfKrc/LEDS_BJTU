@@ -10,3 +10,6 @@ start_tui.bat text eol=crlf
 # 统一入口的别名薄壳（koakuma = qlh）
 koakuma.bat text eol=crlf
 qlh.bat text eol=crlf
+# git 钩子必须是 LF：这些是带 `#!/bin/sh` shebang 的 shell 脚本，CRLF 会让解释器
+# 把 `\r` 当成命令的一部分而在 Windows 检出后直接执行失败（core.hooksPath 指向它们）。
+.githooks/* text eol=lf

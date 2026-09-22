@@ -72,7 +72,7 @@ def _fake_ssh(monkeypatch, module, payload: str, returncode: int = 0, stderr: st
 def test_ready_check_accepts_fresh_heartbeat(monkeypatch) -> None:
     """★ 心跳新鲜 ⇒ 健康。"""
     module = _load()
-    now = dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     _fake_ssh(monkeypatch, module, json.dumps(
         {"role": "tail", "alive_at": now, "pid": 4242}))
     result = module._check_ready("y700", "/tmp/tail.ready", timeout=1.0, stale_seconds=30.0)
@@ -85,7 +85,7 @@ def test_ready_check_accepts_fresh_heartbeat(monkeypatch) -> None:
 def test_ready_check_flags_stale_heartbeat(monkeypatch) -> None:
     """★ 案例 2 的守卫：进程可能还在，但**心跳过期** ⇒ 该段已不再服务。"""
     module = _load()
-    old = (dt.datetime.now() - dt.timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%S")
+    old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=600)).isoformat(timespec="seconds").replace("+00:00", "Z")
     _fake_ssh(monkeypatch, module, json.dumps({"role": "middle", "alive_at": old, "pid": 7}))
     result = module._check_ready("surface", "/tmp/mid.ready", timeout=1.0, stale_seconds=30.0)
     assert result["ok"] is False
@@ -100,6 +100,28 @@ def test_ready_check_handles_missing_file(monkeypatch) -> None:
     result = module._check_ready("y700", "/tmp/none.ready", timeout=1.0, stale_seconds=30.0)
     assert result["ok"] is False
     assert result["reason"] == "no_ready_file"
+
+
+def test_ready_check_rejects_remote_shell_metacharacters(monkeypatch) -> None:
+    module = _load()
+    calls = []
+
+    def fake_run(args, **_kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=1, stdout="", stderr="missing")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    module._check_ready("surface", "C:/tmp/a; touch /tmp/pwned `x`", timeout=1.0, stale_seconds=30.0)
+    assert calls == []
+
+
+def test_ready_check_rejects_naive_heartbeat(monkeypatch) -> None:
+    module = _load()
+    _fake_ssh(monkeypatch, module, json.dumps({"role": "tail", "alive_at": "2026-09-22T12:00:00", "pid": 1}))
+    result = module._check_ready("surface", "/tmp/tail.ready", timeout=1.0, stale_seconds=30.0)
+    assert result["ok"] is False
+    assert result["reason"] == "heartbeat_invalid"
+    assert result["age_s"] is None
 
 
 def test_main_exit_code_and_json(monkeypatch, capsys) -> None:

@@ -214,6 +214,7 @@ scripts/*
 !scripts/relay_l2l_net_probe.py
 !scripts/relay_sync_device.ps1
 !scripts/relay_health.py
+!scripts/run_doc_checks.py
 
 # 根目录：过时日志 / 备份（2026-09-20 剔除）
 # ⚠️ `bjtu.bat` / `bjtu.sh` **保留** —— 它们仍是活跃入口：

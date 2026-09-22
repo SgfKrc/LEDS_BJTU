@@ -135,6 +135,8 @@ from cluster_join import (
     verify_join_grant,
     verify_and_consume_join_grant,
 )
+from cluster_fence import ControlFence, ControlFenceError
+from cluster_score import build_management_score_snapshot
 from node_config import load_node_config, write_node_config
 
 _request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
@@ -148,6 +150,11 @@ _log_buffer_lock = threading.RLock()
 _log_buffer_total_seen = 0
 _join_ledger_lock = threading.RLock()
 _join_ledger_instance: JoinGrantLedger | None = None
+
+# P4.5 fencing is opt-in until a voter set/certificate distribution path is
+# configured.  When enabled, the middleware below covers control-plane writes;
+# read/status routes remain available in read-only mode.
+control_fence = ControlFence.from_environment()
 
 
 def _get_join_ledger() -> JoinGrantLedger:
@@ -377,6 +384,25 @@ def _boundary_response(status_code: int, detail: object) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"detail": detail})
 
 
+def _is_control_write_path(request: Request) -> bool:
+    if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return False
+    path = request.url.path
+    if path.startswith("/api/cluster/queue"):
+        return True
+    if path.startswith("/api/cluster/config") or path.startswith("/api/cluster/layers"):
+        return True
+    if path.startswith("/api/cluster/model-runtime") or path.startswith("/api/cluster/qwen3"):
+        return True
+    if path.startswith("/api/cluster/transfer-master") or path.startswith("/api/cluster/spare-master"):
+        return True
+    if path.startswith("/api/cluster/reset-identity"):
+        return True
+    if "/api/cluster/nodes/" in path and path.endswith("/deregister"):
+        return True
+    return False
+
+
 @app.middleware("http")
 async def api_boundary_middleware(request: Request, call_next):
     """Apply the common source/auth boundary before route validation or work.
@@ -409,7 +435,29 @@ async def api_boundary_middleware(request: Request, call_next):
                 {"code": "auth_required", "message": "需要登录（Bearer token）"},
             )
 
-    return await call_next(request)
+    if _is_control_write_path(request) and control_fence.enabled:
+        try:
+            control_fence.admit_http(
+                request.headers,
+                action=f"http.{request.method.lower()}.{request.url.path}",
+                request_id=_request_id_ctx.get("-"),
+            )
+        except ControlFenceError as exc:
+            control_fence.clear_context()
+            status = 503 if exc.code == "control_fence_unavailable" else 409
+            return _boundary_response(
+                status,
+                {"code": exc.code, "message": str(exc)},
+            )
+
+    try:
+        return await call_next(request)
+    except ControlFenceError as exc:
+        status = 503 if exc.code == "control_fence_unavailable" else 409
+        return _boundary_response(status, {"code": exc.code, "message": str(exc)})
+    finally:
+        if control_fence.enabled:
+            control_fence.clear_context()
 
 def _normalize_request_id(value: str | None) -> str:
     if not value:
@@ -571,6 +619,7 @@ def _runtime_readiness_snapshot() -> dict[str, Any]:
 
 # 调度器（单机 / 分布式模式共用）
 scheduler: ClusterScheduler = ClusterScheduler()
+scheduler.set_control_fence(control_fence)
 _task_graph_runtime_lock = threading.RLock()
 
 
@@ -6863,12 +6912,14 @@ async def get_my_role():
 
 
 @app.put("/api/cluster/config/max-nodes")
-async def update_max_nodes(req: UpdateMaxNodesRequest):
+async def update_max_nodes(req: UpdateMaxNodesRequest, request: Request):
     """
     动态调整最大节点数量（仅主节点可调用）。
 
     仅修改容量上限，不预创建空槽位。从节点通过 TCP 注册动态加入。
     """
+    if control_fence.enabled:
+        control_fence.require_current_permit(action="cluster.config.max_nodes")
     result = scheduler.update_max_nodes(req.max_nodes)
     if result.get("status") == "denied":
         raise HTTPException(403, result.get("reason", "权限不足"))
@@ -7620,6 +7671,48 @@ class SetQueueStrategyRequest(BaseModel):
     strategy: str = Field(..., pattern="^(fifo|mlfq)$", description="调度策略: fifo | mlfq")
 
 
+class ControlCertificateRequest(BaseModel):
+    certificate: dict = Field(..., description="已由 quorum voter set 签发的控制证书")
+
+
+@app.get("/api/cluster/control-plane")
+async def get_control_plane_status():
+    """Read-only fencing status; it remains available while writes are fenced."""
+    return control_fence.snapshot()
+
+
+@app.get("/api/cluster/management-score")
+async def get_cluster_management_score():
+    """Return the versioned, read-only management-capability score snapshot."""
+
+    def _build_snapshot() -> dict[str, Any]:
+        try:
+            import config as _config
+
+            secret = str(getattr(_config, "CLUSTER_SECRET", "") or "")
+        except Exception:
+            secret = os.environ.get("QLH_CLUSTER_SECRET", "")
+        return build_management_score_snapshot(
+            scheduler.get_nodes(),
+            signing_secret=secret,
+        )
+
+    return await run_in_threadpool(_build_snapshot)
+
+
+@app.post("/api/cluster/control-plane/certificate")
+async def install_control_plane_certificate(req: ControlCertificateRequest):
+    """Install a certificate already issued by the quorum protocol."""
+    if scheduler._effective_role() != "master":
+        raise HTTPException(403, {"code": "not_master", "message": "only master may install a control certificate"})
+    try:
+        result = control_fence.install_certificate(req.certificate)
+    except ControlFenceError as exc:
+        status = 503 if exc.code == "control_fence_unavailable" else 409
+        raise HTTPException(status, {"code": exc.code, "message": str(exc)}) from exc
+    return {"status": "installed", **result}
+
+
 class CancelTaskResponse(BaseModel):
     success: bool
     task_id: str
@@ -7641,8 +7734,10 @@ async def get_queue_detail():
 
 
 @app.post("/api/cluster/queue/strategy")
-async def set_queue_strategy(req: SetQueueStrategyRequest):
+async def set_queue_strategy(req: SetQueueStrategyRequest, request: Request):
     """切换调度策略: fifo | mlfq。仅主节点。"""
+    if control_fence.enabled:
+        control_fence.require_current_permit(action="cluster.queue.strategy")
     if not scheduler._effective_role() == "master":
         raise HTTPException(403, "仅主节点可切换调度策略")
     try:
@@ -7653,8 +7748,10 @@ async def set_queue_strategy(req: SetQueueStrategyRequest):
 
 
 @app.post("/api/cluster/queue/pause")
-async def pause_queue():
+async def pause_queue(request: Request):
     """暂停接受新请求。仅主节点。"""
+    if control_fence.enabled:
+        control_fence.require_current_permit(action="cluster.queue.pause")
     if not scheduler._effective_role() == "master":
         raise HTTPException(403, "仅主节点可暂停请求队列")
     scheduler.pipeline_queue.pause()
@@ -7662,8 +7759,10 @@ async def pause_queue():
 
 
 @app.post("/api/cluster/queue/resume")
-async def resume_queue():
+async def resume_queue(request: Request):
     """恢复接受新请求。仅主节点。"""
+    if control_fence.enabled:
+        control_fence.require_current_permit(action="cluster.queue.resume")
     if not scheduler._effective_role() == "master":
         raise HTTPException(403, "仅主节点可恢复请求队列")
     scheduler.pipeline_queue.resume()
@@ -7671,8 +7770,10 @@ async def resume_queue():
 
 
 @app.post("/api/cluster/queue/clear")
-async def clear_queue():
+async def clear_queue(request: Request):
     """清空所有排队任务（不影响执行中的任务）。仅主节点。"""
+    if control_fence.enabled:
+        control_fence.require_current_permit(action="cluster.queue.clear")
     if not scheduler._effective_role() == "master":
         raise HTTPException(403, "仅主节点可清空请求队列")
     count = scheduler.pipeline_queue.clear()
@@ -7680,13 +7781,15 @@ async def clear_queue():
 
 
 @app.delete("/api/cluster/queue/task/{task_id}")
-async def cancel_queue_task(task_id: str):
+async def cancel_queue_task(task_id: str, request: Request):
     """
     取消指定排队任务。
 
     执行中的流水线任务会在当前 token step 完成后通过 PIPELINE_ABORT 中止。
     仅主节点。
     """
+    if control_fence.enabled:
+        control_fence.require_current_permit(action="cluster.queue.cancel")
     if not scheduler._effective_role() == "master":
         raise HTTPException(403, "仅主节点可取消队列任务")
     ok = scheduler.pipeline_queue.cancel_task(task_id)
