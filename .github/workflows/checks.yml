@@ -1,0 +1,40 @@
+# 文档检查（CI 兜底）
+#
+# 为什么有它：仓库原先没有任何自动化检查，于是"文档归档后引用没跟着改"这类问题只能靠人发现
+# —— 实测一次就攒到 20 处死链（`docs/` 内 14 处 + README/README.en 等 6 处）。
+#
+# 覆盖两条**纯静态、只用标准库**的检查（秒级，无需 pip install）：
+#   - scripts/check_doc_links.py    相对链接死链
+#   - scripts/check_readme_l10n.py  README 双语结构同步
+# 两者由 `scripts/run_doc_checks.py` 统一调用 —— **一处定义、两处复用**（本 workflow 与本地
+# `.githooks/pre-push`），避免两份清单漂移。
+#
+# 注意：跨机接力健康检查（scripts/relay_health.py）**不在 CI 里** —— 它需要真实服务/设备，
+# 属于运行期检查；其单元测试已覆盖在 tests/test_relay_health.py（ssh 已 mock）。
+
+name: doc-checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  doc-checks:
+    runs-on: ubuntu-latest
+    env:
+      # 仓库里有中文文件名/中文文档；显式 UTF-8 避免平台差异带来的解码问题
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 文档检查不需要 LFS 大文件，跳过 smudge 以加快速度
+          lfs: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 两条检查均只用标准库 ⇒ 无依赖安装步骤
+      - name: Run documentation checks
+        run: python scripts/run_doc_checks.py

@@ -446,6 +446,8 @@ python -m venv .venv-test
 
 真实硬件、跨机网络、Android ARM64、性能和长时 soak 必须另外保存原始命令、环境、模型摘要、拓扑、输出和失败边界，测试绿灯本身不替代这些证据。
 
+**文档检查**（纯静态、只需标准库）：`python scripts/run_doc_checks.py` 跑相对链接死链检查与 README 双语结构同步检查。同一套检查在 CI（[`.github/workflows/checks.yml`](.github/workflows/checks.yml)）与本地 pre-push 钩子（[`.githooks/`](.githooks/README.md)，用 `git config core.hooksPath .githooks` 启用）各跑一遍——**一处定义、两处复用**。加它的直接原因：仓库原先没有任何自动化检查，而文档一经归档就容易留下"引用没跟着改"的死链，实测一次就攒到 20 处。
+
 ## 文档入口
 
 - [主线开发计划：分布式推理与边缘优化](docs/主线开发计划-分布式推理与边缘优化-2026-09-14.md)

@@ -475,6 +475,8 @@ Targeted checks for high-risk mainlines:
 
 Real hardware, cross-machine networking, Android ARM64, performance and long-run soak must additionally preserve the raw commands, environment, model digests, topology, output and failure boundaries; a green test run alone does not replace that evidence.
 
+**Documentation checks** (purely static, standard library only): `python scripts/run_doc_checks.py` runs the relative-link check and the README bilingual-structure check. The very same suite runs twice — in CI ([`.github/workflows/checks.yml`](../.github/workflows/checks.yml)) and in a local pre-push hook ([`.githooks/`](../.githooks/README.md), enabled with `git config core.hooksPath .githooks`) — i.e. **defined once, reused in both places**. The immediate reason for adding it: the repository had no automated checks at all, and archived documents easily leave behind "reference not updated" dead links — a single pass turned up 20 of them.
+
 ## Documentation Index
 
 - [Current D-to-L Baseline and Optimization Plan (2026-09-21)](跨框架接力-当前有效基线与后续优化计划-2026-09-21.md)

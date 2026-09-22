@@ -1,0 +1,54 @@
+#!/bin/sh
+# pre-push：本地文档检查（提前拦截）+ Git LFS 转发
+#
+# ## 为什么这样写
+#
+# 1. **必须显式转发 LFS**：本仓库的 Git LFS 会在 `.git/hooks/pre-push` 装它自己的钩子。
+#    启用 `core.hooksPath=.githooks` 后，Git 只认 `.githooks/`，原钩子不再执行 —— 若这里不
+#    转发 `git lfs pre-push`，推送 LFS 跟踪的大文件就会**静默漏传**（比检查失败更糟）。
+# 2. **找不到 python 就放行**：文档检查只依赖标准库，但本机不一定有可用解释器。
+#    环境缺失绝不能把 push 卡死；此时只警告，交由 CI（`.github/workflows/checks.yml`）兜底
+#    执行**同一套**检查（两处都调用 `scripts/run_doc_checks.py`，避免清单漂移）。
+#
+# ## 安装
+#
+#     git config core.hooksPath .githooks      # 或运行 .githooks/install.sh / install.ps1
+#
+# ## 绕过（仅在确知后果时）
+#
+#     git push --no-verify
+
+set -u
+
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null || echo .)
+cd "$repo_root" || exit 0
+
+# ---- 1) 文档检查（先跑，快速失败）----
+python_bin=""
+for candidate in ".venv-test/bin/python" ".venv-test/Scripts/python.exe" "python3" "python"; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        python_bin="$candidate"
+        break
+    fi
+done
+if [ -n "${PYTHON:-}" ] && command -v "$PYTHON" >/dev/null 2>&1; then
+    python_bin="$PYTHON"
+fi
+
+if [ -n "$python_bin" ]; then
+    echo "[pre-push] 文档检查：$python_bin scripts/run_doc_checks.py"
+    if ! "$python_bin" scripts/run_doc_checks.py; then
+        echo "[pre-push] FAIL 文档检查未通过，已阻止推送。" >&2
+        echo "[pre-push]      修复后重试；确需绕过：git push --no-verify" >&2
+        exit 1
+    fi
+else
+    echo "[pre-push] WARN 未找到 python，跳过文档检查（CI 会兜底执行同一套检查）" >&2
+fi
+
+# ---- 2) Git LFS（与原钩子等价）----
+command -v git-lfs >/dev/null 2>&1 || {
+    printf >&2 "\n%s\n\n" "This repository is configured for Git LFS but 'git-lfs' was not found on your path. If you no longer wish to use Git LFS, remove this hook by deleting the 'pre-push' file in the hooks directory (set by 'core.hookspath'; usually '.git/hooks')."
+    exit 2
+}
+git lfs pre-push "$@"
