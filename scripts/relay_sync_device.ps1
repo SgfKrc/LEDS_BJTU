@@ -53,16 +53,38 @@ function Get-LocalHash([string]$path) {
 }
 
 function Get-RemoteHash([string]$remotePath) {
-    # 设备侧算法：Termux 有 sha256sum；Windows 用 certutil（输出需清洗）
-    if ($Device -eq 'y700') {
-        $out = & ssh -o BatchMode=yes $ssh "sha256sum '$remotePath' 2>/dev/null | cut -d' ' -f1" 2>$null
-    } else {
-        $out = & ssh -o BatchMode=yes $ssh "certutil -hashfile `"$($remotePath -replace '/', '\')`" SHA256 2>nul | findstr /r /v `"hash CertUtil`"" 2>$null
-    }
+    # 设备侧探测走**工具脚本**（见 `Initialize-RemoteProbe`），避免多层引号转义地狱：
+    # 早先试过 `sha256sum` / `certutil` / `python -c "..."` 三种内联写法，都在 Windows 目标上
+    # 因引号被 PowerShell→ssh→cmd 逐层吃掉而失败（表现为"所有文件都缺"，把排查方向带偏）。
+    $out = & ssh -o BatchMode=yes $ssh "python $probeTool hash $remotePath" 2>$null
     $hash = ($out | Select-Object -First 1)
     if ($null -eq $hash) { return '' }
     return ($hash -replace '\s', '').ToLower()
 }
+
+function Initialize-RemoteProbe {
+    $toolLocal = 'build/_relay_remote_probe.py'
+    if (-not (Test-Path $toolLocal)) {
+        New-Item -ItemType Directory -Force -Path 'build' | Out-Null
+        $body = @'
+import hashlib
+import sys
+
+mode, path = sys.argv[1], sys.argv[2]
+if mode == "hash":
+    with open(path, "rb") as handle:
+        print(hashlib.sha256(handle.read()).hexdigest())
+elif mode == "count":
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        print(handle.read().count(sys.argv[3]))
+'@
+        Set-Content -Path $toolLocal -Value $body -Encoding ASCII
+    }
+    & scp -q $toolLocal "${ssh}:$remoteRoot/_relay_remote_probe.py" 2>$null
+    return "$remoteRoot/_relay_remote_probe.py"
+}
+
+$probeTool = Initialize-RemoteProbe
 
 Write-Host "=== 同步到 $Device（$remoteRoot）==="
 foreach ($item in $files) {
@@ -98,7 +120,8 @@ $checks = @(
 )
 foreach ($check in $checks) {
     $rel, $needle, $why = $check[0], $check[1], $check[2]
-    $count = & ssh -o BatchMode=yes $ssh "grep -c '$needle' '$remoteRoot/$rel' 2>/dev/null || echo 0" 2>$null
+    # 同样走探测工具（Windows 目标没有 grep，内联引号也不可靠）
+    $count = & ssh -o BatchMode=yes $ssh "python $probeTool count $remoteRoot/$rel $needle" 2>$null
     $value = ($count | Select-Object -First 1)
     if ($value -and [int]$value -gt 0) { Write-Host "  [ok]   $why" }
     else { Write-Host "  [FAIL] $why（$rel 缺 '$needle'）"; $mismatch += "${rel}:${needle}" }

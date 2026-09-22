@@ -255,6 +255,18 @@ class ShimTailRunner:
         import numpy as np  # noqa: PLC0415
 
         count = int(n_tokens)
+        expected = count * int(self.n_embd) * 4
+        if os.environ.get("QLH_TAIL_DIAG") == "1":
+            # 诊断用（默认关闭）：定位 A 组（上游在 y700）通、B 组（上游在本机）报 rc=-5 的差异。
+            # rc=-5 的语义是"embd/n_tokens 到了非法值"，所以要看的是**帧的字节数**而不是数值。
+            print(json.dumps({"diag": "tail_frame", "n_tokens": count, "n_embd": self.n_embd,
+                              "got_bytes": len(hidden_bytes), "expected_bytes": expected,
+                              "n_past": self._pos, "ok": len(hidden_bytes) == expected}),
+                  flush=True)
+        if len(hidden_bytes) != expected:
+            raise ValueError(
+                f"tail 段收到 {len(hidden_bytes)} 字节，但 n_tokens={count} × n_embd={self.n_embd}"
+                f" × 4 应为 {expected} 字节（帧与段划分不匹配）")
         incoming = np.frombuffer(hidden_bytes, dtype=np.float32).reshape(count, self.n_embd)
         token = self._upstream.forward_hidden_to_token(incoming, n_past=self._pos)
         self._pos += count
