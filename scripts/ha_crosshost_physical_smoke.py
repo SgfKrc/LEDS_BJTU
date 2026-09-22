@@ -337,6 +337,127 @@ def _discover_y700_serial(adb: str, host: str) -> str | None:
     return None
 
 
+def _ssh_works(target: str, *, timeout: int = 6) -> bool:
+    """探测 Termux sshd 是否可达。
+
+    为什么优先它：Android 无线调试的端口**每次都会变**（设备 `ro.debuggable=0`
+    且 `persist.adb.tcp.port` 为空 ⇒ 无法在设备侧固定），而 Termux 的 sshd 端口是
+    **固定 8022**（实测可用）。所以「能用 SSH 就用 SSH」才能真正摆脱动态端口。
+    """
+    try:
+        completed = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}",
+             "-o", "StrictHostKeyChecking=accept-new", target, "true"],
+            capture_output=True,
+            text=True,
+            timeout=timeout + 5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+# 探针命令与传输方式无关（`adb shell` 与 `ssh` 都能跑），因此两条路径共用同一份。
+Y700_PROBE_COMMAND = (
+    "printf 'model=%s\\n' \"$(getprop ro.product.model)\"; "
+    "printf 'sdk=%s\\n' \"$(getprop ro.build.version.sdk)\"; "
+    "printf 'abi=%s\\n' \"$(getprop ro.product.cpu.abilist)\"; "
+    "printf 'nproc=%s\\n' \"$(nproc)\"; "
+    "printf 'available_mem_kb=%s\\n' \"$(awk '/MemAvailable/ {print $2}' /proc/meminfo)\"; "
+    "printf 'model_root=/sdcard/Download/QLH/models\\n'; "
+    "if test -d /sdcard/Download/QLH/models; then printf 'model_root_exists=true\\n'; "
+    "else printf 'model_root_exists=false\\n'; fi; "
+    "printf 'gguf_count=%s\\n' \"$(find /sdcard/Download/QLH/models -maxdepth 1 -type f -name '*.gguf' 2>/dev/null | wc -l | tr -d ' ')\""
+)
+
+
+def _y700_report(
+    *,
+    transport: str,
+    serial: str | None,
+    completed: subprocess.CompletedProcess[str],
+    failure_code: str,
+) -> dict[str, Any]:
+    """把一次探针结果整理成报告 —— ADB 与 SSH 两条路径共用的收尾逻辑。"""
+    observations: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            observations[key.strip()] = value.strip()
+    online = completed.returncode == 0 and "arm64-v8a" in {
+        item.strip() for item in observations.get("abi", "").split(",")
+    }
+    try:
+        gguf_count = int(observations.get("gguf_count", "0"))
+    except ValueError:
+        gguf_count = 0
+    return {
+        "status": "passed" if online else "failed",
+        "target": "y700",
+        "physical_nodes": True,
+        "transport": transport,
+        "serial": serial,
+        "observations": observations,
+        "model_gate": (
+            "ready_for_arm64_model_smoke"
+            if gguf_count > 0
+            else "blocked_no_gguf"
+        ),
+        "error_code": "" if online else failure_code,
+        "stderr_tail": completed.stderr[-500:] if not online else "",
+    }
+
+
+def _run_y700_ssh(target: str) -> dict[str, Any]:
+    """走 Termux sshd 的 y700 探针（端口固定 8022，推荐路径）。"""
+    try:
+        completed = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+             "-o", "StrictHostKeyChecking=accept-new", target, Y700_PROBE_COMMAND],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "status": "failed",
+            "target": "y700",
+            "physical_nodes": True,
+            "transport": "termux_ssh",
+            "serial": target,
+            "error_code": "termux_ssh_unreachable",
+            "model_gate": "blocked_no_gguf",
+            "hint": ("Termux sshd 不可达：端口 8022 无监听通常意味着 Termux 进程被系统回收，"
+                     "在设备上重新执行 `sshd` 即可（装 Termux:Boot 可开机自启）"),
+        }
+    return _y700_report(transport="termux_ssh", serial=target, completed=completed,
+                        failure_code="ssh_probe_failed")
+
+
+def _run_y700_probe(
+    ssh_target: str | None,
+    serial: str | None,
+    *,
+    adb: str | None = None,
+    host: str = "100.99.211.13",
+) -> dict[str, Any]:
+    """y700 探针选路：**能用 Termux SSH 就用 SSH**（端口固定 8022），否则退回 ADB。
+
+    `--y700-ssh` 显式指定时只用它；否则依次探测 `y700`、`y700-ip` 两个 ssh 别名
+    （局域网别名优先，已在 `~/.ssh/config` 里），都不可达才走 ADB 无线调试。
+    这样"动态 ADB 端口"只在 SSH 不可用时才需要面对。
+    """
+    if ssh_target:
+        return _run_y700_ssh(ssh_target)
+    if not serial:
+        for candidate in ("y700-ip", "y700"):
+            if _ssh_works(candidate):
+                return _run_y700_ssh(candidate)
+    return _run_y700(serial, adb=adb, host=host)
+
+
 def _run_y700(
     serial: str | None = None,
     *,
@@ -364,51 +485,15 @@ def _run_y700(
             "model_gate": "blocked_no_gguf",
             "hint": f"run adb connect {host}:<dynamic_port>, then pass --y700-serial",
         }
-    command = (
-        "printf 'model=%s\\n' \"$(getprop ro.product.model)\"; "
-        "printf 'sdk=%s\\n' \"$(getprop ro.build.version.sdk)\"; "
-        "printf 'abi=%s\\n' \"$(getprop ro.product.cpu.abilist)\"; "
-        "printf 'nproc=%s\\n' \"$(nproc)\"; "
-        "printf 'available_mem_kb=%s\\n' \"$(awk '/MemAvailable/ {print $2}' /proc/meminfo)\"; "
-        "printf 'model_root=/sdcard/Download/QLH/models\\n'; "
-        "if test -d /sdcard/Download/QLH/models; then printf 'model_root_exists=true\\n'; "
-        "else printf 'model_root_exists=false\\n'; fi; "
-        "printf 'gguf_count=%s\\n' \"$(find /sdcard/Download/QLH/models -maxdepth 1 -type f -name '*.gguf' 2>/dev/null | wc -l | tr -d ' ')\""
-    )
     completed = subprocess.run(
-        [adb_path, "-s", serial, "shell", command],
+        [adb_path, "-s", serial, "shell", Y700_PROBE_COMMAND],
         capture_output=True,
         text=True,
         timeout=20,
         check=False,
     )
-    observations: dict[str, str] = {}
-    for line in completed.stdout.splitlines():
-        if "=" in line:
-            key, value = line.split("=", 1)
-            observations[key.strip()] = value.strip()
-    online = completed.returncode == 0 and "arm64-v8a" in {
-        item.strip() for item in observations.get("abi", "").split(",")
-    }
-    try:
-        gguf_count = int(observations.get("gguf_count", "0"))
-    except ValueError:
-        gguf_count = 0
-    return {
-        "status": "passed" if online else "failed",
-        "target": "y700",
-        "physical_nodes": True,
-        "transport": "adb_wireless_debugging",
-        "serial": serial,
-        "observations": observations,
-        "model_gate": (
-            "ready_for_arm64_model_smoke"
-            if gguf_count > 0
-            else "blocked_no_gguf"
-        ),
-        "error_code": "adb_failed" if completed.returncode else "",
-        "stderr_tail": completed.stderr[-500:] if completed.returncode else "",
-    }
+    return _y700_report(transport="adb_wireless_debugging", serial=serial,
+                        completed=completed, failure_code="adb_failed")
 
 
 def _failed_result(target: str, error: Exception) -> dict[str, Any]:
@@ -426,6 +511,9 @@ def main() -> int:
     parser.add_argument("--surface-target", default="surface@100.100.52.106")
     parser.add_argument("--surface-root", default=r"C:\Users\surface\Documents\LEDS_BJTU")
     parser.add_argument("--y700-serial", help="adb wireless serial, for example IP:<dynamic_port>")
+    parser.add_argument("--y700-ssh", default=None,
+                        help="Termux sshd target (fixed port 8022). Default: auto-detect the "
+                             "`y700` / `y700-ip` ssh aliases; falls back to adb when unreachable")
     parser.add_argument("--y700-host", default="100.99.211.13")
     parser.add_argument("--adb", help="path to adb; defaults to PATH or the local Android SDK")
     parser.add_argument("--long-steps", type=int, default=1,
@@ -438,7 +526,8 @@ def main() -> int:
     except Exception as exc:
         surface = _failed_result("surface", exc)
     try:
-        y700 = _run_y700(args.y700_serial, adb=args.adb, host=args.y700_host)
+        y700 = _run_y700_probe(args.y700_ssh, args.y700_serial, adb=args.adb,
+                               host=args.y700_host)
     except Exception as exc:
         y700 = _failed_result("y700", exc)
     report = {
