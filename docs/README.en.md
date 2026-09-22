@@ -3,8 +3,6 @@
 Kllama (Llama for Koakuma) is a distributed inference core for heterogeneous edge devices. The mainline is the lightweight GGUF/llama.cpp engine; the repository also owns a PyTorch layered-distribution engine plus a **layer pipeline** (including cross-framework layer relay), and the user-facing entry point is a cross-platform TUI.
 
 > **Independent project · not official**: Kllama is an **independent** student innovation project (Beijing Jiaotong University, 2026) with **no affiliation, sponsorship or endorsement from the llama.cpp project**, and it does not represent that project's position. It is **built on llama.cpp** (a **descriptive reference** only — no ownership of or trademark claim to "llama.cpp", "llama" or any upstream name is asserted). Upstream components keep their own licenses and version pins, unchanged by this project's use of them.
->
-> Naming history: the project was previously called `QLH`, with the program abbreviation `LEDS_BJTU` (Lightweight Edge Distributed Inference System) and the alias `Koakuma`. Documentation and user-facing surfaces now use **Kllama** uniformly. **Code-level names are kept** (`qlh.py` entry, `QLH_*` environment variables, `qlh-*` repository and package paths) so that compatibility and existing configuration are not broken.
 
 > Status: the main-repository baseline is being reorganized (2026-09-21, baseline `610f4b3`)
 >
