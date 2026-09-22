@@ -478,14 +478,14 @@ Real hardware, cross-machine networking, Android ARM64, performance and long-run
 ## Documentation Index
 
 - [Current D-to-L Baseline and Optimization Plan (2026-09-21)](跨框架接力-当前有效基线与后续优化计划-2026-09-21.md)
-- [Test Quality Audit (2026-09-21): Parallel Flakiness and Race-Coverage Gaps](测试质量审计-2026-09-21.md)
+- [Test Quality Audit (2026-09-21): Parallel Flakiness and Race-Coverage Gaps](archive/测试质量审计-2026-09-21.md)
 - [P4.5 Proposal: Dynamic Master Election and Distributed Management](主节点动态选举与分布式管理-P4.5立项-2026-09-21.md)
 - [Mainline Development Plan: Distributed Inference and Edge Optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md)
 - [Overall Architecture](整体架构.md)
 - [Layer-Segment Protocol Proposal (2026-09-17)](层段协议立项-2026-09-17.md)
 - [Layer Pipeline Node Kinds and Top-Level Transparency](层流水线节点类型与顶层透明性-可行性确认-2026-09-17.md)
 - [Same-Process Dual-Backend Relay Implementation and Performance](archive/同进程双后端接力实现与性能-2026-09-16.md)
-- [Engine Single-Sequence and Concurrency Comparison](引擎单序列与并发性能对比-2026-09-16.md)
+- [Engine Single-Sequence and Concurrency Comparison](archive/引擎单序列与并发性能对比-2026-09-16.md)
 - [Distributed Inference Parallelism and Cross-Framework Route Survey](分布式推理并行与跨框架路线调研汇总-2026-09-15.md)
 - [TUI User Guide](TUI使用指南.md)
 - [TUI Feature Screens and Debug Fallback](TUI使用指南.md#调试兜底非功能验收)
