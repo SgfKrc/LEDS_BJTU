@@ -24,6 +24,12 @@ import httpx
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path.insert(0, os.path.dirname(__file__))
+
+from network_test_support import (  # noqa: E402
+    release_reserved_unreachable_ports,
+    reserve_unreachable_port,
+)
 
 from island_engine import (
     IslandEngine,
@@ -302,14 +308,6 @@ def test_no_api_key_omits_authorization_header(mock_island_server):
 # 错误分类：不可达 / 超时 / HTTP 错误
 # ================================================================
 
-def _closed_port() -> int:
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
-
-
 def test_transport_error_classification_is_platform_independent():
     unreachable = _classify_httpx_error(
         httpx.ConnectError("connection refused"),
@@ -326,26 +324,20 @@ def test_transport_error_classification_is_platform_independent():
     # 消息文案不纳入断言（异常类型即契约，P2-D 后消息仅是给人读的）
 
 
-def test_backend_down_raises_clean_transport_error():
+def test_backend_down_raises_clean_transport_error(monkeypatch):
+    # Loopback must never be routed through a developer/CI HTTP proxy. A proxy
+    # can return a synthetic HTTP status and hide the transport failure.
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
     engine = IslandEngine()
-    last_error: Exception | None = None
-    # _closed_port 释放端口后存在竞态窗口（全量运行时端口可能被其他测试复用），
-    # 连接成功（未抛异常）时换端口重试，最多 5 次。
-    for attempt in range(5):
-        port = _closed_port()
-        try:
-            with pytest.raises((IslandUnreachableError, IslandTimeoutError)) as excinfo:
-                engine.load_model(
-                    base_url=f"http://127.0.0.1:{port}",
-                    timeout=3,
-                    connect_timeout=1,
-                )
-        except Exception as exc:
-            # 端口被其他进程占用（连接成功、HTTP 错误等非预期结果）→ 换端口重试
-            last_error = exc
-            if attempt == 4:
-                raise
-            continue
+    port = reserve_unreachable_port()
+    try:
+        with pytest.raises((IslandUnreachableError, IslandTimeoutError)) as excinfo:
+            engine.load_model(
+                base_url=f"http://127.0.0.1:{port}",
+                timeout=3,
+                connect_timeout=1,
+            )
         message = str(excinfo.value)
         if isinstance(excinfo.value, IslandUnreachableError):
             assert "孤岛后端不可达" in message
@@ -354,9 +346,10 @@ def test_backend_down_raises_clean_transport_error():
         # 错误消息不应泄露原始 traceback / 内部异常 repr
         assert "Traceback" not in message
         assert "ConnectError(" not in message
-        return
-    assert last_error is not None
-    raise last_error
+    finally:
+        release_reserved_unreachable_ports()
+        engine.unload()
+
     assert not engine.is_loaded
 
 

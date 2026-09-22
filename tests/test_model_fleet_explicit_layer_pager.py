@@ -69,6 +69,7 @@ def test_cli_contract_keeps_fixed_tile_choice():
     assert FIXED_SLOTS == 2
 
 
+@pytest.mark.requires_gpu
 def test_cuda_pager_matches_reference_when_available():
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():

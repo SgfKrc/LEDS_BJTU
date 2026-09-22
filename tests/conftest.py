@@ -18,9 +18,31 @@ transformers 5.x 下无法导入，而 transformers 5.x 的 `dynamic_module_util
 from __future__ import annotations
 
 import os
+import random
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+
+def pytest_addoption(parser) -> None:
+    parser.addoption(
+        "--qlh-order-seed",
+        action="store",
+        type=int,
+        default=None,
+        help="deterministically shuffle collected tests with this seed",
+    )
+
+
+def pytest_collection_modifyitems(config, items) -> None:
+    seed = config.getoption("--qlh-order-seed")
+    if seed is not None:
+        random.Random(seed).shuffle(items)
+
+
+def pytest_report_header(config) -> str:
+    seed = config.getoption("--qlh-order-seed")
+    return f"qlh test order seed: {seed}" if seed is not None else ""
 
 try:  # 尽量早地装上；失败也不应让整个测试会话崩掉
     from transformers5_compat import install as _install_transformers5_compat

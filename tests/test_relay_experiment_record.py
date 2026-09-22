@@ -146,6 +146,33 @@ def test_validate_record_rejects_missing_fields_and_bad_kind():
         validate_record(dict(record, kind="end_to_end"))
 
 
+def test_validate_record_enforces_interface_identity_for_direct_records():
+    record = build_record(**_minimal_record())
+
+    missing_iface = json.loads(json.dumps(record))
+    del missing_iface["engines"]["upstream_iface"]
+    with pytest.raises(ValueError, match="engines"):
+        validate_record(missing_iface)
+
+    relabeled_iface = json.loads(json.dumps(record))
+    relabeled_iface["engines"]["downstream_iface"] = IFACE_RAW_LLAMA_DOWNSTREAM
+    with pytest.raises(ValueError, match="kind/path"):
+        validate_record(relabeled_iface)
+
+
+def test_validate_record_requires_middle_iface_for_three_segment_path():
+    from src.relay_experiment_record import IFACE_KEEP_HEAD_UPSTREAM, PATH_D2L2L_KEEP_HEAD
+
+    record = build_record(**_minimal_record(
+        middle_iface=IFACE_KEEP_HEAD_UPSTREAM,
+        path=PATH_D2L2L_KEEP_HEAD,
+    ))
+    broken = json.loads(json.dumps(record))
+    broken["engines"]["middle_iface"] = None
+    with pytest.raises(ValueError, match="kind/path"):
+        validate_record(broken)
+
+
 def test_write_record_stamps_artifact_path(tmp_path):
     record = build_record(**_minimal_record())
     target = write_record(record, tmp_path / "rec.json")
@@ -190,6 +217,13 @@ def test_cli_dry_run_capacity_record_has_no_fake_metrics(capsys):
     payload = json.loads(out[: out.rfind("}") + 1])
     assert payload["metrics"] == {}, "预检不得编造任何数字"
     assert payload["models"]["downstream"]["model_bytes"] is None
+
+
+def test_cli_rejects_non_positive_runtime_counts():
+    module = _cli_module()
+    with pytest.raises(SystemExit):
+        module.main(["--path", "d2l_mainrepo", "--dry-run", "--gen", "0",
+                     "--cut-model", "cut.gguf", "--whole-model", "whole.gguf"])
 
 
 # --------------------------------------------------------------- keep-head / 三段链路

@@ -48,6 +48,7 @@
     "l2l_llama",
     "l2l_keep_head",
     "d2l2l_keep_head",
+    "d2l2l_keep_head_net",
     "capacity_scan"
    ]
   },
@@ -132,10 +133,11 @@
   },
   "engines": {
    "type": "object",
+   "required": ["upstream_iface", "downstream_iface"],
    "properties": {
-    "upstream_iface": {"type": ["string", "null"]},
+    "upstream_iface": {"type": "string", "minLength": 1},
     "middle_iface": {"type": ["string", "null"]},
-    "downstream_iface": {"type": ["string", "null"]}
+    "downstream_iface": {"type": "string", "minLength": 1}
    }
   },
   "handoff": {
@@ -181,6 +183,12 @@
     "downstream_decode_ms": {"$ref": "#/$defs/stat"},
     "baseline_ms_per_step": {"$ref": "#/$defs/stat"},
     "capacity_gain_x": {"type": ["number", "null"]},
+    "mid_uplink_bytes": {"type": ["integer", "null"]},
+    "mid_downlink_bytes": {"type": ["integer", "null"]},
+    "hidden_wire_dtype": {"type": ["string", "null"]},
+    "hidden_wire_compression": {"type": ["boolean", "null"]},
+    "hidden_wire_bytes_per_token": {"type": ["integer", "null"]},
+    "hidden_quant_error": {"type": ["object", "null"]},
     "resident_weight_bytes": {
      "type": ["object", "null"],
      "properties": {
@@ -212,7 +220,7 @@
    "if": {"properties": {"kind": {"const": "mainrepo_end_to_end"}}},
    "then": {
     "properties": {
-     "path": {"enum": ["d2l_mainrepo", "d2l2l_keep_head"]},
+     "path": {"enum": ["d2l_mainrepo", "d2l2l_keep_head", "d2l2l_keep_head_net"]},
      "engines": {
       "properties": {
        "downstream_iface": {"const": "llama_engine.forward_layers_from_hidden"}

@@ -76,6 +76,8 @@ def _load(with_fix: bool):
 
 
 @pytest.mark.timeout(600)
+@pytest.mark.real_model
+@pytest.mark.requires_gpu
 def test_load_succeeds_with_fix_and_produces_output():
     """① 有修复 ⇒ 加载成功，且**能真跑出 token**（不是「加载成功的坏模型」）。"""
     _skip_unless_applicable()
@@ -86,6 +88,8 @@ def test_load_succeeds_with_fix_and_produces_output():
 
 
 @pytest.mark.timeout(600)
+@pytest.mark.real_model
+@pytest.mark.requires_gpu
 def test_control_reproduces_the_crash():
     """② 禁用修复 ⇒ **复现** `not implemented for 'Byte'`。
 

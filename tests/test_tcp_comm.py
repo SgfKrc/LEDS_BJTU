@@ -1339,6 +1339,8 @@ class TestTCPSendSerialization:
             self.overlap = False
             self.calls = 0
             self.lock = threading.Lock()
+            self.first_send = threading.Event()
+            self.release_first = threading.Event()
 
         def sendall(self, _payload):
             with self.lock:
@@ -1346,26 +1348,44 @@ class TestTCPSendSerialization:
                     self.overlap = True
                 self.active += 1
                 self.calls += 1
-            time.sleep(0.03)
+                first = self.calls == 1
+                if first:
+                    self.first_send.set()
+            if first:
+                assert self.release_first.wait(1)
             with self.lock:
                 self.active -= 1
+
+    @staticmethod
+    def _run_concurrent(send, sock):
+        start = threading.Barrier(3)
+
+        def run(index):
+            start.wait(timeout=1)
+            send(index)
+
+        threads = [threading.Thread(target=run, args=(index,)) for index in range(2)]
+        for thread in threads:
+            thread.start()
+        start.wait(timeout=1)
+        assert sock.first_send.wait(1)
+        assert sock.calls == 1, "第二个写入应被同一连接的发送锁挡住"
+        sock.release_first.set()
+        for thread in threads:
+            thread.join(timeout=1)
+            assert not thread.is_alive()
 
     def test_client_send_data_serializes_concurrent_writers(self):
         client = TCPClient(server_host="127.0.0.1", server_port=1, client_id="client1")
         sock = self.DetectingSocket()
         client.sock = sock
 
-        threads = [
-            threading.Thread(
-                target=client.send_data,
-                args=({"index": index}, MessageType.HEARTBEAT),
-            )
-            for index in range(2)
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=1)
+        self._run_concurrent(
+            lambda index: client.send_data(
+                {"index": index}, MessageType.HEARTBEAT,
+            ),
+            sock,
+        )
 
         assert sock.calls == 2
         assert sock.overlap is False
@@ -1378,17 +1398,12 @@ class TestTCPSendSerialization:
             ClientConn(client_id="client1", sock=sock, addr=("127.0.0.1", 1)),
         )
 
-        threads = [
-            threading.Thread(
-                target=server.send_to_client,
-                args=("client1", {"index": index}, MessageType.STATUS_RES),
-            )
-            for index in range(2)
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=1)
+        self._run_concurrent(
+            lambda index: server.send_to_client(
+                "client1", {"index": index}, MessageType.STATUS_RES,
+            ),
+            sock,
+        )
 
         assert sock.calls == 2
         assert sock.overlap is False
@@ -1935,7 +1950,7 @@ class TestDualStackServer:
             # 服务端应已 accept 两个连接（等待 accept 线程处理）
             deadline = time.time() + 3
             while time.time() < deadline and not server._client_ids_snapshot():
-                time.sleep(0.05)
+                threading.Event().wait(0.05)
         finally:
             server.stop()
 

@@ -29,15 +29,19 @@ from src.llama_keep_head import (  # noqa: E402
     SHIM_SYMBOLS,
     KeepHeadUnavailable,
     KeepHeadUpstream,
+    _add_dll_dirs,
 )
 
 SHIM = ROOT / "build" / "keephead" / "build-cpu" / "bin" / "qlh_keep_head.dll"
 HEAD12 = ROOT / "build" / "cross-framework-layer-poc" / "out" / "qwen25-05b-f16-head12.gguf"
 EXTRA_DLL_DIRS = [d for d in (os.environ.get("QLH_KEEP_HEAD_DLL_DIRS") or
                               r"C:\msys64\ucrt64\bin").split(os.pathsep) if d]
+NATIVE_WORKER_ENV = "QLH_KEEP_HEAD_NATIVE_WORKER"
 
 
 def _upstream_or_skip(**kwargs):
+    if os.environ.get(NATIVE_WORKER_ENV) != "1":
+        pytest.skip("keep-head native ABI tests run in an isolated subprocess")
     if not SHIM.is_file():
         pytest.skip(f"需要 keep-head shim（{SHIM.relative_to(ROOT)}）；"
                     "用 scripts/model_tools/build_keep_head_shim.ps1 生成")
@@ -48,6 +52,20 @@ def _upstream_or_skip(**kwargs):
                                 n_ctx=512, n_threads=4, **kwargs)
     except KeepHeadUnavailable as exc:
         pytest.skip(f"keep-head 不可用：{exc}")
+
+
+def test_dll_directory_handles_are_retained(monkeypatch, tmp_path):
+    dll_dir = tmp_path / "dll"
+    dll_dir.mkdir()
+    handle = object()
+    monkeypatch.setattr(os, "add_dll_directory", lambda path: handle)
+    # 环境变量会追加额外目录，测试必须隔离环境（否则断言依赖开发机配置）
+    monkeypatch.delenv("QLH_KEEP_HEAD_DLL_DIRS", raising=False)
+
+    dirs, handles = _add_dll_dirs(dll_dir)
+
+    assert dirs == [str(dll_dir)]
+    assert handles == [handle]
 
 
 # ------------------------------------------------------------------ 失败路径（不需要模型）
@@ -117,3 +135,119 @@ def test_rejects_wrong_hidden_width():
     with _upstream_or_skip(mode="nextn") as up:
         with pytest.raises(ValueError, match="hidden 形状"):
             up.forward_hidden_to_hidden([[0.0] * max(1, up.n_embd // 2)])
+
+
+# --------------------------------------------------- P3：多序列数据流契约
+def test_token_list_validates_length_without_a_model():
+    """`seq_ids` / `positions` 与 n_tokens 必须等长（纯校验，不需要模型）。"""
+    assert KeepHeadUpstream._token_list(None, 3, "seq_ids") is None
+    assert KeepHeadUpstream._token_list([0, 1, 2], 3, "seq_ids") == [0, 1, 2]
+    with pytest.raises(ValueError, match="长度 2 != n_tokens 3"):
+        KeepHeadUpstream._token_list([0, 1], 3, "positions")
+
+
+def test_multi_sequence_binding_is_accepted():
+    """P3：2 序列 × 2 token 的显式绑定（seq_ids + positions）必须与单序列同形返回。"""
+    import numpy as np
+
+    with _upstream_or_skip(mode="nextn", n_seq_max=2) as up:
+        hidden = np.zeros((4, up.n_embd), dtype=np.float32)
+        out = up.forward_hidden_to_hidden(hidden, seq_ids=[0, 0, 1, 1],
+                                          positions=[0, 1, 0, 1])
+        assert out.shape == hidden.shape
+        assert np.isfinite(out).all()
+
+
+def test_seq_id_beyond_n_seq_max_is_rejected():
+    """seq_id ≥ n_seq_max 必须 fail-loud（否则 llama.cpp 直接 rc=-1，错误难定位）。"""
+    import numpy as np
+
+    with _upstream_or_skip(mode="nextn", n_seq_max=1) as up:
+        hidden = np.zeros((2, up.n_embd), dtype=np.float32)
+        with pytest.raises(ValueError, match="n_seq_max"):
+            up.forward_hidden_to_hidden(hidden, seq_ids=[0, 3], positions=[0, 0])
+
+
+def test_single_sequence_positions_stay_consecutive_across_steps():
+    """★ 回归：单序列增量必须延续位置（曾因多序列改造丢掉 n_past 而第二步 decode 失败）。"""
+    import numpy as np
+
+    with _upstream_or_skip(mode="nextn", n_seq_max=1) as up:
+        first = up.forward_hidden_to_hidden(np.zeros((2, up.n_embd), dtype=np.float32),
+                                            n_past=0)
+        second = up.forward_hidden_to_hidden(np.zeros((1, up.n_embd), dtype=np.float32),
+                                             n_past=2)
+        assert first.shape[0] == 2 and second.shape[0] == 1
+
+
+# --------------------------------------------------- P3：hidden 压缩字节口径
+def test_hidden_quant_bytes_accounting():
+    """压缩档位的**每 token 有效线上字节**（int8 块量化含每 128 维 1 个 f32 scale）。"""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "relay_experiment_cli", ROOT / "scripts" / "relay_experiment.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    assert module._hidden_bytes(896, "none") == 896 * 4
+    assert module._hidden_bytes(896, "f16") == 896 * 2
+    assert module._hidden_bytes(896, "int8_block128") == 896 + 7 * 4   # 7 个 128 块
+    assert module._hidden_bytes(0, "f16") is None
+
+
+def test_int8_hidden_quant_supports_non_block_aligned_width():
+    import importlib.util
+    import numpy as np
+
+    spec = importlib.util.spec_from_file_location(
+        "relay_experiment_cli_non_aligned", ROOT / "scripts" / "relay_experiment.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    hidden = np.arange(3 * 130, dtype=np.float32).reshape(3, 130) - 100.0
+    out = module._quantize_hidden(hidden, "int8_block128")
+    assert out.shape == hidden.shape
+    assert out.dtype == np.float32
+    assert np.isfinite(out).all()
+
+
+def test_token_entry_requires_shim_symbol():
+    """★ P4.5 末段入口：shim 缺 `qlh_kh_forward_embd_token` 时必须**明确报错**。
+
+    旧版 shim 只缺这一个入口，middle/上游照常可用 ⇒ 不能把它放进 `SHIM_SYMBOLS`（那会让设备上
+    未升级的 shim 整体加载失败），但也绝不能静默降级 —— 报错必须指名缺哪个符号。
+    """
+    import types
+
+    import numpy as np
+
+    upstream = object.__new__(KeepHeadUpstream)
+    upstream._lib = types.SimpleNamespace()          # 模拟旧 shim：没有 token 入口
+    upstream.shim_path = "fake.dll"
+    upstream.n_embd = 8
+    upstream._worker = None
+    with pytest.raises(KeepHeadUnavailable, match="qlh_kh_forward_embd_token"):
+        upstream.forward_hidden_to_token(np.zeros((1, 8), dtype=np.float32))
+
+
+def test_token_symbol_argtypes_are_set():
+    """★ 符号存在时**必须**设置 `argtypes`：否则 ctypes 把 64 位句柄按 `c_int` 处理 ⇒
+    `OverflowError: int too long to convert`（实测踩到：服务端每次连接都失败）。"""
+    import ctypes
+
+    shim = ROOT / "build" / "keephead" / "build-cpu" / "bin" / "qlh_keep_head.dll"
+    if not shim.exists():
+        pytest.skip("缺本机 shim（先跑 scripts/model_tools/build_keep_head_shim.ps1）")
+    lib = ctypes.CDLL(str(shim))
+    if not hasattr(lib, "qlh_kh_forward_embd_token"):
+        pytest.skip("本机 shim 尚未包含 P4.5 末段入口")
+    lib.qlh_kh_forward_embd_token.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32, ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
+    ]
+    # 第一参数必须是 c_void_p（而不是 ctypes 的默认 c_int），否则 64 位句柄会溢出
+    assert lib.qlh_kh_forward_embd_token.argtypes[0] is ctypes.c_void_p

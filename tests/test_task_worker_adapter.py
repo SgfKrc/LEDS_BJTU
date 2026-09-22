@@ -42,11 +42,12 @@ def _enable_task_worker_experiment(monkeypatch):
 
 
 def _wait_until(predicate, timeout=2.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    wake = threading.Event()
+    while time.monotonic() < deadline:
         if predicate():
             return True
-        time.sleep(0.01)
+        wake.wait(min(0.01, max(0.0, deadline - time.monotonic())))
     return bool(predicate())
 
 
@@ -500,9 +501,7 @@ def test_remote_provider_requires_exact_model_and_returns_fenced_identity():
             finished.set()
 
     threading.Thread(target=execute, daemon=True).start()
-    deadline = time.time() + 2
-    while not sent and time.time() < deadline:
-        time.sleep(0.01)
+    assert _wait_until(lambda: bool(sent))
     assert sent and sent[0].message_type == "stage_offer"
     offer = sent[0].payload
     identity = _response_identity(offer)
@@ -556,6 +555,92 @@ def test_remote_provider_requires_exact_model_and_returns_fenced_identity():
     with pytest.raises(ProviderUnavailable) as mismatch:
         provider.reserve(wrong_model_request)
     assert mismatch.value.code == "model_identity_mismatch"
+
+
+def test_remote_provider_accept_race_records_one_terminal_acceptance():
+    """Concurrent duplicate accepts must not wake the same attempt twice."""
+    coordinator_control, _worker_control = _admitted_control_plane()
+    sent = []
+    provider = RemoteFullWorkerProvider(
+        node_id="worker_01",
+        peer_snapshot=lambda: coordinator_control.worker_snapshot("worker_01"),
+        send_message=sent.append,
+    )
+    request = _remote_request(provider.provider_id)
+    reservation = provider.reserve(request)
+    attempt = StageAttempt(
+        attempt_id="att_accept_race01",
+        request=request,
+        provider_id=provider.provider_id,
+        lease_id="lease_accept_race01",
+        lease_epoch=1,
+        lease_expires_at=time.time() + 5,
+    )
+    outcome = {}
+    finished = threading.Event()
+
+    def execute():
+        try:
+            outcome["result"] = provider.execute(
+                attempt, reservation, threading.Event(),
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            finished.set()
+
+    threading.Thread(target=execute, daemon=True).start()
+    assert _wait_until(lambda: bool(sent))
+    identity = _response_identity(sent[0].payload)
+    start = threading.Barrier(3)
+    results = []
+
+    def accept(message_id):
+        try:
+            start.wait(timeout=2)
+            provider.handle_message(build_message(
+                "stage_accept",
+                {**identity, "accepted": True, "reason_code": "", "retryable": False},
+                message_id=message_id,
+                sent_at_ms=int(time.time() * 1000),
+                version=2,
+            ).snapshot())
+            results.append("accepted")
+        except BaseException as exc:
+            results.append(exc)
+
+    threads = [
+        threading.Thread(target=accept, args=(f"msg_accept_race0{index}",))
+        for index in (1, 2)
+    ]
+    for thread in threads:
+        thread.start()
+    start.wait(timeout=2)
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert results.count("accepted") == 1
+    errors = [item for item in results if isinstance(item, WorkerProtocolError)]
+    assert len(errors) == 1
+    assert errors[0].code == "duplicate_stage_response"
+
+    output = {"content": "accepted once"}
+    provider.handle_message(build_message(
+        "stage_result",
+        {
+            **identity,
+            "output": output,
+            "output_sha256": canonical_sha256(output),
+            "metadata": {},
+        },
+        message_id="msg_result_accept_race01",
+        sent_at_ms=int(time.time() * 1000),
+        version=2,
+    ).snapshot())
+    assert finished.wait(2)
+    assert "error" not in outcome
+    assert outcome["result"].output == output
+    provider.release(reservation.reservation_id)
 
 
 def test_remote_v2_provider_rejects_partial_dependencies_before_offer():
@@ -693,9 +778,7 @@ def test_remote_provider_rejects_wrong_epoch_without_waking_attempt():
             finished.set()
 
     threading.Thread(target=execute, daemon=True).start()
-    deadline = time.time() + 2
-    while not sent and time.time() < deadline:
-        time.sleep(0.01)
+    assert _wait_until(lambda: bool(sent))
     offer = sent[0].payload
     identity = _response_identity(offer)
     provider.handle_message(build_message(
@@ -771,9 +854,7 @@ def test_remote_provider_disconnect_unblocks_pending_attempt():
             finished.set()
 
     threading.Thread(target=execute, daemon=True).start()
-    deadline = time.time() + 2
-    while not sent and time.time() < deadline:
-        time.sleep(0.01)
+    assert _wait_until(lambda: bool(sent))
     assert sent
 
     provider.notify_disconnect()
@@ -1604,9 +1685,7 @@ def test_remote_provider_renews_lease_and_finishes_after_original_deadline():
             finished.set()
 
     threading.Thread(target=execute, daemon=True).start()
-    deadline = time.time() + 2
-    while not sent and time.time() < deadline:
-        time.sleep(0.01)
+    assert _wait_until(lambda: bool(sent))
     offer = sent[0].payload
     identity = _response_identity(offer)
     provider.handle_message(build_message(
@@ -1628,7 +1707,7 @@ def test_remote_provider_renews_lease_and_finishes_after_original_deadline():
         lambda: any(message.message_type == "lease_renew" for message in sent)
     )
     assert sent[-1].message_type == "lease_renew"
-    time.sleep(max(0.0, original_deadline - time.time()) + 0.05)
+    threading.Event().wait(max(0.0, original_deadline - time.time()) + 0.05)
     assert not finished.is_set()
 
     output = {"content": "after renewal"}
@@ -1679,9 +1758,7 @@ def test_remote_provider_sends_cancel_and_accepts_cancel_ack():
             finished.set()
 
     threading.Thread(target=execute, daemon=True).start()
-    deadline = time.time() + 2
-    while not sent and time.time() < deadline:
-        time.sleep(0.01)
+    assert _wait_until(lambda: bool(sent))
     identity = _response_identity(sent[0].payload)
     provider.handle_message(build_message(
         "stage_accept",
@@ -1817,7 +1894,7 @@ def test_task_graph_auto_renews_remote_lease_before_result():
         ).snapshot())
 
         def finish_later():
-            time.sleep(0.35)
+            threading.Event().wait(0.35)
             output = {"content": "renewed graph result"}
             provider.handle_message(build_message(
                 "stage_result",
@@ -2130,7 +2207,7 @@ def test_scheduler_worker_lease_renew_extends_active_execution(monkeypatch):
     scheduler._handle_task_worker_message(
         "master", {"data": renewal.snapshot()},
     )
-    time.sleep(max(0.0, (now_ms + 300) / 1000.0 - time.time()))
+    threading.Event().wait(max(0.0, (now_ms + 300) / 1000.0 - time.time()))
     assert not completed.is_set()
 
     release_execution.set()
@@ -2227,9 +2304,7 @@ def test_scheduler_worker_cancel_ack_is_replayed_without_stage_error(
     )
     scheduler._handle_task_worker_message("master", {"data": cancel.snapshot()})
     assert cancelled.wait(2)
-    deadline = time.time() + 2
-    while scheduler._task_worker_active_attempts and time.time() < deadline:
-        time.sleep(0.01)
+    assert _wait_until(lambda: not scheduler._task_worker_active_attempts)
     scheduler._handle_task_worker_message("master", {"data": cancel.snapshot()})
 
     message_types = [item[0]["message_type"] for item in sent]
@@ -2304,9 +2379,7 @@ def test_scheduler_worker_replays_cached_result_after_send_failure(monkeypatch):
     )
     scheduler._handle_task_worker_message("master", {"data": offer.snapshot()})
     assert result_failed.wait(2)
-    deadline = time.time() + 2
-    while scheduler._task_worker_active_attempts and time.time() < deadline:
-        time.sleep(0.01)
+    assert _wait_until(lambda: not scheduler._task_worker_active_attempts)
 
     replayed = []
 
@@ -2363,7 +2436,9 @@ def test_scheduler_worker_does_not_resurrect_an_expired_lease(monkeypatch):
         full_chat_execution_lock=threading.RLock(),
     ))
     scheduler.configure_callbacks(_scheduler_callbacks(
-        execute=lambda request, cancel_event: time.sleep(0.3) or {"content": "too late"},
+        execute=lambda request, cancel_event: (
+            threading.Event().wait(0.3) or {"content": "too late"}
+        ),
     ))
     now_ms = int(time.time() * 1000)
     root_input = {"message": "hello"}
@@ -2390,7 +2465,7 @@ def test_scheduler_worker_does_not_resurrect_an_expired_lease(monkeypatch):
     )
     scheduler._handle_task_worker_message("master", {"data": offer.snapshot()})
     assert accepted.wait(2)
-    time.sleep(0.15)
+    threading.Event().wait(0.15)
     renew_now_ms = int(time.time() * 1000)
     renewal = build_message(
         "lease_renew",

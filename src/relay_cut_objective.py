@@ -59,6 +59,20 @@ def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+def _bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
 @dataclass(frozen=True)
 class SegmentProfile:
     """一个候选段（设备 + 引擎）的画像。耗时单位 ms，容量单位 byte。"""
@@ -92,8 +106,6 @@ class SegmentProfile:
         net = _mapping(data.get("network"))
         gpu = _mapping(data.get("gpu"))
         available_gb = _number(ram.get("available_gb", data.get("ram_available_gb")), 0.0)
-        if available_gb <= 0:
-            available_gb = _number(ram.get("total_gb", data.get("ram_total_gb")), 0.0)
         values: dict[str, Any] = {
             "node_id": str(node_id),
             "engine": str(engine),
@@ -104,9 +116,9 @@ class SegmentProfile:
             "ms_fixed_prefill": _number(data.get("ms_fixed_prefill")),
             "rtt_ms": _number(data.get("rtt_ms", net.get("rtt_ms"))),
             "bandwidth_mbps": _number(data.get("bandwidth_mbps", net.get("bandwidth_mbps"))),
-            "thermal_throttled": bool(data.get("thermal_throttled", False)),
+            "thermal_throttled": _bool(data.get("thermal_throttled"), False),
             "retry_rate": _number(data.get("retry_rate")),
-            "artifacts_ready": bool(data.get("artifacts_ready", True)),
+            "artifacts_ready": _bool(data.get("artifacts_ready"), True),
             "source": str(data.get("source", "device_profile")),
         }
         if gpu and not values["capacity_bytes"]:
@@ -305,17 +317,21 @@ def plan_relay_cut_n_segments(
         return reject("no_legal_cut_point")
 
     n_segments = len(profiles)
-    combos = list(itertools.combinations(cuts, n_segments - 1))
-    if not combos:
+    if n_segments - 1 > len(cuts):
         return reject("no_legal_cut_combination")
-    truncation_note = None
-    if len(combos) > max_candidates:
-        truncation_note = f"candidates_truncated:{max_candidates}/{len(combos)}"
-        combos = combos[:max_candidates]
+    candidate_limit = _int(max_candidates, 0)
+    if candidate_limit <= 0:
+        return reject("candidate_limit_invalid")
+    candidate_count = math.comb(len(cuts), n_segments - 1)
+    if candidate_count > candidate_limit:
+        return reject("candidate_space_too_large")
+    combos = list(itertools.combinations(cuts, n_segments - 1))
 
     evaluated: list[dict[str, Any]] = []
     best: dict[str, Any] | None = None
-    total_bytes = sum(int(b) for b in layer_bytes) + int(non_split_bytes)
+    # The non-split weights live on both endpoint segments, so the resident
+    # total must match the per-segment accounting below.
+    total_bytes = sum(int(b) for b in layer_bytes) + 2 * int(non_split_bytes)
     single_ms = _single_segment_ms(profiles, total)
 
     for combo in combos:
@@ -366,7 +382,7 @@ def plan_relay_cut_n_segments(
 
     plan = RelayCutPlan(
         admitted=True,
-        reason=truncation_note or "best_objective",
+        reason="best_objective",
         cuts=tuple(best["cuts"]),
         segment_layers=tuple(best["segment_layers"]),
         capacity_feasible=bool(best["capacity_feasible"]),

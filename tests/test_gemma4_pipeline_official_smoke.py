@@ -10,6 +10,7 @@ pytest.importorskip("transformers.models.gemma4_unified")
 transformers = pytest.importorskip("transformers")
 
 
+@pytest.mark.slow
 def test_official_gemma4_transformers_segmented_prefill_decode():
     if str(getattr(transformers, "__version__", "")) != "5.10.1":
         pytest.skip("official Gemma 4 smoke requires Transformers 5.10.1 sidecar")

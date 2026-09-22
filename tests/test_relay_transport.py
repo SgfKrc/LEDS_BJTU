@@ -157,3 +157,33 @@ def test_client_rejects_local_shape_and_limit_errors_before_sending():
         thread.join(timeout=2)
         for connection, _ in accepted:
             connection.close()
+
+
+def test_tokens_frame_roundtrip_helper():
+    """★ P4.5 上游段请求：`TOKENS` 帧的 payload 编解码（紧凑 i32 数组）。"""
+    from src.relay_transport import decode_tokens, encode_tokens
+
+    payload = encode_tokens([1, 42, 151936])
+    assert len(payload) == 12
+    assert decode_tokens(payload, limit=8) == [1, 42, 151936]
+
+
+def test_tokens_frame_rejects_bad_payload_shape():
+    """长度不是 4 的倍数 / 空 payload / 超限都必须 fail-loud（不猜语义）。"""
+    from src.relay_transport import decode_tokens, encode_tokens
+
+    with pytest.raises(RelayProtocolError, match="invalid_token_response"):
+        decode_tokens(b"", limit=8)
+    with pytest.raises(RelayProtocolError, match="invalid_token_response"):
+        decode_tokens(b"\x01\x02\x03", limit=8)
+    with pytest.raises(RelayProtocolError, match="token_count_exceeds_limit"):
+        decode_tokens(encode_tokens([1] * 9), limit=8)
+    with pytest.raises(RelayProtocolError, match="token_count_exceeds_limit"):
+        encode_tokens([])
+
+
+def test_tokens_frame_kind_is_distinct():
+    """新帧类型不得与既有 HIDDEN / TOKEN / HIDDEN_SEQ 碰撞（协议兼容的硬约束）。"""
+    kinds = {RelayFrameKind.HIDDEN, RelayFrameKind.TOKEN, RelayFrameKind.CLOSE,
+             RelayFrameKind.ERROR, RelayFrameKind.HIDDEN_SEQ, RelayFrameKind.TOKENS}
+    assert len(kinds) == 6

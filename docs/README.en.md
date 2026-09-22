@@ -26,6 +26,75 @@ The engine is **dual-track**, and both tracks live in the main repository - this
 
 **The D track is not part of the Edge default dependency set**, but layer splitting, the layer pipeline and cross-framework relay are in practice implemented by the PyTorch stack (`model_module.py`, `tcp_comm.py`, `qwen3_pipeline_*`), so it is not a "comparison-only path". On the same card llama.cpp is faster for a single sequence (about 4.3x), so the default production path remains the L track.
 
+## Architecture Overview
+
+QLH is **two layers in one process**: a control plane aimed at people, and an engine layer aimed at
+machines and protocols. There is exactly one boundary between them — the layer-range contract
+`(layer_range, engine, location)`.
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│ Control plane (aimed at people)                                            │
+│ Textual TUI · read-only single commands · HTTP API (/api/cluster/*)        │
+│ device profile · capacity plan · layer-range contract · lease / epoch      │
+│ fencing · admission                                                        │
+└──────────────────────────────┬─────────────────────────────────────────────┘
+                               │ layer-range contract (layer_range, engine, location)
+┌──────────────────────────────┴─────────────────────────────────────────────┐
+│ Engine layer (aimed at machines)                                           │
+│ Tier L: llama.cpp / GGUF            Tier D: PyTorch / Safetensors          │
+│ ├ single-machine inference          ├ layer splitting and tensor placement │
+│ ├ ggml RPC worker (borrowed GPU)    ├ inter-layer pipeline (qwen3_pipeline)│
+│ └ layer-segment forward (shim)      └ cross-framework upstream (model_mod) │
+└──────────────────────────────┬─────────────────────────────────────────────┘
+                               │ segment channel: Relay TCP (HIDDEN / HIDDEN_SEQ / TOKEN)
+┌──────────────────────────────┴─────────────────────────────────────────────┐
+│ Nodes and transport (cross-host, heterogeneous)                            │
+│ local loopback · SSH tunnel · Surface (x86_64, Windows) · y700 (ARM64)     │
+│ hidden compression: f32 / f16 / bf16 / int8_block128 · weak-net budgets    │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+One four-stage chain that has actually been measured end-to-end (records and method: the relay
+baseline document linked from the [Documentation Index](#documentation-index)):
+
+```
+prompt → torch(0..7) →hidden→ Surface(8..15) →hidden→ y700(16..19) →hidden→ llama(20..23+head) → token
+           local CUDA          x86_64 Windows        ARM64 Android           local llama.cpp
+```
+
+The acceptance criterion is **per-token argmax equality with the same-precision monolithic model**
+(cosine is not a substitute); any divergence is reported as FAIL, never as an "acceptable
+approximation".
+
+## Is This System Software or User Software?
+
+**Layered answer**: QLH ships as **a system-software core plus a user-software shell**.
+
+- **Control plane ≈ user software**: TUI, model assets, node/layout/queue/log/settings pages, HTTP API.
+  Its users are **people**; the failure mode is degraded experience (retry, switch model, switch
+  layout), and its interfaces may evolve.
+- **Engine layer ≈ system software**: layer-range contracts, the layer pipeline, cross-framework
+  relay, heterogeneous node hosting, hidden-state compression and transport. Its users are **other
+  software** (the control plane, higher-level orchestration, peer nodes), and its failure mode is
+  **silently wrong numerics** — hence strong contracts and fail-closed criteria.
+
+| Criterion | Control plane | Engine layer |
+| --- | --- | --- |
+| Primary users | People (end users / operators) | Other software (TUI, API orchestration, peer nodes) |
+| Failure consequence | Degraded experience, retryable | Wrong numerics, possibly **silent** |
+| Interface stability | May evolve (pages/commands can change) | Strong contract (layer contract, protocol version, record schema) |
+| Replaceable alone | Yes (new frontend, same engine) | No (a new engine means new numeric semantics → re-run per-token comparison) |
+| Analogy | Application / admin panel | Kernel + runtime + distributed subsystem |
+
+Two engineering consequences:
+
+1. **The change site decides the verification strength**: control-plane changes need UI/contract tests;
+   engine-layer changes require per-token comparison + record-schema validation + matrix runs.
+2. **"Borrowed compute" is a node type, not a fallback**: `remote_rpc` / `cross_framework` are
+   isomorphic to `local`, so the engine layer is "one subsystem, many node kinds" rather than
+   "main path + degraded path".
+
 ## Layer Pipeline and Cross-Framework Layer Relay
 
 ### Unified Node Abstraction
@@ -86,7 +155,7 @@ The upstream PyTorch layer segment computes up to layer N and hands the hidden s
 | Cut-point solver | `scripts/relay_cut_plan.py` + `src/relay_cut_objective.py`: fits segment profiles (fixed cost + per-layer cost) from **measured** records, then solves for the cut with `capacity_feasible` / `latency_estimate` / `risk_penalty` outputs; n-segment capable, with the Qwen3.5 4-layer-multiple hard constraint. The 2-segment loop passes on both Qwen2.5 (r2 0.96/0.99) and Qwen3.5 (0.79/0.96) |
 | Current positioning | **Architecture-compatibility track**; off by default, does not replace RPC, does not enter the Edge default route; optimization items are registered in [acceptance list D29](验收清单与资源限制登记.md) |
 
-**Corrected conclusion**: the earlier judgement "IPC is the main cost" has been overturned - that was an illusion masked while both sides were slow. **The leverage is in the compute on both sides (cut point, kernel, batching), not in the transport layer.** See [Same-Process Dual-Backend Relay Implementation and Performance](同进程双后端接力实现与性能-2026-09-16.md) sections 12-14.
+**Corrected conclusion**: the earlier judgement "IPC is the main cost" has been overturned - that was an illusion masked while both sides were slow. **The leverage is in the compute on both sides (cut point, kernel, batching), not in the transport layer.** See [Same-Process Dual-Backend Relay Implementation and Performance](archive/同进程双后端接力实现与性能-2026-09-16.md) sections 12-14.
 
 ### Cut-Point Sweep Results (P0, measured 2026-09-18)
 
@@ -409,11 +478,13 @@ Real hardware, cross-machine networking, Android ARM64, performance and long-run
 ## Documentation Index
 
 - [Current D-to-L Baseline and Optimization Plan (2026-09-21)](跨框架接力-当前有效基线与后续优化计划-2026-09-21.md)
+- [Test Quality Audit (2026-09-21): Parallel Flakiness and Race-Coverage Gaps](测试质量审计-2026-09-21.md)
+- [P4.5 Proposal: Dynamic Master Election and Distributed Management](主节点动态选举与分布式管理-P4.5立项-2026-09-21.md)
 - [Mainline Development Plan: Distributed Inference and Edge Optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md)
 - [Overall Architecture](整体架构.md)
 - [Layer-Segment Protocol Proposal (2026-09-17)](层段协议立项-2026-09-17.md)
 - [Layer Pipeline Node Kinds and Top-Level Transparency](层流水线节点类型与顶层透明性-可行性确认-2026-09-17.md)
-- [Same-Process Dual-Backend Relay Implementation and Performance](同进程双后端接力实现与性能-2026-09-16.md)
+- [Same-Process Dual-Backend Relay Implementation and Performance](archive/同进程双后端接力实现与性能-2026-09-16.md)
 - [Engine Single-Sequence and Concurrency Comparison](引擎单序列与并发性能对比-2026-09-16.md)
 - [Distributed Inference Parallelism and Cross-Framework Route Survey](分布式推理并行与跨框架路线调研汇总-2026-09-15.md)
 - [TUI User Guide](TUI使用指南.md)
@@ -421,7 +492,7 @@ Real hardware, cross-machine networking, Android ARM64, performance and long-run
 - [TUI Command Set](TUI指令集.md)
 - [Edge Device Simulation Environment Plan](边缘设备模拟环境计划-2026-09-15.md)
 - [Android Validation Alternative Paths](../android/Android验证替代路径-2026-09-18.md)
-- [Baseline Rewrite Plan](基线重写方案-2026-09-16.md)
+- [Baseline Rewrite Plan](archive/基线重写方案-2026-09-16.md)
 - [Module Interfaces](模块接口说明.md)
 - [Testing and Evaluation Criteria](测试与评判标准.md)
 - [Document Status and Cleanup List](文档状态与清理清单.md)

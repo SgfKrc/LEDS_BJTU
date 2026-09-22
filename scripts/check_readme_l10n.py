@@ -21,6 +21,8 @@ EN = ROOT / "docs" / "README.en.md"
 # 章节映射（中文 H2 -> 英文 H2）。新增中文章节必须在此登记并同步英文版。
 SECTION_MAP = {
     "主仓做什么": "What the Main Repository Does",
+    "架构总览": "Architecture Overview",
+    "这是什么软件：系统软件还是用户软件？": "Is This System Software or User Software?",
     "层流水线与跨框架逐层接力": "Layer Pipeline and Cross-Framework Layer Relay",
     "当前状态": "Current Status",
     "主仓边界": "Main Repository Boundary",

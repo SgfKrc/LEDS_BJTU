@@ -48,9 +48,11 @@ static void qlh_set_err(char *err, size_t errlen, const char *msg) {
     }
 }
 
-/* 返回值：句柄；失败返回 NULL 并把原因写进 err。 */
+/* 返回值：句柄；失败返回 NULL 并把原因写进 err。
+ * `n_seq_max` ★ P3：context 的并行序列上限（多序列数据流所必需）；<=0 视为 1（旧行为）。 */
 void * qlh_kh_load(const char * model_path,
                    int32_t n_ctx, int32_t n_threads, int32_t n_batch,
+                   int32_t n_seq_max,
                    int32_t mode, int32_t cut_layer,
                    int32_t * out_n_embd, int32_t * out_n_layer,
                    char * err, size_t errlen) {
@@ -78,6 +80,7 @@ void * qlh_kh_load(const char * model_path,
     cparams.n_ubatch        = (uint32_t) (n_batch > 0 ? n_batch : 512);
     cparams.n_threads       = (n_threads > 0 ? n_threads : 4);
     cparams.n_threads_batch = (n_threads > 0 ? n_threads : 4);
+    cparams.n_seq_max       = (uint32_t) (n_seq_max > 0 ? n_seq_max : 1);
 
     struct llama_context * ctx = llama_init_from_model(model, cparams);
     if (ctx == NULL) {
@@ -155,6 +158,25 @@ static void qlh_fill_common(struct llama_batch * batch, int32_t n_tokens, int32_
     batch->n_tokens = n_tokens;
 }
 
+/* ★ P3：多序列显式绑定 —— 每个 token 自带 `n_seq_id / seq_id / pos`，**不依赖隐式位置递增**。
+ * 与主仓 `llama_engine.forward_layers_from_hidden(seq_ids=..., positions=...)` 同一契约；
+ * 多序列交错推进时，位置由调用方决定（每序列可各自递增）。
+ * ⚠️ `positions == NULL` 时回落到 `n_past + i`（单序列增量语义）—— 少了这一项，
+ *    单序列 decode 的第二步会从位置 0 重放，直接触发
+ *    "tokens ... have inconsistent sequence positions" 而 decode 失败（实测踩过）。 */
+static void qlh_fill_explicit(struct llama_batch * batch, int32_t n_tokens, int32_t n_past,
+                              const int32_t * n_seq_id, const int32_t * seq_ids,
+                              const int32_t * positions) {
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        const int32_t per_token = (n_seq_id == NULL) ? 1 : n_seq_id[i];
+        batch->n_seq_id[i]  = per_token > 0 ? per_token : 1;
+        batch->seq_id[i][0] = (seq_ids == NULL) ? 0 : seq_ids[i];
+        batch->pos[i]       = (positions == NULL) ? (n_past + i) : positions[i];
+        batch->logits[i]    = 1;
+    }
+    batch->n_tokens = n_tokens;
+}
+
 /* 前向：跑 tokens（从 n_past 起），把结果写进 out（容量 n_tokens * n_embd 个 float）。
  * 返回 0 成功；否则为负的错误码（-1 参数错，-2 decode 失败，-3/-4 取 hidden 失败）。 */
 int32_t qlh_kh_forward(void * handle_void,
@@ -182,16 +204,42 @@ int32_t qlh_kh_forward(void * handle_void,
 /* ★ 中间段能力：吃 hidden（`embd` 注入）→ 吐 hidden（本模型末层 / 第 cut_layer 层输入）。
  * 这是「1 个 torch 上游 + n 个 llama 下游」链式拼接的关键 —— 中间的 llama 段必须能
  * 既接受上游 hidden 又交出 hidden。返回码同 qlh_kh_forward（另有 -5 = embd 参数错）。 */
+int32_t qlh_kh_forward_embd_seq(void * handle_void,
+                                const float * embd, int32_t n_tokens, int32_t n_past,
+                                const int32_t * n_seq_id, const int32_t * seq_ids,
+                                const int32_t * positions, float * out);
+
+/* ★ P4.5 退化路径（无 PC 集群）：吃 hidden（embd 注入）→ 吐 **token**（末位 argmax）。
+ * 末段能力：集群里可能没有任何能跑 torch 的节点，此时层接力必须全部由 llama.cpp 承载，
+ * 末段就要能"吃 hidden 出 token"。与 `qlh_kh_forward_embd_seq` 共用同一份 decode 路径，
+ * 只把输出从 hidden 换成末位 argmax ⇒ 语义天然对齐（同一份 C 源、同一份 llama.cpp，
+ * 不引入第二个 llama.cpp 版本）。
+ * 返回码同 `qlh_kh_forward_embd_seq`（另有 -6 = 取 logits 失败）。 */
+int32_t qlh_kh_forward_embd_token(void * handle_void,
+                                  const float * embd, int32_t n_tokens, int32_t n_past,
+                                  const int32_t * n_seq_id, const int32_t * seq_ids,
+                                  const int32_t * positions, int32_t * out_token);
+
 int32_t qlh_kh_forward_embd(void * handle_void,
                             const float * embd, int32_t n_tokens, int32_t n_past,
                             float * out) {
+    return qlh_kh_forward_embd_seq(handle_void, embd, n_tokens, n_past, NULL, NULL, NULL, out);
+}
+
+/* ★ P3：多序列版 `embd` 前向 —— 显式 `n_seq_id / seq_ids / positions`（长度均为 n_tokens）。
+ * 三个数组都可为 NULL（等价于旧的单序列、位置自 n_past 起递增）⇒ 向后兼容。
+ * ⚠️ 需要 `qlh_kh_load(..., n_seq_max >= 序列数)`，否则 llama.cpp 拒绝 >0 的 seq_id。 */
+int32_t qlh_kh_forward_embd_seq(void * handle_void,
+                                const float * embd, int32_t n_tokens, int32_t n_past,
+                                const int32_t * n_seq_id, const int32_t * seq_ids,
+                                const int32_t * positions, float * out) {
     qlh_keep_head * handle = (qlh_keep_head *) handle_void;
     if (handle == NULL || embd == NULL || out == NULL || n_tokens <= 0) {
         return -5;
     }
 
     struct llama_batch batch = llama_batch_init(n_tokens, handle->n_embd, 1);
-    qlh_fill_common(&batch, n_tokens, n_past);
+    qlh_fill_explicit(&batch, n_tokens, n_past, n_seq_id, seq_ids, positions);
     memcpy(batch.embd, embd, (size_t) n_tokens * (size_t) handle->n_embd * sizeof(float));
 
     const int32_t rc = llama_decode(handle->ctx, batch);
@@ -202,14 +250,72 @@ int32_t qlh_kh_forward_embd(void * handle_void,
     return qlh_extract_hidden(handle, n_tokens, out);
 }
 
-int32_t qlh_kh_n_embd(void * handle_void) {
+/* ★ P4.5：末段能力实现 —— 与 `qlh_kh_forward_embd_seq` 共用同一条 decode 路径，
+ * 只把输出从 hidden 换成末位 argmax（因此语义天然对齐）。 */
+int32_t qlh_kh_forward_embd_token(void * handle_void,
+                                  const float * embd, int32_t n_tokens, int32_t n_past,
+                                  const int32_t * n_seq_id, const int32_t * seq_ids,
+                                  const int32_t * positions, int32_t * out_token) {
     qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL || embd == NULL || out_token == NULL || n_tokens <= 0) {
+        return -5;
+    }
+
+    struct llama_batch batch = llama_batch_init(n_tokens, handle->n_embd, 1);
+    qlh_fill_explicit(&batch, n_tokens, n_past, n_seq_id, seq_ids, positions);
+    memcpy(batch.embd, embd, (size_t) n_tokens * (size_t) handle->n_embd * sizeof(float));
+
+    const int32_t rc = llama_decode(handle->ctx, batch);
+    llama_batch_free(batch);
+    if (rc != 0) {
+        return -2;
+    }
+
+    const float * logits = llama_get_logits_ith(handle->ctx, n_tokens - 1);
+    if (logits == NULL) {
+        return -6;
+    }
+    const struct llama_model * model = llama_get_model(handle->ctx);
+    if (model == NULL) {
+        return -6;
+    }
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    if (n_vocab <= 0) {
+        return -6;
+    }
+    int32_t best = 0;
+    float best_logit = logits[0];
+    for (int32_t i = 1; i < n_vocab; ++i) {
+        if (logits[i] > best_logit) {
+            best_logit = logits[i];
+            best = i;
+        }
+    }
+    *out_token = best;
+    return 0;
+}
+
+int32_t qlh_kh_n_embd(void * handle_void) {    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
     return handle == NULL ? 0 : handle->n_embd;
 }
 
 int32_t qlh_kh_n_layer(void * handle_void) {
     qlh_keep_head * handle = (qlh_keep_head *) handle_void;
     return handle == NULL ? 0 : handle->n_layer;
+}
+
+/* ★ P3：清空 KV / recurrent 记忆。跨机服务在**同一进程**里服务多条连接时必须调用 ——
+ * 否则新连接从位置 0 开始会与上一条连接留下的位置冲突（llama.cpp 报
+ * "tokens ... have inconsistent sequence positions"，实测表现为远端 runner_failed）。 */
+void qlh_kh_reset(void * handle_void) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL || handle->ctx == NULL) {
+        return;
+    }
+    llama_memory_t mem = llama_get_memory(handle->ctx);
+    if (mem != NULL) {
+        llama_memory_clear(mem, true);
+    }
 }
 
 void qlh_kh_close(void * handle_void) {

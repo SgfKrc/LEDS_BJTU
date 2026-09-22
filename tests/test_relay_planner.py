@@ -90,6 +90,18 @@ def test_auto_split_accepts_device_info_mapping():
     assert decision.to_dict()["profile"]["node_id"] == "relay-downstream"
 
 
+def test_auto_split_does_not_treat_total_ram_as_available_headroom():
+    decision = plan_relay_cut(
+        24,
+        n_embd=2048,
+        downstream_profile={"ram": {"total_gb": 16.0}},
+    )
+
+    assert decision.admitted is False
+    assert decision.reason == "downstream_capacity_insufficient"
+    assert decision.profile.ram_available_gb == 0.0
+
+
 def test_profile_from_device_info_marks_missing_telemetry():
     profile = RelayDownstreamProfile.from_device_info({})
 
