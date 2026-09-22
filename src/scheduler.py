@@ -24,7 +24,7 @@ import threading
 import time
 import uuid
 from enum import Enum
-from typing import Any, Mapping, Optional, Callable, TYPE_CHECKING
+from typing import Any, Mapping, Optional, Callable, Sequence, TYPE_CHECKING
 from dataclasses import dataclass, field
 
 if TYPE_CHECKING:
@@ -72,6 +72,7 @@ from gemma4_pipeline_sidecar import (
     Gemma4SidecarError,
 )
 from cluster_fence import ControlFence
+from cluster_auto_role import AutoRoleController
 
 from task_provider import (
     ModelIdentity as TaskModelIdentity,
@@ -1096,6 +1097,7 @@ class Scheduler:
         # Protocol bundle 注入，避免 scheduler 反向依赖 api_server。
         self._host = host if host is not None else get_model_host()
         self._control_fence: ControlFence | None = None
+        self._auto_role_controller: AutoRoleController | None = None
         self._callbacks = callbacks if callbacks is not None else getattr(
             self._host, "scheduler_callbacks", None,
         )
@@ -1296,6 +1298,81 @@ class Scheduler:
             setter = getattr(transport, "set_control_fence", None)
             if callable(setter):
                 setter(fence)
+
+    def set_auto_role_controller(self, controller: AutoRoleController | None) -> None:
+        """Attach the explicit auto-role adapter without changing startup defaults."""
+        if controller is not None and not isinstance(controller, AutoRoleController):
+            raise TypeError("auto role controller must be an AutoRoleController or None")
+        self._auto_role_controller = controller
+
+    def get_auto_role_snapshot(self, *, now_ms: int | None = None) -> dict:
+        """Expose auto-role state for read-only control-plane/TUI status."""
+        controller = self._auto_role_controller
+        if controller is None:
+            role = self._effective_role()
+            return {
+                "enabled": False,
+                "state": "disabled",
+                "runtime_role": role,
+                "writable": role == "master",
+            }
+        snapshot = controller.snapshot(now_ms=now_ms)
+        snapshot["enabled"] = True
+        return snapshot
+
+    def start_auto_role(
+        self,
+        *,
+        available_voter_ids: Sequence[str] | None = None,
+        now_ms: int | None = None,
+    ) -> dict:
+        """Start the explicitly attached role controller and return its decision."""
+        controller = self._auto_role_controller
+        if controller is None:
+            return {
+                "accepted": False,
+                "state": "disabled",
+                "runtime_role": self._effective_role(),
+                "reason": "auto_role_disabled",
+            }
+        return controller.start(
+            available_voter_ids=available_voter_ids,
+            now_ms=now_ms,
+        ).to_dict()
+
+    def auto_role_on_disconnect(self) -> dict:
+        """Apply the auto-role write fence after a control-plane disconnect."""
+        controller = self._auto_role_controller
+        if controller is None:
+            return {
+                "accepted": False,
+                "state": "disabled",
+                "runtime_role": self._effective_role(),
+                "reason": "auto_role_disabled",
+            }
+        return controller.on_disconnect().to_dict()
+
+    def auto_role_on_reconnect(
+        self,
+        *,
+        certificate: object | None = None,
+        available_voter_ids: Sequence[str] | None = None,
+        now_ms: int | None = None,
+    ) -> dict:
+        """Rejoin through a new quorum certificate or remain read-only."""
+        controller = self._auto_role_controller
+        if controller is None:
+            return {
+                "accepted": False,
+                "state": "disabled",
+                "runtime_role": self._effective_role(),
+                "reason": "auto_role_disabled",
+            }
+        return controller.on_reconnect(
+            certificate=certificate,
+            available_voter_ids=available_voter_ids,
+            now_ms=now_ms,
+        ).to_dict()
 
     def _require_control_write(self, action: str) -> None:
         fence = self._control_fence
@@ -1646,7 +1723,13 @@ class Scheduler:
             configured_role = getattr(cfg, "NODE_ROLE", NODE_ROLE)
         except Exception:
             configured_role = NODE_ROLE
-        return getattr(self, '_role_override', None) or configured_role
+        override = getattr(self, '_role_override', None)
+        if override:
+            return override
+        controller = getattr(self, "_auto_role_controller", None)
+        if controller is not None:
+            return controller.runtime_role
+        return configured_role
 
     def init_nodes(self) -> None:
         """
@@ -9815,6 +9898,8 @@ class Scheduler:
             "my_node": my_info.to_dict() if my_info else None,
             "tcp_server_running": self._tcp_server is not None and self._tcp_server._running,
         }
+        if self._auto_role_controller is not None:
+            result["auto_role"] = self.get_auto_role_snapshot()
 
         provisional_master = effective_role == "master" and self.can_join_existing_master()
         if provisional_master:
