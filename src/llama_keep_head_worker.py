@@ -75,6 +75,15 @@ def main() -> int:
                     hidden, n_past=int(request.get("n_past", 0)),
                     seq_ids=request.get("seq_ids"), positions=request.get("positions")))
                 continue
+            if operation == "hidden_token":
+                shape = tuple(int(value) for value in request["shape"])
+                hidden = np.frombuffer(
+                    base64.b64decode(str(request["data"])), dtype=np.float32).reshape(shape)
+                token = upstream.forward_hidden_to_token(
+                    hidden, n_past=int(request.get("n_past", 0)),
+                    seq_ids=request.get("seq_ids"), positions=request.get("positions"))
+                _response(ok=True, token=int(token))
+                continue
             raise ValueError(f"unknown operation: {operation!r}")
     except Exception as exc:  # noqa: BLE001 - serialized worker boundary
         _response(ok=False, error=f"{type(exc).__name__}: {exc}")

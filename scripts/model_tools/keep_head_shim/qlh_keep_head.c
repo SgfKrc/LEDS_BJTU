@@ -209,6 +209,17 @@ int32_t qlh_kh_forward_embd_seq(void * handle_void,
                                 const int32_t * n_seq_id, const int32_t * seq_ids,
                                 const int32_t * positions, float * out);
 
+/* ★ P4.5 退化路径（无 PC 集群）：吃 hidden（embd 注入）→ 吐 **token**（末位 argmax）。
+ * 末段能力：集群里可能没有任何能跑 torch 的节点，此时层接力必须全部由 llama.cpp 承载，
+ * 末段就要能"吃 hidden 出 token"。与 `qlh_kh_forward_embd_seq` 共用同一份 decode 路径，
+ * 只把输出从 hidden 换成末位 argmax ⇒ 语义天然对齐（同一份 C 源、同一份 llama.cpp，
+ * 不引入第二个 llama.cpp 版本）。
+ * 返回码同 `qlh_kh_forward_embd_seq`（另有 -6 = 取 logits 失败）。 */
+int32_t qlh_kh_forward_embd_token(void * handle_void,
+                                  const float * embd, int32_t n_tokens, int32_t n_past,
+                                  const int32_t * n_seq_id, const int32_t * seq_ids,
+                                  const int32_t * positions, int32_t * out_token);
+
 int32_t qlh_kh_forward_embd(void * handle_void,
                             const float * embd, int32_t n_tokens, int32_t n_past,
                             float * out) {
@@ -239,8 +250,52 @@ int32_t qlh_kh_forward_embd_seq(void * handle_void,
     return qlh_extract_hidden(handle, n_tokens, out);
 }
 
-int32_t qlh_kh_n_embd(void * handle_void) {
+/* ★ P4.5：末段能力实现 —— 与 `qlh_kh_forward_embd_seq` 共用同一条 decode 路径，
+ * 只把输出从 hidden 换成末位 argmax（因此语义天然对齐）。 */
+int32_t qlh_kh_forward_embd_token(void * handle_void,
+                                  const float * embd, int32_t n_tokens, int32_t n_past,
+                                  const int32_t * n_seq_id, const int32_t * seq_ids,
+                                  const int32_t * positions, int32_t * out_token) {
     qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL || embd == NULL || out_token == NULL || n_tokens <= 0) {
+        return -5;
+    }
+
+    struct llama_batch batch = llama_batch_init(n_tokens, handle->n_embd, 1);
+    qlh_fill_explicit(&batch, n_tokens, n_past, n_seq_id, seq_ids, positions);
+    memcpy(batch.embd, embd, (size_t) n_tokens * (size_t) handle->n_embd * sizeof(float));
+
+    const int32_t rc = llama_decode(handle->ctx, batch);
+    llama_batch_free(batch);
+    if (rc != 0) {
+        return -2;
+    }
+
+    const float * logits = llama_get_logits_ith(handle->ctx, n_tokens - 1);
+    if (logits == NULL) {
+        return -6;
+    }
+    const struct llama_model * model = llama_get_model(handle->ctx);
+    if (model == NULL) {
+        return -6;
+    }
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    if (n_vocab <= 0) {
+        return -6;
+    }
+    int32_t best = 0;
+    float best_logit = logits[0];
+    for (int32_t i = 1; i < n_vocab; ++i) {
+        if (logits[i] > best_logit) {
+            best_logit = logits[i];
+            best = i;
+        }
+    }
+    *out_token = best;
+    return 0;
+}
+
+int32_t qlh_kh_n_embd(void * handle_void) {    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
     return handle == NULL ? 0 : handle->n_embd;
 }
 

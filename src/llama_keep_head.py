@@ -167,6 +167,17 @@ class KeepHeadUpstream:
             ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float),
         ]
         lib.qlh_kh_forward_embd_seq.restype = ctypes.c_int32
+        # ★ P4.5 末段能力（可选符号）：**必须显式设 argtypes** —— 否则 ctypes 把 64 位句柄按
+        #   `c_int` 处理 ⇒ `OverflowError: int too long to convert`（实测踩到）。
+        #   旧版 shim 没有这个符号，因此只在存在时设置，保持向后兼容。
+        if hasattr(lib, "qlh_kh_forward_embd_token"):
+            lib.qlh_kh_forward_embd_token.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
+                ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
+            ]
+            lib.qlh_kh_forward_embd_token.restype = ctypes.c_int32
         lib.qlh_kh_forward_embd.argtypes = [
             ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32,
             ctypes.c_int32, ctypes.POINTER(ctypes.c_float),
@@ -316,6 +327,72 @@ class KeepHeadUpstream:
             raise KeepHeadUnavailable(
                 f"keep-head 前向失败 rc={rc}：{FORWARD_ERRORS.get(rc, '未知错误码')}")
         return out
+
+    def forward_hidden_to_token(self, hidden, *, n_past: int = 0,
+                                seq_ids: Sequence[int] | None = None,
+                                positions: Sequence[int] | None = None) -> int:
+        """★ **末段能力（P4.5 退化路径）**：吃上游 hidden（`embd` 注入）→ 吐**末位 argmax**。
+
+        用途：集群里可能没有任何能跑 torch 的节点（无 PC 边缘集群），此时层接力必须全部由
+        llama.cpp 承载 —— 末段就得能"吃 hidden 出 token"。本入口与 `forward_hidden_to_hidden`
+        共用同一条 shim decode 路径，只把输出换成 argmax ⇒ **数值口径天然对齐**
+        （同一份 C 源、同一份 llama.cpp，不引入第二个 llama.cpp 版本）。
+
+        ⚠️ **可选能力**：需要 shim 带 `qlh_kh_forward_embd_token`（P4.5 新增）。旧版 shim 只缺
+        这一个符号，不影响上游/中间段；缺失时给明确错误，绝不静默降级。
+        """
+        import numpy as np
+
+        if not hasattr(self._lib, "qlh_kh_forward_embd_token"):
+            raise KeepHeadUnavailable(
+                f"{self.shim_path} 缺 qlh_kh_forward_embd_token（末段能力）"
+                "—— 需用含 P4.5 入口的 shim 重新编译")
+
+        arr = np.ascontiguousarray(np.asarray(hidden, dtype=np.float32))
+        if arr.ndim == 1:
+            arr = arr[None, :]
+        if arr.ndim != 2 or arr.shape[1] != self.n_embd:
+            raise ValueError(f"hidden 形状应为 [n_tokens, {self.n_embd}]，实得 {arr.shape}")
+        n_tokens = int(arr.shape[0])
+        if n_tokens == 0:
+            raise ValueError("hidden 的 token 数不能为 0")
+        seq_list = self._token_list(seq_ids, n_tokens, "seq_ids")
+        pos_list = self._token_list(positions, n_tokens, "positions")
+        if seq_list is not None and max(set(seq_list)) >= self.n_seq_max:
+            raise ValueError(
+                f"seq_ids 最大 {max(set(seq_list))} ≥ n_seq_max {self.n_seq_max}；"
+                "多序列必须用 n_seq_max 构造 KeepHeadUpstream")
+
+        if self._worker is not None:
+            payload = {
+                "op": "hidden_token", "shape": list(arr.shape),
+                "data": base64.b64encode(arr.tobytes()).decode("ascii"),
+                "n_past": int(n_past),
+            }
+            if seq_list is not None:
+                payload["seq_ids"] = seq_list
+            if pos_list is not None:
+                payload["positions"] = pos_list
+            response = self._worker_request(payload)
+            token = int(response.get("token", -1))
+            if token < 0:
+                raise KeepHeadUnavailable(
+                    f"keep-head 末段前向失败 rc={response.get('rc')}："
+                    f"{FORWARD_ERRORS.get(response.get('rc'), '未知错误码')}")
+            return token
+
+        out_token = ctypes.c_int32(-1)
+        rc = self._lib.qlh_kh_forward_embd_token(
+            self._handle, arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            n_tokens, int(n_past),
+            None,
+            (ctypes.c_int32 * n_tokens)(*seq_list) if seq_list is not None else None,
+            (ctypes.c_int32 * n_tokens)(*pos_list) if pos_list is not None else None,
+            ctypes.byref(out_token))
+        if rc != 0:
+            raise KeepHeadUnavailable(
+                f"keep-head 末段前向失败 rc={rc}：{FORWARD_ERRORS.get(rc, '未知错误码')}")
+        return int(out_token.value)
 
     def forward_hidden_to_hidden(self, hidden, *, n_past: int = 0,
                                  seq_ids: Sequence[int] | None = None,

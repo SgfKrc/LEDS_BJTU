@@ -153,6 +153,66 @@ class TailRunner:
         self.reset()
 
 
+class ShimTailRunner:
+    """末段（**无 pip `llama_cpp` 的设备**）：吃 hidden → 吐 token，走 **keep-head shim**。
+
+    为什么需要它（而不是"在设备上装 llama-cpp-python"）：
+
+    1. `TailRunner` 依赖 pip `llama_cpp`，而 head/middle 需要的
+       `llama_get_embeddings_nextn_ith` / `llama_get_embeddings_layer_inp` /
+       `llama_set_embeddings_layer_inp` 这些**补丁符号在 pip 的绑定层里不存在**（实测：三个符号
+       在 `llama_cpp.llama_cpp` 里全部 MISSING，而标准符号都在）⇒ 用 pip 版做 head/middle
+       不仅要换它 vendor 的 llama.cpp，**还要改 `llama_cpp.py` 补声明并长期跟进上游**；
+    2. shim 的 C 源与 NDK 交叉编译流程本仓已有且**已在真机验证过**，编译发生在**开发机**，
+       设备只收产物 —— 边缘设备不该承担编译；
+    3. 末段走同一份 shim ⇒ **同一份 C 源、同一份 llama.cpp**，与 head/middle 的数值口径天然对齐，
+       不会在同一链路里混入**第二套构建配置**的 llama.cpp。
+
+    因此设备侧统一走 shim：本类的 `request_token` 与 `TailRunner.request_token` 同语义
+    （吃 hidden、吐末位 argmax），可被 `serve_relay_middle_connection` 直接替换。
+    """
+
+    def __init__(self, *, shim: str, model: str, n_ctx: int, n_threads: int,
+                 mode: str = "nextn", cut_layer: int | None = None,
+                 extra_dll_dirs: list[str], n_seq_max: int = 1,
+                 n_batch: int = 512) -> None:
+        import os  # noqa: PLC0415
+
+        from llama_keep_head import KeepHeadUpstream  # noqa: PLC0415
+
+        dirs = list(extra_dll_dirs)
+        dirs.extend(d for d in (os.environ.get("QLH_KEEP_HEAD_DLL_DIRS") or "")
+                    .split(os.pathsep) if d)
+        self._upstream = KeepHeadUpstream(shim, model, mode=mode, cut_layer=cut_layer,
+                                          n_ctx=n_ctx, n_threads=n_threads,
+                                          n_seq_max=max(1, int(n_seq_max)),
+                                          n_batch=max(512, int(n_batch)),
+                                          extra_dll_dirs=dirs)
+        self.n_embd = self._upstream.n_embd
+        self.n_layer = self._upstream.n_layer
+        self._pos = 0
+        print(json.dumps({"role": "tail", "n_embd": self.n_embd, "n_layer": self.n_layer,
+                          "channel": "keep_head.forward_hidden_to_token",
+                          "mode": mode, "cut_layer": cut_layer}), flush=True)
+
+    def reset(self) -> None:
+        self._pos = 0
+        self._upstream.reset()
+
+    def request_token(self, hidden_bytes: bytes, *, n_tokens: int) -> int:
+        import numpy as np  # noqa: PLC0415
+
+        count = int(n_tokens)
+        incoming = np.frombuffer(hidden_bytes, dtype=np.float32).reshape(count, self.n_embd)
+        token = self._upstream.forward_hidden_to_token(incoming, n_past=self._pos)
+        self._pos += count
+        return int(token)
+
+    def close(self) -> None:
+        self.reset()
+        self._upstream.close()
+
+
 def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="跨机接力的远端段服务（keep-head / 末段）")
     ap.add_argument("--role", choices=("middle", "tail"), default="middle")
@@ -202,7 +262,15 @@ def main(argv: list[str] | None = None) -> int:
                                            extra_dll_dirs=list(args.dll_dir))
         serve = serve_relay_middle_connection
     else:
-        runner = TailRunner(model=args.model, n_ctx=args.n_ctx, n_threads=args.threads)
+        if args.keep_head_shim:
+            # ★ P4.5：末段走 shim（设备侧既没有 pip llama_cpp，也不该为它维护打补丁的 fork）
+            runner = ShimTailRunner(shim=args.keep_head_shim, model=args.model,
+                                    n_ctx=args.n_ctx, n_threads=args.threads,
+                                    mode=args.mode, cut_layer=args.cut_layer,
+                                    extra_dll_dirs=list(args.dll_dir),
+                                    n_seq_max=args.n_seq_max, n_batch=args.n_batch)
+        else:
+            runner = TailRunner(model=args.model, n_ctx=args.n_ctx, n_threads=args.threads)
         serve = serve_relay_connection
 
     if args.n_embd is not None and int(args.n_embd) != int(runner.n_embd):

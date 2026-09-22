@@ -212,3 +212,42 @@ def test_int8_hidden_quant_supports_non_block_aligned_width():
     assert out.shape == hidden.shape
     assert out.dtype == np.float32
     assert np.isfinite(out).all()
+
+
+def test_token_entry_requires_shim_symbol():
+    """★ P4.5 末段入口：shim 缺 `qlh_kh_forward_embd_token` 时必须**明确报错**。
+
+    旧版 shim 只缺这一个入口，middle/上游照常可用 ⇒ 不能把它放进 `SHIM_SYMBOLS`（那会让设备上
+    未升级的 shim 整体加载失败），但也绝不能静默降级 —— 报错必须指名缺哪个符号。
+    """
+    import types
+
+    import numpy as np
+
+    upstream = object.__new__(KeepHeadUpstream)
+    upstream._lib = types.SimpleNamespace()          # 模拟旧 shim：没有 token 入口
+    upstream.shim_path = "fake.dll"
+    upstream.n_embd = 8
+    upstream._worker = None
+    with pytest.raises(KeepHeadUnavailable, match="qlh_kh_forward_embd_token"):
+        upstream.forward_hidden_to_token(np.zeros((1, 8), dtype=np.float32))
+
+
+def test_token_symbol_argtypes_are_set():
+    """★ 符号存在时**必须**设置 `argtypes`：否则 ctypes 把 64 位句柄按 `c_int` 处理 ⇒
+    `OverflowError: int too long to convert`（实测踩到：服务端每次连接都失败）。"""
+    import ctypes
+
+    shim = ROOT / "build" / "keephead" / "build-cpu" / "bin" / "qlh_keep_head.dll"
+    if not shim.exists():
+        pytest.skip("缺本机 shim（先跑 scripts/model_tools/build_keep_head_shim.ps1）")
+    lib = ctypes.CDLL(str(shim))
+    if not hasattr(lib, "qlh_kh_forward_embd_token"):
+        pytest.skip("本机 shim 尚未包含 P4.5 末段入口")
+    lib.qlh_kh_forward_embd_token.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32, ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
+    ]
+    # 第一参数必须是 c_void_p（而不是 ctypes 的默认 c_int），否则 64 位句柄会溢出
+    assert lib.qlh_kh_forward_embd_token.argtypes[0] is ctypes.c_void_p
