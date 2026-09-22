@@ -1,6 +1,6 @@
 """QLH Edge —— 本地小模型 + 原生 RPC worker 的边缘入口。
 
-基线定义见 local_docs/边缘基线框定-2026-09-14.md：
+基线定义见 local_docs/plans/边缘基线框定-2026-09-14.md：
 - 只依赖白名单：llama-cpp-python + fastapi + uvicorn + psutil（+ numpy 传递依赖）
 - 不 import torch / transformers / accelerate / 多模态 / RAG / 实验链
 - 目标：运行时 venv ≤300MB、冷启动 ≤15s（无 torch import 链）

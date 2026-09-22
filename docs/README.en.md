@@ -177,7 +177,7 @@ A full sweep over the upstream layer count N (N=0 means **no relay** - llama.cpp
 - **Engineering constraint**: the cut point must be a multiple of `full_attention_interval` (Qwen3.5 = 4), otherwise the layer types of the layer-cut GGUF are misaligned and it fails to load (measured at N=2);
 - **Methodology warning**: isolated measurements detached from the end-to-end chain are not trustworthy (this sweep under-measured the upstream per-step cost by about 5.6x); cut-point conclusions must use the end-to-end basis.
 
-Report: `local_docs/CORE-RELAY-XFRAME-02-sweep-2026-09-18.json`; ticket: [acceptance list D29](验收清单与资源限制登记.md).
+Report: `local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-sweep-2026-09-18.json`; ticket: [acceptance list D29](验收清单与资源限制登记.md).
 
 **Same-day correction (v2) - the section above (including its table) only holds when the upstream runs on CPU**: `relay_sameproc_4L.py` never calls `.to(device)` after `from_pretrained`, so `dev = tmodel.device` is **cpu**; the isolated script `upstream_layer_cost.py` explicitly does `.to("cuda")`. Measured with the same script and the same basis for the same 4 layers: **cpu 34.9 ms / cuda 8.3 ms** => that 5.6x difference **is explained by the device** (neither by KV shape nor by idle down-clocking - both were disproved by controls: `shape_sensitivity` fixed 47.4 > growing 34.4; `idle_wakeup_and_overlap` idle 8.56 vs continuous 7.53 = 1.14x, with the SM clock steady at 780/3105 MHz throughout).
 
@@ -195,7 +195,7 @@ After adding `--upstream-device cuda` to relay (with f16 + `--upstream-partial` 
 - The 64-token sequence at every cut point remains **token-identical** (including the GPU upstream);
 - So "no relay is fastest / cut points give no benefit" **holds only for a CPU upstream** and must not be extrapolated. In real deployments the downstream is usually a **CUDA-less edge device**, which supports the direction "put layers on the GPU upstream" - and therefore **P1 (adding a GPU to the downstream) has narrow applicability; what is actually worth doing is "GPU-izing the upstream" and P2 overlap**.
 
-Report: `local_docs/CORE-RELAY-XFRAME-02-p0-corrected-2026-09-18.json` (v2, supersedes v1).
+Report: `local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-p0-corrected-2026-09-18.json` (v2, supersedes v1).
 
 ### Fair Comparison Against "All-llama + CUDA" + P2 Overlap (measured 2026-09-18)
 
@@ -219,7 +219,7 @@ A **1.291x** speed-up, and both sequences are **identical** to the single-sequen
 
 **Conclusion and positioning**: the 1.45x from P0 above is only the local gain of "CPU llama.cpp -> GPU **torch**"; the better move is "CPU llama.cpp -> GPU **llama.cpp**" (`-ngl`). So **cross-framework relay is not a faster inference path** - it is the mechanism for "**layers that can only run under torch**" (hybrid/custom operators) and for "**capacity merging / layer pipeline** (too large for a single machine)", plus an experiment platform. **When the cluster has a CUDA node, the best practice is to use it as a llama.cpp CUDA worker (RPC/sharding), not as a relay upstream**; P2 overlap only recovers part of the loss inside the "relay is unavoidable" scenario (78.3 ms/token is still about 3x slower than 26.6).
 
-Report: `local_docs/CORE-RELAY-XFRAME-02-p2-2026-09-18.json`. All of the above is **same-machine** data; the **cross-machine (GPU node + CUDA-less edge node) RPC vs. relay comparison is still unmeasured**.
+Report: `local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-p2-2026-09-18.json`. All of the above is **same-machine** data; the **cross-machine (GPU node + CUDA-less edge node) RPC vs. relay comparison is still unmeasured**.
 
 ### torch.compile and the "Layer Loop" Switches (`USE_COMPILE` / `USE_MONOLITHIC_FORWARD`)
 
@@ -249,7 +249,7 @@ Hybrid models (Qwen3.5's 18 `linear_attention` + 6 `full_attention` layers) need
 
 Current **serial full-suite** baseline: `2991 passed / 13 skipped / 0 failed` (`-n 0`; recorded after `610f4b3`; xdist concurrency occasionally flakes - judge by the serial run).
 
-Reports: `local_docs/CORE-RELAY-XFRAME-02-a4-layer-loop-2026-09-18.json`, `...-b14-hybrid-layer-loop-2026-09-18.json`, `...-compile-numerics-2026-09-18.json`.
+Reports: `local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-a4-layer-loop-2026-09-18.json`, `...-b14-hybrid-layer-loop-2026-09-18.json`, `...-compile-numerics-2026-09-18.json`.
 
 ### Top-Level Transparency
 

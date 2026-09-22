@@ -448,7 +448,7 @@ Invalid read of size 4
 | `embd` vs token 路径（同一 141-token prompt） | argmax `132/141` | **`141/141`、cosine min = `0.999999`** |
 | token 路径对照（连跑两次） | bitwise 一致 | bitwise 一致（不变） |
 | `llama-relay-gen` L→L 141 步贪心生成（连跑 2 次） | 第 46 / 51 步分叉 | **`全部 141 步一致`（2/2）** |
-| `llama-relay-gen-dl` **D→L 逐步生成**（A=PyTorch 每步 layer 0..3 → B=裁层 llama.cpp，141 步） | 无法进行（`embd` 每步结果不可复现） | **`全部 141 步一致`**（驱动 `drive_dl_relay.py`；报告 `local_docs/CORE-RELAY-XFRAME-01-dl-stepwise-141-2026-09-16.json`） |
+| `llama-relay-gen-dl` **D→L 逐步生成**（A=PyTorch 每步 layer 0..3 → B=裁层 llama.cpp，141 步） | 无法进行（`embd` 每步结果不可复现） | **`全部 141 步一致`**（驱动 `drive_dl_relay.py`；报告 `local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-01-dl-stepwise-141-2026-09-16.json`） |
 
 修法实现见 `build/cross-framework-layer-poc/patches/embd-pos-overread-fix-2026-09-16.patch`
 （`relay-check.cpp` / `relay-gen.cpp` / `embd-inject-test.cpp` 的 `pos4` 分配）。
@@ -541,7 +541,7 @@ QLH_NO_POS_FIX=1 $BIN/llama-relay-check.exe H:/qlh_models/Qwen-1_8B-Chat.Q4_K_M.
 4. **可放宽路径**：真实的 D→L 形态是 **A 侧只提供 hidden、只由 B 侧采样**（RNG 只有一个）→ 不存在"两侧 RNG 不一致"问题，因此**采样本身并非不可行**；契约约束的实质应表述为 **"禁止两侧各自采样"**，而不是"禁止采样"。
 
 脚本：`build/cross-framework-layer-poc/sampling_matrix_check.py`（读两份 dump，纯 numpy，跑完释放约 1.2 GB）；
-报告：`local_docs/CORE-RELAY-XFRAME-01-dl-sampling-matrix-2026-09-16.json`。
+报告：`local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-01-dl-sampling-matrix-2026-09-16.json`。
 
 ### 13.7 f32 权重对照（2026-09-16，本仓库实测）
 
@@ -563,7 +563,7 @@ QLH_NO_POS_FIX=1 $BIN/llama-relay-check.exe H:/qlh_models/Qwen-1_8B-Chat.Q4_K_M.
 
 - 若上游在**库侧**修复（对单段位置做广播，或扩展 header 语义），本地补丁即可移除；
 - 重跑此前被"非确定性"阻断的 D→L 正式实验，重新给出准入证据；
-- 回复上游：**仅做独立复现确认**，草稿见 `local_docs/给上游的回复草稿-embd-pos越界-2026-09-16.md`。
+- 回复上游：**仅做独立复现确认**，草稿见 `local_docs/plans/给上游的回复草稿-embd-pos越界-2026-09-16.md`。
 
 ### 13.8 上游社区状态追踪（2026-09-19 核查）
 

@@ -158,7 +158,7 @@ prompt → torch(0..7) →hidden→ Surface(8..15) →hidden→ y700(16..19) →
 - **工程约束**：切点必须是 `full_attention_interval`（Qwen3.5 = 4）的整数倍，否则裁层 GGUF 的层类型错位而无法加载（N=2 实测）；
 - **方法学警告**：脱离端到端链路的孤立测量不可信（本次把上游单步耗时测低了约 5.6×），切点类结论必须以端到端口径为准。
 
-报告：`local_docs/CORE-RELAY-XFRAME-02-sweep-2026-09-18.json`；票：[验收清单 D29](docs/验收清单与资源限制登记.md)。
+报告：`local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-sweep-2026-09-18.json`；票：[验收清单 D29](docs/验收清单与资源限制登记.md)。
 
 **⚠️ 同日修正（v2）—— 上面这一节（含表格）的结论仅在"上游跑在 CPU"时成立**：`relay_sameproc_4L.py` 的 `from_pretrained` 之后没有 `.to(device)`，`dev = tmodel.device` 于是是 **cpu**；而孤立脚本 `upstream_layer_cost.py` 显式 `.to("cuda")`。同一脚本同口径实测同 4 层：**cpu 34.9 ms / cuda 8.3 ms** ⇒ 那 5.6× 差异**由设备解释**（既不是 KV 形状，也不是空闲降频——两者已用对照实验否证：`shape_sensitivity` fixed 47.4 > growing 34.4；`idle_wakeup_and_overlap` idle 8.56 vs continuous 7.53 = 1.14×，SM 时钟全程 780/3105 MHz 不变）。
 
@@ -176,7 +176,7 @@ prompt → torch(0..7) →hidden→ Surface(8..15) →hidden→ y700(16..19) →
 - 全部切点的 64-token 序列仍**逐 token 一致**（含 GPU 上游）；
 - 所以"不接力最快 / 切点无收益"**只在 CPU 上游条件下成立**，不可外推。下游在真实部署里多为 **无 CUDA 的边缘设备**，恰好支持"层往 GPU 上游放"这一方向——也因此 **P1（给下游加 GPU）适用面窄，真正值得做的是「上游 GPU 化」与 P2 交叠**。
 
-报告：`local_docs/CORE-RELAY-XFRAME-02-p0-corrected-2026-09-18.json`（v2，取代 v1）。
+报告：`local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-p0-corrected-2026-09-18.json`（v2，取代 v1）。
 
 ### 与「全 llama + CUDA」的公平对照 + P2 交叠（2026-09-18 实测）
 
@@ -200,7 +200,7 @@ prompt → torch(0..7) →hidden→ Surface(8..15) →hidden→ y700(16..19) →
 
 **结论与定位**：上面 P0 那个 1.45× 只是「CPU llama.cpp → GPU **torch**」的局部收益；更好的做法是「CPU llama.cpp → GPU **llama.cpp**」（`-ngl`）。所以 **跨框架接力不是更快的推理路径**，而是「**只能用 torch 跑的层**」（hybrid/自定义算子）与「**容量合并 / 层流水线**（单机装不下）」的机制，外加实验平台。**集群里有 CUDA 节点时，最佳实践是把它作为 llama.cpp 的 CUDA worker（RPC/分片），而不是接力上游**；P2 交叠只在「不得不接力」的场景内把损失补回一部分（78.3 ms/token 仍慢于 26.6 约 3×）。
 
-报告：`local_docs/CORE-RELAY-XFRAME-02-p2-2026-09-18.json`。⚠️ 以上均为**同机**数据；**跨机（GPU 节点 + 无 CUDA 边缘节点）的 RPC vs 接力对照仍未测**。
+报告：`local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-p2-2026-09-18.json`。⚠️ 以上均为**同机**数据；**跨机（GPU 节点 + 无 CUDA 边缘节点）的 RPC vs 接力对照仍未测**。
 
 ### torch.compile 与「层循环」开关（`USE_COMPILE` / `USE_MONOLITHIC_FORWARD`）
 
@@ -228,7 +228,7 @@ hybrid（Qwen3.5 的 18 层 `linear_attention` + 6 层 `full_attention`）需要
 2. **有「逐 token 一致」验收判据的场景不得开启 compile**（例如跨框架接力的准入判据）。
 3. **Windows 需要两件事**：`PYTHONUTF8=1`（否则 torch/inductor 内部按 GBK 解码失败、**静默回退 eager**）与 [`triton-windows`](requirements-compile.txt)（可选加速，`requirements-compile.txt` 声明；**已实测可用**，官方 PyPI 无 Windows wheel，用社区构建 `triton-windows-3.8.0.post28`）。两者缺一都不会崩，只是拿不到收益。
 
-报告：`local_docs/CORE-RELAY-XFRAME-02-a4-layer-loop-2026-09-18.json`、`…-b14-hybrid-layer-loop-2026-09-18.json`、`…-compile-numerics-2026-09-18.json`。
+报告：`local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-a4-layer-loop-2026-09-18.json`、`…-b14-hybrid-layer-loop-2026-09-18.json`、`…-compile-numerics-2026-09-18.json`。
 
 ### 顶层透明性
 

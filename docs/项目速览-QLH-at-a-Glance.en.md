@@ -123,7 +123,7 @@ Distributed mode: all nodes sign in with the same Tailscale account → TUI clus
 
 - **Entry point**: [README](../README.md) (Chinese) · [README.en](README.en.md) (English)
 - **Relay (the most active track)**: [Current effective baseline & optimization plan](跨框架接力-当前有效基线与后续优化计划-2026-09-21.md) — **use it as the index**; conflicting numbers in older reports are triaged by validity. Companion docs: [project report](跨框架层接力-项目报告.md), [capacity-gain measurements](跨框架层接力-容量收益实测-2026-09-21.md)
-- **Newcomer**: [项目技术说明](项目技术说明.md) → [整体架构](整体架构.md) → [模块接口说明](模块接口说明.md)
+- **Newcomer**: [项目技术说明](archive/distributed/项目技术说明.md) → [整体架构](整体架构.md) → [模块接口说明](模块接口说明.md)
 - **Plans**: [Distributed Inference & Edge Optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md) · [P4.5: dynamic master election & distributed management](主节点动态选举与分布式管理-P4.5立项-2026-09-21.md) · [总体下一步计划](archive/distributed/总体下一步计划.md) (historical schedule)
 - **Protocol & nodes**: [layer-segment protocol proposal](层段协议立项-2026-09-17.md) · [node types & top-level transparency](层流水线节点类型与顶层透明性-可行性确认-2026-09-17.md)
 - **TUI**: [TUI usage guide](TUI使用指南.md) · [TUI command set](TUI指令集.md)
