@@ -59,7 +59,10 @@ _RELAY_ERROR_CODES = frozenset({
     "hidden_seq_payload_too_small",
     "hidden_seq_token_count_mismatch",
     "hidden_seq_unsupported",
-    "invalid_close_ack",
+    #: ★ P4.5：远端不支持"送 token 跑上游段"这种请求（旧 runner）时 fail-loud。
+    "token_frame_unsupported",
+    #: ★ P4.5：`TOKENS` 帧里声明的 token 数与 payload 实际长度不一致。
+    "token_frame_count_mismatch",    "invalid_close_ack",
     "invalid_close_frame",
     "invalid_frame_header",
     "invalid_hidden_shape",
@@ -93,6 +96,10 @@ class RelayFrameKind(IntEnum):
     #: ★ P3：带 `seq_ids` / `positions` 的 hidden 请求（响应仍是纯 `HIDDEN`）——
     #: 多序列数据流跨机时必须逐 token 显式绑定，不能靠远端隐式位置递增。
     HIDDEN_SEQ = 5
+    #: ★ P4.5：**上游段请求** —— 客户端送 token id 列表，远端跑自己的 head 段并回 `HIDDEN`。
+    #: 用途：无 PC 集群下层接力要能"全设备"运行（head 段也在设备上），
+    #: 与 `HIDDEN`（吃 hidden 吐 hidden）/ `TOKEN`（吃 hidden 吐 token）配成三种远端角色。
+    TOKENS = 6
 
 
 class RelayProtocolError(RuntimeError):
@@ -251,6 +258,25 @@ def recv_frame(
     return RelayFrame(kind=kind, sequence=sequence, n_tokens=n_tokens, payload=payload)
 
 
+def encode_tokens(tokens: Sequence[int]) -> bytes:
+    """★ P4.5：上游段请求的 payload —— 紧凑 i32 数组（token id 列表）。"""
+    values = [int(t) for t in tokens]
+    if not values:
+        raise RelayProtocolError("token_count_exceeds_limit")
+    return b"".join(_TOKEN.pack(v) for v in values)
+
+
+def decode_tokens(payload: bytes, *, limit: int) -> list[int]:
+    """解析 `TOKENS` 帧的 payload；长度必须是 4 的倍数且不超过 `limit` 个 token。"""
+    size = _TOKEN.size
+    if not payload or len(payload) % size != 0:
+        raise RelayProtocolError("invalid_token_response")
+    count = len(payload) // size
+    if count < 1 or count > int(limit):
+        raise RelayProtocolError("token_count_exceeds_limit")
+    return [int(_TOKEN.unpack_from(payload, i * size)[0]) for i in range(count)]
+
+
 def _decode_token(frame: RelayFrame, expected_sequence: int) -> int:
     if frame.kind == RelayFrameKind.ERROR:
         if frame.sequence != expected_sequence:
@@ -317,6 +343,39 @@ class RelayTcpClient:
             raise RelayProtocolError("runner_failed")
         self._sequence += 1
         return token
+
+    def request_hidden_from_tokens(self, tokens: "Sequence[int]") -> bytes:
+        """★ P4.5 **上游段往返**：送 token id 列表，远端跑它自己的 head 段并回 `HIDDEN`。
+
+        与 `request_hidden`（吃 hidden 吐 hidden）、`request_token`（吃 hidden 吐 token）
+        配成三种远端角色 —— 三者齐备后，层接力可以**完全不依赖本机**（无 PC 集群场景）。
+
+        远端语义必须与本机 keep-head 一致（末层输出、`output_norm` 之前）；响应
+        必须带相同 `n_tokens`，否则 fail-loud。
+        """
+        if self._closed:
+            raise RelayProtocolError("client_closed")
+        values = [int(t) for t in tokens]
+        count = len(values)
+        if count < 1 or count > self.max_tokens:
+            raise RelayProtocolError("token_count_exceeds_limit")
+        sequence = self._sequence
+        send_frame(
+            self._sock,
+            RelayFrame(RelayFrameKind.TOKENS, sequence, n_tokens=count,
+                       payload=encode_tokens(values)),
+        )
+        response = recv_frame(self._sock, max_payload_bytes=self.max_payload_bytes)
+        if response.sequence != sequence:
+            raise RelayProtocolError("response_sequence_mismatch")
+        if response.kind != RelayFrameKind.HIDDEN:
+            raise RelayProtocolError("hidden_response_required")
+        if response.n_tokens != count:
+            raise RelayProtocolError("hidden_token_count_mismatch")
+        if len(response.payload) != expected_hidden_bytes(count, self.n_embd):
+            raise RelayProtocolError("hidden_payload_size_mismatch")
+        self._sequence += 1
+        return bytes(response.payload)
 
     def request_hidden(self, hidden: bytes, *, n_tokens: int) -> bytes:
         """★ 中间段往返：发 HIDDEN，收 HIDDEN（远端段交出它自己的 hidden）。
@@ -648,6 +707,34 @@ def serve_relay_middle_connection(
                 )
                 frames += 1
                 tokens += n_tokens
+                payload_bytes += len(frame.payload)
+                sequence += 1
+                continue
+            if frame.kind == RelayFrameKind.TOKENS:
+                # ★ P4.5 上游段：payload 是 token id 列表；远端 runner 必须支持该角色，
+                # 否则 fail-loud（绝不猜测"这是 hidden 还是 token"）。
+                incoming = decode_tokens(frame.payload, limit=limit)
+                if len(incoming) != frame.n_tokens:
+                    raise RelayProtocolError("token_frame_count_mismatch")
+                if not hasattr(runner, "request_hidden_from_tokens"):
+                    raise RelayProtocolError("token_frame_unsupported")
+                try:
+                    produced = bytes(runner.request_hidden_from_tokens(incoming))
+                except RelayProtocolError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Relay upstream runner failed: code=%s",
+                                     RELAY_RUNNER_ERROR)
+                    raise RelayProtocolError(RELAY_RUNNER_ERROR) from exc
+                if len(produced) != expected_hidden_bytes(len(incoming), width):
+                    raise RelayProtocolError("hidden_payload_size_mismatch")
+                send_frame(
+                    sock,
+                    RelayFrame(RelayFrameKind.HIDDEN, sequence, n_tokens=len(incoming),
+                               payload=produced),
+                )
+                frames += 1
+                tokens += len(incoming)
                 payload_bytes += len(frame.payload)
                 sequence += 1
                 continue

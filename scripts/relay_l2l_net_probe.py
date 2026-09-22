@@ -102,7 +102,13 @@ def main() -> int:
             pass
 
     ap = argparse.ArgumentParser(description="纯 llama（L→L）跨机接力的可执行证据探针")
-    ap.add_argument("--head-model", required=True, help="上游 head 工件（blk.0..K-1）")
+    ap.add_argument("--head-model", default=None,
+                    help="本地上游 head 工件；与 --head-endpoint 二选一")
+    ap.add_argument("--head-endpoint", default=None,
+                    help="★ P4.5：**远端**上游段 host:port（吃 token 吐 hidden）—— "
+                         "给它就完全不用本机跑模型")
+    ap.add_argument("--n-embd", type=int, default=896,
+                    help="远端 head 模式下本机不知道隐藏宽度，需显式给（默认 896）")
     ap.add_argument("--tail-endpoint", required=True, help="末段（tail）host:port（loopback 隧道）")
     ap.add_argument("--middle-endpoint", default=None,
                     help="可选：中间段（middle）host:port；给了就是三段")
@@ -132,11 +138,21 @@ def main() -> int:
     baseline = _whole_tokens(Path(args.whole_model), prompt, int(args.gen), int(args.threads))
     baseline_s = round(time.perf_counter() - started, 2)
 
-    upstream = KeepHeadUpstream(str(Path(args.shim).resolve()), args.head_model,
-                                mode="nextn", n_ctx=len(prompt) + int(args.gen) + 8,
-                                n_threads=int(args.threads),
-                                n_batch=max(512, len(prompt)), n_seq_max=1)
-    n_embd = int(upstream.n_embd)
+    # ★ P4.5：上游可以是**本机 head 段**（shim）或**远端 head 段**（TOKENS → HIDDEN）。
+    #   后者让本机全程不跑任何模型 —— 无 PC 集群的完整形态。
+    upstream = None
+    head_client = None
+    if args.head_endpoint:
+        n_embd = int(args.n_embd)
+        head_client = RelayTcpClient(*_split(args.head_endpoint), n_embd=n_embd, timeout=300.0)
+    else:
+        if not args.head_model:
+            raise SystemExit("FAIL: 需要 --head-model（本地上游）或 --head-endpoint（远端上游）")
+        upstream = KeepHeadUpstream(str(Path(args.shim).resolve()), args.head_model,
+                                    mode="nextn", n_ctx=len(prompt) + int(args.gen) + 8,
+                                    n_threads=int(args.threads),
+                                    n_batch=max(512, len(prompt)), n_seq_max=1)
+        n_embd = int(upstream.n_embd)
     tail = RelayTcpClient(*_split(args.tail_endpoint), n_embd=n_embd, timeout=180.0)
     middle = (RelayTcpClient(*_split(args.middle_endpoint), n_embd=n_embd, timeout=180.0)
               if args.middle_endpoint else None)
@@ -148,9 +164,14 @@ def main() -> int:
     try:
         for step in range(int(args.gen)):
             toks = prompt if step == 0 else [tokens[-1]]
-            hidden = upstream.forward_tokens_to_hidden(toks, n_past=pos)
-            payload = np.ascontiguousarray(hidden, dtype=np.float32).tobytes()
-            n_tok = int(hidden.shape[0])
+            if head_client is not None:
+                # ★ P4.5：上游在远端（吃 token 吐 hidden）—— 本机不跑任何模型
+                payload = head_client.request_hidden_from_tokens(toks)
+                n_tok = len(toks)
+            else:
+                hidden = upstream.forward_tokens_to_hidden(toks, n_past=pos)
+                payload = np.ascontiguousarray(hidden, dtype=np.float32).tobytes()
+                n_tok = int(hidden.shape[0])
             if middle is not None:
                 payload = middle.request_hidden(payload, n_tokens=n_tok)
                 used_middle += 1
@@ -158,10 +179,11 @@ def main() -> int:
             tokens.append(int(token))
             pos += n_tok
     finally:
-        for client in (tail, middle):
+        for client in (tail, middle, head_client):
             if client is not None:
                 client.close()
-        upstream.close()
+        if upstream is not None:
+            upstream.close()
     relay_s = round(time.perf_counter() - started, 2)
 
     matched = sum(1 for a, b in zip(tokens, baseline) if a == b)

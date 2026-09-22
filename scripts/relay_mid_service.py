@@ -153,6 +153,56 @@ class TailRunner:
         self.reset()
 
 
+class HeadRunner:
+    """★ P4.5 **上游段**（无 PC 集群）：吃 **token** → 吐 hidden（本节点自己的 head 段）。
+
+    为什么需要：层接力要能**完全不依赖本机**运行（集群里可能没有任何 PC / 能跑 torch 的节点）。
+    上游段只需 keep-head 的 token 入口（`forward_tokens_to_hidden`，shim 早已支持），
+    因此设备侧无需 pip `llama_cpp` —— 与 `middle` / `ShimTailRunner` 共用同一份 shim。
+
+    走 `serve_relay_middle_connection` 的会话循环（它支持 `TOKENS → HIDDEN`）。
+    """
+
+    def __init__(self, *, shim: str, model: str, n_ctx: int, n_threads: int,
+                 mode: str = "nextn", cut_layer: int | None = None,
+                 extra_dll_dirs: list[str], n_seq_max: int = 1,
+                 n_batch: int = 512) -> None:
+        import os  # noqa: PLC0415
+
+        from llama_keep_head import KeepHeadUpstream  # noqa: PLC0415
+
+        dirs = list(extra_dll_dirs)
+        dirs.extend(d for d in (os.environ.get("QLH_KEEP_HEAD_DLL_DIRS") or "")
+                    .split(os.pathsep) if d)
+        self._upstream = KeepHeadUpstream(shim, model, mode=mode, cut_layer=cut_layer,
+                                          n_ctx=n_ctx, n_threads=n_threads,
+                                          n_seq_max=max(1, int(n_seq_max)),
+                                          n_batch=max(512, int(n_batch)),
+                                          extra_dll_dirs=dirs)
+        self.n_embd = self._upstream.n_embd
+        self.n_layer = self._upstream.n_layer
+        self._pos = 0
+        print(json.dumps({"role": "head", "n_embd": self.n_embd, "n_layer": self.n_layer,
+                          "channel": "keep_head.forward_tokens_to_hidden",
+                          "mode": mode, "cut_layer": cut_layer}), flush=True)
+
+    def reset(self) -> None:
+        self._pos = 0
+        self._upstream.reset()
+
+    def request_hidden_from_tokens(self, tokens: list[int]) -> bytes:
+        import numpy as np  # noqa: PLC0415
+
+        hidden = self._upstream.forward_tokens_to_hidden([int(t) for t in tokens],
+                                                         n_past=self._pos)
+        self._pos += len(tokens)
+        return np.ascontiguousarray(hidden, dtype=np.float32).tobytes()
+
+    def close(self) -> None:
+        self.reset()
+        self._upstream.close()
+
+
 class ShimTailRunner:
     """末段（**无 pip `llama_cpp` 的设备**）：吃 hidden → 吐 token，走 **keep-head shim**。
 
@@ -215,7 +265,7 @@ class ShimTailRunner:
 
 def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="跨机接力的远端段服务（keep-head / 末段）")
-    ap.add_argument("--role", choices=("middle", "tail"), default="middle")
+    ap.add_argument("--role", choices=("head", "middle", "tail"), default="middle")
     ap.add_argument("--listen", required=True, help="loopback 端点，host:port（跨机用 SSH 隧道）")
     ap.add_argument("--keep-head-shim", default=None, help="--role middle 必需")
     ap.add_argument("--model", required=True)
@@ -260,6 +310,17 @@ def main(argv: list[str] | None = None) -> int:
                                            n_seq_max=args.n_seq_max, n_batch=args.n_batch,
                                            mode=args.mode, cut_layer=args.cut_layer,
                                            extra_dll_dirs=list(args.dll_dir))
+        serve = serve_relay_middle_connection
+    elif args.role == "head":
+        # ★ P4.5：上游段（吃 token 吐 hidden）—— 同样走 shim，设备侧无需 pip llama_cpp。
+        # 会话循环复用 middle 的那套（它支持 TOKENS → HIDDEN）。
+        if not args.keep_head_shim:
+            raise SystemExit("FAIL: --role head 需要 --keep-head-shim")
+        runner = HeadRunner(shim=args.keep_head_shim, model=args.model,
+                            n_ctx=args.n_ctx, n_threads=args.threads,
+                            mode=args.mode, cut_layer=args.cut_layer,
+                            extra_dll_dirs=list(args.dll_dir),
+                            n_seq_max=args.n_seq_max, n_batch=args.n_batch)
         serve = serve_relay_middle_connection
     else:
         if args.keep_head_shim:
