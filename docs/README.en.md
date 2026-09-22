@@ -253,7 +253,7 @@ Reports: `local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-a4-layer-loop-20
 
 ### Top-Level Transparency
 
-The TUI and API top layer only needs to know the **aggregate resources** (GPU/CPU/memory) and "whether it is distributed"; it does not need to know who is local and who is remote. Engine choice is decided by **resources + capability + goal**, not by "torch whenever there is a GPU". Optional policies (privacy, bandwidth) are not implemented yet and are left to a later policy ticket. See [Layer Pipeline Node Kinds and Top-Level Transparency](层流水线节点类型与顶层透明性-可行性确认-2026-09-17.md).
+The TUI and API top layer only needs to know the **aggregate resources** (GPU/CPU/memory) and "whether it is distributed"; it does not need to know who is local and who is remote. Engine choice is decided by **resources + capability + goal**, not by "torch whenever there is a GPU". Optional policies (privacy, bandwidth) are not implemented yet and are left to a later policy ticket. See [Layer Pipeline Node Kinds and Top-Level Transparency](archive/relay/层流水线节点类型与顶层透明性-可行性确认-2026-09-17.md).
 
 ## Current Status
 
@@ -484,8 +484,8 @@ Real hardware, cross-machine networking, Android ARM64, performance and long-run
 - [P4.5 Proposal: Dynamic Master Election and Distributed Management](主节点动态选举与分布式管理-P4.5立项-2026-09-21.md)
 - [Mainline Development Plan: Distributed Inference and Edge Optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md)
 - [Overall Architecture](整体架构.md)
-- [Layer-Segment Protocol Proposal (2026-09-17)](层段协议立项-2026-09-17.md)
-- [Layer Pipeline Node Kinds and Top-Level Transparency](层流水线节点类型与顶层透明性-可行性确认-2026-09-17.md)
+- [Layer-Segment Protocol Proposal (2026-09-17)](archive/relay/层段协议立项-2026-09-17.md)
+- [Layer Pipeline Node Kinds and Top-Level Transparency](archive/relay/层流水线节点类型与顶层透明性-可行性确认-2026-09-17.md)
 - [Same-Process Dual-Backend Relay Implementation and Performance](archive/relay/同进程双后端接力实现与性能-2026-09-16.md)
 - [Engine Single-Sequence and Concurrency Comparison](archive/relay/引擎单序列与并发性能对比-2026-09-16.md)
 - [Distributed Inference Parallelism and Cross-Framework Route Survey](分布式推理并行与跨框架路线调研汇总-2026-09-15.md)

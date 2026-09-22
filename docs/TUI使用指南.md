@@ -8,7 +8,7 @@
 >
 > **更新日期**：2026-09-18
 >
-> **适用范围**：QLH 终端版交互外壳与只读单命令（`qlh` / `qlh chat` / `src/tui_commands.py`）的启动方式、参数与使用说明；实现细节与网关契约见 [TUI 适配实施计划](TUI适配实施计划.md)，功能口径以源码与本文为准
+> **适用范围**：QLH 终端版交互外壳与只读单命令（`qlh` / `qlh chat` / `src/tui_commands.py`）的启动方式、参数与使用说明；实现细节与网关契约见 [TUI 适配实施计划](archive/tui/TUI适配实施计划.md)，功能口径以源码与本文为准
 
 ---
 
@@ -217,7 +217,7 @@ python src/tui_commands.py models --json                        # 机读输出
 |------|-----------|
 | 一键启动 120 秒未就绪 | 查看后端窗口日志（Windows）或 `logs/backend_tui.log`（Linux/macOS）。多为端口被占用（改 `QLH_BACKEND_PORT`）、Python 环境缺依赖、`.env`/数据库配置不可达 |
 | TUI 显示"后端未启动"提示 | 后端未运行或地址不对：确认 `start_tui.bat` / `start_tui.sh` 已跑完后端启动步骤，或用 `python src/api_server.py` 手动起后端 |
-| TUI 报"内部错误" | 多为网关/后端版本与 TUI 契约不一致（字段缺失或类型错误）。契约测试见 `gateway/test/tui-contract.e2e-spec.ts`；排障见 [TUI 适配实施计划](TUI适配实施计划.md) §7 |
+| TUI 报"内部错误" | 多为网关/后端版本与 TUI 契约不一致（字段缺失或类型错误）。契约测试见 `gateway/test/tui-contract.e2e-spec.ts`；排障见 [TUI 适配实施计划](archive/tui/TUI适配实施计划.md) §7 |
 | 中文乱码 | Windows：脚本已自动 `chcp 65001`，直接双击即可；若手动启动请先执行 `chcp 65001`。Linux/macOS：确认终端使用 UTF-8 |
 | 远程模式日志打不开 | 远程日志需 `--log-token`（未配置 token 时后端也允许放行）；本地模式（TUI 与后端同机）不走 HTTP，直接读 `logs/` 目录 |
 
