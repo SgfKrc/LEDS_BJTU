@@ -4,7 +4,7 @@
 >
 > 更新日期：2026-09-23
 >
-> 结论摘要见 §1；可行性建议见 §6；**待裁决的口径冲突**见 §7。
+> 结论摘要见 §1；可行性建议见 §6；联合排期见 §7；**待裁决的口径冲突**见 §8。
 
 ---
 
@@ -21,9 +21,12 @@
 
 **三条核心结论**：
 
-1. **KT 的价值是"CPU 侧算子与设备分工仍有数量级空间"的证据，而不是可复制的软件** —— 它的全部主收益来自 MoE 专家下放 CPU + hot/cold 放置 + 专家调度，而 QLH 的登记模型是 **dense ≤2B**，且主仓已否决 MoE-EP。
-2. **最该做的一件事反而最便宜**：KT 相对 llama.cpp 的 27.79× 是**它自研 AMX kernel vs llama.cpp CPU 实现**的差距 —— 而同一份 AMX/AVX-512 实现**已经在主仓 vendor 的 llama.cpp 里**（`ggml/src/ggml-cpu/amx/mmq.cpp`、`ggml/src/CMakeLists.txt:387-401`）。所以**不要重写 kernel，要核实"我们实际跑的构建开没开这些变体"**。
-3. **KT 的算法级近似与 QLH 的判据直接冲突**：Expert Deferral（精度降 ≤0.5% 换 1.45× 吞吐）、选择性专家激活都属于「用精度换吞吐」，而 QLH 引擎层的判据是**逐 token argmax 一致、fail-closed** ⇒ **不应引入**（可作为实验档，不能进生产路径）。
+1. **KT 不是、也不会成为 QLH 的第三个正式引擎**。它只作为公开研究参照，用来指导 QLH 自己的 **PyTorch 上游引擎**做算子、数据布局和异构调度实验；llama.cpp/GGUF 仍是稳定主线和无 CUDA/Edge 回退。
+2. **KT 的价值是"CPU 侧算子与设备分工仍有数量级空间"的证据，而不是可复制的软件** —— 它的主要收益来自 MoE 专家下放 CPU + hot/cold 放置 + 专家调度；QLH 当前正式登记模型以 **dense ≤2B** 为主，因此先研究可迁移的 dense PyTorch 机制，MoE 仅作为科研扩展。
+3. **最该做的一件事反而最便宜**：KT 相对 llama.cpp 的 27.79× 是**它自研 AMX kernel vs llama.cpp CPU 实现**的差距 —— 而同一份 AMX/AVX-512 实现**已经在主仓 vendor 的 llama.cpp 里**（`ggml/src/ggml-cpu/amx/mmq.cpp`、`ggml/src/CMakeLists.txt:387-401`）。所以**不要重写 llama.cpp kernel，要核实 QLH 实际构建是否打开这些变体**。
+4. **KT 的算法级近似与 QLH 的默认判据直接冲突**：Expert Deferral、选择性专家激活可以作为科研对照，但不能绕过 QLH 的**逐 token argmax 一致、fail-closed**生产门。
+
+**本报告的正式定位**：研究对象是 `model_module.py` 及其后续拆分后的 PyTorch 上游组件；研究结果必须能与未优化 PyTorch、整模 llama.cpp 和连续层分布式三组基线比较。研究代码受 feature gate 控制，不进入 Koakuma backend 枚举，不进入 Edge 最小发行，也不让 KTransformers 依赖进入主仓运行时。
 
 ---
 
@@ -33,7 +36,7 @@
 
 | 层 | KT 用什么 |
 | --- | --- |
-| 模型加载 / 算子替换 | 基于 **Transformers/HF 权重**，用 YAML `optimize_rules` 做 **match/replace 注入**（如 `model.layers.*.mlp.experts` → `KTransformersExperts`），逐算子指定 `prefill_device: cuda` / `generate_device: cpu` |
+| 模型加载 / 算子替换 | 基于 **Transformers/HF 权重**，用 YAML `optimize_rules` 做 **match/replace 注入**（如 `model.layers.*.mlp.experts` → `KTransformersExperts`），逐算子指定 `prefill_device: cuda` / `generate_device: cpu`；QLH 只借鉴这种声明式边界，不引入 KT loader |
 | CPU 侧算子 | 自研 **AMX / AVX-512 / AVX2** MoE kernel；`LLAMAFILE` 后端直接吃 **GGUF** 权重 |
 | GPU 侧算子 | PyTorch/CUDA + **FlashInfer**（含 variable-batch **CUDA Graph**）、Triton MLA、FP8/GPTQ/Marlin |
 | 服务 / 调度 | 自研 `balance_serve`（C++ continuous batching + chunked prefill）→ **2025-10 起改为集成 SGLang**（`sglang-kt`） |
@@ -87,22 +90,21 @@ KT 论文自己在摘要里就把它限定为 low-concurrency。高并发下瓶�
 
 | 维度 | KT | QLH | 后果 |
 | --- | --- | --- | --- |
-| 模型 | 大 **MoE**（DeepSeek-V3/R1、Kimi-K2、GLM-5、Qwen3-30B/235B） | 登记模型是 **dense ≤2B**（Qwen2.5-0.5B、Qwen3.5-2B），主仓已否决 MoE-EP | **专家卸载 / Expert Deferral / 专家放置整套不可迁移** |
+| 模型 | 大 **MoE**（DeepSeek-V3/R1、Kimi-K2、GLM-5、Qwen3-30B/235B） | 当前正式登记以 **dense ≤2B** 为主；MoE 只作为科研样本 | 专家卸载整套不能直接迁移；其热度统计、放置和预取思想可进入 PyTorch 科研线 |
 | 拓扑 | **单机** CPU+GPU（多 GPU 交给 SGLang） | 跨机、异构、跨框架层接力 | KT **不含任何跨机/层接力语义** ⇒ 对分布式中枢零帮助 |
-| 硬件 | 服务级 x86（AVX512 至少、AMX 最佳，Linux） | Windows x86_64（Surface）+ **ARM64 Android**（y700） | 边缘侧**完全不在 KT 支持面内**（ARM 侧对应的是 SME2/dotprod，不是 AMX） |
+| 硬件 | 服务级 x86（AVX512 至少、AMX 最佳，Linux） | Windows x86_64（Surface）+ **ARM64 Android**（y700） | KT runtime 不在 Edge 支持面内；但 PyTorch 上游研究可在 PC/CUDA 节点做，结果必须保留无 Torch 回退 |
 | 判据 | 允许精度换吞吐（≤0.5% 降质换 1.45×） | **逐 token argmax 一致、fail-closed** | 算法级近似**违反判据** |
 
-**明确不适用清单**：AMX/AVX-512 手写 kernel（自研成本极高，且边缘 ARM64 无 AMX）、NUMA 多路优化（边缘单 socket）、
-专家卸载与专家调度（非 MoE）、Gate/Up 融合（MoE 专用）、GPTQ/Marlin/FP8 kernel（依赖 SGLang/vLLM 栈）、
-引入 `kt-kernel` / `sglang-kt` 作为运行时（Linux x86-64 wheel、只服务 MoE、与 llama.cpp 主线重复且互斥）。
+**不直接引入清单**：KT runtime、`kt-kernel`、`sglang-kt`、AMX/AVX-512 私有 kernel、NUMA 专用执行器、MoE 专家卸载运行时、
+Gate/Up 融合实现、GPTQ/Marlin/FP8 依赖栈。它们可以作为外部对照或科研原型，但不得成为 QLH 的第三个后端。
 
-**但有三条经验被 KT 证明、且与 QLH 相容**，见下节。
+**可借鉴的是机制而不是依赖**：声明式算子替换、设备能力约束、prefill/decode 双计划、数据热度驱动的放置、KV 分层缓存和计算成本画像，见下节。
 
 ---
 
 ## 6. 对 QLH 的可行建议
 
-### 6.1 算法 / 数据层
+### 6.1 PyTorch 上游算法 / 数据层
 
 | 优先级 | 建议 | 理由与来源 | 预估工作量 |
 | --- | --- | --- | --- |
@@ -111,7 +113,7 @@ KT 论文自己在摘要里就把它限定为 low-concurrency。高并发下瓶�
 | **P1** | **量化资产管线纪律**：上游/下游量化源一律从 **BF16** 出发；核对 `quant_type="int4"` **静默回退 fp16** 的实际生效 dtype | KT 明确警告 FP8→INT4 明显掉精度；QLH 已记录该回退陷阱 | 0.5–1 人日（多为核对与文档） |
 | **P2** | **投机解码从 PoC 走到真实链路**（`src/speculative.py` 尚未接入生产循环） | 属算法层提速；vLLM/SGLang 生态的 MTP 是同类杠杆 | 5–10 人日（含分布等价回归） |
 | **P2** | **hidden 压缩真正上线**（`int8_block128` 数值往返已 32/32，但 `RELAY_WIRE_VERSION=1` 仍固定 f32） | **只对弱网/跨机有意义**（同机占比 <1%） | 2–3 人日（含协议版本升级与兼容门） |
-| **不建议** | Expert Deferral、选择性专家激活、专家放置策略 | 非 MoE + **违反逐 token 一致判据** | — |
+| **科研档** | Expert Deferral、选择性专家激活、专家放置策略 | 先在 PyTorch 上游和 MoE 样本中验证；默认不能绕过逐 token 一致门 | 仅产出实验报告 |
 
 ### 6.2 工程层
 
@@ -123,11 +125,41 @@ KT 论文自己在摘要里就把它限定为 low-concurrency。高并发下瓶�
 | **P1** | **上游 torch 段引入 CUDA Graph / 减少 kernel launch**（不改数值，需与逐 token 判据并行验证；与已落地的 `torch.compile` 分开评估） | KT 用 CUDA Graph 把 launch 开销 >20% → ~0；QLH 上游 torch 每层耗时明显高于下游 | 3–5 人日 |
 | **P2** | **权重 mmap 冷启动/缺页专项**（模型放磁盘/网络盘时的首 token 抖动） | KT roadmap 把「AI SSD / 慢 mmap 读盘」列为已识别瓶颈 | 2–3 人日 |
 
-**一句话总纲**：落地路径应是「**先把 llama.cpp 自己的 AMX/AVX512 变体与 CPU 线程/NUMA 标定吃满 → 再用 CUDA Graph 与多请求交叠压上游与调度 → 最后才谈自研 kernel**」；KT 的算法级近似与 QLH 的 fail-closed 判据直接冲突，不应引入。
+**一句话总纲**：落地路径应是「**先完成大文件拆解和行为基线 → 在 PyTorch 上游建立算子成本画像/注册表 → 做异构放置与 prefill/decode 双计划 → 再做 MoE 热度/预取科研**」；llama.cpp 继续承担稳定路径，KT 不作为运行时依赖。
 
 ---
 
-## 7. ⚠️ 本轮发现的待裁决口径冲突
+## 7. 与大文件拆解计划的联合排期
+
+大文件拆解必须先于 PyTorch 算子研究。原因不是形式上的代码整洁，而是当前 `scheduler.py`、`api_server.py` 和 PyTorch 执行路径之间仍有较大的装配耦合；在拆解前引入算子放置会把实验依赖继续埋进上帝对象，后续无法区分性能收益来自算法还是结构变化。
+
+### 7.1 阶段与依赖
+
+| 阶段 | 票号 | 交付 | 依赖 | 状态 |
+| ---: | --- | --- | --- | --- |
+| 0 | `REFACTOR-LARGEFILE-01` | 固化 scheduler/API OpenAPI、公共符号、monkeypatch 面、锁身份、导入/冷启动和全量定向测试基线 | 无 | **下一票** |
+| 1 | `REFACTOR-LARGEFILE-02` | 按计划拆出 `scheduler_layer_plan` 与 `scheduler_sidecars`，保留门面 re-export；只允许移动定义 | 01 | 排队 |
+| 2 | `REFACTOR-LARGEFILE-03` | 拆出 task-worker、cluster/HA、pipeline mixin；保持实例私有属性、锁和调用点不变 | 02 | 排队 |
+| 3 | `REFACTOR-LARGEFILE-04` | 以 APIRouter 拆分 api_server，先 health/device/logs，再 cluster/models/auth/sessions/tasks/chat | 01 | 排队 |
+| 4 | `REFACTOR-LARGEFILE-05` | 重构收口：门面契约、OpenAPI 路径/方法集合、冷启动和完整回归，确认无逻辑夹带 | 03、04 | 排队 |
+| 5 | `TORCH-OP-PROFILE-01` | 对项目 PyTorch 上游建立按算子形状、dtype、设备、阶段的成本画像；修正“平均每层”口径 | 05 | 排队 |
+| 6 | `TORCH-OP-REGISTRY-01` | 建立逻辑算子到 eager/compile/实验实现的注册、能力声明和 fail-closed 回退合同 | OP-PROFILE-01 | 排队 |
+| 7 | `TORCH-HETERO-PLAN-01` | 离线算子放置 planner：设备画像、内存、带宽、边界传输和正确性门；与连续层 planner 对照 | OP-REGISTRY-01 | 排队 |
+| 8 | `TORCH-PHASE-PLAN-01` | prefill/decode 双计划和受控状态切换；失败时回退单一 PyTorch 计划或 llama.cpp | HETERO-PLAN-01 | 科研排队 |
+| 9 | `TORCH-ACT-COMPRESS-01` | hidden/激活压缩实验；只在跨机带宽受限时启用，逐 token 和长序列门禁 | HETERO-PLAN-01 | 科研排队 |
+| 10 | `TORCH-MOE-PLACEMENT-01` | 以可运行 MoE 样本验证专家热度、复制、预取和故障回退；不进入默认 dense 路径 | OP-REGISTRY-01、PHASE-PLAN-01 | 科研排队 |
+
+### 7.2 共同门禁
+
+- `REFACTOR-LARGEFILE-*` 期间不改变推理语义，不新增 KTransformers 依赖，不改默认 backend 选择。
+- `TORCH-*` 只在 CUDA/PC 研究环境启用；Edge、Android 和无 CUDA 发行继续使用 llama.cpp/GGUF，不 import torch。
+- 每个研究实现必须能退回未优化 PyTorch；整个 PyTorch 上游仍能退回 llama.cpp 或已有连续层计划。
+- 研究报告必须同时记录正确性、首 token、decode、峰值内存、通信量和回退边界；性能数字不得跨设备、跨模型或跨阶段直接比较。
+- MoE 研究不改变 dense 模型主线，不提前把 MoE 专家调度写进 `PipelineNode` 的稳定合同。
+
+---
+
+## 8. ⚠️ 本轮发现的待裁决口径冲突
 
 **同一件事（"层该推给上游还是下游"）在两处文档里结论方向相反**：
 
@@ -144,7 +176,7 @@ KT 论文自己在摘要里就把它限定为 low-concurrency。高并发下瓶�
 
 ---
 
-## 8. 明确标注为「未核实」的条目
+## 9. 明确标注为「未核实」的条目
 
 1. KT 与 **vLLM** 是否另有官方整合（本轮只找到它用 vLLM 项目的 `llmcompressor` 做 GPU 量化）。
 2. KT 的 **AMX kernel 是否已回流 llama.cpp**（旧文档只写"考虑贡献"，本轮未查到对应 PR）。

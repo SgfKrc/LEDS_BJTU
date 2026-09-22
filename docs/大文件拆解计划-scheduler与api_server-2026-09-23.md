@@ -26,6 +26,11 @@
 2. `src/scheduler.py` 拆分**不得改变测试可 patch 的名字面**（模块级 `NODE_ROLE` / `NODE_ID` / `RUN_MODE` / `PIPELINE_PREEMPT_ENABLED`、
    实例方法名、私有属性名 —— 见 §4 风险清单）。
 
+**与 PyTorch 科研优化的依赖**：本计划是后续 `TORCH-OP-PROFILE-01`、`TORCH-OP-REGISTRY-01`
+和异构算子放置研究的前置工程票。拆解阶段只做安全网、定义移动和门面兼容，不把
+KTransformers、算子替换、设备调度或新的 PyTorch 执行语义塞进 `Scheduler`/`api_server`。
+研究对象是拆解后的项目自有 PyTorch 上游；KTransformers 仅提供设计参照，不作为第三个后端或依赖。
+
 ---
 
 ## 2. `src/scheduler.py` 职责地图
@@ -238,3 +243,23 @@ TestClient(api_server.app).get("/openapi.json").json()["paths"]
 - `src/inference_service/routes.py` —— chat/models 端点 + 引擎宿主解耦范式。
 
 **建议**：本次只做「移动 + re-export」，**不要**顺手把 `/api/*` 改成 `/v1/*` —— 两套契约并存是既定架构。
+
+---
+
+## 8. 联合排期与当前下一票
+
+本计划与《KTransformers 算子级优化调研 + QLH 算法/数据层优化方向》采用同一排期。顺序固定为：
+
+1. `REFACTOR-LARGEFILE-01`：先固化 OpenAPI、公共符号、锁身份、monkeypatch 面、导入和回归基线。
+2. `REFACTOR-LARGEFILE-02` 至 `REFACTOR-LARGEFILE-05`：完成 scheduler/API 拆解、门面兼容和端点集合不变验收。
+3. `TORCH-OP-PROFILE-01`：建立项目 PyTorch 上游的算子成本画像，替代平均每层的路由依据。
+4. `TORCH-OP-REGISTRY-01`：建立逻辑算子、候选实现、设备能力、误差边界和回退实现的合同。
+5. `TORCH-HETERO-PLAN-01` 及后续科研票：研究算子放置、prefill/decode 双计划、激活压缩和 MoE 热度/预取。
+
+当前下一票为 `REFACTOR-LARGEFILE-01`。该票未完成前，不登记 PyTorch 算子优化已经进入主线；未完成科研票不得改变 llama.cpp/GGUF 默认路径、Edge 无 Torch 边界或 Koakuma 正式 backend 枚举。
+
+### 联合验收顺序
+
+- 重构票：定向测试、门面导入、OpenAPI 路径/方法集合、路由顺序、锁身份和 `git diff` 移动行检查。
+- PyTorch 研究票：未优化 PyTorch、优化 PyTorch、整模 llama.cpp、连续层分布式四组对照；记录正确性、首 token、decode、峰值内存、通信和回退。
+- MoE 研究票：必须单独声明实验模型和硬件，不能用 dense 模型数字外推；任何近似策略先作为研究档，不能绕过逐 token/fail-closed 门。
