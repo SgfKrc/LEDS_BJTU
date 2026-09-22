@@ -1,12 +1,15 @@
 # 大文件拆解计划：`scheduler.py` 与 `api_server.py`
 
-> 状态：**现行（重构计划）**
+> 状态：**现行（重构计划；REFACTOR-LARGEFILE-01 已完成）**
 >
 > 更新日期：2026-09-23
 >
 > 背景：主仓代码量统计显示这两个文件严重超标（`src/` 平均约 840 行/文件）：
-> `src/scheduler.py` **14,775 行**、`src/api_server.py` **10,167 行**。
+> `src/scheduler.py` **14,207 行**、`src/api_server.py` **9,774 行**。
 > 本计划给出**可独立回滚的分步方案**与**动手前必须先建的安全网**。
+
+> `REFACTOR-LARGEFILE-01` 证据：`tests/test_refactor_largefile_baseline.py`、
+> `local_docs/evidence/refactor-largefile/REFACTOR-LARGEFILE-01-openapi-baseline-2026-09-23.json`。
 
 ---
 
@@ -14,15 +17,15 @@
 
 | 文件 | 形状 | 本质 |
 | --- | --- | --- |
-| `src/scheduler.py` | 14,775 行，**92.7% 是单个 `Scheduler` 类**（13,697 行 / ≈302 个方法），模块级可变全局 **0 个** | **上帝对象** —— 拆分的本质是给 `Scheduler` 减负，不是给文件分堆 |
-| `src/api_server.py` | 10,167 行，**144 个路由全部挂在模块级单例 `app` 上**（无 `APIRouter` / `include_router` / `mount`） | 单体 FastAPI 应用 —— 拆分的本质是**按领域切路由 + 抽共享状态** |
+| `src/scheduler.py` | 14,207 行，**主要逻辑仍集中在单个 `Scheduler` 类**，模块级公共符号已建立显式门面契约 | **上帝对象** —— 拆分的本质是给 `Scheduler` 减负，不是给文件分堆 |
+| `src/api_server.py` | 9,774 行，**144 个路由全部挂在模块级单例 `app` 上**（无 `APIRouter` / `include_router` / `mount`） | 单体 FastAPI 应用 —— 拆分的本质是**按领域切路由 + 抽共享状态** |
 
 **共同的兼容策略**：`src/scheduler.py` 与 `src/api_server.py` **永不删除**，始终作为**唯一对外模块名**做 re-export 门面；
 每步只搬**定义**、不动调用点，使 `git diff` 只含移动行 —— 这样 `git revert` 单步即可回滚。
 
 **两条硬约束**（违反则等于拆解失败）：
 
-1. `src/api_server.py` 拆分**不得改变端点集合与路径**（`README.md` 记录主后端 OpenAPI 快照为 152 个操作）；
+1. `src/api_server.py` 拆分**不得改变端点集合与路径**；本票已固化主后端 OpenAPI 快照为 **123 条路径 / 144 个操作**；
 2. `src/scheduler.py` 拆分**不得改变测试可 patch 的名字面**（模块级 `NODE_ROLE` / `NODE_ID` / `RUN_MODE` / `PIPELINE_PREEMPT_ENABLED`、
    实例方法名、私有属性名 —— 见 §4 风险清单）。
 
@@ -195,7 +198,7 @@ TestClient(api_server.app).get("/openapi.json").json()["paths"]
 | **私有属性直读** | `api_server.py` 与 `scheduler_svc_http.py` 用 `getattr(scheduler, "_qwen3_artifact_transfer_runtime")` 之类字符串访问 | 改名/改归属**不报错，只静默返回 None** ⇒ 功能降级难排查 |
 | **锁归属** | `_inference_lock`、`_layer_config_lock`、`_layer_execution_lock` 被 api_server 直接当上下文管理器用 | Mixin 拆分时必须保证锁仍挂在**实例**上（不能变模块级） |
 | **路由注册顺序** | `/api/logs/{filename:path}` 与 `/api/logs/recent` 共存 | 顺序变化会改变匹配结果 |
-| **OpenAPI 快照** | `README.md:422` 记 152，实测 144，仓内**无快照文件** | 拆分前后"端点集合是否变化"**当前无法自动验证** |
+| **OpenAPI 快照** | `README.md` 的旧数字待后续同步；本票已记录实测 **123 条路径 / 144 个操作**，并加入 JSON 快照摘要 | 拆分前后"端点集合是否变化"由 `test_refactor_largefile_baseline.py` 自动验证 |
 | **测试辅助进程** | `tests/helpers/task_worker_process.py:17` `from scheduler import Scheduler` | 门面缺 re-export 会直接 ImportError |
 
 ### 5.2 需要先补的测试
@@ -220,6 +223,13 @@ TestClient(api_server.app).get("/openapi.json").json()["paths"]
 ---
 
 ## 6. 验收方式
+
+### 6.1 REFACTOR-LARGEFILE-01 收口记录
+
+- 已完成 scheduler 门面 `__all__`、HEAD 符号保留、模块级角色 monkeypatch、实例锁身份和 `handle_infer_forward` 成功/拒绝/取消测试。
+- 已将 scheduler 源码扫描门禁扩展到 `scheduler.py` 与所有 `scheduler_*.py`；当前仓库已有 `scheduler_svc_http.py`，后续新增拆分模块会自动纳入扫描。
+- 已固定 API OpenAPI 路径/方法摘要，并固定 `/api/logs/recent` 必须早于 `/api/logs/{filename:path}` 的注册顺序。
+- 定向验收：`30 passed`（本票基线、数据库退场门禁、引擎门禁）。
 
 每步之后必须同时满足：
 
@@ -250,13 +260,13 @@ TestClient(api_server.app).get("/openapi.json").json()["paths"]
 
 本计划与《KTransformers 算子级优化调研 + QLH 算法/数据层优化方向》采用同一排期。顺序固定为：
 
-1. `REFACTOR-LARGEFILE-01`：先固化 OpenAPI、公共符号、锁身份、monkeypatch 面、导入和回归基线。
+1. `REFACTOR-LARGEFILE-01`：**已完成**；已固化 OpenAPI、公共符号、锁身份、monkeypatch 面、导入和回归基线。
 2. `REFACTOR-LARGEFILE-02` 至 `REFACTOR-LARGEFILE-05`：完成 scheduler/API 拆解、门面兼容和端点集合不变验收。
 3. `TORCH-OP-PROFILE-01`：建立项目 PyTorch 上游的算子成本画像，替代平均每层的路由依据。
 4. `TORCH-OP-REGISTRY-01`：建立逻辑算子、候选实现、设备能力、误差边界和回退实现的合同。
 5. `TORCH-HETERO-PLAN-01` 及后续科研票：研究算子放置、prefill/decode 双计划、激活压缩和 MoE 热度/预取。
 
-当前下一票为 `REFACTOR-LARGEFILE-01`。该票未完成前，不登记 PyTorch 算子优化已经进入主线；未完成科研票不得改变 llama.cpp/GGUF 默认路径、Edge 无 Torch 边界或 Koakuma 正式 backend 枚举。
+当前下一票为 `REFACTOR-LARGEFILE-02`。在大文件拆分门面继续稳定前，不登记 PyTorch 算子优化已经进入主线；未完成科研票不得改变 llama.cpp/GGUF 默认路径、Edge 无 Torch 边界或 Koakuma 正式 backend 枚举。
 
 ### 联合验收顺序
 

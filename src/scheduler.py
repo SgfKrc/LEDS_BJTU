@@ -142,6 +142,19 @@ ANDROID_HTTP_CLIENT_LEASE_SECONDS = 120
 ANDROID_HTTP_CLIENT_TIMEOUT_SECONDS = ANDROID_HTTP_CLIENT_LEASE_SECONDS
 _LAYER_ASSIGNMENT_CACHE_VERSION = 3
 
+# Keep the current scheduler import surface explicit while the implementation
+# is split into smaller modules. Private helpers listed here are compatibility
+# hooks used by bootstrap and Android capability gates.
+__all__ = [
+    "Scheduler",
+    "PipelineQueue",
+    "NodeInfo",
+    "NodeState",
+    "NodeRole",
+    "_node_supports_forward_layers",
+    "_bootstrap_api_port",
+]
+
 
 def _sample_pipeline_token_id(logits, temperature: float, top_p: float) -> int:
     """Sample one token with the same zero-temperature semantics as local inference."""
@@ -1813,14 +1826,12 @@ class Scheduler:
         """
         返回当前节点的有效角色。
 
-        正常情况返回 config.NODE_ROLE；若 MAC 不匹配时自动切换到
-        client 模式，则返回 "client"（通过 _role_override 覆盖）。
+        正常情况返回 scheduler 模块持有的运行时 NODE_ROLE；若 MAC 不匹配
+        时自动切换到 client 模式，则返回 "client"（通过 _role_override 覆盖）。
+        node_config/bootstrap 会同步这个模块级值，不能回读启动时已经过期的
+        config.NODE_ROLE。
         """
-        try:
-            import config as cfg
-            configured_role = getattr(cfg, "NODE_ROLE", NODE_ROLE)
-        except Exception:
-            configured_role = NODE_ROLE
+        configured_role = NODE_ROLE
         override = getattr(self, '_role_override', None)
         if override:
             return override

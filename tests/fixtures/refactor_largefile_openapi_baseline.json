@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "captured_from": "api_server.app.openapi()",
+  "path_count": 123,
+  "operation_count": 144,
+  "canonical_path_method_sha256": "3d23913eba2b4f74249082cfee6e5c758080b5a17e9b9c0f70d5c217337b3963",
+  "canonicalization": "json.dumps({path: sorted(methods) for path, methods in sorted(paths.items())}, separators=(',', ':'), ensure_ascii=True)",
+  "route_order_invariant": {
+    "before": "/api/logs/recent",
+    "after": "/api/logs/{filename:path}"
+  }
+}
