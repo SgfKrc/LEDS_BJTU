@@ -3,8 +3,7 @@
 
 闭环（P2 判据「给定设备对，搜索使墙钟最小的切点并落可复算报告」）：
 
-1. 读入同一切点扫描的端到端记录（P1 统一驱动记录 `build/relay-records/*.json`，或
-   P0 时期的 runner 输出 `out/p0/*.json`）；
+1. 读入 `relay_cut_model_analysis.py` 基于同一实验身份的多轮原始记录生成的分析报告；
 2. `src.relay_cut_objective.fit_two_segment` 从实测点回归出**每段的固定开销 + 每层耗时**；
 3. `plan_relay_cut_n_segments` 在该设备对上求解最优切点（含合法切点约束，如 Qwen3.5 的
    4 层倍数）并输出 `capacity_feasible` / `latency_estimate` / `risk_penalty`；
@@ -13,7 +12,7 @@
 用法::
 
     python scripts/relay_cut_plan.py \
-        --records "build/cross-framework-layer-poc/out/p0/qwen25-05b-k*-b1-p32-g32.json" \
+        --analysis-report build/relay-records/cut-model-analysis-qwen25.json \
         --total-layers 24 --cut-multiple 1 --capacity-gb 16 \
         --json-out build/relay-records/cut-plan-qwen25.json
 """
@@ -39,6 +38,7 @@ from src.relay_cut_objective import (  # noqa: E402
 )
 
 REPORT_SCHEMA_VERSION = "qlh.relay_cut_plan_report.v1"
+ANALYSIS_SCHEMA_VERSION = "qlh.relay_cut_model_analysis.v2"
 MIB = 1024 ** 2
 
 
@@ -91,7 +91,10 @@ def _extract(record: dict[str, Any]) -> dict[str, Any] | None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="P2 切点重搜：实测拟合 → 求解 → 对比")
-    ap.add_argument("--records", required=True, help="记录 glob（同一次切点扫描）")
+    ap.add_argument("--analysis-report", default=None,
+                    help="relay_cut_model_analysis.py 生成的多轮分析报告（必需）")
+    ap.add_argument("--records", default=None,
+                    help="已废弃：规划器不再直接消费原始/中位记录")
     ap.add_argument("--total-layers", type=int, required=True)
     ap.add_argument("--cut-multiple", type=int, default=1,
                     help="合法切点步长（Qwen3.5 = full_attention_interval = 4）")
@@ -105,29 +108,84 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json-out", default=None)
     args = ap.parse_args(argv)
 
-    paths = sorted(Path(p) for p in glob.glob(args.records))
-    samples = []
-    for path in paths:
-        record = json.loads(path.read_text(encoding="utf-8"))
-        extracted = _extract(record)
-        if extracted:
-            extracted["file"] = path.name
-            samples.append(extracted)
-    if len(samples) < 2:
-        print(f"FAIL: 需要至少 2 条同切点扫描记录，实得 {len(samples)}（glob={args.records}）")
+    if not args.analysis_report:
+        print("FAIL: --analysis-report is required; raw or median records are not decision evidence")
         return 2
-    identity_fields = ("model", "kind", "path", "commit", "prefill", "gen", "batch")
-    identity_errors = []
-    for field in identity_fields:
-        values = {sample.get(field) for sample in samples}
-        if len(values) > 1:
-            identity_errors.append(f"{field}={sorted(map(str, values))}")
-    if identity_errors:
-        print("FAIL: records mix multiple experiment identities: " + "; ".join(identity_errors))
+    try:
+        analysis_path = Path(args.analysis_report)
+        analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"FAIL: cannot read analysis report: {exc}")
         return 2
 
+    if not isinstance(analysis, dict):
+        print("FAIL: analysis report must be a JSON object")
+        return 2
+    origin = analysis.get("record_origin") or {}
+    verdict = analysis.get("verdict") or {}
+    warmup = analysis.get("warmup") or {}
+    min_rounds = analysis.get("min_rounds")
+    rounds_per_cut = analysis.get("rounds_per_cut") or {}
+    by_cut = analysis.get("by_cut")
+    if not isinstance(origin, dict) or not isinstance(verdict, dict):
+        print("FAIL: analysis report has invalid provenance/verdict objects")
+        return 2
+    if not isinstance(warmup, dict) or not isinstance(rounds_per_cut, dict):
+        print("FAIL: analysis report has invalid warmup/round-count objects")
+        return 2
+    try:
+        round_values = [int(value) for value in rounds_per_cut.values()]
+    except (TypeError, ValueError):
+        print("FAIL: analysis report has invalid round counts")
+        return 2
+    verdict_input = verdict.get("input_valid")
+    if (
+        analysis.get("schema_version") != ANALYSIS_SCHEMA_VERSION
+        or verdict_input is not True
+        or origin.get("kind") != "raw_repeated_measurements"
+        or not isinstance(origin.get("source_records"), list)
+        or not origin.get("source_records")
+        or not isinstance(min_rounds, int) or min_rounds < 3
+        or not isinstance(origin.get("rounds"), int)
+        or origin.get("rounds") < min_rounds
+        or not isinstance(by_cut, list) or len(by_cut) < 2
+        or not rounds_per_cut
+        or analysis.get("total_layers") != args.total_layers
+        or warmup.get("consistent") is not True
+        or len(set(round_values)) != 1
+        or min(round_values) < min_rounds
+    ):
+        print("FAIL: analysis report is not a valid multi-round raw-measurement gate")
+        return 2
+    identity = analysis.get("experiment_identity") or {}
+    required_identity = ("model", "kind", "path", "commit", "prefill", "gen", "batch", "warmup")
+    if any(identity.get(field) is None for field in required_identity):
+        print("FAIL: analysis report is missing experiment identity/warmup provenance")
+        return 2
+    samples = []
+    seen_cuts: set[int] = set()
+    for row in by_cut:
+        try:
+            cut = int(row["cut"])
+            if cut in seen_cuts:
+                raise ValueError("duplicate cut in analysis report")
+            seen_cuts.add(cut)
+            if not row.get("all_passed") or int(row["rounds"]) < min_rounds:
+                raise ValueError("cut is not correctness-passed or has too few rounds")
+            samples.append({
+                "file": str(row.get("cut")),
+                "upstream_layers": cut,
+                "upstream_decode_ms": float(row["upstream_median_ms"]),
+                "downstream_decode_ms": float(row["downstream_median_ms"]),
+                "total_ms": float(row["total_median_ms"]),
+                "whole_model_bytes": analysis.get("whole_model_bytes"),
+            })
+        except (KeyError, TypeError, ValueError) as exc:
+            print(f"FAIL: invalid analysis by_cut row: {exc}")
+            return 2
+
     samples.sort(key=lambda item: item["upstream_layers"])
-    print(f"[records] {len(samples)} 条：cuts={[s['upstream_layers'] for s in samples]}")
+    print(f"[analysis] {analysis_path}；{len(samples)} 个切点：cuts={[s['upstream_layers'] for s in samples]}")
 
     capacity_bytes = int(max(0.0, args.capacity_gb) * 1024 ** 3)
     base = {"capacity_bytes": capacity_bytes, "bandwidth_mbps": args.bandwidth_mbps,
@@ -205,8 +263,12 @@ def main(argv: list[str] | None = None) -> int:
     }
     report = {
         "schema_version": REPORT_SCHEMA_VERSION,
-        "records_glob": args.records,
-        "records_used": [s["file"] for s in samples],
+        "analysis_report": str(analysis_path),
+        "analysis_schema_version": analysis["schema_version"],
+        "records_used": list(origin.get("source_records") or []),
+        "record_origin": origin,
+        "experiment_identity": identity,
+        "warmup": warmup,
         "total_layers": args.total_layers,
         "cut_multiple": args.cut_multiple,
         "capacity_gb": args.capacity_gb,

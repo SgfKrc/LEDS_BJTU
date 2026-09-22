@@ -27,6 +27,42 @@ def _record(*, model: str = "model-a", cut: int = 4) -> dict:
     }
 
 
+def _analysis_report() -> dict:
+    identity = {
+        "model": "model-a",
+        "kind": "mainrepo_end_to_end",
+        "path": "d2l_mainrepo",
+        "commit": "same-head",
+        "prefill": 32,
+        "gen": 32,
+        "batch": 1,
+        "warmup": 3,
+    }
+    return {
+        "schema_version": "qlh.relay_cut_model_analysis.v2",
+        "total_layers": 24,
+        "min_rounds": 3,
+        "rounds_per_cut": {"4": 3, "8": 3},
+        "experiment_identity": identity,
+        "warmup": {"steps": 3, "consistent": True},
+        "whole_model_bytes": 240 * 1024 * 1024,
+        "record_origin": {
+            "kind": "raw_repeated_measurements",
+            "source_records": ["r1-k4.json", "r1-k8.json"],
+            "rounds": 3,
+        },
+        "by_cut": [
+            {"cut": 4, "rounds": 3, "all_passed": True,
+             "upstream_median_ms": 14.0, "downstream_median_ms": 36.0,
+             "total_median_ms": 50.0},
+            {"cut": 8, "rounds": 3, "all_passed": True,
+             "upstream_median_ms": 18.0, "downstream_median_ms": 32.0,
+             "total_median_ms": 50.0},
+        ],
+        "verdict": {"input_valid": True},
+    }
+
+
 def test_extract_accepts_p1_layer_layout_and_metrics():
     record = {
         "experiment_id": "relay-d2l_mainrepo-model-a-k4-p32-g32-b1",
@@ -49,7 +85,7 @@ def test_extract_accepts_p1_layer_layout_and_metrics():
     assert extracted["gen"] == 32
 
 
-def test_main_rejects_mixed_experiment_identity(tmp_path, capsys):
+def test_main_requires_analysis_report(tmp_path, capsys):
     (tmp_path / "a.json").write_text(json.dumps(_record(cut=4)), encoding="utf-8")
     (tmp_path / "b.json").write_text(json.dumps(_record(model="model-b", cut=8)), encoding="utf-8")
     code = relay_cut_plan.main([
@@ -57,15 +93,14 @@ def test_main_rejects_mixed_experiment_identity(tmp_path, capsys):
         "--total-layers", "24",
     ])
     assert code == 2
-    assert "multiple experiment identities" in capsys.readouterr().out
+    assert "analysis-report" in capsys.readouterr().out
 
 
 def test_main_does_not_pass_an_unmeasured_global_prediction(tmp_path):
-    for cut in (4, 8):
-        (tmp_path / f"{cut}.json").write_text(
-            json.dumps(_record(cut=cut)), encoding="utf-8")
+    analysis = tmp_path / "analysis.json"
+    analysis.write_text(json.dumps(_analysis_report()), encoding="utf-8")
     code = relay_cut_plan.main([
-        "--records", str(tmp_path / "*.json"),
+        "--analysis-report", str(analysis),
         "--total-layers", "24",
         "--json-out", str(tmp_path / "report.json"),
     ])
@@ -73,3 +108,15 @@ def test_main_does_not_pass_an_unmeasured_global_prediction(tmp_path):
     report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
     assert report["verdict"]["passed"] is False
     assert report["verdict"]["reason"] == "predicted_cut_not_measured"
+
+
+def test_main_rejects_malformed_analysis_report_without_traceback(tmp_path, capsys):
+    analysis = tmp_path / "analysis.json"
+    payload = _analysis_report()
+    payload["rounds_per_cut"] = [3, 3]
+    analysis.write_text(json.dumps(payload), encoding="utf-8")
+    code = relay_cut_plan.main([
+        "--analysis-report", str(analysis), "--total-layers", "24",
+    ])
+    assert code == 2
+    assert "invalid warmup/round-count objects" in capsys.readouterr().out

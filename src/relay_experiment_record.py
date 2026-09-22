@@ -280,6 +280,7 @@ def build_record(
         "metrics": dict(metrics),
         "evidence": dict(evidence) if evidence is not None else None,
         "artifacts": dict(artifacts or {}),
+        "record_origin": {"kind": "raw_measurement", "rounds": 1},
     }
     if validate:
         validate_record(record, root)

@@ -155,7 +155,8 @@
     "prompt": {"type": ["string", "null"]},
     "prefill_tokens": {"type": ["integer", "null"]},
     "gen_tokens": {"type": ["integer", "null"]},
-    "batch": {"type": ["integer", "null"]}
+   "batch": {"type": ["integer", "null"]}
+   ,"warmup": {"type": ["integer", "null"], "minimum": 0}
    }
   },
   "criterion": {
