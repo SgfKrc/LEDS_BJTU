@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional, Callable
 
+from cluster_fence import ControlFence, ControlFenceError
+
 try:  # torch is optional: the edge runtime omits it; tensor APIs then fail closed
     import torch
 except ImportError:  # pragma: no cover - exercised by the edge venv
@@ -229,6 +231,43 @@ class MessageType(str, Enum):
 # ================================================================
 # 网络类型检测
 # ================================================================
+
+# Control messages that can mutate cluster ownership or execution topology.
+FENCED_CONTROL_MESSAGE_TYPES = frozenset({
+    MessageType.TASK_START.value, MessageType.TASK_STOP.value,
+    MessageType.LAYER_CONFIG.value, MessageType.LAYER_CONFIG_ACK.value,
+    MessageType.QWEN3_PIPELINE_DRY_RUN.value,
+    MessageType.QWEN3_PIPELINE_DRY_RUN_ACK.value,
+    MessageType.LAYER_WORKER_OPT_OUT.value, MessageType.LAYER_WORKER_OPT_IN.value,
+    MessageType.TASK_WORKER.value, MessageType.ROLE_TRANSFER.value,
+    MessageType.ROLE_TRANSFER_ACK.value, MessageType.SPARE_MASTER_DESIGNATE.value,
+    MessageType.SPARE_MASTER_DESIGNATE_ACK.value,
+    MessageType.SPARE_MASTER_ACTIVATE.value, MessageType.SPARE_MASTER_ACTIVATE_ACK.value,
+    MessageType.SPARE_MASTER_DEACTIVATE.value, MessageType.NODE_LIST_SYNC.value,
+    MessageType.NODE_UPDATE.value, MessageType.PIPELINE_PAUSE.value,
+    MessageType.PIPELINE_RESUME.value,
+})
+
+
+def _is_fenced_control_message(msg_type: MessageType | str) -> bool:
+    value = msg_type.value if isinstance(msg_type, MessageType) else str(msg_type)
+    return value in FENCED_CONTROL_MESSAGE_TYPES
+
+
+def _decorate_control_payload(data: Any, msg_type: MessageType, fence: ControlFence | None) -> Any:
+    if fence is None or not fence.enabled or not _is_fenced_control_message(msg_type):
+        return data
+    if not isinstance(data, dict):
+        raise ControlFenceError("control_certificate_invalid", "fenced control messages require an object payload")
+    payload = dict(data)
+    if "control_certificate" not in payload:
+        certificate = fence.current_certificate()
+        if certificate is None:
+            raise ControlFenceError("control_certificate_missing", "fenced control message has no current certificate")
+        payload["control_certificate"] = certificate
+    fence.admit(payload.get("control_certificate"), action=f"tcp.send.{msg_type.value}", source="tcp")
+    return payload
+
 
 def detect_network_type() -> str:
     """
@@ -1046,6 +1085,21 @@ class TCPServer:
         # Called only after a successful REGISTER ACK has been written to the
         # socket.  Scheduler-side layer/config pushes must wait for this edge.
         self.on_registration_confirmed: Optional[Callable] = None
+        self._control_fence: ControlFence | None = None
+
+    def set_control_fence(self, fence: ControlFence | None) -> None:
+        if fence is not None and not isinstance(fence, ControlFence):
+            raise TypeError("control fence must be a ControlFence or None")
+        self._control_fence = fence
+
+    def _admit_inbound_control(self, msg: dict) -> None:
+        fence = self._control_fence
+        msg_type = msg.get("type", "")
+        if fence is None or not fence.enabled or not _is_fenced_control_message(msg_type):
+            return
+        data = msg.get("data")
+        certificate = data.get("control_certificate") if isinstance(data, dict) else None
+        fence.admit(certificate, action=f"tcp.receive.{msg_type}", source="tcp")
 
     def start(self, on_message: Callable = None,
               on_disconnect: Callable = None,
@@ -1312,6 +1366,20 @@ class TCPServer:
 
                 msg_type = msg.get("type", "")
                 registration_pending = False
+
+                try:
+                    self._admit_inbound_control(msg)
+                except ControlFenceError as exc:
+                    logger.warning("TCP control frame rejected code=%s type=%s", exc.code, msg_type)
+                    try:
+                        self.send_to_client(
+                            client_id,
+                            {"status": "rejected", "error_code": exc.code},
+                            MessageType.ERROR,
+                        )
+                    except Exception:
+                        pass
+                    continue
 
                 # ---- 消息分发 ----
                 if msg_type == MessageType.REGISTER.value:
@@ -1655,6 +1723,7 @@ class TCPServer:
         conn = self._get_client(client_id)
         if conn is None:
             raise ConnectionError(f"从节点 {client_id} 未连接")
+        data = _decorate_control_payload(data, msg_type, self._control_fence)
         packet = build_message(msg_type, data)
         try:
             # 心跳 ACK、控制消息和大张量会由不同线程发送，必须保持完整帧原子写入。
@@ -1864,6 +1933,21 @@ class TCPClient:
         self._reconnect_state_lock = threading.Lock()
         self._reconnect_in_progress = False
         self._reconnect_retry_scheduled = False
+        self._control_fence: ControlFence | None = None
+
+    def set_control_fence(self, fence: ControlFence | None) -> None:
+        if fence is not None and not isinstance(fence, ControlFence):
+            raise TypeError("control fence must be a ControlFence or None")
+        self._control_fence = fence
+
+    def _admit_inbound_control(self, msg: dict) -> None:
+        fence = self._control_fence
+        msg_type = msg.get("type", "")
+        if fence is None or not fence.enabled or not _is_fenced_control_message(msg_type):
+            return
+        data = msg.get("data")
+        certificate = data.get("control_certificate") if isinstance(data, dict) else None
+        fence.admit(certificate, action=f"tcp.receive.{msg_type}", source="tcp")
 
     def _transport_runtime_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         runtime = self.transport_runtime
@@ -2208,6 +2292,11 @@ class TCPClient:
                     if msg.get("type") == MessageType.HEARTBEAT_ACK.value:
                         self._handle_heartbeat_ack(msg, connection_generation)
                         continue  # 不向上层转发
+                    try:
+                        self._admit_inbound_control(msg)
+                    except ControlFenceError as exc:
+                        logger.warning("TCP control frame rejected code=%s type=%s", exc.code, msg.get("type"))
+                        continue
                     if self.on_message:
                         try:
                             self.on_message(msg)
@@ -2281,6 +2370,7 @@ class TCPClient:
     def send_data(self, data: Any, msg_type: MessageType = MessageType.TENSOR,
                   connection_sock: socket.socket = None) -> None:
         """向主节点发送数据"""
+        data = _decorate_control_payload(data, msg_type, self._control_fence)
         packet = build_message(msg_type, data)
         self._transport_runtime_call(
             "observe_legacy_send",

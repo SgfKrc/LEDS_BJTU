@@ -572,6 +572,11 @@ class ControlPlaneAuthority:
                 read_only_reason=reason,
             )
 
+    def current_certificate(self) -> QuorumCertificate | None:
+        """Return the installed public certificate for transport decoration."""
+        with self._lock:
+            return self._certificate
+
     def admit_control_write(
         self,
         certificate: QuorumCertificate | Mapping[str, Any] | None,

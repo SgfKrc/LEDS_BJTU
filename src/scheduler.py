@@ -45,6 +45,7 @@ from pipeline_node_contract import (
     pipeline_layout_from_capacity_plan,
 )
 from pipeline_reshard import PipelineArtifactAvailability, PipelineReshardCoordinator
+from llama_rpc_contract import RpcShardLeaseBook
 from qwen3_pipeline_transaction import (
     Qwen3PipelineDryRunTransaction,
     Qwen3PipelineProtocolError,
@@ -70,6 +71,7 @@ from gemma4_pipeline_sidecar import (
     Gemma4PipelineSidecarSession,
     Gemma4SidecarError,
 )
+from cluster_fence import ControlFence
 
 from task_provider import (
     ModelIdentity as TaskModelIdentity,
@@ -1093,6 +1095,7 @@ class Scheduler:
         # 推理宿主默认使用全局单例；回调由 API composition root 以具名
         # Protocol bundle 注入，避免 scheduler 反向依赖 api_server。
         self._host = host if host is not None else get_model_host()
+        self._control_fence: ControlFence | None = None
         self._callbacks = callbacks if callbacks is not None else getattr(
             self._host, "scheduler_callbacks", None,
         )
@@ -1284,6 +1287,21 @@ class Scheduler:
             raise TypeError("transport runtime factory must be callable or None")
         self._transport_runtime_factory = factory
 
+    def set_control_fence(self, fence: ControlFence | None) -> None:
+        """Attach the runtime control gate without changing legacy tests."""
+        if fence is not None and not isinstance(fence, ControlFence):
+            raise TypeError("control fence must be a ControlFence or None")
+        self._control_fence = fence
+        for transport in (self._tcp_server, self._tcp_client):
+            setter = getattr(transport, "set_control_fence", None)
+            if callable(setter):
+                setter(fence)
+
+    def _require_control_write(self, action: str) -> None:
+        fence = self._control_fence
+        if fence is not None:
+            fence.require_current_permit(action=action)
+
     def _new_transport_runtime(self, node_id: str) -> object | None:
         factory = self._transport_runtime_factory
         if not callable(factory):
@@ -1354,6 +1372,8 @@ class Scheduler:
             try:
                 server = create_server(bind_host, actual_port)
                 self._tcp_server = server
+                if self._control_fence is not None:
+                    server.set_control_fence(self._control_fence)
                 server.start(
                     on_message=self._bind_tcp_server_callback(
                         server, self._on_tcp_message,
@@ -1842,6 +1862,7 @@ class Scheduler:
         Returns:
             注销是否成功
         """
+        self._require_control_write("cluster.node.deregister")
         with self._nodes_lock:
             if node_id not in self.nodes:
                 return False
@@ -3338,7 +3359,10 @@ class Scheduler:
             layout = pipeline_layout_from_capacity_plan(
                 plan, node_metadata=self._pipeline_node_metadata(),
             )
-            coordinator = PipelineReshardCoordinator(layout)
+            coordinator = PipelineReshardCoordinator(
+                layout,
+                lease_book=RpcShardLeaseBook(control_fence=self._control_fence),
+            )
         except (PipelineNodeContractError, ValueError) as exc:
             logger.warning("未启用自动重分片合同: %s", exc)
             with self._layer_config_lock:
@@ -3775,6 +3799,7 @@ class Scheduler:
         Returns:
             {status, message, current_assignments}
         """
+        self._require_control_write("cluster.layers.override")
         total_layers = self._get_total_model_layers()
 
         def invalid(reason_code: str, reason: str) -> dict:
@@ -5201,6 +5226,7 @@ class Scheduler:
 
     def bind_model_runtime_contract(self, profile: str, model_id: str) -> dict:
         """Create an auditable, path-free contract from MODEL-FLEET capacity."""
+        self._require_control_write("cluster.model_runtime.contract.bind")
         if self._effective_role() != "master":
             raise Qwen3PipelineProtocolError(
                 "model runtime contract binding is available only on the master node"
@@ -5337,6 +5363,7 @@ class Scheduler:
         *, contract_id: Optional[str] = None,
     ) -> dict:
         """Start an explicit experimental chain only from a supplied contract."""
+        self._require_control_write("cluster.model_runtime.sidecar.begin")
         if self._effective_role() != "master":
             raise Qwen3PipelineProtocolError("model runtime Sidecar control is available only on the master node")
         persisted_contract_id = ""
@@ -5368,6 +5395,7 @@ class Scheduler:
         return {"profile": profile, **result, "production_admitted": False}
 
     def release_model_runtime_sidecar(self, profile: str) -> dict:
+        self._require_control_write("cluster.model_runtime.sidecar.release")
         if self._effective_role() != "master":
             raise Qwen3PipelineProtocolError("model runtime Sidecar control is available only on the master node")
         active_contract_id = self._model_runtime_active_contract_id(profile)
@@ -5392,6 +5420,7 @@ class Scheduler:
         return {"profile": profile, **result, "production_admitted": False}
 
     def cancel_model_runtime_sidecar(self, profile: str) -> dict:
+        self._require_control_write("cluster.model_runtime.sidecar.cancel")
         if self._effective_role() != "master":
             raise Qwen3PipelineProtocolError("model runtime Sidecar control is available only on the master node")
         active_contract_id = self._model_runtime_active_contract_id(profile)
@@ -7796,6 +7825,7 @@ class Scheduler:
         Returns:
             {status, message, transfer_id, ...}
         """
+        self._require_control_write("cluster.role.transfer")
         if self._effective_role() != "master":
             return {"status": "denied", "reason": "仅主节点可发起角色转让"}
 
@@ -8258,6 +8288,7 @@ class Scheduler:
         Returns:
             {status, message, spare_master, ...}
         """
+        self._require_control_write("cluster.spare_master.designate")
         if self._effective_role() != "master":
             return {"status": "denied", "reason": "仅主节点可指定备用主节点"}
 
@@ -8639,6 +8670,7 @@ class Scheduler:
         Returns:
             {status, message}
         """
+        self._require_control_write("cluster.spare_master.clear")
         if self._effective_role() != "master":
             return {"status": "denied", "reason": "仅主节点可清除备用主节点"}
 
@@ -9215,6 +9247,8 @@ class Scheduler:
             # connect() 返回前进入回调。提前绑定连接和最终 node_id，保证
             # 模型同步能取得主节点地址，且 ready/error ACK 能正常发回。
             self._tcp_client = client
+            if self._control_fence is not None:
+                client.set_control_fence(self._control_fence)
             _sync_runtime_node_config(node_id=node_id, node_role="client")
             # ★ 心跳回调：更新自身节点的心跳时间 + 同步 RTT 测量值
             # _sync_node_rtt 内部已有 _nodes_lock 保护
@@ -9296,6 +9330,8 @@ class Scheduler:
                         **self._transport_runtime_kwargs(node_id),
                     )
                     self._tcp_client = client
+                    if self._control_fence is not None:
+                        client.set_control_fence(self._control_fence)
                     _sync_runtime_node_config(node_id=node_id, node_role="client")
                     _bind_client_callbacks(client)
                     ok = client.connect(
@@ -12316,6 +12352,8 @@ class Scheduler:
                         node_type="pipeline_peer",
                         **self._transport_runtime_kwargs(target_node_id),
                     )
+                    if self._control_fence is not None:
+                        client.set_control_fence(self._control_fence)
                     if not client.connect():
                         logger.error(
                             "链式转发: 连接 %s (%s:%s) 失败",
@@ -14175,6 +14213,7 @@ class Scheduler:
 
         调用后立即把当前物理 MAC 绑定到主节点 SQLite，无需重启。
         """
+        self._require_control_write("cluster.identity.reset")
         if self._effective_role() != "master":
             return {"status": "denied", "reason": "仅主节点可重置身份标识"}
 
