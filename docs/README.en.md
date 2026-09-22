@@ -350,22 +350,14 @@ The main project keeps no image-generation runtime or assets; image generation b
 ```bash
 git clone https://github.com/SgfKrc/qlh.git
 cd qlh
-git submodule update --init --recursive
+git submodule update --init --recursive     # pulls only the 4 submodules (see the table above)
 ```
 
-Submodule remotes are in `.gitmodules`. Common sibling repositories:
+Submodule remotes are in `.gitmodules`. **Related repositories** (development / experiment tooling, **not**
+submodules) are cloned separately into `tools/` and `packages/` as needed:
 
-- `https://github.com/SgfKrc/qlh-android.git`
-- `https://github.com/SgfKrc/qlh-shell.git`
-- `https://github.com/SgfKrc/qlh-release.git`
-- `https://github.com/SgfKrc/qlh-toolbox.git`
-- `https://github.com/SgfKrc/qlh-docagent.git`
-- `https://github.com/SgfKrc/Koakumix.git`
-
-> **Bridges (not submodules since 2026-09-20)** — clone separately into `tools/` if you need them;
-> they are gitignored and intentionally kept out of the main repository:
-> - `https://github.com/SgfKrc/reasonix-codex-bridge.git`
-> - `https://github.com/SgfKrc/dsh-codex-bridge.git`
+- Submodules: `https://github.com/SgfKrc/qlh-android.git` · `qlh-shell.git` · `qlh-release.git` · `Koakumix.git`
+- Related repositories: `https://github.com/SgfKrc/qlh-docagent.git` · `qlh-toolbox.git` · `reasonix-codex-bridge.git` · `dsh-codex-bridge.git` · `spawnledger.git`
 
 ### 2. Choose a Runtime Environment
 
