@@ -94,8 +94,12 @@ def test_links_extraction_and_existence(tmp_path):
     paths = [h for _, h in links]
     assert "A.md" in paths and "../README.md" in paths
     assert not any(h.startswith(("http", "#")) for h in paths)
-    # 存在性
-    assert _check_link("缓存机制专项计划-2026-09-13.md")
+    # 存在性：样本**动态取自 docs/ 下真实存在的文档**，不写死文件名。
+    # 原先写死 `缓存机制专项计划-2026-09-13.md`，而它随归档整理进了 docs/archive/<分类>/，
+    # 断言只按 `docs/<名字>` 解析 ⇒ 结构一变测试就断。动态取样可避免把测试绑死在某一版目录结构上。
+    docs_dir = REPO_ROOT / "docs"
+    sample = next(iter(sorted(docs_dir.rglob("*.md")))).relative_to(docs_dir).as_posix()
+    assert _check_link(sample), sample
     assert not _check_link("不存在的文档.md")
 
 

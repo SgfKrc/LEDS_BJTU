@@ -6,7 +6,7 @@
 >
 > 适用范围：QLH 的 Qwen-1.8B、DeepSeek Distill 等 LLM，在 PyTorch/Transformers、llama.cpp/GGUF、Windows/Linux PC 和 Android Full 路线上的权重量化；2/3-bit 正式评估仅面向计划中的 14B 及以上模型
 
-> 总计划入口：[总体下一步计划](总体下一步计划.md)
+> 总计划入口：[总体下一步计划](../distributed/总体下一步计划.md)
 
 本文回答两个问题：QLH 是否能落地 2/3-bit 量化，以及低比特是否因为“采用浮点”而比 4-bit 精度更强。本文只定义研究、准入和止损规则，不代表当前已经支持任意 2/3-bit 模型。
 
