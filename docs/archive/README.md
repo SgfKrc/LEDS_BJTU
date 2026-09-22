@@ -48,7 +48,7 @@ Android、测试等多个主题，找东西只能靠文件名记忆。现按主�
 - [跨框架接力性能优化-汇总报告-2026-09-16.md](relay/跨框架接力性能优化-汇总报告-2026-09-16.md)
 - [跨框架接力量化与加速解耦分析-2026-09-16.md](relay/跨框架接力量化与加速解耦分析-2026-09-16.md)
 
-### 分布式与调度（`distributed/`，17 篇）
+### 分布式与调度（`distributed/`，23 篇）
 
 - [PC完整任务Worker接线准入报告.md](distributed/PC完整任务Worker接线准入报告.md)
 - [QW3.8-27B分布式蒸馏展望.md](distributed/QW3.8-27B分布式蒸馏展望.md)
@@ -63,10 +63,16 @@ Android、测试等多个主题，找东西只能靠文件名记忆。现按主�
 - [分布式推理流水线实施计划.md](distributed/分布式推理流水线实施计划.md)
 - [分布式组网审核与可用性重构调研-2026-09-15.md](distributed/分布式组网审核与可用性重构调研-2026-09-15.md)
 - [单机工作整理与分布式路线盘点-2026-09-16.md](distributed/单机工作整理与分布式路线盘点-2026-09-16.md)
+- [待完成工作清单与推进顺序-2026-08-23.md](distributed/待完成工作清单与推进顺序-2026-08-23.md)
+- [微服务架构改造计划.md](distributed/微服务架构改造计划.md)
 - [总体下一步计划.md](distributed/总体下一步计划.md)
 - [抗弱网通信协议专项计划.md](distributed/抗弱网通信协议专项计划.md)
+- [支线开发计划-外置迁移与Koakumix-2026-09-14.md](distributed/支线开发计划-外置迁移与Koakumix-2026-09-14.md)
+- [混合分布式推理体系规划.md](distributed/混合分布式推理体系规划.md)
+- [集群接入稳定性与本地RAG实施计划.md](distributed/集群接入稳定性与本地RAG实施计划.md)
 - [非对称分工论证-2026-09-14.md](distributed/非对称分工论证-2026-09-14.md)
 - [项目技术说明.md](distributed/项目技术说明.md)
+- [项目进展与下一步计划.md](distributed/项目进展与下一步计划.md)
 
 ### 运行时与容量（`runtime/`，6 篇）
 
@@ -77,22 +83,26 @@ Android、测试等多个主题，找东西只能靠文件名记忆。现按主�
 - [缓存单元对齐实验-2026-09-14.md](runtime/缓存单元对齐实验-2026-09-14.md)
 - [缓存机制专项计划-2026-09-13.md](runtime/缓存机制专项计划-2026-09-13.md)
 
-### TUI（`tui/`，5 篇）
+### TUI（`tui/`，7 篇）
 
+- [Patchouli知识库管理TUI专项计划-2026-09-14.md](tui/Patchouli知识库管理TUI专项计划-2026-09-14.md)
 - [TUI接入层段协议-10F落地后-2026-09-17.md](tui/TUI接入层段协议-10F落地后-2026-09-17.md)
 - [TUI环境变量注册优化方案.md](tui/TUI环境变量注册优化方案.md)
 - [TUI适配实施计划.md](tui/TUI适配实施计划.md)
 - [TUI重写-准备工作清单-2026-09-16.md](tui/TUI重写-准备工作清单-2026-09-16.md)
 - [TUI重写方案-2026-09-16.md](tui/TUI重写方案-2026-09-16.md)
+- [主线票据-CORE-TUI-01-2026-09-15.md](tui/主线票据-CORE-TUI-01-2026-09-15.md)
 
-### 边缘与 Android（`edge/`，4 篇）
+### 边缘与 Android（`edge/`，6 篇）
 
+- [Android版本远期计划.md](edge/Android版本远期计划.md)
 - [PC与Android端交互体验优化计划.md](edge/PC与Android端交互体验优化计划.md)
+- [主线票据-CORE-EDGE-01-2026-09-15.md](edge/主线票据-CORE-EDGE-01-2026-09-15.md)
 - [安卓验证阶梯D-E层-真机Termux方案-2026-09-20.md](edge/安卓验证阶梯D-E层-真机Termux方案-2026-09-20.md)
 - [安卓验证阶梯D层-AVD执行方案-2026-09-20.md](edge/安卓验证阶梯D层-AVD执行方案-2026-09-20.md)
 - [边缘设备模拟环境计划-2026-09-15.md](edge/边缘设备模拟环境计划-2026-09-15.md)
 
-### 模型与资产（`models/`，6 篇）
+### 模型与资产（`models/`，9 篇）
 
 - [DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md](models/DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md)
 - [Gemma-4-12B多模态支持方案.md](models/Gemma-4-12B多模态支持方案.md)
@@ -100,18 +110,33 @@ Android、测试等多个主题，找东西只能靠文件名记忆。现按主�
 - [亚1B小模型专项实验计划.md](models/亚1B小模型专项实验计划.md)
 - [克隆后离线资产获取清单.md](models/克隆后离线资产获取清单.md)
 - [模型一键下载计划（预设列表与搜索）.md](models/模型一键下载计划（预设列表与搜索）.md)
+- [模型文件LZ4压缩必要性调研与评估.md](models/模型文件LZ4压缩必要性调研与评估.md)
+- [模型通用小工具调研与方案.md](models/模型通用小工具调研与方案.md)
+- [重模型实验支持计划-DeepSeek.md](models/重模型实验支持计划-DeepSeek.md)
 
 ### 生图与多模态（`media/`，2 篇）
 
 - [SD 1.5引擎与分布式图像生成实施计划.md](media/SD 1.5引擎与分布式图像生成实施计划.md)
 - [SD 1.5离线资产包与签名源站发布计划.md](media/SD 1.5离线资产包与签名源站发布计划.md)
 
-### 杂项（`misc/`，5 篇）
+### 杂项（`misc/`，17 篇）
 
+- [Koakumix子项目定位与增强路线计划-2026-09-14.md](misc/Koakumix子项目定位与增强路线计划-2026-09-14.md)
+- [frontend_cybergothic功能复核与页面重构清单.md](misc/frontend_cybergothic功能复核与页面重构清单.md)
+- [reasonix-codex-bridge-ACP会话级恢复专项计划-2026-09-13.md](misc/reasonix-codex-bridge-ACP会话级恢复专项计划-2026-09-13.md)
+- [reasonix-codex-bridge-Harness工具扩展与能力补齐排期-2026-09-13.md](misc/reasonix-codex-bridge-Harness工具扩展与能力补齐排期-2026-09-13.md)
+- [reasonix-codex-bridge主仓接线清单-2026-09-12.md](misc/reasonix-codex-bridge主仓接线清单-2026-09-12.md)
+- [reasonix-codex-bridge全面审计与多次实测报告-2026-09-13.md](misc/reasonix-codex-bridge全面审计与多次实测报告-2026-09-13.md)
+- [reasonix-codex-bridge完善方向-2026-09-12.md](misc/reasonix-codex-bridge完善方向-2026-09-12.md)
+- [reasonix-codex-bridge审计报告-2026-09-12.md](misc/reasonix-codex-bridge审计报告-2026-09-12.md)
+- [reasonix-codex-bridge工具面现状-2026-09-13.md](misc/reasonix-codex-bridge工具面现状-2026-09-13.md)
 - [外部推理服务Provider接入指南.md](misc/外部推理服务Provider接入指南.md)
 - [开发票计划-审计收口与答辩演示-2026-09-09.md](misc/开发票计划-审计收口与答辩演示-2026-09-09.md)
 - [数据库测试指南.md](misc/数据库测试指南.md)
 - [测试质量审计-2026-09-21.md](misc/测试质量审计-2026-09-21.md)
+- [联网搜索与轻量Fetch工具调用可行性调研与分期计划.md](misc/联网搜索与轻量Fetch工具调用可行性调研与分期计划.md)
 - [自动化优化实验与报告方案.md](misc/自动化优化实验与报告方案.md)
+- [通用工具与子项目候选计划-2026-09-12.md](misc/通用工具与子项目候选计划-2026-09-12.md)
+- [项目后续可做方向发散与子项目独立化评估-2026-09-09.md](misc/项目后续可做方向发散与子项目独立化评估-2026-09-09.md)
 
-合计 **64** 篇。
+合计 **89** 篇。

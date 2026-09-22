@@ -13,7 +13,7 @@
     },
     {
       "id": "cybergothic-review-metadata",
-      "doc": "docs/frontend_cybergothic功能复核与页面重构清单.md",
+      "doc": "docs/archive/misc/frontend_cybergothic功能复核与页面重构清单.md",
       "sha256": "7dc2688a738a95c7ba59b7f154074c2e48f901f1444f6e2917a814c24ab861a1",
       "rules": ["R5"],
       "expected_judgement": "needs_review",
