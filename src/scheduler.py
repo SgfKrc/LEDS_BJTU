@@ -73,6 +73,7 @@ from gemma4_pipeline_sidecar import (
 )
 from cluster_fence import ControlFence
 from cluster_auto_role import AutoRoleController
+from cluster_handoff import HandoffCoordinator
 
 from task_provider import (
     ModelIdentity as TaskModelIdentity,
@@ -1098,6 +1099,7 @@ class Scheduler:
         self._host = host if host is not None else get_model_host()
         self._control_fence: ControlFence | None = None
         self._auto_role_controller: AutoRoleController | None = None
+        self._handoff_coordinator: HandoffCoordinator | None = None
         self._callbacks = callbacks if callbacks is not None else getattr(
             self._host, "scheduler_callbacks", None,
         )
@@ -1373,6 +1375,83 @@ class Scheduler:
             available_voter_ids=available_voter_ids,
             now_ms=now_ms,
         ).to_dict()
+
+    def set_handoff_coordinator(self, coordinator: HandoffCoordinator | None) -> None:
+        """Attach the explicit certificate-first handoff coordinator."""
+        if coordinator is not None and not isinstance(coordinator, HandoffCoordinator):
+            raise TypeError("handoff coordinator must be a HandoffCoordinator or None")
+        if coordinator is not None and coordinator.event_sink is None:
+            coordinator.event_sink = self._persist_handoff_event
+        self._handoff_coordinator = coordinator
+
+    def _persist_handoff_event(self, event: dict[str, Any]) -> None:
+        """Persist handoff evidence through the existing bounded HA audit log."""
+        self._append_ha_log(
+            "transfer_logs",
+            str(event.get("event_type", "handoff_event")),
+            event,
+        )
+
+    def get_handoff_snapshot(self) -> dict:
+        """Expose handoff metadata without exposing task/model runtime state."""
+        coordinator = self._handoff_coordinator
+        if coordinator is None:
+            return {"enabled": False, "state": "disabled", "record": None, "events": []}
+        snapshot = coordinator.snapshot()
+        snapshot["enabled"] = True
+        return snapshot
+
+    def prepare_leader_handoff(
+        self,
+        new_leader_id: str,
+        manifest: Mapping[str, Any],
+        *,
+        reason: str,
+        operator: str,
+        now_ms: int | None = None,
+        handoff_id: str | None = None,
+    ) -> dict:
+        """Prepare a term-bound handoff through the explicit coordinator."""
+        coordinator = self._handoff_coordinator
+        if coordinator is None:
+            return {"status": "disabled", "reason": "handoff_disabled"}
+        return coordinator.prepare(
+            new_leader_id,
+            manifest,
+            reason=reason,
+            operator=operator,
+            now_ms=now_ms,
+            handoff_id=handoff_id,
+        ).to_dict()
+
+    def commit_leader_handoff(
+        self,
+        *,
+        available_voter_ids: Sequence[str],
+        now_ms: int | None = None,
+        lease_id: str | None = None,
+    ) -> dict:
+        """Commit a prepared handoff or return its awaiting-quorum record."""
+        coordinator = self._handoff_coordinator
+        if coordinator is None:
+            return {"status": "disabled", "reason": "handoff_disabled"}
+        return coordinator.commit(
+            available_voter_ids=available_voter_ids,
+            now_ms=now_ms,
+            lease_id=lease_id,
+        ).to_dict()
+
+    def abort_leader_handoff(
+        self,
+        *,
+        now_ms: int | None = None,
+        reason: str = "aborted",
+    ) -> dict:
+        """Abort only a prepared handoff; a fenced handoff needs recovery."""
+        coordinator = self._handoff_coordinator
+        if coordinator is None:
+            return {"status": "disabled", "reason": "handoff_disabled"}
+        return coordinator.abort(now_ms=now_ms, reason=reason).to_dict()
 
     def _require_control_write(self, action: str) -> None:
         fence = self._control_fence
