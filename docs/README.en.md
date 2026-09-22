@@ -127,61 +127,44 @@ The upstream PyTorch layer segment computes up to layer N and hands the hidden s
 3. **It is the precondition for customizability** - cut-point assignment, mixed precision, operator substitution and batch overlap all build on "hidden states are transferable between layers";
 4. **There is no direct academic precedent** - Petals is same-framework, KTransformers is operator-level, distributed-llama is TP; on this path we also filed a defect upstream and independently verified the fix (issue #28963).
 
-**Current validity note (2026-09-21)**: the cumulative table below is historical process data, not the current dual-main-repository performance baseline. The dual-engine sample is Qwen2.5-0.5B, 12+12 layers, gen=32: upstream `ModelManager.forward_layers` plus downstream `LlamaCppEngine.forward_layers_from_hidden`, **47.501 ms/step**, token-identical to the pure llama.cpp control. **A same-day rerun completed the full matrix**: two models x cut points / loads (prefill 32/128/512, decode 32/64/256) / batch (2/4) / mixed precision (upstream fp16-f32-NF4 x downstream Q4_K_M) - **27 runs, all token-identical** - with Qwen3.5 hybrid **K=8/12/16/20 all 32/32**. The 2026-09-21 capacity scan still used raw `llama_cpp` downstream, so it remains `capacity_only`/`raw_binding_probe`, not a dual-engine speed baseline. Before quoting a tier, verify what actually took effect: `quant_type="int4"` **silently falls back to fp16** in the main-repository layer pipeline, and upstream compile is disabled by the size gate below 1.5B params.
+**Current validity note (2026-09-21)**: the dual-engine sample is Qwen2.5-0.5B, 12+12 layers, gen=32 -
+upstream `model_module.forward_layers` plus downstream `llama_engine.forward_layers_from_hidden`,
+**47.501 ms/step**, token-identical to the pure llama.cpp control.
 
-**Historical cumulative measurements (gen=64, every token identical)**:
+**Full matrix**: two models x cut points / loads (prefill 32/128/512, decode 32/64/256) / batch (2/4) /
+mixed precision (upstream fp16-f32-NF4 x downstream Q4_K_M) - **27 runs, all token-identical**;
+Qwen3.5 hybrid **K=8/12/16/20 all 32/32**.
 
-| Configuration | Wall clock | vs. first version |
-| --- | ---: | ---: |
-| Cross-process + full-segment recompute | 182 s | 1.0x |
-| Same-process + full-segment recompute | 167 s | 1.09x |
-| Same-process + both-side KV reuse | 53 s | 3.4x |
-| **Same-process + KV + upstream manual 4 layers** | **21.3 s (about 333 ms/step)** | **8.5x** |
-| Cross-process + KV + 4L + downstream GPU offload | 81 s | 2.2x (IPC-bound) |
-| *Control: native llama.cpp full-model GPU* | *about 0.9 s* | *about 200x* |
+⚠️ Before quoting a tier, verify what actually took effect: `quant_type="int4"` **silently falls back to
+fp16** in the main-repository layer pipeline, and upstream compile is disabled by the size gate below 1.5B params.
 
-**Evidence and boundaries (stated as measured; all from persisted runs)**:
+**D-to-L capacity value**: two-segment cut points give **1.568x / 1.547x** for Qwen2.5-0.5B / qwen3-5-2b;
+under the same controlled 3.0 GB CUDA budget the whole model is rejected while a 12-layer upstream passes.
+That budget is a reproducible experiment constraint, not a physical OOM. D-to-L is positioned as capacity
+merging and heterogeneous capability composition - **not** as a CUDA single-machine speed-up substitute.
 
-| Item | Result |
+**Evidence and boundaries**:
+
+| Item | Current basis |
 | --- | --- |
-| Correctness | Cross-process, same-process, cross-machine (SSH tunnel) and f32 controls are token-identical; the **upstream manual 4 layers are bit-exact** (max absolute difference = 0) |
-| Time breakdown | **99.3% is actual compute on both sides** (upstream 66.5% + downstream 32.9%); communication, synchronization and batch management total only **0.34%** |
-| Largest single win | The upstream was **idling through 20 layers** (running all 24 but using only the first 4); switching to a manual 4-layer forward made the upstream **10.7x** faster (407.6 -> 38.1 ms/step) |
-| Layer pipeline | The upstream loads only `embed_tokens + L0-3`: **1.47 GB (f16)** vs. 4.55 GB for the full model - **3.1x smaller**, end-to-end 64/64 identical |
-| Falsified | Removing the process boundary (only 8%, and only an artifact of "both sides slow"), reusing `llama_batch` (0.09%), naive upstream layer truncation (numerically broken), `--override-tensor` as a speed-up (actually a capacity knob) |
-| Production readiness | Historical speed comparisons remain for audit. Current Relay admission is based on correctness evidence; an unverified or hard-gated path remains fail-closed, while speed affects default routing. Capacity and long-run/remote-asset evidence are tracked separately |
-| Operator environment | Native Windows `triton-windows==3.8.0.post28` has been measured working with `PYTHONUTF8=1`; WSL2 Ubuntu-22.04 with CUDA/fla is a parallel path, not the only Triton route. There is no CI-level native Triton compile guarantee |
-| L-to-L upstream channel | The pip-bound `llama_get_embeddings_ith` returns `output_norm(H)` (measured cos 0.999998), so it **cannot** serve as a layer-relay upstream. The patched **keep-head channel is now live**: `--path l2l_keep_head` / `d2l2l_keep_head` measured **32/32** (including a three-segment "1 torch upstream + 2 llama downstream" chain); the old `l2l_llama` stays as the fail-loud counter-example |
+| Correctness | Main-repo dual-engine D-to-L matrix **27/27 token-identical** (Qwen2.5-0.5B K=4/8/12/16/20, Qwen3.5-2B K=8/12/16/20; loads prefill 32/128/512, decode 32/64/256; batch 2/4; mixed precision fp16-f32-NF4 x Q4_K_M); per-token criteria are recorded separately from speed and capacity |
+| Mixed precision | A full-precision PyTorch upstream with a quantized GGUF downstream is a deliberate "incomplete quantization" strategy; it must be compared against a same-precision downstream full model |
+| L-to-L upstream channel | The pip-bound `llama_get_embeddings_ith` returns `output_norm(H)` (measured cos 0.999998), so it **cannot** serve as a layer-relay upstream. The patched **keep-head channel is live**: `--path l2l_keep_head` / `d2l2l_keep_head` measured **32/32** (including a three-segment "1 torch upstream + 2 llama downstream" chain); the old `l2l_llama` stays as the fail-loud counter-example |
 | Cut-point solver | `scripts/relay_cut_plan.py` + `src/relay_cut_objective.py`: fits segment profiles (fixed cost + per-layer cost) from **measured** records, then solves for the cut with `capacity_feasible` / `latency_estimate` / `risk_penalty` outputs; n-segment capable, with the Qwen3.5 4-layer-multiple hard constraint. The 2-segment loop passes on both Qwen2.5 (r2 0.96/0.99) and Qwen3.5 (0.79/0.96) |
-| Current positioning | **Architecture-compatibility track**; off by default, does not replace RPC, does not enter the Edge default route; optimization items are registered in [acceptance list D29](验收清单与资源限制登记.md) |
+| Windows operators | Native Windows `triton-windows==3.8.0.post28` is measured working; `PYTHONUTF8=1` is a prerequisite for the compile path; WSL2/fla is a parallel path, not the only option |
+| Production positioning | Correctness evidence satisfies Relay contract admission; speed only shifts the default routing preference. Long-run, remote-artifact auto-distribution and multi-segment failure acceptance remain open |
+| Current documents | Use the [current effective baseline and optimization plan](跨框架接力-当前有效基线与后续优化计划-2026-09-21.md) as the index; conflicting numbers in older reports are triaged by validity |
+| Key quantitative results | **Compute is 99.3%** of the time on both sides (communication + sync + batching only 0.34%); the single largest win was removing the upstream's **idling through 20 layers** (**10.7x**); the layer pipeline loads only `embed_tokens + L0-3`, **1.47 GB vs 4.55 GB** (3.1x); falsified: the process boundary (only 8%), reusing `llama_batch` (0.09%), naive upstream layer truncation (numerically broken), treating `--override-tensor` as a speed-up (it is a capacity knob) |
 
-**Corrected conclusion**: the earlier judgement "IPC is the main cost" has been overturned - that was an illusion masked while both sides were slow. **The leverage is in the compute on both sides (cut point, kernel, batching), not in the transport layer.** See [Same-Process Dual-Backend Relay Implementation and Performance](archive/relay/同进程双后端接力实现与性能-2026-09-16.md) sections 12-14.
+**Where the bottleneck is**: the earlier "IPC is the main cost" judgement does not hold - that was an illusion masked while both sides were slow. **The leverage is in the compute on both sides (cut point, kernel, batching), not in the transport layer.**
+See [Same-Process Dual-Backend Relay Implementation and Performance](archive/relay/同进程双后端接力实现与性能-2026-09-16.md) sections 12-14.
 
 ### Cut-Point Sweep Results (P0, measured 2026-09-18)
 
-A full sweep over the upstream layer count N (N=0 means **no relay** - llama.cpp runs the whole model; the downstream is the corresponding f16 layer-cut GGUF, CPU / 8 threads):
+A full sweep over the upstream layer count N (N=0 means **no relay** - llama.cpp runs the whole model; the downstream is the corresponding f16 layer-cut GGUF, CPU / 8 threads).
+**The conclusion depends on whether the upstream runs on CPU or GPU** - both were measured.
 
-| Upstream layers N | Upstream ms/step | Downstream ms/step | **Total ms/step** | 64-token sequence |
-| ---: | ---: | ---: | ---: | --- |
-| **0 (no relay)** | 1.9 | 184.8 | **186.8** | token-identical to baseline |
-| 4 (current default) | 42.7 | 171.6 | **214.3** | identical |
-| 8 | 77.9 | 145.9 | 223.8 | identical |
-| 12 | 120.8 | 103.8 | 224.6 | identical |
-| 16 | 137.2 | 84.6 | 221.9 | identical |
-| 20 | 182.9 | 66.8 | 249.7 | identical |
-
-- **Correctness does not vary with the cut point**: the greedy sequence is token-identical at every cut point;
-- **Total time is nearly insensitive to the cut point** (N in {4,8,12,16} spans only 214-225 ms/step, about +/-2.6%), **there is no intermediate valley**; the current default N=4 is already optimal under the constraint that relay must happen;
-- **Not relaying is actually fastest** (186.8 ms/step, 12.9% faster than the default N=4) => on the same machine, single-sequence, relay costs about **+15%** (relative to a pure llama.cpp CPU baseline). This is far milder than "about **25x** slower than native llama.cpp full-model GPU" (`333 / 13.5`) - **that 25x is mostly the CPU/GPU difference, not the cost of the relay mechanism**;
-- An upstream layer (torch/CUDA, 8.8-10.7 ms) is **not** cheaper than a downstream layer (llama.cpp/CPU, 7.7-8.6 ms), so "moving layers to the torch GPU" yields no speed advantage on this machine;
-- **Engineering constraint**: the cut point must be a multiple of `full_attention_interval` (Qwen3.5 = 4), otherwise the layer types of the layer-cut GGUF are misaligned and it fails to load (measured at N=2);
-- **Methodology warning**: isolated measurements detached from the end-to-end chain are not trustworthy (this sweep under-measured the upstream per-step cost by about 5.6x); cut-point conclusions must use the end-to-end basis.
-
-Report: `local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-sweep-2026-09-18.json`; ticket: [acceptance list D29](验收清单与资源限制登记.md).
-
-**Same-day correction (v2) - the section above (including its table) only holds when the upstream runs on CPU**: `relay_sameproc_4L.py` never calls `.to(device)` after `from_pretrained`, so `dev = tmodel.device` is **cpu**; the isolated script `upstream_layer_cost.py` explicitly does `.to("cuda")`. Measured with the same script and the same basis for the same 4 layers: **cpu 34.9 ms / cuda 8.3 ms** => that 5.6x difference **is explained by the device** (neither by KV shape nor by idle down-clocking - both were disproved by controls: `shape_sensitivity` fixed 47.4 > growing 34.4; `idle_wakeup_and_overlap` idle 8.56 vs continuous 7.53 = 1.14x, with the SM clock steady at 780/3105 MHz throughout).
-
-After adding `--upstream-device cuda` to relay (with f16 + `--upstream-partial` loading only the first N layers, roughly N/24 x 4.3 GB of VRAM) and re-sweeping:
+**Upstream on GPU (the real deployment direction).** Adding `--upstream-device cuda` to relay (with f16 + `--upstream-partial` loading only the first N layers, roughly N/24 x 4.3 GB of VRAM):
 
 | Upstream layers N | CPU upstream total ms/step | **GPU upstream total ms/step** | Gain |
 | ---: | ---: | ---: | ---: |
@@ -190,12 +173,28 @@ After adding `--upstream-device cuda` to relay (with f16 + `--upstream-partial` 
 | 16 | 221.9 | **146.4** | 1.52x |
 | **20** | 249.7 | **129.1** | **1.93x** |
 
+- **Optimal N=20 = 129.1 ms/step**, **1.45x faster** than the 186.8 ms/step of **no relay** - relay has a clear benefit in this configuration;
 - Upstream **GPU about 2.5-4.3 ms/layer**, downstream **CPU llama.cpp about 5.8-8.6 ms/layer** => **push as many layers as possible to the GPU upstream**;
-- **Corrected optimum (measured) N=20 = 129.1 ms/step**, **1.45x faster** than the 186.8 ms/step of **no relay** - **relay shows a clear benefit for the first time**;
-- The 64-token sequence at every cut point remains **token-identical** (including the GPU upstream);
-- So "no relay is fastest / cut points give no benefit" **holds only for a CPU upstream** and must not be extrapolated. In real deployments the downstream is usually a **CUDA-less edge device**, which supports the direction "put layers on the GPU upstream" - and therefore **P1 (adding a GPU to the downstream) has narrow applicability; what is actually worth doing is "GPU-izing the upstream" and P2 overlap**.
+- The 64-token sequence at every cut point remains **token-identical** (including the GPU upstream).
 
-Report: `local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-p0-corrected-2026-09-18.json` (v2, supersedes v1).
+**Upstream on CPU: the opposite holds** (an early basis, kept only to delimit applicability):
+
+- **No relay is fastest** (186.8 ms/step); relay costs about **+15%**;
+- **Total time is nearly insensitive to the cut point** (N in {4,8,12,16} spans 214-225 ms/step, about +/-2.6%), **there is no intermediate valley**;
+- An upstream layer (8.8-10.7 ms) is **not** cheaper than a downstream layer (7.7-8.6 ms) => in this configuration "moving layers to the torch GPU" gives no speed advantage.
+
+=> So "no relay is fastest / cut points give no benefit" **holds only for a CPU upstream and must not be extrapolated**. In real deployments the downstream is usually a
+**CUDA-less edge device**, which supports "put layers on the GPU upstream": **P1 (adding a GPU to the downstream) has narrow applicability; what is worth doing is "GPU-izing the upstream" and P2 overlap**.
+
+**Two general constraints**:
+
+- **Correctness does not vary with the cut point**: the greedy sequence is token-identical at every cut point;
+- **The cut point must be a multiple of `full_attention_interval`** (Qwen3.5 = 4), otherwise the layer types of the layer-cut GGUF are misaligned and it fails to load (measured at N=2).
+
+⚠️ **Methodology**: isolated measurements detached from the end-to-end chain are not trustworthy - an early sweep under-measured the upstream per-step cost by about 5.6x because the **upstream was actually running on CPU while being compared against GPU data** (same script, same basis, same 4 layers: cpu 34.9 ms / cuda 8.3 ms; the difference is explained by the device, not by KV shape or idle down-clocking). Cut-point conclusions must use the end-to-end basis.
+
+Report: `local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-p0-corrected-2026-09-18.json`;
+ticket: [acceptance list D29](验收清单与资源限制登记.md).
 
 ### Fair Comparison Against "All-llama + CUDA" + P2 Overlap (measured 2026-09-18)
 
