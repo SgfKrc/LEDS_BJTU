@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -286,6 +288,10 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--dll-dir", action="append", default=[])
     ap.add_argument("--ready-file", default=None, help="写就绪标记（含实际端点），供驱动等待")
     ap.add_argument("--max-connections", type=int, default=0, help="0 = 不限制")
+    ap.add_argument("--heartbeat-interval", type=float, default=5.0,
+                    help="★ P4.5 健康检查：定期刷新 ready 文件的时间戳（秒；0 = 关闭）。"
+                         "外部据此判断服务是否还活着 —— 服务跑在 ssh 会话里时会被网络抖动静默带走，"
+                         "没有心跳就分不清'服务已退出'与'模型算错'")
     return ap.parse_args(argv)
 
 
@@ -343,8 +349,30 @@ def main(argv: list[str] | None = None) -> int:
     if args.ready_file:
         target = Path(args.ready_file)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(ready, ensure_ascii=False), encoding="utf-8")
-    print(f"[ready] role={args.role} listening {host}:{port} n_embd={runner.n_embd}", flush=True)
+
+        def _write_ready() -> None:
+            payload = dict(ready)
+            payload["alive_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            payload["pid"] = os.getpid()
+            target.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+        _write_ready()
+        if args.heartbeat_interval and float(args.heartbeat_interval) > 0:
+            # ★ P4.5 健康检查：定期刷新 ready 文件的时间戳，外部据此判断"服务是否还活着"。
+            # 教训：服务跑在 ssh 会话里时，一次网络抖动就会把它**静默带走**，而客户端只会
+            # 看到一个与"模型层错误"难以区分的连接错误（实测踩到，见文档 §8.4）。
+            # 有了心跳，"服务已退出"与"模型算错"就能被分开。
+            def _beat() -> None:
+                while True:
+                    time.sleep(float(args.heartbeat_interval))
+                    try:
+                        _write_ready()
+                    except Exception:  # noqa: BLE001 - 心跳写失败不应终止服务
+                        pass
+
+            threading.Thread(target=_beat, daemon=True).start()
+    print(f"[ready] role={args.role} listening {host}:{port} n_embd={runner.n_embd} "
+          f"(heartbeat={args.heartbeat_interval}s)", flush=True)
 
     served = 0
     try:
