@@ -108,3 +108,17 @@ def test_wrong_committed_reference_is_still_caught() -> None:
     for md in module.iter_md_files():
         problems += [(md, raw, why) for _, raw, why in module.check_file(md)]
     assert problems == [], problems
+
+
+def test_gitignored_inside_repo_target_is_flagged() -> None:
+    """★ 约定 3：**仓库内但未入库**的目标必须被标记。
+
+    本机有工作区独立目录（`tools/`、`docs/agent_tool/` 等已被主仓裁撤的路径），所以
+    「文件存在」在本机恒真 —— 放过这类引用就会**本地全绿、CI 红**（2026-09-23 连挂两次，
+    根因都是这个）。主仓文档本就不该链接已从主仓移除的东西。
+    """
+    module = _load()
+    assert module._is_gitignored("tools/docagent/docs/文档维护Agent工具设计.md") is True
+    assert module._is_gitignored("docs/agent_tool/doc_maintenance_audit.py") is True
+    assert module._is_gitignored("README.md") is False
+    assert module._is_gitignored("docs/项目速览-QLH-at-a-Glance.md") is False
