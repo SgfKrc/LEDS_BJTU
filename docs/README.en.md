@@ -174,7 +174,8 @@ A full sweep over the upstream layer count N (N=0 means **no relay** - llama.cpp
 | **20** | 249.7 | **129.1** | **1.93x** |
 
 - **Optimal N=20 = 129.1 ms/step**, **1.45x faster** than the 186.8 ms/step of **no relay** - relay has a clear benefit in this configuration;
-- Upstream **GPU about 2.5-4.3 ms/layer**, downstream **CPU llama.cpp about 5.8-8.6 ms/layer** => **push as many layers as possible to the GPU upstream**;
+- Upstream **GPU about 2.5-4.3 ms/layer**, downstream **CPU llama.cpp about 5.8-8.6 ms/layer** => **push as many layers as possible to the GPU upstream** (this table's basis);
+- ⚠️ **Scope note**: refitting this table's data (`local_docs/evidence/relay-xframe/CORE-RELAY-XFRAME-02-p0-corrected-2026-09-18.json`) as **fixed overhead + marginal per layer** gives upstream marginal **2.48 ms/layer** (r²=0.944) and downstream marginal **6.43 ms/layer** (r²=0.991), with nearly identical fixed overhead (25.5 vs 26.4) => the marginal basis supports "push to upstream". A separate K=1..20 sweep ([current baseline](跨框架接力-当前有效基线与后续优化计划-2026-09-21.md) §P2) gives upstream 1.54 / downstream 0.91 => the **opposite direction**. The two differ in model, quantization, single-sequence basis and tooling, so they are **not comparable side by side**; do not treat either as a general conclusion until a single unified basis is measured (see that document's §P2 scope note and TODO).
 - The 64-token sequence at every cut point remains **token-identical** (including the GPU upstream).
 
 **Upstream on CPU: the opposite holds** (an early basis, kept only to delimit applicability):
