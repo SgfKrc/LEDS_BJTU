@@ -492,6 +492,8 @@ The very same suite runs twice — in **CI** ([`.github/workflows/checks.yml`](.
 ## Documentation Index
 
 - [Current D-to-L Baseline and Optimization Plan (2026-09-21)](跨框架接力-当前有效基线与后续优化计划-2026-09-21.md)
+- [KTransformers optimization-transfer research and algorithmic/data-layer directions](KTransformers优化迁移调研与算法数据层优化方向-2026-09-23.md)
+- [Large-file split plan: scheduler.py and api_server.py](大文件拆解计划-scheduler与api_server-2026-09-23.md)
 - [Test Quality Audit (2026-09-21): Parallel Flakiness and Race-Coverage Gaps](archive/misc/测试质量审计-2026-09-21.md)
 - [P4.5 Proposal: Dynamic Master Election and Distributed Management](主节点动态选举与分布式管理-P4.5立项-2026-09-21.md)
 - [Mainline Development Plan: Distributed Inference and Edge Optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md)

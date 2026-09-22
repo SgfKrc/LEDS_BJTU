@@ -489,6 +489,8 @@ python -m venv .venv-test
 - [层流水线的节点类型与顶层透明性](docs/archive/relay/层流水线节点类型与顶层透明性-可行性确认-2026-09-17.md)
 - [同进程双后端接力实现与性能](docs/archive/relay/同进程双后端接力实现与性能-2026-09-16.md)
 - [跨框架接力当前有效基线与后续优化计划](docs/跨框架接力-当前有效基线与后续优化计划-2026-09-21.md)
+- [KTransformers 优化迁移调研与算法数据层优化方向](docs/KTransformers优化迁移调研与算法数据层优化方向-2026-09-23.md)
+- [大文件拆解计划：scheduler.py 与 api_server.py](docs/大文件拆解计划-scheduler与api_server-2026-09-23.md)
 - [测试质量审计（2026-09-21）：并行 flaky 实测与竞态覆盖差距](docs/archive/misc/测试质量审计-2026-09-21.md)
 - [P4.5 立项：主节点动态选举与配套分布式管理](docs/主节点动态选举与分布式管理-P4.5立项-2026-09-21.md)
 - [引擎单序列与并发性能对比](docs/archive/relay/引擎单序列与并发性能对比-2026-09-16.md)
