@@ -452,7 +452,10 @@ def _run_y700_probe(
     if ssh_target:
         return _run_y700_ssh(ssh_target)
     if not serial:
-        for candidate in ("y700-ip", "y700"):
+        # 顺序很关键：**局域网别名排最前**。设备刚重启时 Tailscale 往往还在重建打洞
+        # （实测 `tailscale status` 会短暂显示 `relay`），此时 Tailscale IP 超时、
+        # 而局域网 IP 仍然通。所以按 lan -> ip -> ts.net 逐个探测。
+        for candidate in ("y700-lan", "y700-ip", "y700"):
             if _ssh_works(candidate):
                 return _run_y700_ssh(candidate)
     return _run_y700(serial, adb=adb, host=host)
