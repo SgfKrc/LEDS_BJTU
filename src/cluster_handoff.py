@@ -328,6 +328,40 @@ class HandoffCoordinator:
             self._emit_locked("handoff_aborted", self._record)
             return self._record
 
+    def recover_pending(
+        self,
+        *,
+        now_ms: int | None = None,
+        timeout_ms: int = 30_000,
+    ) -> HandoffRecord | None:
+        """Resolve an orphaned fenced handoff without restoring old write access.
+
+        A process restart cannot safely recreate the old role controller from a
+        handoff snapshot.  Until a fresh quorum commits, the old role remains
+        fenced.  Once the bounded recovery window expires, the operation is
+        made auditable as ``handoff_timeout`` and must be started again with a
+        new certificate-first handoff.
+        """
+        now = _now_ms(now_ms)
+        if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or timeout_ms <= 0:
+            raise HandoffError("handoff_timeout_invalid", "timeout_ms must be a positive integer")
+        with self._lock:
+            record = self._record
+            if record is None or record.state != "awaiting_quorum":
+                return record
+            if now < record.updated_at_ms:
+                raise HandoffError("handoff_time_invalid", "now_ms cannot move backwards")
+            if now - record.updated_at_ms < timeout_ms:
+                return record
+            self._record = self._replace(
+                record,
+                state="failed",
+                result="handoff_timeout",
+                updated_at_ms=now,
+            )
+            self._emit_locked("handoff_timeout", self._record)
+            return self._record
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             record = self._record

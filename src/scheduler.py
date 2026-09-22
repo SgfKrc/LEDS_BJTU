@@ -1453,6 +1453,25 @@ class Scheduler:
             return {"status": "disabled", "reason": "handoff_disabled"}
         return coordinator.abort(now_ms=now_ms, reason=reason).to_dict()
 
+    def recover_leader_handoff(
+        self,
+        *,
+        now_ms: int | None = None,
+        timeout_ms: int = 30_000,
+    ) -> dict:
+        """Reconcile a fenced handoff; never restore the old write permit."""
+        coordinator = self._handoff_coordinator
+        if coordinator is None:
+            return {"status": "disabled", "reason": "handoff_disabled"}
+        record = coordinator.recover_pending(
+            now_ms=now_ms,
+            timeout_ms=timeout_ms,
+        )
+        return record.to_dict() if record is not None else {
+            "status": "idle",
+            "reason": "handoff_not_active",
+        }
+
     def _require_control_write(self, action: str) -> None:
         fence = self._control_fence
         if fence is not None:

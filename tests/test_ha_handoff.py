@@ -152,6 +152,29 @@ def test_no_majority_keeps_handoff_awaiting_and_old_role_fenced(tmp_path: Path):
     assert error.value.code == "handoff_old_leader_fenced"
 
 
+def test_recovery_timeout_keeps_old_role_fenced(tmp_path: Path):
+    events: list[dict] = []
+    voter_set, coordinator, old, new = _coordinator(tmp_path, events)
+    coordinator.prepare(
+        "voter-1", {"layout_sha256": "abc"}, reason="maintenance", operator="admin", now_ms=1_001,
+    )
+    waiting = coordinator.commit(
+        available_voter_ids=("voter-0",), now_ms=1_101,
+    )
+    assert waiting.state == "awaiting_quorum"
+
+    still_waiting = coordinator.recover_pending(now_ms=1_101 + 29_999, timeout_ms=30_000)
+    assert still_waiting is not None
+    assert still_waiting.state == "awaiting_quorum"
+    timed_out = coordinator.recover_pending(now_ms=1_101 + 30_000, timeout_ms=30_000)
+    assert timed_out is not None
+    assert timed_out.state == "failed"
+    assert timed_out.result == "handoff_timeout"
+    assert old.can_write(now_ms=1_101 + 30_000) is False
+    assert new.state == "starting"
+    assert events[-1]["event_type"] == "handoff_timeout"
+
+
 def test_old_certificate_change_aborts_commit_without_releasing_old_state(tmp_path: Path):
     events: list[dict] = []
     voter_set, coordinator, old, _ = _coordinator(tmp_path, events)
