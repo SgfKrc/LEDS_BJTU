@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import api_server  # noqa: E402
 import scheduler  # noqa: E402
+from scheduler_sidecars import SchedulerSidecarMixin  # noqa: E402
 from scheduler import (  # noqa: E402
     NodeInfo,
     NodeRole,
@@ -118,6 +119,15 @@ def test_scheduler_source_scan_covers_current_and_split_modules() -> None:
     sources = _scheduler_sources()
     assert sources
     assert all(path.exists() and path.read_text(encoding="utf-8") for path in sources)
+
+
+def test_scheduler_sidecars_are_mixin_methods_with_facade_factory() -> None:
+    assert issubclass(Scheduler, SchedulerSidecarMixin)
+    assert Scheduler.configure_gemma4_pipeline_sidecar is (
+        SchedulerSidecarMixin.configure_gemma4_pipeline_sidecar
+    )
+    instance = Scheduler()
+    assert instance._qwen3_multisidecar_factory() is scheduler.Qwen3PipelineMultiSidecar
 
 
 def test_effective_role_reads_scheduler_runtime_global(monkeypatch) -> None:
