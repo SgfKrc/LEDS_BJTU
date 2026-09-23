@@ -1,11 +1,11 @@
 # 大文件拆解计划：`scheduler.py` 与 `api_server.py`
 
-> 状态：**现行（REFACTOR-LARGEFILE-01/02 已完成）**
+> 状态：**现行（REFACTOR-LARGEFILE-01/02/03 已完成）**
 >
 > 更新日期：2026-09-23
 >
 > 背景：主仓代码量统计显示这两个文件严重超标（`src/` 平均约 840 行/文件）：
-> `REFACTOR-LARGEFILE-02` 前 `src/scheduler.py` 为 14,786 行（`Scheduler` 类 13,695 行）；完成后门面为 13,095 行（类 12,002 行），sidecars mixin 为 1,518 行。
+> `REFACTOR-LARGEFILE-02` 前 `src/scheduler.py` 为 14,786 行（`Scheduler` 类 13,695 行）；完成 `REFACTOR-LARGEFILE-03` 后门面约 3,736 行，`scheduler_task_worker.py` 约 907 行、`scheduler_cluster.py` 约 3,597 行、`scheduler_pipeline.py` 约 4,937 行、`scheduler_types.py` 约 173 行，`scheduler_sidecars.py` 约 1,518 行。
 > `src/api_server.py` 当前仍约 9,774 行。
 > 本计划给出**可独立回滚的分步方案**与**动手前必须先建的安全网**。
 
@@ -59,14 +59,14 @@ KTransformers、算子替换、设备调度或新的 PyTorch 执行语义塞进 
 | # | 子职责 | 拆分结果 |
 | --- | --- | --- |
 | A | 构造 / 依赖注入 / **~40 个锁与状态字典** | 状态仍由 Scheduler 实例持有 |
-| B | 集群角色与 HA 注入点（control fence / auto-role / handoff） | 留待 `scheduler_cluster` 拆分 |
+| B | 集群角色与 HA 注入点（control fence / auto-role / handoff） | 已移至 `scheduler_cluster`；实例状态和依赖仍由 Scheduler 持有 |
 | C | 生命周期 start/stop + TCP server 装配 | 留待 `scheduler_core` 拆分 |
-| D | 节点注册 / 心跳 / Android presence / 设备画像 | 留待 `scheduler_cluster` 拆分 |
+| D | 节点注册 / 心跳 / Android presence / 设备画像 | 已移至 `scheduler_cluster` |
 | E | 节点权重、GPU 选择与 assignment 锚点 | 无状态 helper 已移至 `scheduler_layer_plan` |
 | F | 层分配计算 + 容量规划 + 手工覆盖 | 本票保持原位 |
-| G | 层配置下发 / 权威同步 / 版本栅栏 | 本票保持原位 |
+| G | 层配置下发 / 权威同步 / 版本栅栏 | 对外操作移至 `scheduler_pipeline`；锁与运行时状态仍由 Scheduler 实例持有 |
 | H–K | Gemma4/Qwen3/model-runtime/loopback/dry-run | 60 个方法已移至 `SchedulerSidecarMixin` |
-| L+ | Task-Worker、cluster/client-mode、pipeline/forward、HA … | 留待后续 mixin 票拆分 |
+| L+ | Task-Worker、cluster/client-mode、pipeline/forward、HA … | 已拆至 `scheduler_task_worker`、`scheduler_cluster`、`scheduler_pipeline`；`_effective_role` 与跨域 TCP dispatch 留在门面 |
 
 **关键观察**：模块级可变全局只有 `from config import RUN_MODE, NODE_ROLE, NODE_ID, MAX_NODES, PIPELINE_*` 这几个引用
 （测试会 `monkeypatch.setattr(scheduler_mod, "NODE_ROLE", …)`），其余状态全在**单个实例**上。
@@ -78,13 +78,14 @@ KTransformers、算子替换、设备调度或新的 PyTorch 执行语义塞进 
 ### 3.1 目标结构（依赖单向、无环）
 
 ```
-src/scheduler.py              门面 + re-export + 编排/状态查询（约 1500 行）
+src/scheduler.py              门面 + re-export + 编排/状态查询（当前约 3,737 行）
 src/scheduler_core.py         __init__ 状态、start/stop、status/config、节点注册查询
 src/scheduler_layer_plan.py   纯函数：节点权重、GPU 选择、master 锚点与区间重排（约 257 行）
 src/scheduler_sidecars.py     Qwen3 / Gemma4 / model-runtime-contract / loopback / dry-run（约 1520 行）
-src/scheduler_task_worker.py  Task-Worker 控制面（约 875 行）
-src/scheduler_cluster.py      节点注册/心跳/Android、client-mode、角色转让、HA（约 4400 行）
-src/scheduler_pipeline.py     forward、layer_config、layer_forward、chain、run_pipeline、全模型回退（约 3600 行）
+src/scheduler_task_worker.py  Task-Worker 控制面（约 907 行）
+src/scheduler_cluster.py      节点注册/心跳/Android、client-mode、角色转让、HA（约 3,597 行）
+src/scheduler_pipeline.py     forward、layer_config、layer_forward、chain、run_pipeline、全模型回退（约 4,937 行）
+src/scheduler_types.py        scheduler 共享 DTO 与队列状态类型（约 173 行）
 ```
 
 ```
@@ -116,12 +117,12 @@ scheduler.py（门面/编排）
 
 | 步 | 抽什么 | 手法 | 安全网 |
 | ---: | --- | --- | --- |
-| 1 | `scheduler_layer_plan`（纯函数） | 搬成模块级函数；`Scheduler` 内保留同名兼容转发器 | `test_scheduler.py`、`test_island_engine.py` |
-| 2 | **`scheduler_sidecars`（MVS）** | Mixin；工厂经 Scheduler 门面注入 | §3.2 列出的 6 个测试文件 |
-| 3 | `scheduler_task_worker` | Mixin（`_task_worker_*` 状态仍在 `__init__`） | `test_task_worker_adapter.py`（>2,500 行）、`tests/helpers/task_worker_process.py` |
-| 4 | `scheduler_cluster`（最大一刀） | Mixin；**`_effective_role` 必须留在 `scheduler.py`**，否则 monkeypatch 全线失效 | `TestEffectiveRole`、`TestProvisionalMasterRole`、HA 系列、`test_connect_to_master_bootstrap_recovery` |
-| 5 | `scheduler_pipeline` | Mixin；`_run_pipeline` / `_handle_layer_forward_locked` **最后搬** | `TestPipelineOrchestrationIntegration`、`TestChainTopology`、`TestPipelineMessageDispatch` |
-| 6 | `scheduler.py` 收敛为门面 | 显式 `__all__` + re-export | 新增门面契约测试（§4.3 T1） |
+| 1 | `scheduler_layer_plan`（纯函数） | **已完成**：搬成模块级函数；`Scheduler` 内保留同名兼容转发器 | `test_scheduler.py`、`test_island_engine.py` |
+| 2 | **`scheduler_sidecars`（MVS）** | **已完成**：Mixin；工厂经 Scheduler 门面注入 | §3.2 列出的 6 个测试文件 |
+| 3 | `scheduler_task_worker` | **已完成**：Mixin；`_task_worker_*` 实例状态仍在 `__init__` | Task-Worker 协议、适配器及 layer-forward 回归 |
+| 4 | `scheduler_cluster`（最大一刀） | **已完成**：Mixin；`_effective_role` 与跨域 TCP dispatch 留在门面，保留 facade 模块级 patch 点 | `TestEffectiveRole`、`TestProvisionalMasterRole`、HA 系列、`test_connect_to_master_bootstrap_recovery` |
+| 5 | `scheduler_pipeline` | **已完成**：Mixin；实例 pipeline 状态不迁移，方法实现仅搬移 | `TestPipelineOrchestrationIntegration`、`TestChainTopology`、`TestPipelineMessageDispatch` |
+| 6 | `scheduler.py` 门面收口 | `__all__`/re-export 已由 01 固化；最终 API 迁移后的门面回归归 05 | 门面契约测试与 OpenAPI 快照 |
 
 ---
 
@@ -237,6 +238,14 @@ TestClient(api_server.app).get("/openapi.json").json()["paths"]
 - 新 mixin 不导入 `scheduler`；定向联合回归 `424 passed`，覆盖 baseline、scheduler、Qwen3、Gemma4 与 model-runtime sidecar。
 - `py_compile` 与 `git diff --check` 通过；AST 对比确认搬出的 60 个方法实现一致，唯一方法体适配是侧车 factory 注入。
 
+### 6.3 REFACTOR-LARGEFILE-03 收口记录
+
+- 拆出 `scheduler_task_worker.py`、`scheduler_cluster.py`、`scheduler_pipeline.py` 三个 mixin，并将共享节点/任务/抢占 DTO 放入 `scheduler_types.py`；`Scheduler` 只增加 mixin 继承，状态仍由原实例持有。
+- 搬移 172 个方法；模块级配置和 helper 通过 facade lookup 动态读取，保持 `scheduler` 模块 monkeypatch 行为。`_effective_role`、`_on_tcp_message`、`_on_tcp_disconnect`、`_on_master_connection_lost` 保留在 `Scheduler`，避免跨领域 dispatch 被拆散。
+- AST 对照确认搬移方法体等价（除显式 facade-global lookup 适配）；新增基线测试锁定 MRO、代表性方法归属和运行时 patch 点。
+- Task-Worker、cluster/HA、pipeline 联测：`647 passed`；收口基线测试 `20 passed`。全仓并行测试在 `1071 passed, 16 skipped` 后遇到两个非本票基线/环境失败：缓存命名测试引用的计划文档缺失，以及 Windows `llama.dll` 加载 WinError 127；因此不宣称全仓通过。
+- 清理机械搬移产生的空白行后，`scheduler.py` 约 3,736 行；`import scheduler` 成功，OpenAPI 保持 123 条路径，静态编译通过。
+
 每步之后必须同时满足：
 
 1. 定向测试通过 —— scheduler 侧：
@@ -272,7 +281,7 @@ TestClient(api_server.app).get("/openapi.json").json()["paths"]
 4. `TORCH-OP-REGISTRY-01`：建立逻辑算子、候选实现、设备能力、误差边界和回退实现的合同。
 5. `TORCH-HETERO-PLAN-01` 及后续科研票：研究算子放置、prefill/decode 双计划、激活压缩和 MoE 热度/预取。
 
-`REFACTOR-LARGEFILE-01/02` 已完成；当前下一票为 `REFACTOR-LARGEFILE-03`（task-worker、cluster/HA、pipeline mixin）。在大文件拆分门面继续稳定前，不登记 PyTorch 算子优化已经进入主线；未完成科研票不得改变 llama.cpp/GGUF 默认路径、Edge 无 Torch 边界或 Koakuma 正式 backend 枚举。
+`REFACTOR-LARGEFILE-01/02/03` 已完成；当前下一票为 `REFACTOR-LARGEFILE-04`（按领域拆分 API routers）。在大文件拆分门面继续稳定前，不登记 PyTorch 算子优化已经进入主线；未完成科研票不得改变 llama.cpp/GGUF 默认路径、Edge 无 Torch 边界或 Koakuma 正式 backend 枚举。
 
 ### 联合验收顺序
 

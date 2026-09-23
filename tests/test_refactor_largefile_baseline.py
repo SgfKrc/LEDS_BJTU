@@ -19,7 +19,10 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import api_server  # noqa: E402
 import scheduler  # noqa: E402
+from scheduler_cluster import SchedulerClusterMixin  # noqa: E402
+from scheduler_pipeline import SchedulerPipelineMixin  # noqa: E402
 from scheduler_sidecars import SchedulerSidecarMixin  # noqa: E402
+from scheduler_task_worker import SchedulerTaskWorkerMixin  # noqa: E402
 from scheduler import (  # noqa: E402
     NodeInfo,
     NodeRole,
@@ -128,6 +131,25 @@ def test_scheduler_sidecars_are_mixin_methods_with_facade_factory() -> None:
     )
     instance = Scheduler()
     assert instance._qwen3_multisidecar_factory() is scheduler.Qwen3PipelineMultiSidecar
+
+
+def test_scheduler_split_mixins_preserve_facade_patch_points(monkeypatch) -> None:
+    instance = Scheduler()
+    assert issubclass(Scheduler, SchedulerTaskWorkerMixin)
+    assert issubclass(Scheduler, SchedulerClusterMixin)
+    assert issubclass(Scheduler, SchedulerPipelineMixin)
+    assert "_effective_role" not in SchedulerClusterMixin.__dict__
+    assert Scheduler._on_tcp_message.__qualname__.startswith("Scheduler.")
+    assert Scheduler.register_node is SchedulerClusterMixin.register_node
+    assert Scheduler._run_pipeline is SchedulerPipelineMixin._run_pipeline
+    assert Scheduler._send_task_worker_hello is SchedulerTaskWorkerMixin._send_task_worker_hello
+
+    monkeypatch.setattr(scheduler, "RUN_MODE", "facade-patch-probe")
+    assert instance.get_status()["run_mode"] == "facade-patch-probe"
+
+    enabled = scheduler.TASK_WORKER_EXPERIMENTAL_ENABLED
+    monkeypatch.setattr(scheduler, "TASK_WORKER_EXPERIMENTAL_ENABLED", not enabled)
+    assert instance.get_task_worker_protocol_status()["experiment_enabled"] is not enabled
 
 
 def test_effective_role_reads_scheduler_runtime_global(monkeypatch) -> None:
