@@ -131,6 +131,36 @@ def test_full_inference_offer_without_layer_fields_still_works():
     assert "layer_range" not in message.payload
 
 
+# ---------------------------------------------------------------- ★ 2026-09-23 middle_channel
+
+
+@pytest.mark.parametrize("channel", ["extract_hidden", "keep_head_layer_out"])
+def test_layer_forward_accepts_known_middle_channels(channel):
+    """`middle_channel` 的两个合法值都放行（与 Android/主仓两侧同集合）。"""
+    payload = _offer_payload(**_layer_fields(middle_channel=channel))
+    assert _build(payload).payload["middle_channel"] == channel
+
+
+def test_layer_forward_without_middle_channel_stays_backward_compatible():
+    """缺省（不发该字段）= `extract_hidden`（旧行为）⇒ 既有对端不受影响。"""
+    payload = _offer_payload(**_layer_fields())
+    assert "middle_channel" not in _build(payload).payload
+
+
+def test_unknown_middle_channel_is_rejected():
+    """值域外的通道必须 fail-closed（不能让执行侧按未知通道猜）。"""
+    with pytest.raises(WorkerProtocolError) as exc:
+        _build(_offer_payload(**_layer_fields(middle_channel="bogus_channel")))
+    assert exc.value.code == "unsupported_middle_channel"
+
+
+def test_full_inference_must_not_carry_middle_channel():
+    """★ 关键回归：`middle_channel` 也只对 `layer_forward` 生效（不做全局可选）。"""
+    payload = _offer_payload(stage_type="full_inference", middle_channel="extract_hidden")
+    with pytest.raises(WorkerProtocolError):
+        _build(payload)
+
+
 # ---------------------------------------------------------------- 值校验
 
 @pytest.mark.parametrize(

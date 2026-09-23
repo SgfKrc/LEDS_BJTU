@@ -146,6 +146,26 @@ def test_worker_capability_lists_and_concurrency_are_bounded(golden):
     assert concurrency_error.value.code == "invalid_capabilities"
 
 
+def test_hello_capabilities_may_advertise_middle_channel_and_n_pos_per_embd(golden):
+    """★ 2026-09-23：中间段通道与 M-RoPE 位置分量数是**可选**能力键（向后兼容）。"""
+    hello = copy.deepcopy(golden["messages"][0])
+    hello["payload"]["capabilities"]["middle_channel"] = "keep_head_layer_out"
+    hello["payload"]["capabilities"]["n_pos_per_embd"] = 4
+    decode_message(hello)          # 允许（值域内）
+
+    bad_channel = copy.deepcopy(golden["messages"][0])
+    bad_channel["payload"]["capabilities"]["middle_channel"] = "bogus_channel"
+    with pytest.raises(WorkerProtocolError) as channel_error:
+        decode_message(bad_channel)
+    assert channel_error.value.code == "invalid_capabilities"
+
+    bad_npos = copy.deepcopy(golden["messages"][0])
+    bad_npos["payload"]["capabilities"]["n_pos_per_embd"] = 3
+    with pytest.raises(WorkerProtocolError) as npos_error:
+        decode_message(bad_npos)
+    assert npos_error.value.code == "invalid_capabilities"
+
+
 def test_hello_ack_fields_cannot_claim_an_invalid_negotiation(golden):
     accepted = copy.deepcopy(golden["messages"][1])
     accepted["payload"]["reason_code"] = "unsupported_protocol_version"
