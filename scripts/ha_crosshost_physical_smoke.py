@@ -13,11 +13,13 @@ import argparse
 import base64
 import json
 import os
+import random
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -263,17 +265,17 @@ def _expect_ok(sock: socket.socket, value: dict[str, Any]) -> dict[str, Any]:
     return response
 
 
-def _ssh_process(target: str, remote_root: str, remote_port: int, local_port: int) -> subprocess.Popen[bytes]:
+def _ssh_process(target: str, remote_root: str, remote_port: int, local_port: int,
+                 proxy_command: str | None = None) -> subprocess.Popen[bytes]:
     command = f'cd /d "{remote_root}" && python - --root "{remote_root}" --port {remote_port}'
+    options = ["BatchMode=yes", "ConnectTimeout=8", "ExitOnForwardFailure=yes"]
+    if proxy_command:
+        # ★ 真实弱网（网络层）：整条 SSH 通道经本地 TCP 代理（延迟/丢包注入）
+        options.append(f"ProxyCommand={proxy_command}")
     process = subprocess.Popen(
         [
             "ssh",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=8",
-            "-o",
-            "ExitOnForwardFailure=yes",
+            *[arg for option in options for arg in ("-o", option)],
             "-R",
             f"127.0.0.1:{remote_port}:127.0.0.1:{local_port}",
             target,
@@ -499,7 +501,8 @@ def _run_quorum_exchange(target: str, remote_root: str, *,
     }
 
 
-def _run_surface(target: str, remote_root: str, *, long_steps: int = 1) -> dict[str, Any]:
+def _run_surface(target: str, remote_root: str, *, long_steps: int = 1,
+                 proxy_command: str | None = None) -> dict[str, Any]:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", 0))
@@ -510,7 +513,8 @@ def _run_surface(target: str, remote_root: str, *, long_steps: int = 1) -> dict[
     events: list[dict[str, Any]] = []
     payload = b"physical-ha-control-metadata"
     now_ms = int(time.time() * 1000)
-    first_process = _ssh_process(target, remote_root, remote_port, local_port)
+    first_process = _ssh_process(target, remote_root, remote_port, local_port,
+                                 proxy_command=proxy_command)
     try:
         connection, _ = listener.accept()
         connection.settimeout(15)
@@ -570,7 +574,8 @@ def _run_surface(target: str, remote_root: str, *, long_steps: int = 1) -> dict[
         _stop_ssh(first_process)
         events.append({"event": "surface_worker_stopped", "reason": "simulated_crash"})
 
-        second_process = _ssh_process(target, remote_root, remote_port, local_port)
+        second_process = _ssh_process(target, remote_root, remote_port, local_port,
+                                      proxy_command=proxy_command)
         try:
             connection, _ = listener.accept()
             connection.settimeout(15)
@@ -840,7 +845,85 @@ def _failed_result(target: str, error: Exception) -> dict[str, Any]:
     }
 
 
+def _read_stream(src: Any) -> bytes:
+    """统一读一块：socket 用 `recv`，stdio 用 `read`（`BufferedReader` 没有 `recv` —— 踩过）。"""
+    if hasattr(src, "recv"):
+        return src.recv(65536)
+    return src.read1(65536) if hasattr(src, "read1") else src.read(65536)
+
+
+def _write_stream(dst: Any, chunk: bytes) -> None:
+    """统一写一块：socket 用 `sendall`，stdio 用 `write` + `flush`。"""
+    if hasattr(dst, "sendall"):
+        dst.sendall(chunk)
+    else:
+        dst.write(chunk)
+        dst.flush()
+
+
+def _weaknet_bridge(argv: list[str]) -> int:
+    """★ **真实弱网（网络层）**注入：本脚本以 SSH `ProxyCommand` 代理的形式运行。
+
+    在 stdio 与 `HOST:PORT` 之间双向转发，并按 `--delay-ms`（每块单向延迟）与 `--loss-pct`
+    （按比例**整块丢弃**、交由 TCP 重传 —— 等效链路丢包）注入。
+
+    与 `--inject-delay-ms` 的**区别**：后者只在**应用层**给控制帧加延迟；本模式作用在**整条 SSH
+    通道**上（含其中的控制帧、也含 worker 源码下发），因此才算 §21 里 open 的「真实弱网」的一张证据。
+    """
+    parser = argparse.ArgumentParser(prog="ha_crosshost_physical_smoke --weaknet-bridge")
+    parser.add_argument("--weaknet-bridge", required=True, metavar="HOST:PORT")
+    parser.add_argument("--delay-ms", type=int, default=0)
+    parser.add_argument("--loss-pct", type=float, default=0.0)
+    args = parser.parse_args(argv)
+    host, _, port_text = args.weaknet_bridge.rpartition(":")
+    if not host or not port_text.isdigit():
+        print(f"weaknet bridge: bad target {args.weaknet_bridge!r}", file=sys.stderr)
+        return 2
+    delay_s = max(0.0, float(args.delay_ms) / 1000.0)
+    loss = min(max(float(args.loss_pct), 0.0), 100.0) / 100.0
+    remote = socket.create_connection((host, int(port_text)), timeout=15)
+
+    def _read_chunk(src: Any) -> bytes:
+        return _read_stream(src)
+
+    def _write_chunk(dst: Any, chunk: bytes) -> None:
+        _write_stream(dst, chunk)
+
+    def _pump(dst: Any, src: Any) -> None:
+        try:
+            while True:
+                chunk = _read_chunk(src)
+                if not chunk:
+                    break
+                if loss and random.random() < loss:
+                    continue                      # 丢这一块 ⇒ 上层 TCP 重传
+                if delay_s:
+                    time.sleep(delay_s)
+                _write_chunk(dst, chunk)
+        except (OSError, AttributeError, ValueError):
+            pass
+        finally:
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except (OSError, AttributeError):
+                pass
+
+    stdin = getattr(sys.stdin, "buffer", sys.stdin)
+    stdout = getattr(sys.stdout, "buffer", sys.stdout)
+    upstream = threading.Thread(target=_pump, args=(remote, stdin), daemon=True)
+    upstream.start()
+    try:
+        _pump(stdout, remote)
+    finally:
+        upstream.join(timeout=5)
+        remote.close()
+    return 0
+
+
 def main() -> int:
+    # ★ 真实弱网（网络层）：本脚本同时可作 SSH 的 `ProxyCommand` 代理运行 —— 见 `--weaknet-bridge`。
+    if "--weaknet-bridge" in sys.argv[1:]:
+        return _weaknet_bridge(sys.argv[1:])
     # GBK 控制台下 `--help` / 日志里的非 ASCII 字符会抛 UnicodeEncodeError（项目里踩过，
     # 见 `scripts/relay_health.py` 的同类兜底）⇒ 这里降级为 replace。
     for stream in (sys.stdout, sys.stderr):
@@ -869,13 +952,28 @@ def main() -> int:
     parser.add_argument("--quorum-remote-state",
                         default=r"C:/Users/surface/qlh-keephead/voter-b.sqlite",
                         help="远端 voter 账本路径（SQLite）")
+    parser.add_argument("--weaknet-delay-ms", type=int, default=0,
+                        help="真实弱网（网络层）：SSH 经本地 TCP 代理注入的单向延迟（毫秒）")
+    parser.add_argument("--weaknet-loss-pct", type=float, default=0.0,
+                        help="真实弱网（网络层）：SSH 代理注入的丢包率（%%）")
     parser.add_argument("--evidence", type=Path)
     args = parser.parse_args()
     long_steps = max(1, min(int(args.long_steps), 10_000))
     global _WEAKNET_DELAY_S
     _WEAKNET_DELAY_S = max(0.0, min(float(args.inject_delay_ms), 30_000.0) / 1000.0)
+    proxy_command: str | None = None
+    network_delay_ms = max(0, int(args.weaknet_delay_ms))
+    network_loss_pct = min(max(float(args.weaknet_loss_pct), 0.0), 100.0)
+    if network_delay_ms or network_loss_pct:
+        # ★ 真实弱网（网络层）：SSH 经本脚本的 `--weaknet-bridge` 代理（延迟 + 丢包注入）
+        surface_host = args.surface_target.rpartition("@")[2] or args.surface_target
+        proxy_command = (
+            f'"{sys.executable}" "{Path(__file__).resolve()}" --weaknet-bridge '
+            f"{surface_host}:22 --delay-ms {network_delay_ms} "
+            f"--loss-pct {network_loss_pct}")
     try:
-        surface = _run_surface(args.surface_target, args.surface_root, long_steps=long_steps)
+        surface = _run_surface(args.surface_target, args.surface_root, long_steps=long_steps,
+                               proxy_command=proxy_command)
     except Exception as exc:
         surface = _failed_result("surface", exc)
     try:
@@ -897,6 +995,13 @@ def main() -> int:
         "y700": y700,
         "long_steps": long_steps,
         "quorum": quorum,
+        "weaknet_network": {
+            "via_ssh_proxy": bool(proxy_command),
+            "delay_ms_per_direction": network_delay_ms,
+            "loss_pct": network_loss_pct,
+            "scope": "whole_ssh_channel",
+            "note": "网络层注入（本地 TCP 代理 + TCP 重传补丢包）；与 --inject-delay-ms（仅应用层控制帧）不同",
+        },
         "production_availability_claim": False,
     }
     rendered = json.dumps(report, ensure_ascii=True, sort_keys=True, indent=2) + "\n"

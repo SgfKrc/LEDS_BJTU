@@ -124,3 +124,34 @@ def test_remote_voter_surfaces_stable_error_code():
         right.close()
     message = f"{excinfo.value}{getattr(excinfo.value, 'code', '')}"
     assert "quorum_unavailable" in message
+
+
+def test_weaknet_bridge_stream_adapters_cover_stdio_and_socket():
+    """★ 弱网代理的读写适配：socket 走 recv/sendall，stdio 走 read/write（混用会 AttributeError）。"""
+    import io
+    import socket as _socket
+
+    left, right = _socket.socketpair()
+    try:
+        right.sendall(b"hello")
+        assert smoke._read_stream(left) == b"hello"
+        smoke._write_stream(left, b"world")
+        assert right.recv(16) == b"world"
+    finally:
+        left.close()
+        right.close()
+
+    buffer = io.BytesIO(b"stdio-payload")
+    assert smoke._read_stream(buffer) == b"stdio-payload"
+    sink = io.BytesIO()
+    smoke._write_stream(sink, b"out")
+    assert sink.getvalue() == b"out"
+
+
+def test_weaknet_bridge_is_routed_before_smoke_flow():
+    """`--weaknet-bridge` 必须在冒烟流程**之前**分流（否则 `ProxyCommand` 调用会真去跑冒烟）。"""
+    import inspect
+
+    source = inspect.getsource(smoke.main)
+    assert "--weaknet-bridge" in source
+    assert source.index("_weaknet_bridge") < source.index("_run_surface")
