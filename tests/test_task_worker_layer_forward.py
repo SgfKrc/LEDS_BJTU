@@ -212,3 +212,45 @@ def test_layer_forward_requires_v3_so_v2_clients_are_rejected():
 
 def test_protocol_version_is_at_least_3_for_layer_forward():
     assert PROTOCOL_VERSION >= 3
+
+
+# ---------------------------------------------------------------- ★ 2026-09-23 A12：多序列显式位置
+
+
+def test_layer_forward_accepts_explicit_multi_sequence_positions():
+    """`seq_ids` / `positions` 可选；给了就必须与 `hidden_spec.n_tokens` 等长。"""
+    fields = _layer_fields(hidden_spec={"n_tokens": 2, "n_embd": 8, "dtype": "float32"},
+                           seq_ids=[0, 1], positions=[0, 0])
+    payload = _build(_offer_payload(**fields)).payload
+    assert payload["seq_ids"] == [0, 1]
+    assert payload["positions"] == [0, 0]
+
+
+def test_layer_forward_without_multi_sequence_fields_stays_backward_compatible():
+    """不发这两个字段 = 单序列旧行为（既有对端不受影响）。"""
+    payload = _build(_offer_payload(**_layer_fields())).payload
+    assert "seq_ids" not in payload and "positions" not in payload
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("seq_ids", [0]),            # 长度与 n_tokens 不符
+        ("positions", [0, 0, 0]),    # 长度与 n_tokens 不符
+        ("seq_ids", [0, -1]),        # 负值
+        ("positions", [0, "x"]),     # 非整数
+    ],
+)
+def test_invalid_multi_sequence_fields_are_rejected(field, value):
+    fields = _layer_fields(hidden_spec={"n_tokens": 2, "n_embd": 8, "dtype": "float32"})
+    fields[field] = value
+    with pytest.raises(WorkerProtocolError) as exc:
+        _build(_offer_payload(**fields))
+    assert exc.value.code == f"invalid_{field}"
+
+
+def test_full_inference_must_not_carry_multi_sequence_fields():
+    """★ 关键回归：多序列字段也只对 `layer_forward` 生效（不做全局可选）。"""
+    payload = _offer_payload(stage_type="full_inference", seq_ids=[0])
+    with pytest.raises(WorkerProtocolError):
+        _build(payload)

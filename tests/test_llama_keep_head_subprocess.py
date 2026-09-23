@@ -56,3 +56,38 @@ assert up._worker is None
     )
     output = (result.stdout or "") + (result.stderr or "")
     assert result.returncode == 0, output[-8000:]
+
+
+def test_worker_path_supports_last_segment_hidden_to_token():
+    """★ A14（2026-09-23）：worker 隔离路径下的**末段能力**必须可用。
+
+    回归背景：`forward_hidden_to_token` 的「可选符号检查」原先**没排除 worker 分支** —— worker 模式
+    下符号在子进程里（`self._lib is None`），于是必然抛「缺 `qlh_kh_forward_embd_token`」；
+    表现为 tail 段 `runner_failed`（本轮接线时才被真实跑到）。这里刻意在**已 import llama_cpp**
+    的进程里构造 worker 隔离，再跑一次末段前向。
+    """
+    shim = ROOT / "build" / "keephead" / "build-cpu" / "bin" / "qlh_keep_head.dll"
+    # 末段前向要有 output / output_norm ⇒ 必须用 tail 工件（head 工件没有）
+    model = ROOT / "build" / "cross-framework-layer-poc" / "out" / "qwen25-05b-f16-tail8.gguf"
+    if not shim.is_file() or not model.is_file():
+        pytest.skip("keep-head native artifacts are unavailable")
+    code = """
+import numpy as np
+import llama_cpp                      # ★ 触发 worker 隔离（正是回归场景）
+from llama_keep_head import KeepHeadUpstream
+up = KeepHeadUpstream(SHIM, MODEL, n_ctx=256, n_threads=4,
+                      extra_dll_dirs=[r'C:\\msys64\\ucrt64\\bin'])
+assert up._worker is not None, "预期走 worker 隔离路径"
+hidden = np.zeros((1, up.n_embd), dtype=np.float32)
+token = up.forward_hidden_to_token(hidden)   # ★ 旧实现此处必抛「缺符号」
+assert isinstance(token, int) and token >= 0, f"非法 token: {token}"
+up.close()
+""".replace("SHIM", repr(str(shim))).replace("MODEL", repr(str(model)))
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    result = subprocess.run(
+        [sys.executable, "-c", code], cwd=ROOT, env=env,
+        capture_output=True, text=True, check=False,
+    )
+    output = (result.stdout or "") + (result.stderr or "")
+    assert result.returncode == 0, output[-8000:]

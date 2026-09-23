@@ -76,7 +76,7 @@ _LAYER_FORWARD_OFFER_FIELDS = {
 #: ⚠️ **不能**并入 `_LAYER_FORWARD_OFFER_FIELDS`：那里的字段集合是**精确**校验（缺失即
 #: `field_mismatch`）⇒ 会把可选字段变成必填、破坏既有对端（实测踩到）。可选字段在
 #: `_validate_payload` 里按「payload 是否真的出现」动态放宽。
-_LAYER_FORWARD_OPTIONAL_FIELDS = {"middle_channel"}
+_LAYER_FORWARD_OPTIONAL_FIELDS = {"middle_channel", "seq_ids", "positions"}
 
 #: `middle_channel` 的允许值（协议两侧必须同集合）。
 #: * `extract_hidden` —— `llama_get_embeddings_ith` 通道，返回 `output_norm(H)`（旧默认）；
@@ -680,6 +680,27 @@ def _validate_payload(
                         "middle_channel must be one of "
                         + ", ".join(sorted(_LAYER_FORWARD_MIDDLE_CHANNELS)),
                     )
+            # ★ 2026-09-23（A12）：**多序列显式位置**（可选）—— `seq_ids` / `positions`
+            #   长度必须等于 `hidden_spec.n_tokens`，且每个元素是非负整数；与 Android 侧
+            #   `layerForward(seqIds=…, positions=…)` 同一契约（多序列交错推进时必需）。
+            n_tokens = int(hidden_spec["n_tokens"])
+            for field in ("seq_ids", "positions"):
+                if field not in payload:
+                    continue
+                values = payload[field]
+                if not isinstance(values, (list, tuple)) or len(values) != n_tokens:
+                    raise _error(
+                        f"invalid_{field}", f"payload.{field}",
+                        f"{field} must be a list of length n_tokens ({n_tokens})",
+                    )
+                for index, item in enumerate(values):
+                    # 错误码与 Android 侧一致（`invalid_<field>`）：长度与取值问题都归同一码，
+                    # 便于两侧对账；不用通用 `_require_int`（那会抛 `invalid_integer`）。
+                    if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                        raise _error(
+                            f"invalid_{field}", f"payload.{field}[{index}]",
+                            f"{field} entries must be non-negative integers",
+                        )
         elif "layer_range" in payload or "handoff_at" in payload:
             # 非层段 stage 不得携带层段字段（精确字段集已拦，这里是双保险）
             raise _error(
