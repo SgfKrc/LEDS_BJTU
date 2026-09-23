@@ -99,6 +99,38 @@ def _llama_cpp_loaded() -> bool:
                for name in sys.modules)
 
 
+def _shim_abi_collides_with_llama_cpp(shim_dir: Path) -> bool:
+    """shim 所在目录是否带**与 pip llama_cpp 同名**的 ggml DLL（⇒ 必须隔离进程）。
+
+    ★ 2026-09-23：这是 `WinError 127` 的根因所在，别退回「只在 llama_cpp 已加载时隔离」。
+
+    `qlh_keep_head.dll` 经 `libllama.dll` 依赖 **按 basename** 解析的 `ggml-base.dll` /
+    `ggml.dll`；而 pip 的 `llama_cpp/lib` 用的是**同名**文件但是**更新的** llama.cpp 构建。
+    Windows 的 loader 对同一 basename 在**进程生命周期内只认第一个加载的模块**，
+    且该绑定**不可撤销** —— `os.add_dll_directory` / `PATH` 之后怎么改都换不回来。
+
+    实测（.venv-test，llama_cpp_python 0.3.35）：
+      * `llama_cpp/lib/ggml-base.dll` 导出 `ggml_dsv4_hc_comb` / `_pre` / `_post` /
+        `ggml_lightning_indexer`；
+      * `build/keephead/build-cpu/bin/ggml-base.dll`（更早的构建）**不导出**这 4 个符号；
+      * 只要 keep-head 的 ggml 先被加载，随后 `import llama_cpp.llama_cpp` 就在
+        `CDLL(llama_cpp/lib/llama.dll)` 处抛
+        `RuntimeError: ... [WinError 127] 找不到指定的程序`
+        （xdist worker 更早一步：进程绑定期直接 `0xc0000139`＝STATUS_ENTRYPOINT_NOT_FOUND）。
+
+    ⚠️ 因此隔离判据**不能**是「llama_cpp 是否已导入」—— 那个方向只覆盖了一半：
+    llama_cpp 先导入 ⇒ 走 worker（安全）；keep-head 先导入 ⇒ 就地加载 shim（污染进程，
+    后续 `tests/test_llama_relay_entry.py` 的 `import llama_cpp.llama_cpp` 必炸）。
+    判据必须是「**同名依赖是否真的冲突**」这个**顺序无关**的事实。
+
+    没有同名 ggml 的 shim 目录（例如只带 MinGW 运行时的目录）不冲突 ⇒ 允许就地加载。
+    """
+    for name in ("ggml-base.dll", "ggml.dll"):
+        if (shim_dir / name).is_file():
+            return True
+    return False
+
+
 class KeepHeadUpstream:
     """最小 keep-head 上游：吃 token → 吐「前 K 层输出」`[n_tokens, n_embd]` f32。
 
@@ -118,6 +150,7 @@ class KeepHeadUpstream:
         n_batch: int = 512,
         n_seq_max: int = 1,
         extra_dll_dirs: Sequence[str] = (),
+        _worker_process: bool = False,
     ) -> None:
         if mode not in MODE_CODES:
             raise KeepHeadUnavailable(f"mode 必须是 {sorted(MODE_CODES)}，实得 {mode!r}")
@@ -136,7 +169,18 @@ class KeepHeadUpstream:
 
         self._worker = None
         self.n_seq_max = max(1, int(n_seq_max))
-        if _llama_cpp_loaded():
+        # ★ 隔离判据必须**顺序无关**（2026-09-23 修 `WinError 127`）：
+        #   旧代码只判 `_llama_cpp_loaded()` ⇒ 「keep-head 先加载、llama_cpp 后导入」这一半
+        #   会就地加载 shim，把 keep-head 的 ggml-base.dll/ggml.dll 永久绑进进程，
+        #   后续 `import llama_cpp.llama_cpp` 便以 WinError 127 失败（详见
+        #   `_shim_abi_collides_with_llama_cpp` 的实测说明）。
+        #   现在：同名的 shim 目录**一律**走独立 worker（两个方向都安全）；
+        #   llama_cpp 已导入时也仍然走 worker（保持原有行为与理由）。
+        #   ⚠️ 但 worker 进程自身必须**就地**加载 shim —— 它就是隔离边界，再隔离就是递归。
+        shim_dir = self.shim_path.parent
+        needs_isolation = (_llama_cpp_loaded()
+                           or _shim_abi_collides_with_llama_cpp(shim_dir))
+        if needs_isolation and not _worker_process:
             self._init_isolated_worker(
                 n_ctx=n_ctx, n_threads=n_threads, n_batch=n_batch,
                 n_seq_max=self.n_seq_max,

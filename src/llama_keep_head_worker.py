@@ -1,4 +1,4 @@
-"""Private worker for keep-head when another llama.cpp ABI is already loaded."""
+"""Private worker that isolates keep-head's llama.cpp ABI from the host process."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ def main() -> int:
             args.shim, args.model, mode=args.mode, cut_layer=args.cut_layer,
             n_ctx=args.n_ctx, n_threads=args.n_threads, n_batch=args.n_batch,
             n_seq_max=args.n_seq_max,
-            extra_dll_dirs=args.dll_dir)
+            extra_dll_dirs=args.dll_dir, _worker_process=True)
     except Exception as exc:  # noqa: BLE001 - serialized worker boundary
         _response(ok=False, error=f"{type(exc).__name__}: {exc}")
         return 1
