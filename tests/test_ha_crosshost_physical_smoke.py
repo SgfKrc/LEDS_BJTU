@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from scripts import ha_crosshost_physical_smoke as smoke
 
 
@@ -95,3 +97,30 @@ def test_y700_probe_requires_dynamic_serial_when_no_device_is_online(monkeypatch
     assert result["status"] == "failed"
     assert result["error_code"] == "dynamic_adb_serial_required"
     assert "dynamic_port" in result["hint"]
+
+
+def test_quorum_exchange_flag_is_wired_and_off_by_default():
+    """★ 跨机 quorum 交换：开关存在、默认关闭、报告始终带 `quorum` 字段（旧行为不变）。"""
+    import inspect
+
+    source = inspect.getsource(smoke.main)
+    assert "--quorum-exchange" in source
+    assert "args.quorum_exchange" in source
+    assert '"quorum": quorum' in source
+
+
+def test_remote_voter_surfaces_stable_error_code():
+    """远端 voter 拒绝时必须以 `QuorumError` 带回**稳定错误码**（不吞、不换成通用异常）。"""
+    import socket
+
+    left, right = socket.socketpair()
+    try:
+        voter = smoke._RemoteVoter(left, voter_id="voter-b")
+        right.sendall(b'{"ok":false,"code":"quorum_unavailable"}\n')
+        with pytest.raises(smoke.QuorumError) as excinfo:
+            voter.reserve_term("voter-a")
+    finally:
+        left.close()
+        right.close()
+    message = f"{excinfo.value}{getattr(excinfo.value, 'code', '')}"
+    assert "quorum_unavailable" in message

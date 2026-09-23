@@ -17,6 +17,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,25 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from cluster_transport import TransportEnvelope  # noqa: E402
+
+from cluster_control_contract import (  # noqa: E402
+    VoterSet,
+    VoterSignature,
+    validate_certificate,
+)
+from cluster_quorum import (  # noqa: E402
+    QuorumCollector,
+    QuorumError,
+    QuorumVoter,
+    SQLiteVoterLedger,
+)
+
+try:  # ★ 跨机 quorum 用 Ed25519 签票；缺 cryptography 时该模式 fail-loud（默认不跑）
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (  # noqa: E402
+        Ed25519PrivateKey,
+    )
+except Exception:  # noqa: BLE001
+    Ed25519PrivateKey = None  # type: ignore[assignment]
 
 
 REMOTE_WORKER = r'''
@@ -105,6 +125,96 @@ class PhysicalSmokeError(RuntimeError):
     pass
 
 
+#: ★ 跨机 quorum 的**远端 voter** worker：在 Surface 侧持有自己的 durable 账本（SQLite）与私钥，
+#: 通过 SSH 反向 TCP 响应 `reserve_term` / `prepare` / `sign_vote` / `commit_certificate` / `snapshot`。
+#: 设计意图与 `src/cluster_quorum.py` 里 `QuorumVoter` 的注释一致（"used by the collector and
+#: **future transport**"）⇒ 本机侧用 `_RemoteVoter` 做同接口代理，**不改 quorum 代码**。
+#: ⚠️ 私钥经 SSH 通道传入（不落远端磁盘、不进证据）；这是冒烟工装，不是生产密钥分发方式。
+_REMOTE_VOTER = r'''
+import argparse
+import base64
+import json
+import socket
+import sys
+
+# ★ 配置**不经命令行**传入：SSH→cmd 的多层引号会把 JSON 的 {}"/, 吃掉（项目里反复踩过），
+#   改为在下发源码时用 Python repr 字面量插入下面这一行（见 `_run_quorum_exchange`）。
+# __QLH_VOTER_CONFIG__
+parser = argparse.ArgumentParser()
+parser.add_argument("--root", required=True)
+parser.add_argument("--port", required=True, type=int)
+args = parser.parse_args()
+sys.path.insert(0, args.root + r"\src")
+from cluster_control_contract import QuorumCertificate, VoterSet
+from cluster_quorum import QuorumError, QuorumVoter, SQLiteVoterLedger
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+padding = "=" * (-len(PRIVATE_KEY_B64) % 4)
+private_key = Ed25519PrivateKey.from_private_bytes(
+    base64.urlsafe_b64decode(PRIVATE_KEY_B64 + padding))
+voter_set = VoterSet.from_dict(json.loads(VOTER_SET_JSON))
+ledger = SQLiteVoterLedger(LEDGER_PATH, voter_id=VOTER_ID,
+                           cluster_id=voter_set.cluster_id,
+                           voter_set_epoch=voter_set.voter_set_epoch)
+voter = QuorumVoter(voter_id=VOTER_ID, private_key=private_key,
+                    voter_set=voter_set, ledger=ledger)
+
+
+def send(sock, value):
+    sock.sendall((json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"))
+
+
+def read(sock):
+    data = bytearray()
+    while True:
+        chunk = sock.recv(1)
+        if not chunk:
+            return None
+        if chunk == b"\n":
+            break
+        data.extend(chunk)
+    return json.loads(bytes(data).decode("utf-8"))
+
+
+with socket.create_connection(("127.0.0.1", args.port), timeout=30) as sock:
+    sock.settimeout(30)
+    send(sock, {"ok": True, "event": "voter_ready", "voter_id": VOTER_ID})
+    while True:
+        request = read(sock)
+        if request is None:
+            break
+        op = request.get("op")
+        try:
+            if op == "reserve_term":
+                term = voter.reserve_term(request["leader_id"], now_ms=request.get("now_ms"))
+                send(sock, {"ok": True, "term": int(term)})
+            elif op == "prepare":
+                voter.prepare(request["leader_id"], int(request["term"]),
+                              now_ms=request.get("now_ms"))
+                send(sock, {"ok": True})
+            elif op == "sign_vote":
+                signature = voter.sign_vote(QuorumCertificate.from_dict(request["certificate"]),
+                                            now_ms=request.get("now_ms"))
+                send(sock, {"ok": True, "signature": signature.to_dict()})
+            elif op == "commit_certificate":
+                voter.commit_certificate(QuorumCertificate.from_dict(request["certificate"]),
+                                         now_ms=request.get("now_ms"))
+                send(sock, {"ok": True})
+            elif op == "snapshot":
+                send(sock, {"ok": True, "snapshot": voter.snapshot().to_dict()})
+            elif op == "close":
+                send(sock, {"ok": True})
+                break
+            else:
+                send(sock, {"ok": False, "code": "unknown_op"})
+        except QuorumError as exc:
+            send(sock, {"ok": False, "code": str(getattr(exc, "code", "quorum_error"))})
+        except Exception as exc:  # noqa: BLE001 - 只回稳定码，不回异常内容
+            send(sock, {"ok": False, "code": "remote_voter_error",
+                        "detail": type(exc).__name__})
+'''
+
+
 #: ★ HA-CROSSHOST-01 的 open 项「weak-network」：对**每一次控制帧往返**注入固定延迟。
 #: ⚠️ 这是**应用层注入**，只验证「控制面在 RTT 被抬高时的行为（RTO / 超时 / 重连）」，
 #: **不等于真实弱网**（没有丢包、抖动、带宽限制，也没有真机链路）—— 证据里必须带上注入值，
@@ -179,6 +289,33 @@ def _ssh_process(target: str, remote_root: str, remote_port: int, local_port: in
     return process
 
 
+def _ssh_worker(target: str, remote_root: str, remote_port: int, local_port: int,
+                source: str, extra_args: str = "") -> subprocess.Popen[bytes]:
+    """与 `_ssh_process` 同机制（源码经 stdin 流式传入、控制帧走 SSH 反向 TCP），
+    但可注入**任意 worker 源码**与附加参数 —— 供跨机 quorum voter 使用。"""
+    command = (f'cd /d "{remote_root}" && python - {extra_args} '
+               f'--root "{remote_root}" --port {remote_port}')
+    process = subprocess.Popen(
+        [
+            "ssh",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=8",
+            "-o", "ExitOnForwardFailure=yes",
+            "-R", f"127.0.0.1:{remote_port}:127.0.0.1:{local_port}",
+            target,
+            command,
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdin is not None
+    process.stdin.write(source.encode("utf-8"))
+    process.stdin.flush()
+    process.stdin.close()
+    return process
+
+
 def _stop_ssh(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is None:
         process.terminate()
@@ -187,6 +324,179 @@ def _stop_ssh(process: subprocess.Popen[bytes]) -> None:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=8)
+
+
+def _public_key_b64(private_key: Any) -> str:
+    from cryptography.hazmat.primitives import serialization  # noqa: PLC0415
+
+    raw = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _private_key_b64(private_key: Any) -> str:
+    from cryptography.hazmat.primitives import serialization  # noqa: PLC0415
+
+    raw = private_key.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption())
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+class _RemoteVoter:
+    """把 `QuorumVoter` 的同名方法转发到对端 voter worker —— 跨机代理，**不改 quorum 代码**。
+
+    `QuorumCollector` 只按 duck typing 调用 `reserve_term` / `prepare` / `sign_vote` /
+    `commit_certificate`，因此远端代理天然可替换本地 voter（这正是 `src/cluster_quorum.py`
+    里 `QuorumVoter` 注释所说的 "future transport"）。
+    """
+
+    def __init__(self, sock: socket.socket, *, voter_id: str) -> None:
+        self._sock = sock
+        self.voter_id = voter_id
+
+    def _call(self, request: dict[str, Any]) -> dict[str, Any]:
+        response = _request(self._sock, request)     # 复用既有收发（受弱网注入开关影响）
+        if not response.get("ok"):
+            raise QuorumError(str(response.get("code") or "quorum_error"),
+                              "remote voter rejected the request")
+        return response
+
+    def reserve_term(self, leader_id: str, *, now_ms: int | None = None) -> int:
+        return int(self._call({"op": "reserve_term", "leader_id": leader_id,
+                               "now_ms": now_ms})["term"])
+
+    def prepare(self, leader_id: str, term: int, *, now_ms: int | None = None) -> None:
+        self._call({"op": "prepare", "leader_id": leader_id, "term": int(term),
+                    "now_ms": now_ms})
+
+    def sign_vote(self, certificate: Any, *, now_ms: int | None = None) -> VoterSignature:
+        response = self._call({"op": "sign_vote", "certificate": certificate.to_dict(),
+                               "now_ms": now_ms})
+        return VoterSignature.from_dict(response["signature"])
+
+    def commit_certificate(self, certificate: Any, *, now_ms: int | None = None) -> None:
+        self._call({"op": "commit_certificate", "certificate": certificate.to_dict(),
+                    "now_ms": now_ms})
+
+    def snapshot(self) -> dict[str, Any]:
+        return self._call({"op": "snapshot"})["snapshot"]
+
+
+def _run_quorum_exchange(target: str, remote_root: str, *,
+                         remote_state: str) -> dict[str, Any]:
+    """★ HA-CROSSHOST-01 的 open 项「quorum certificate exchange」的**跨机实测**。
+
+    配 3 个 voter（`QuorumPolicy.election_allowed` 要求 ≥3 ⇒ 两节点场景必须配 3 个），
+    **只联系本机 `voter-a` + Surface `voter-b`** ⇒ `quorum_size == 2` ⇒ 证书的每一票都来自
+    不同主机。三条判据：
+
+    1. **跨机颁证**：`acquire` 成功、`signed_voters == (voter-a, voter-b)`、`validate_certificate` 通过；
+    2. **fail-closed**：只联系 `voter-a` ⇒ `quorum_unavailable`（不许单机自签）；
+    3. **对端 durability**：向 Surface 要 `snapshot`，确认该 term / 证书摘要**持久化在它的 SQLite 账本里**。
+    """
+    if Ed25519PrivateKey is None:
+        raise PhysicalSmokeError("quorum_crypto_unavailable")
+    voter_ids = ("voter-a", "voter-b", "voter-c")
+    keys = {voter_id: Ed25519PrivateKey.generate() for voter_id in voter_ids}
+    voter_set = VoterSet(cluster_id="qlh-physical-quorum", voter_set_epoch=1,
+                         voters={voter_id: _public_key_b64(keys[voter_id])
+                                 for voter_id in voter_ids})
+    local_dir = tempfile.mkdtemp(prefix="qlh-quorum-a-")
+    local_voter = QuorumVoter(
+        voter_id="voter-a", private_key=keys["voter-a"], voter_set=voter_set,
+        ledger=SQLiteVoterLedger(Path(local_dir) / "voter-a.sqlite", voter_id="voter-a",
+                                 cluster_id=voter_set.cluster_id,
+                                 voter_set_epoch=voter_set.voter_set_epoch))
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(20)
+    local_port = int(listener.getsockname()[1])
+    remote_port = 44000 + (local_port % 1000)
+    voter_set_json = json.dumps(voter_set.to_dict(), sort_keys=True, separators=(",", ":"))
+    source = _REMOTE_VOTER.replace(
+        "# __QLH_VOTER_CONFIG__",
+        "\n".join((
+            f"VOTER_ID = {'voter-b'!r}",
+            f"PRIVATE_KEY_B64 = {_private_key_b64(keys['voter-b'])!r}",
+            f"VOTER_SET_JSON = {voter_set_json!r}",
+            f"LEDGER_PATH = {remote_state!r}",
+        )))
+    worker = _ssh_worker(target, remote_root, remote_port, local_port, source)
+    events: list[dict[str, Any]] = []
+    try:
+        try:
+            connection, _ = listener.accept()
+        except OSError as exc:      # 远端 voter 没连上来 ⇒ 附上它的 stderr 便于诊断
+            detail = ""
+            if worker.stderr is not None:
+                try:
+                    detail = worker.stderr.read(2000).decode("utf-8", "replace").strip()
+                except OSError:
+                    detail = ""
+            raise PhysicalSmokeError(
+                f"remote voter did not connect: {exc}; stderr={detail[:400]!r}") from exc
+        connection.settimeout(20)
+        with connection:
+            ready = _recv_line(connection)
+            if not ready.get("ok") or ready.get("event") != "voter_ready":
+                raise PhysicalSmokeError("remote voter did not become ready")
+            events.append({"event": "remote_voter_ready", "voter_id": ready.get("voter_id")})
+            remote_voter = _RemoteVoter(connection, voter_id="voter-b")
+            now_ms = int(time.time() * 1000)
+            collector = QuorumCollector(voter_set=voter_set,
+                                        voters={"voter-a": local_voter,
+                                                "voter-b": remote_voter})
+            single = collector.acquire("voter-a", available_voter_ids=("voter-a",),
+                                       now_ms=now_ms)
+            if single.accepted:
+                raise PhysicalSmokeError("single voter was allowed to issue a certificate")
+            events.append({"event": "single_voter_is_read_only", "reason": single.reason})
+            outcome = collector.acquire("voter-a",
+                                        available_voter_ids=("voter-a", "voter-b"),
+                                        now_ms=now_ms)
+            certificate = outcome.certificate
+            if not outcome.accepted or certificate is None:
+                raise PhysicalSmokeError(f"cross-host quorum failed: {outcome.reason}")
+            signed = tuple(sorted(signature.voter_id for signature in certificate.signatures))
+            if signed != ("voter-a", "voter-b"):
+                raise PhysicalSmokeError(f"unexpected signers: {signed}")
+            validate_certificate(certificate, voter_set, now_ms=now_ms)
+            digest = certificate.digest()
+            events.append({"event": "cross_host_certificate_issued", "term": outcome.term,
+                           "signed_voters": list(signed),
+                           "certificate_digest_prefix": digest[:16]})
+            snapshot = remote_voter.snapshot()
+            if (snapshot.get("active_leader") != "voter-a"
+                    or not snapshot.get("active_certificate_digest")):
+                raise PhysicalSmokeError("remote voter did not persist the certificate")
+            if str(snapshot.get("active_certificate_digest")) != digest:
+                raise PhysicalSmokeError("remote ledger digest does not match the certificate")
+            events.append({"event": "remote_ledger_persisted",
+                           "term": snapshot.get("active_term"),
+                           "digest_prefix": digest[:16]})
+            _expect_ok(connection, {"op": "close"})
+    finally:
+        _stop_ssh(worker)
+        listener.close()
+    return {
+        "status": "passed",
+        "transport": "ssh_reverse_tcp",
+        "voter_ids": list(voter_ids),
+        "contacted_voters": ["voter-a", "voter-b"],
+        "quorum_size": voter_set.quorum_size,
+        "term": outcome.term,
+        "signed_voters": list(signed),
+        "certificate_digest_prefix": digest[:16],
+        "remote_ledger": {"voter_id": snapshot.get("voter_id"),
+                          "active_term": snapshot.get("active_term"),
+                          "active_leader": snapshot.get("active_leader")},
+        "events": events,
+    }
 
 
 def _run_surface(target: str, remote_root: str, *, long_steps: int = 1) -> dict[str, Any]:
@@ -531,6 +841,13 @@ def _failed_result(target: str, error: Exception) -> dict[str, Any]:
 
 
 def main() -> int:
+    # GBK 控制台下 `--help` / 日志里的非 ASCII 字符会抛 UnicodeEncodeError（项目里踩过，
+    # 见 `scripts/relay_health.py` 的同类兜底）⇒ 这里降级为 replace。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--surface-target", default="surface@100.100.52.106")
     parser.add_argument("--surface-root", default=r"C:\Users\surface\Documents\LEDS_BJTU")
@@ -543,8 +860,15 @@ def main() -> int:
     parser.add_argument("--long-steps", type=int, default=1,
                         help="Surface control frames before restart (default: 1)")
     parser.add_argument("--inject-delay-ms", type=int, default=0,
-                        help="★ 弱网模拟：对每次控制帧往返注入该延迟（毫秒，单向 ⇒ 等效 RTT +2×）。"
-                             "属**应用层注入**，证据里会标注注入值；不得当真实网络证据引用")
+                        help="弱网模拟：对每次控制帧往返注入该延迟（毫秒，单向 = RTT +2x）。"
+                             "属应用层注入，证据里会标注注入值；不得当真实网络证据引用")
+    parser.add_argument("--quorum-exchange", action="store_true",
+                        help="跨机 quorum 证书交换：在 Surface 侧起真正的 voter（自带 SQLite 账本），"
+                             "本机 collector 只联系 voter-a + 远端 voter-b（quorum_size=2），"
+                             "证书两票来自两台主机，并核对对端账本已持久化")
+    parser.add_argument("--quorum-remote-state",
+                        default=r"C:/Users/surface/qlh-keephead/voter-b.sqlite",
+                        help="远端 voter 账本路径（SQLite）")
     parser.add_argument("--evidence", type=Path)
     args = parser.parse_args()
     long_steps = max(1, min(int(args.long_steps), 10_000))
@@ -559,12 +883,20 @@ def main() -> int:
                                host=args.y700_host)
     except Exception as exc:
         y700 = _failed_result("y700", exc)
+    quorum: dict[str, Any] | None = None
+    if args.quorum_exchange:
+        try:
+            quorum = _run_quorum_exchange(args.surface_target, args.surface_root,
+                                          remote_state=args.quorum_remote_state)
+        except Exception as exc:
+            quorum = _failed_result("quorum", exc)
     report = {
         "schema_version": "qlh.cluster.crosshost.physical.v1",
         "scenario": "physical_surface_y700_smoke",
         "surface": surface,
         "y700": y700,
         "long_steps": long_steps,
+        "quorum": quorum,
         "production_availability_claim": False,
     }
     rendered = json.dumps(report, ensure_ascii=True, sort_keys=True, indent=2) + "\n"
