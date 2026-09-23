@@ -33,6 +33,11 @@ from pathlib import Path
 UPSTREAM_QUANTS = ("fp16", "f32", "int8", "int4", "nf4")
 HIDDEN_QUANTS = ("none", "f16", "bf16", "int8_block128", "int4_block128")
 
+#: ★ A10：判定严重度排序（`--fail-on` 闸门用）。
+#: `tight` = 余量不足；`no-headroom` = 该档遇到的 prompt 基线本身就没有余量（**没有可用的安全证据**）
+#: ⇒ 与 `tight` 同级（保守）；`unsafe` = 有余量的 prompt 上仍出现翻转 ⇒ 最高。
+_VERDICT_RANK = {"safe": 0, "safe-headroom-only": 0, "tight": 1, "no-headroom": 1, "unsafe": 2}
+
 
 def _parse_case(stem: str) -> tuple[str, str, str] | None:
     """从文件名 stem 解析 `(prompt, upstream, hidden)`；不匹配返回 None。"""
@@ -175,6 +180,10 @@ def main() -> int:
                     help="安全余量：要求 margin_min ≥ threshold + safety_margin")
     ap.add_argument("--min-prompts", type=int, default=6,
                     help="每个量化档至少覆盖的 prompt 数；默认 6")
+    ap.add_argument("--fail-on", choices=("off", "unsafe", "tight"), default="off",
+                    help="★ A10：出现该级别判定时以非零码退出 ⇒ 供 CI / 驱动当闸门用。"
+                         "off=只报告（默认，保持旧行为）；unsafe=有档位不安全即红；"
+                         "tight=连余量不足 / 无安全证据也红")
     ap.add_argument("--out", default=None, help="汇总 JSON 落盘路径")
     args = ap.parse_args()
 
@@ -253,6 +262,19 @@ def main() -> int:
             "records": rows,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"[record] {args.out}")
+
+    if args.fail_on != "off":
+        # ★ A10：闸门 —— 判定达到 `--fail-on` 级别就以 1 退出（CI / 驱动据此变红）。
+        threshold = _VERDICT_RANK[args.fail_on]
+        offenders = [e for e in table
+                     if _VERDICT_RANK.get(str(e["verdict"]), 2) >= threshold]
+        if offenders:
+            detail = ", ".join(f"{e['upstream']}x{e['hidden']}={e['verdict']}"
+                               for e in offenders[:4])
+            more = "" if len(offenders) <= 4 else f"（共 {len(offenders)} 个）"
+            print(f"[gate] FAIL: --fail-on {args.fail_on} 命中 {detail}{more}", file=sys.stderr)
+            return 1
+        print(f"[gate] OK: {len(table)} 个档位均未达到 --fail-on {args.fail_on} 级别")
     return 0
 
 

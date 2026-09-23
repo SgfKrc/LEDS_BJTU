@@ -1,0 +1,40 @@
+# 接力闸门自检（CI 兜底）
+#
+# 为什么有它：`scripts/relay_quant_budget.py`（精度预算闸门）与 `scripts/relay_health.py`
+# （跨机健康检查）此前只在**本机有工件 / 有真机**时才跑 —— CI 里没有兜底，于是"闸门逻辑被改坏"
+# （最典型的一种：记录明明越线却不报红）只能靠人发现。
+#
+# `scripts/ci_relay_gates.py` 用**合成输入**把两条闸门的判定方向钉死：
+#   - 预算闸门：合格集必须 green、越线集必须 red（`--fail-on unsafe`）；
+#   - 健康检查：活监听必须判健康、已释放端口必须判死，且退出码为 1。
+# 纯标准库、秒级、无需网络 / 设备 / 模型 ⇒ 与 doc-checks 同级的兜底检查。
+#
+# 注意：这**不是**真机检查 —— 跨机可用性（Surface / y700 / 隧道）仍需在本机跑
+# `relay_health.py --ssh-ready ...`（见 docs/跨框架接力-当前有效基线与后续优化计划-2026-09-21.md §8.5）。
+
+name: relay-gates
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  relay-gates:
+    runs-on: ubuntu-latest
+    env:
+      # 仓库里有中文输出；显式 UTF-8 避免平台差异带来的解码问题
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 闸门自检不读大文件，跳过 LFS smudge 以加快速度
+          lfs: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 两个被检脚本与驱动均只用标准库 ⇒ 无依赖安装步骤
+      - name: Run relay gate self-checks
+        run: python scripts/ci_relay_gates.py
