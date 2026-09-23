@@ -26,6 +26,15 @@ Python 侧**不直接 ctypes 调 libllama**：`llama_context_params` 是按值�
 * ``mode="layer_inp"``：配**整模工件** + `cut_layer=K`，取第 K 层输入（语义等价，
   但会跑满全部层，只适合数值对照）。
 
+⚠️ **层输出的实现通道（2026-09-23 起）**：上面两个模式现在都走 llama.cpp 的 `layer_inp`
+通道（shim 的 `qlh_kh_load` 里 `mode 0` ⇒ `lid = n_layer`，`mode 1` ⇒ `lid = cut_layer`）。
+`lid == n_layer` 是「第 n_layer 层的输入」= **末层输出（`output_norm` 之前）**，由 llama.cpp
+侧多分配一个槽位实现（见 `scripts/model_tools/patches/llama-cpp-layer-forward-api.patch`）。
+为什么不能继续用 `llama_set_embeddings_nextn`：各架构的 `t_h_nextn` 挂点不同（qwen2 在
+`output_norm` **之前**，qwen35 在**之后** —— 后者多一次 RMSNorm，实测会让 9B 接力首步分叉）。
+**目前登记该槽位的架构只有 `qwen2` 与 `qwen35`**；其他架构会因槽位为空而在 decode 时触发
+GGML_ASSERT（fail-closed，不会静默给出错值）。
+
 ⚠️ 运行时依赖：shim 由 MinGW 构建 ⇒ 除同目录的 `libllama.dll` / `ggml*.dll` 外还需要
 `libgcc_s_seh-1.dll` / `libstdc++-6.dll` / `libwinpthread-1.dll` 与 MSYS 的
 `api-ms-win-crt-*` 副本。本模块会依次把「shim 所在目录」与
@@ -55,8 +64,8 @@ SHIM_SYMBOLS = ("qlh_kh_load", "qlh_kh_forward", "qlh_kh_forward_embd",
 FORWARD_ERRORS = {
     -1: "参数非法（句柄 / tokens / 输出缓冲）",
     -2: "llama_decode 失败",
-    -3: "llama_get_embeddings_layer_inp 返回空（该层导出没打开？）",
-    -4: "llama_get_embeddings_nextn_ith 返回空（nextn 导出没打开，或该架构没把末层输出挂上？）",
+    -3: "llama_get_embeddings_layer_inp 返回空（该槽位导出没打开，或架构没登记该槽位）",
+    -4: "保留（旧 nextn 通道已停用：现统一走 layer_inp 的 n_layer 槽位）",
     -5: "参数非法（句柄 / embd / 输出缓冲）",
 }
 

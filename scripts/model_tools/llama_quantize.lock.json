@@ -6,8 +6,8 @@
     "revision": "47e1de77aa0f06bf73cfd8c5281d95979f89fcbe",
     "license": "MIT"
   },
-  "revision_local": "cb5f7b7a8539108f5680b789afbe9e368d297c25",
-  "revision_local_note": "★ 2026-09-20：QLH 在 submodule 内提交的补丁 commit（detached HEAD）。`upstream.revision` 仍是它基于的上游 commit，用于溯源；submodule 的 HEAD 应当等于本字段。若把补丁改为「只在工作树、不提交」的形态，删掉本字段即可回落到只认 upstream.revision。",
+  "revision_local": "784cbbbbe03568727b9e02e64efda51d52bc8bbf",
+  "revision_local_note": "★ 2026-09-20：QLH 在 submodule 内提交的补丁 commit（detached HEAD）。`upstream.revision` 仍是它基于的上游 commit，用于溯源；submodule 的 HEAD 应当等于本字段。若把补丁改为「只在工作树、不提交」的形态，删掉本字段即可回落到只认 upstream.revision。★ 2026-09-23：层输出槽位（layer_out）改动已作为 submodule commit `784cbbb` 提交（含 9 个架构登记），本字段与 patches[].sha256 已同步。",
   "source": "android/app/src/main/cpp/llama.cpp",
   "cmake_target": "llama-quantize",
   "patches": [
@@ -16,11 +16,20 @@
       "path": "scripts/model_tools/patches/llama-cpp-layer-forward-api.patch",
       "targets": [
         "include/llama.h",
-        "src/models/qwen2.cpp"
+        "src/llama-context.cpp",
+        "src/models/gemma4.cpp",
+        "src/models/llama.cpp",
+        "src/models/openai-moe.cpp",
+        "src/models/qwen2.cpp",
+        "src/models/qwen3.cpp",
+        "src/models/qwen3moe.cpp",
+        "src/models/qwen35moe.cpp",
+        "src/models/qwen3next.cpp",
+        "src/models/qwen35.cpp"
       ],
-      "marker": "★ QLH 2026-09-20",
-      "sha256": "D674FCAB150A56CB8A9470E9F24388D0C7E1FCC307FE966952C224CED318EEA4",
-      "note": "层段接力（layer_forward）所需的上游能力：(1) 把 src/llama-context.cpp 里早已实现但未导出的 set/get_embeddings_layer_inp、set_embeddings_nextn、set_nextn_layer_offset、get_embeddings_nextn[_ith] 这 6 个 API 补进 include/llama.h；(2) src/models/qwen2.cpp 登记 res->t_layer_inp[il]（原先只有 qwen3/qwen35/llama/gemma4 等架构登记，qwen2 缺失会导致 layer_inp 导出触发 GGML_ASSERT），并把最后一层输出（output_norm 之前）挂到 t_h_nextn。不改任何计算语义，全部受 cparams 开关控制（默认关闭）⇒ 正常推理零影响。C+ 层验证：x86_64 自编译后两个 prompt 共 11 步逐 token 一致。"
+      "marker": "★ QLH 2026-09-20（2026-09-23 新增部分用 ★ QLH 2026-09-23）",
+      "sha256": "8C479841560F5FA4B817D0FC716042EE06B06E206C3317C87393C9417A6D659B",
+      "note": "（2026-09-20）把 src/llama-context.cpp 里早已实现但未导出的 set/get_embeddings_layer_inp、set_embeddings_nextn、set_nextn_layer_offset、get_embeddings_nextn[_ith] 这 6 个 API 补进 include/llama.h；src/models/qwen2.cpp 登记 res->t_layer_inp[il]（原先只有 qwen3/qwen35/llama/gemma4 等架构登记，qwen2 缺失会导致 layer_inp 导出触发 GGML_ASSERT），并把最后一层输出（output_norm 之前）挂到 t_h_nextn。（2026-09-23）新增**架构无关的「末层输出（output_norm 之前）」通道**：layer_inp 的槽位多分配一个（cparams.embeddings_layer_inp / embd_layer_inp 大小 = n_layer + 1），索引 lid == n_layer 即「第 n_layer 层的输入」= 末层输出；qwen35.cpp 与 qwen2.cpp 的 graph 在 output_norm 之前登记该槽位。为什么必须新增：qwen35 的 t_h_nextn 设在 output_norm 之后（MTP head 的消费方），拿它当层段上游会多一次 RMSNorm ⇒ 实测 Qwen3.5-9B 两段接力首步即分叉。t_h_nextn 的既有语义不动；其余架构暂未登记该槽位（未登记者在 decode 时 GGML_ASSERT，fail-closed）。验证：Qwen3.5-9B（hybrid + M-RoPE）两段 32/32、三段 32/32；0.5B（qwen2）回归 32/32。（2026-09-23 续）把该槽位登记扩展到 gemma4 / llama / openai-moe / qwen3 / qwen3moe / qwen35moe / qwen3next（连 qwen2 / qwen35 共 9 个架构）—— 这些架构现在都能当层段上游；未登记的架构会在 decode 时 GGML_ASSERT（fail-closed）。"
     }
   ],
   "targets": {

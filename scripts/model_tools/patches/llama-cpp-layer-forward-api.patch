@@ -34,8 +34,86 @@ index b89ab758b..cdde636ec 100644
      //
      // backend sampling API [EXPERIMENTAL]
      // note: use only if the llama_context was created with at least one llama_sampler_seq_config
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 0465430df..73114b703 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -71,8 +71,14 @@ llama_context::llama_context(
+     cparams.no_perf                 = params.no_perf;
+     cparams.warmup                  = false;
+ 
+-    cparams.embeddings_layer_inp.resize(hparams.n_layer(), false);
+-    embd_layer_inp.resize(hparams.n_layer());
++    // ★ QLH 2026-09-23：**多留一个槽位**（索引 == `n_layer`）用于导出「末层输出（`output_norm`
++    //   之前）」—— 语义上就是「第 `n_layer` 层的输入」，也就是下游层段（裁层模型保留
++    //   blk.K..N-1）所期望的输入形态。
++    //   为什么必须新增通道：qwen35.cpp 的 `t_h_nextn` 设在 `output_norm` **之后**（那里的
++    //   消费方是 MTP head），拿它当层段上游会多一次 RMSNorm ⇒ 接力数值分叉（实测 9B 首步）。
++    //   `lid == hparams.n_layer()` 是这一槽位的**唯一合法用法**（该层不存在，只能放"末层之后"）。
++    cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
++    embd_layer_inp.resize(hparams.n_layer() + 1);
+ 
+     cparams.ctx_type     = params.ctx_type;
+     cparams.pooling_type = params.pooling_type;
+@@ -1148,7 +1154,7 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
+ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
+     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
+ 
+-    GGML_ASSERT(lid < model.hparams.n_layer());
++    GGML_ASSERT(lid < model.hparams.n_layer() + 1);   // lid == n_layer ⇒ 末层输出（output_norm 之前）
+ 
+     cparams.embeddings_layer_inp[lid] = enable;
+ 
+diff --git a/src/models/gemma4.cpp b/src/models/gemma4.cpp
+index 6a96979ce..129d57cd5 100644
+--- a/src/models/gemma4.cpp
++++ b/src/models/gemma4.cpp
+@@ -402,6 +402,11 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
+     }
+     cur = inpL;
+ 
++    // ★ QLH 2026-09-23（层段接力上游）：登记「末层输出（output_norm 之前）」到 `t_layer_inp[n_layer]`
++    //   （"第 n_layer 层的输入" 槽位）。上游/中段必须交这个形态的 hidden；各架构 `t_h_nextn`
++    //   的挂点不一致（有的在 norm 之后）⇒ 不能复用它。详见 src/models/qwen2.cpp 与补丁文件。
++    res->t_layer_inp[n_layer] = cur;
++
+     cur = build_norm(cur,
+             model.output_norm, nullptr,
+             LLM_NORM_RMS, -1);
+diff --git a/src/models/llama.cpp b/src/models/llama.cpp
+index 4bfebc884..ca05b6cfc 100644
+--- a/src/models/llama.cpp
++++ b/src/models/llama.cpp
+@@ -228,6 +228,11 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
+     }
+     cur = inpL;
+ 
++    // ★ QLH 2026-09-23（层段接力上游）：登记「末层输出（output_norm 之前）」到 `t_layer_inp[n_layer]`
++    //   （"第 n_layer 层的输入" 槽位）。上游/中段必须交这个形态的 hidden；各架构 `t_h_nextn`
++    //   的挂点不一致（有的在 norm 之后）⇒ 不能复用它。详见 src/models/qwen2.cpp 与补丁文件。
++    res->t_layer_inp[n_layer] = cur;
++
+     cur = build_norm(cur,
+             model.output_norm, NULL,
+             LLM_NORM_RMS, -1);
+diff --git a/src/models/openai-moe.cpp b/src/models/openai-moe.cpp
+index 6d74f9c7e..98abb60ba 100644
+--- a/src/models/openai-moe.cpp
++++ b/src/models/openai-moe.cpp
+@@ -154,6 +154,11 @@ llama_model_openai_moe::graph::graph(const llama_model & model, const llm_graph_
+     }
+     cur = inpL;
+ 
++    // ★ QLH 2026-09-23（层段接力上游）：登记「末层输出（output_norm 之前）」到 `t_layer_inp[n_layer]`
++    //   （"第 n_layer 层的输入" 槽位）。上游/中段必须交这个形态的 hidden；各架构 `t_h_nextn`
++    //   的挂点不一致（有的在 norm 之后）⇒ 不能复用它。详见 src/models/qwen2.cpp 与补丁文件。
++    res->t_layer_inp[n_layer] = cur;
++
+     cur = build_norm(cur,
+             model.output_norm, NULL,
+             LLM_NORM_RMS, -1);
 diff --git a/src/models/qwen2.cpp b/src/models/qwen2.cpp
-index e9c2ea80a..d708bdaa4 100644
+index e9c2ea80a..081aaac5a 100644
 --- a/src/models/qwen2.cpp
 +++ b/src/models/qwen2.cpp
 @@ -69,6 +69,17 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
@@ -56,10 +134,16 @@ index e9c2ea80a..d708bdaa4 100644
          ggml_tensor * inpSA = inpL;
  
          // norm
-@@ -134,6 +145,24 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
+@@ -134,6 +145,30 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
      }
      cur = inpL;
  
++    // ★ QLH 2026-09-23（层段接力上游）：与 qwen35 一致，把「末层输出（`output_norm` 之前）」
++    //   登记到 `t_layer_inp[n_layer]`（"第 n_layer 层的输入"槽位）。本架构的 t_h_nextn 本来
++    //   就在 norm 之前，但为让 shim/Python 只用**一条**通道（不依赖各架构 t_h_nextn 的差异），
++    //   这里同样登记一份。
++    res->t_layer_inp[n_layer] = cur;
++
 +    // ★ QLH 2026-09-20（层段接力 / C+ 验证）：把「最后一层的输出」暴露到 t_h_nextn。
 +    //
 +    // 语义：此处 `cur` 是**未经 output_norm** 的层输出，正是**裁层模型**（保留
@@ -81,3 +165,84 @@ index e9c2ea80a..d708bdaa4 100644
      cur = build_norm(cur,
              model.output_norm, NULL,
              LLM_NORM_RMS, -1);
+diff --git a/src/models/qwen3.cpp b/src/models/qwen3.cpp
+index f4b2a2aeb..cc7ebae88 100644
+--- a/src/models/qwen3.cpp
++++ b/src/models/qwen3.cpp
+@@ -142,6 +142,11 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
+     }
+     cur = inpL;
+ 
++    // ★ QLH 2026-09-23（层段接力上游）：登记「末层输出（output_norm 之前）」到 `t_layer_inp[n_layer]`
++    //   （"第 n_layer 层的输入" 槽位）。上游/中段必须交这个形态的 hidden；各架构 `t_h_nextn`
++    //   的挂点不一致（有的在 norm 之后）⇒ 不能复用它。详见 src/models/qwen2.cpp 与补丁文件。
++    res->t_layer_inp[n_layer] = cur;
++
+     cur = build_norm(cur,
+             model.output_norm, NULL,
+             LLM_NORM_RMS, -1);
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index d8ffe43ae..1c16c49a0 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -206,6 +206,12 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
+     }
+     cur = inpL;
+ 
++    // ★ QLH 2026-09-23（层段接力上游）：登记「末层输出（`output_norm` 之前）」到
++    //   `t_layer_inp[n_layer]` —— 即"第 n_layer 层的输入"槽位（见 llama-context.cpp 的槽位分配）。
++    //   为什么不能复用 `t_h_nextn`：本架构把 t_h_nextn 设在 `output_norm` **之后**（MTP head 消费），
++    //   拿它当上游会多一次 RMSNorm ⇒ 下游层段数值分叉（实测 9B 首步即分叉）。
++    res->t_layer_inp[n_layer] = cur;
++
+     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+ 
+     cb(cur, "h_nextn", -1);
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 7b0876cbb..7b5a1b713 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -229,6 +229,11 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
+     }
+     cur = inpL;
+ 
++    // ★ QLH 2026-09-23（层段接力上游）：登记「末层输出（output_norm 之前）」到 `t_layer_inp[n_layer]`
++    //   （"第 n_layer 层的输入" 槽位）。上游/中段必须交这个形态的 hidden；各架构 `t_h_nextn`
++    //   的挂点不一致（有的在 norm 之后）⇒ 不能复用它。详见 src/models/qwen2.cpp 与补丁文件。
++    res->t_layer_inp[n_layer] = cur;
++
+     // post-norm hidden state feeds both the LM head and the MTP seed below
+     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+ 
+diff --git a/src/models/qwen3moe.cpp b/src/models/qwen3moe.cpp
+index 6f6df5390..9d987524c 100644
+--- a/src/models/qwen3moe.cpp
++++ b/src/models/qwen3moe.cpp
+@@ -162,6 +162,11 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
+     }
+     cur = inpL;
+ 
++    // ★ QLH 2026-09-23（层段接力上游）：登记「末层输出（output_norm 之前）」到 `t_layer_inp[n_layer]`
++    //   （"第 n_layer 层的输入" 槽位）。上游/中段必须交这个形态的 hidden；各架构 `t_h_nextn`
++    //   的挂点不一致（有的在 norm 之后）⇒ 不能复用它。详见 src/models/qwen2.cpp 与补丁文件。
++    res->t_layer_inp[n_layer] = cur;
++
+     cur = build_norm(cur,
+             model.output_norm, NULL,
+             LLM_NORM_RMS, -1);
+diff --git a/src/models/qwen3next.cpp b/src/models/qwen3next.cpp
+index 09b66423d..998d0477b 100644
+--- a/src/models/qwen3next.cpp
++++ b/src/models/qwen3next.cpp
+@@ -171,6 +171,11 @@ llama_model_qwen3next::graph::graph(const llama_model & model, const llm_graph_p
+     }
+     cur = inpL;
+ 
++    // ★ QLH 2026-09-23（层段接力上游）：登记「末层输出（output_norm 之前）」到 `t_layer_inp[n_layer]`
++    //   （"第 n_layer 层的输入" 槽位）。上游/中段必须交这个形态的 hidden；各架构 `t_h_nextn`
++    //   的挂点不一致（有的在 norm 之后）⇒ 不能复用它。详见 src/models/qwen2.cpp 与补丁文件。
++    res->t_layer_inp[n_layer] = cur;
++
+     // Final norm
+     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+ 

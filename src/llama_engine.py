@@ -105,6 +105,25 @@ def _new_llama_with_seq_max(load_kwargs: Dict[str, Any], n_seq_max: Optional[int
         _lc.llama_context_default_params = original_default_params
 
 
+def _model_n_pos_per_embd(native_model, llama_cpp_module) -> int:
+    """每个 token 的**位置分量数**（M-RoPE 模型为 4，其余为 1）。
+
+    与 llama.cpp 的 `llama_hparams::n_pos_per_embd()` 对齐：`MROPE` / `IMROPE` ⇒ 4。
+    为什么需要它：`embd` 注入通道下 llama.cpp 按 **planar** 布局取 `pos`
+    （`llama-batch.cpp::llama_batch_allocr::ubatch_add`：
+    `src_off = batch.token ? 0 : j*batch.n_tokens`）⇒ 调用方必须提供
+    `n_tokens * n_pos_per_embd` 个位置；只给 n_tokens 个会让 M-RoPE 模型读到越界位置。
+    见 `forward_layers_from_hidden()`（层段接力的下游入口）。
+    """
+    try:
+        rope = int(llama_cpp_module.llama_model_rope_type(native_model))
+    except AttributeError:   # 老绑定没有该 API ⇒ 只能按单分量处理（等价于修复前的行为）
+        return 1
+    mrope = int(getattr(llama_cpp_module, "LLAMA_ROPE_TYPE_MROPE", 8))
+    imrope = int(getattr(llama_cpp_module, "LLAMA_ROPE_TYPE_IMROPE", 40))
+    return 4 if rope in (mrope, imrope) else 1
+
+
 class LlamaCppEngine:
     """
     llama.cpp 推理引擎 — 面向 CPU / 集显环境优化。
@@ -1573,14 +1592,19 @@ class LlamaCppEngine:
             if len(pos_list) != n_tokens:
                 raise ValueError(f"positions 长度 {len(pos_list)} != n_tokens {n_tokens}")
 
-        batch = M.llama_batch_init(n_tokens, n_embd, 1)
+        # ★ M-RoPE（Qwen3.5 等，n_pos_per_embd = 4）：**embd 注入通道**下 llama.cpp 按 planar 取
+        #   位置 ⇒ 必须先用倍数分配、再把同一位置广播到各分量（与 token 通道语义一致）。
+        #   只填 n_tokens 个会让 M-RoPE 模型读到越界位置 ⇒ 位置语义错、argmax 首步即分叉。
+        n_pos_per_embd = _model_n_pos_per_embd(native_model, M)
+        batch = M.llama_batch_init(n_tokens * n_pos_per_embd, n_embd, 1)
         try:
             for i in range(n_tokens):
                 batch.n_seq_id[i] = 1
                 batch.seq_id[i][0] = seq_list[i]
                 # ★ 每个 token 都可能是「某条序列的末位」⇒ logits 全开（下游只跑少数 token，开销可接受）
                 batch.logits[i] = 1
-                batch.pos[i] = pos_list[i]
+                for j in range(n_pos_per_embd):
+                    batch.pos[j * n_tokens + i] = pos_list[i]
             batch.n_tokens = n_tokens
             ctypes.memmove(batch.embd, h.ctypes.data, h.nbytes)
             rc = M.llama_decode(native_ctx, batch)

@@ -118,14 +118,33 @@ class KeepHeadMiddleRunner:
 
 
 class TailRunner:
-    """末段：吃 hidden → 吐 token（主仓 llama_engine）。"""
+    """末段：吃 hidden → 吐 token（主仓 llama_engine）。
 
-    def __init__(self, *, model: str, n_ctx: int, n_threads: int) -> None:
+    ★ 2026-09-23：pip 绑定的 `Llama.__init__` 会**无条件**把 `flash_attn_type` 写成
+    `DISABLED`、把 `n_threads_batch` 写成 `multiprocessing.cpu_count()`；而自建 shim 那份
+    llama.cpp 是 `flash_attn = auto → enabled`、`n_threads_batch = n_threads`。这两项在
+    32-token prefill（`ubatch.n_tokens > 1`）上都会改变浮点结果 ⇒ 与 shim 段**混用**时可能把
+    近并列的 top-1 翻转（实测：同一 head 段下 9B 两段 pip tail 1/32、shim tail 32/32）。
+    这里把两者暴露为可显式对齐的参数；不传则保持 pip 默认（便于复现差异本身）。
+    """
+
+    def __init__(self, *, model: str, n_ctx: int, n_threads: int,
+                 flash_attn: bool = True, n_threads_batch: int | None = None) -> None:
         from llama_engine import LlamaCppEngine  # noqa: PLC0415
 
+        # 默认与自建 shim 取齐（`flash_attn=True`、`n_threads_batch=n_threads`）：
+        #   - flash attention 是**判据关键**：pip 绑定默认 DISABLED 时 9B 两段 1/32，
+        #     打开后 32/32（单变量实测：只对齐 batch 线程仍 1/32）；
+        #   - batch 线程数不是判据关键，但取齐可避免无谓的浮点差异。
+        load_kwargs: dict[str, object] = {
+            "flash_attn": bool(flash_attn),
+            "n_threads_batch": (int(n_threads_batch)
+                                if (n_threads_batch is not None and int(n_threads_batch) > 0)
+                                else int(n_threads)),
+        }
         self._engine = LlamaCppEngine()
         self._engine.load_model(model_path=str(model), n_ctx=n_ctx, n_threads=n_threads,
-                               n_seq_max=1)
+                               n_seq_max=1, **load_kwargs)
         if not self._engine.is_loaded:
             raise RuntimeError(f"下游模型加载失败：{model}")
         import llama_cpp.llama_cpp as M  # noqa: PLC0415
@@ -134,8 +153,14 @@ class TailRunner:
         self.n_embd = int(M.llama_model_n_embd_inp(native))
         self.n_layer = int(M.llama_model_n_layer(native))
         self._pos = 0
+        # ★ 逐段引擎/参数标识（§10.2 待办的一部分）：写清实际生效的构建与开关
         print(json.dumps({"role": "tail", "n_embd": self.n_embd, "n_layer": self.n_layer,
-                          "channel": "llama_engine.forward_layers_from_hidden"}), flush=True)
+                          "channel": "llama_engine.forward_layers_from_hidden",
+                          "flash_attn": bool(flash_attn),
+                          "n_threads_batch": (int(n_threads_batch)
+                                              if n_threads_batch is not None else None),
+                          "llama_cpp_version": getattr(
+                              __import__("llama_cpp"), "__version__", "?")}), flush=True)
 
     def reset(self) -> None:
         self._pos = 0
@@ -297,6 +322,14 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
                          "会跑满全部层，只适合验证或没有裁层工件时）")
     ap.add_argument("--cut-layer", type=int, default=None,
                     help="--mode layer_inp 必需：切点 K（取第 K 层输入 = 前 K 层输出）")
+    ap.add_argument("--tail-no-flash-attn", action="store_true",
+                    help="★ 仅 --role tail（pip llama_engine）：**关闭** flash attention。"
+                         "默认打开（与自建 shim 的 AUTO→enabled 取齐）—— pip 绑定默认写成 "
+                         "DISABLED，那是 9B 两段 1/32 的根因（单变量实测：只对齐 batch 线程"
+                         "仍 1/32，只打开 FA 即 32/32）。此开关只用于复现差异")
+    ap.add_argument("--tail-threads-batch", type=int, default=None,
+                    help="★ 仅 --role tail（pip llama_engine）：批处理线程数；缺省取 --threads "
+                         "（与 shim 一致。pip 绑定默认 cpu_count()）")
     ap.add_argument("--max-tokens", type=int, default=RELAY_DEFAULT_MAX_TOKENS)
     ap.add_argument("--dll-dir", action="append", default=[])
     ap.add_argument("--ready-file", default=None, help="写就绪标记（含实际端点），供驱动等待")
@@ -350,7 +383,9 @@ def main(argv: list[str] | None = None) -> int:
                                     extra_dll_dirs=list(args.dll_dir),
                                     n_seq_max=args.n_seq_max, n_batch=args.n_batch)
         else:
-            runner = TailRunner(model=args.model, n_ctx=args.n_ctx, n_threads=args.threads)
+            runner = TailRunner(model=args.model, n_ctx=args.n_ctx, n_threads=args.threads,
+                                flash_attn=not bool(args.tail_no_flash_attn),
+                                n_threads_batch=args.tail_threads_batch)
         serve = serve_relay_connection
 
     if args.n_embd is not None and int(args.n_embd) != int(runner.n_embd):
