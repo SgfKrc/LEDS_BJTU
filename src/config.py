@@ -407,7 +407,11 @@ PIPELINE_TIMEOUT = 120                   # 流水线单步超时（秒），含�
 PIPELINE_MODEL_SYNC_TIMEOUT = _env_float(
     "QLH_PIPELINE_MODEL_SYNC_TIMEOUT", 60.0, min_val=1.0, max_val=600.0,
 )                                           # 等待从节点同步模型和分层 ACK
-PIPELINE_MAX_CONCURRENT = 1              # 最大并发流水线任务数（当前仅支持 1，串行执行）
+# ⚠️ **未接线**（全仓仅此一处定义、**无消费者**）：它只说明「D 档层流水线是串行的」，
+# 真正的串行由 `src/scheduler.py` 的 `_pipeline_lock` 保证。多请求交叠落地后再接线
+# （并行组 P1「多请求/多序列交叠」），在那之前**不要**把它当生效配置读。
+# 见 docs/未完成工作备忘-2026-09-23.md 的 A3。
+PIPELINE_MAX_CONCURRENT = 1              # 最大并发流水线任务数（当前仅支持 1，串行执行；**未接线**）
 # CPU-only workers may need tens of seconds for the first layer forward over
 # a DERP/Tailscale path.  Keep this configurable so deployments can tune it
 # to their slowest participating node without changing source code.
