@@ -180,6 +180,10 @@ scripts/*
 !scripts/llama_relay_probe.py
 !scripts/llama_relay_xframe_probe.py
 !scripts/llama_rpc_sim.py
+!scripts/torch_operator_profile.py
+!scripts/torch_activation_compress.py
+!scripts/torch_hardware_admit.py
+!scripts/torch_lan_echo_probe.py
 !scripts/setup_envs.py
 !scripts/setup_test_env.py
 !scripts/setup_qwen3_sidecar_env.py
@@ -223,5 +227,3 @@ scripts/*
 runtime-master*.log
 surface-ssh*.log
 .gitignore_bak
-
-
