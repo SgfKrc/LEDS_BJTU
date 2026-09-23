@@ -105,6 +105,18 @@ class PhysicalSmokeError(RuntimeError):
     pass
 
 
+#: ★ HA-CROSSHOST-01 的 open 项「weak-network」：对**每一次控制帧往返**注入固定延迟。
+#: ⚠️ 这是**应用层注入**，只验证「控制面在 RTT 被抬高时的行为（RTO / 超时 / 重连）」，
+#: **不等于真实弱网**（没有丢包、抖动、带宽限制，也没有真机链路）—— 证据里必须带上注入值，
+#: 不得当网络证据引用（见 `docs/主节点动态选举与分布式管理-P4.5立项-2026-09-21.md` §18）。
+_WEAKNET_DELAY_S = 0.0
+
+
+def _inject_delay() -> None:
+    if _WEAKNET_DELAY_S > 0:
+        time.sleep(_WEAKNET_DELAY_S)
+
+
 def _send_line(sock: socket.socket, value: dict[str, Any]) -> None:
     sock.sendall((json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"))
 
@@ -127,7 +139,10 @@ def _recv_line(sock: socket.socket) -> dict[str, Any]:
 
 
 def _request(sock: socket.socket, value: dict[str, Any]) -> dict[str, Any]:
+    # ★ 弱网模拟：发送前 + 接收前各注入一次 ⇒ 等效把控制面 RTT 抬高 2×delay（默认 0 = 旧行为）。
+    _inject_delay()
     _send_line(sock, value)
+    _inject_delay()
     return _recv_line(sock)
 
 
@@ -290,6 +305,12 @@ def _run_surface(target: str, remote_root: str, *, long_steps: int = 1) -> dict[
             "rto_ms": max(0, int((time.perf_counter() - failure_started) * 1000)),
             "rpo": {"last_durable_sequence": 0, "lost_events": 0, "scope": "transport_only"},
             "long_running": long_running,
+            "weaknet": {
+                "inject_delay_ms_per_direction": int(_WEAKNET_DELAY_S * 1000),
+                "effective_rtt_delta_ms": int(_WEAKNET_DELAY_S * 2000),
+                "scope": "app_layer_control_frame_only",
+                "note": "应用层延迟注入；不含丢包/抖动/带宽限制，**不是**真实弱网证据",
+            },
         }
     finally:
         _stop_ssh(first_process)
@@ -521,9 +542,14 @@ def main() -> int:
     parser.add_argument("--adb", help="path to adb; defaults to PATH or the local Android SDK")
     parser.add_argument("--long-steps", type=int, default=1,
                         help="Surface control frames before restart (default: 1)")
+    parser.add_argument("--inject-delay-ms", type=int, default=0,
+                        help="★ 弱网模拟：对每次控制帧往返注入该延迟（毫秒，单向 ⇒ 等效 RTT +2×）。"
+                             "属**应用层注入**，证据里会标注注入值；不得当真实网络证据引用")
     parser.add_argument("--evidence", type=Path)
     args = parser.parse_args()
     long_steps = max(1, min(int(args.long_steps), 10_000))
+    global _WEAKNET_DELAY_S
+    _WEAKNET_DELAY_S = max(0.0, min(float(args.inject_delay_ms), 30_000.0) / 1000.0)
     try:
         surface = _run_surface(args.surface_target, args.surface_root, long_steps=long_steps)
     except Exception as exc:
