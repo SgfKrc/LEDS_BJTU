@@ -1,12 +1,19 @@
 # 大文件拆解计划：`scheduler.py` 与 `api_server.py`
 
-> 状态：**现行（REFACTOR-LARGEFILE-01/02/03 已完成）**
+> 状态：**历史参考（REFACTOR-LARGEFILE-01 至 05 已完成，计划收口后归档）**
+>
+> 归档（2026-09-23）：01–05 全部落地（`src/api/` 领域路由拆分 + 收口验收，全量回归
+> 990 passed / 4 skipped）⇒ 移入 `docs/archive/refactor/`，**不再随实现维护**；
+> 文中源码行号与路径均为**拆分前与收口时**的口径。
+> 现行入口：[主线开发计划](../../主线开发计划-分布式推理与边缘优化-2026-09-14.md)、
+> [文档状态与清理清单](../../文档状态与清理清单.md)、
+> [跨框架接力当前有效基线](../../跨框架接力-当前有效基线与后续优化计划-2026-09-21.md)。
 >
 > 更新日期：2026-09-23
 >
 > 背景：主仓代码量统计显示这两个文件严重超标（`src/` 平均约 840 行/文件）：
 > `REFACTOR-LARGEFILE-02` 前 `src/scheduler.py` 为 14,786 行（`Scheduler` 类 13,695 行）；完成 `REFACTOR-LARGEFILE-03` 后门面约 3,736 行，`scheduler_task_worker.py` 约 907 行、`scheduler_cluster.py` 约 3,597 行、`scheduler_pipeline.py` 约 4,937 行、`scheduler_types.py` 约 173 行，`scheduler_sidecars.py` 约 1,518 行。
-> `src/api_server.py` 当前仍约 9,774 行。
+> 完成 `REFACTOR-LARGEFILE-04` 全量路由迁移后，`src/api_server.py` 约 4,731 行；原 144 个 OpenAPI 操作均由领域 `APIRouter` 提供。
 > 本计划给出**可独立回滚的分步方案**与**动手前必须先建的安全网**。
 
 > `REFACTOR-LARGEFILE-01` 证据：`tests/test_refactor_largefile_baseline.py`、
@@ -19,7 +26,7 @@
 | 文件 | 形状 | 本质 |
 | --- | --- | --- |
 | `src/scheduler.py` | 拆分前 14,786 行，**主要逻辑仍集中在单个 `Scheduler` 类**，模块级公共符号已建立显式门面契约 | **上帝对象** —— 拆分的本质是给 `Scheduler` 减负，不是给文件分堆 |
-| `src/api_server.py` | 9,774 行，**144 个路由全部挂在模块级单例 `app` 上**（无 `APIRouter` / `include_router` / `mount`） | 单体 FastAPI 应用 —— 拆分的本质是**按领域切路由 + 抽共享状态** |
+| `src/api_server.py` | 拆分前 9,774 行、144 个操作；当前约 4,731 行，144 个操作由领域 `APIRouter` 接入 | 作为应用组合根与兼容门面，保留共享状态、lifespan、schema 和 patch 点 |
 
 **共同的兼容策略**：`src/scheduler.py` 与 `src/api_server.py` **永不删除**，始终作为**唯一对外模块名**做兼容门面；
 优先移动定义、不改调用点；如需保留 monkeypatch 或依赖注入行为，则在门面留显式转发点并以测试锁定。
@@ -132,7 +139,7 @@ scheduler.py（门面/编排）
 
 | 事实 | 含义 |
 | --- | --- |
-| 全部路由挂在模块级 `app`（`api_server.py:341`），**无 `APIRouter`** | 拆分必须引入 `APIRouter` + `include_router`，且**注册顺序**要复现 |
+| 拆分前路由全部挂在模块级 `app`（`api_server.py:341`），现有 health/device/logs 已用 `APIRouter` | 后续迁移继续核验注册顺序，尤其 logs 的 literal/path 通配路径 |
 | 生命周期用 `lifespan`（318–338）而非 `on_event` | 迁移时不要改写风格 |
 | 已有一次「边界治理」：`model_host` 单例 + 尾部回调注入（526、10073–10083） | 这是**依赖倒置的先例**，拆分应沿用同一手法 |
 | **唯一运行时 `import api_server` 的是 `src/tui_backend.py:80,92,101`** | 消费者极少 ⇒ 门面策略可行 |
@@ -158,23 +165,20 @@ scheduler.py（门面/编排）
 
 ```
 src/api/__init__.py
-src/api/app.py             create_app：FastAPI 实例 + 中间件 + lifespan + include_router
-src/api/state.py           全局单例与共享状态（scheduler / model_host / kv_cache / session_histories …）
-src/api/deps.py            依赖注入与权限/边界校验
-src/api/schemas.py         Pydantic 模型
-src/api/routes_health.py   health/ready/status/presets
-src/api/routes_device.py   device/*
-src/api/routes_logs.py     logs/*（先抽，自包含）
-src/api/routes_cluster.py  cluster/*（65 个，可再按子域分）
-src/api/routes_models.py   models/*
-src/api/routes_auth.py     auth/*、users/*
-src/api/routes_sessions.py sessions/*、conversations/*
-src/api/routes_tasks.py    workflows/*、task-graph
-src/api/routes_chat.py     chat/*（最重，单独分支）
+src/api/_routing.py        router 对兼容门面的窄解析
+src/api/routes_health.py   health/ready/status/presets（4 个操作）
+src/api/routes_device.py   device/*（3 个操作）
+src/api/routes_logs.py     logs/*（12 个操作，通配路由保持末位）
+src/api/routes_cluster.py  cluster/bootstrap（66 个操作）
+src/api/routes_models.py   models/*（23 个操作）
+src/api/routes_auth.py     auth/*、users/*、user/settings（12 个操作）
+src/api/routes_sessions.py sessions/*、conversations/*（10 个操作）
+src/api/routes_tasks.py    workflows/*（4 个操作）
+src/api/routes_chat.py     chat/experimental（7 个操作）
+src/api/routes_system.py   system/db/storage（3 个操作）
 ```
 
-**推进顺序（薄 → 厚）**：`api/app.py` → `routes_logs` → `routes_health` / `routes_device` / `routes_cluster`
-→ `schemas` / `state` / `routes_models` / `routes_auth` / `routes_sessions` / `routes_tasks` → `routes_chat`。
+**推进顺序（薄 → 厚）**：health/device/logs → cluster/models/auth/sessions/tasks/chat/system 已全部迁移。`REFACTOR-LARGEFILE-05` 完成门面验收，但没有把 FastAPI app/lifespan、共享状态与 schema 迁出 `api_server`：router 仍通过显式配置的兼容门面解析这些运行时依赖，以保持现有单例与 monkeypatch 契约。它们不是已拆出的 `api/*` 模块；若以后迁移，必须单独设计注入与兼容边界，不属于本轮验收。
 
 **第一件事（强制）**：固化 **OpenAPI baseline** ——
 
@@ -246,6 +250,23 @@ TestClient(api_server.app).get("/openapi.json").json()["paths"]
 - Task-Worker、cluster/HA、pipeline 联测：`647 passed`；收口基线测试 `20 passed`。全仓并行测试在 `1071 passed, 16 skipped` 后遇到两个非本票基线/环境失败：缓存命名测试引用的计划文档缺失，以及 Windows `llama.dll` 加载 WinError 127；因此不宣称全仓通过。
 - 清理机械搬移产生的空白行后，`scheduler.py` 约 3,736 行；`import scheduler` 成功，OpenAPI 保持 123 条路径，静态编译通过。
 
+### 6.4 REFACTOR-LARGEFILE-04 全量路由迁移
+
+- 按 health/device/logs/cluster/models/auth/sessions/tasks/chat/system 拆出 10 个领域 router；原 144 个操作 handler 已移出 `api_server.py`，兼容门面仍 re-export 同名 handler。
+- 共享状态、日志 helper、Scheduler 和可变运行时配置仍由 `api_server` 持有；router 通过窄类型解析与 facade 动态读取保留 monkeypatch 和单例语义。session 串行化装饰器及依赖/响应模型元数据保持原注册行为。
+- OpenAPI 路径/方法摘要保持 `123 paths / 144 operations`；router operations 与 OpenAPI operation 集合逐项相等，logs 的 literal 路由仍早于 `/api/logs/{filename:path}`。
+- 验证：API/模型/集群/会话/聊天/task-graph 定向回归 `251 passed`；API cold-start/auth/bootstrap/TUI SSE `86 passed`；cache naming + keep-head/relay `30 passed, 7 skipped`，其中真实 shim/head 模型隔离后宿主 `llama_cpp` 导入通过；125 个本轮迁移 handler 的 AST 实现体对照无差异。
+
+### 6.5 REFACTOR-LARGEFILE-05 门面与联合回归收口
+
+- 门面契约：scheduler 保留 HEAD 模块符号、`__all__`、运行时 monkeypatch 点与实例锁身份；API 门面 re-export 全部 router handlers 及历史调用符号。当前路由均由 10 个领域 router 注册，`api_server.py` 不再定义 endpoint handler。
+- API 契约：OpenAPI 快照固定为 `123 paths / 144 operations`；router operation 与 OpenAPI 的 path/method 多重集合逐项相等；`/api/logs/recent` 仍先于通配 filename 路由。
+- 启动契约：API 冷启动测试覆盖默认 GGUF 路径不导入 torch、后台启动期间 health/readiness 可响应；默认引擎和无 Torch 边缘路径未改变。
+- 联合回归（Windows，单进程 `pytest -n 0`）：API/chat/task-graph/core-cutover/baseline `275 passed`；scheduler/task-worker/reshard/Qwen3/Gemma4/HA `715 passed, 4 skipped`；合计 `990 passed, 4 skipped`。跳过项属于需要外部模型或设备条件的 smoke/门禁，不计作通过。
+- 静态审计：原 125 个迁移 handler 的 AST 函数体对比无行为差异；当前门面 AST 不含 endpoint 定义。`api_server` 的共享状态、schema 与 lifespan 仍是有意保留的兼容边界，不能据此宣称它们已模块化。
+
+`REFACTOR-LARGEFILE-01` 至 `05` 已完成。本批目标是 scheduler mixin 拆分、API endpoint 按域迁移及兼容验收；没有承诺把所有运行时状态和 schema 拆成独立模块。
+
 每步之后必须同时满足：
 
 1. 定向测试通过 —— scheduler 侧：
@@ -276,12 +297,12 @@ TestClient(api_server.app).get("/openapi.json").json()["paths"]
 本计划与《KTransformers 算子级优化调研 + QLH 算法/数据层优化方向》采用同一排期。顺序固定为：
 
 1. `REFACTOR-LARGEFILE-01`：**已完成**；已固化 OpenAPI、公共符号、锁身份、monkeypatch 面、导入和回归基线。
-2. `REFACTOR-LARGEFILE-02` 至 `REFACTOR-LARGEFILE-05`：完成 scheduler/API 拆解、门面兼容和端点集合不变验收。
-3. `TORCH-OP-PROFILE-01`：建立项目 PyTorch 上游的算子成本画像，替代平均每层的路由依据。
+2. `REFACTOR-LARGEFILE-02` 至 `REFACTOR-LARGEFILE-05`：**已完成**；scheduler/API 拆解、门面兼容、端点集合不变和联合回归均已验收。
+3. `TORCH-OP-PROFILE-01`：**当前下一票**；建立项目 PyTorch 上游的算子成本画像，替代平均每层的路由依据。
 4. `TORCH-OP-REGISTRY-01`：建立逻辑算子、候选实现、设备能力、误差边界和回退实现的合同。
 5. `TORCH-HETERO-PLAN-01` 及后续科研票：研究算子放置、prefill/decode 双计划、激活压缩和 MoE 热度/预取。
 
-`REFACTOR-LARGEFILE-01/02/03` 已完成；当前下一票为 `REFACTOR-LARGEFILE-04`（按领域拆分 API routers）。在大文件拆分门面继续稳定前，不登记 PyTorch 算子优化已经进入主线；未完成科研票不得改变 llama.cpp/GGUF 默认路径、Edge 无 Torch 边界或 Koakuma 正式 backend 枚举。
+`REFACTOR-LARGEFILE-01/02/03/04/05` 已完成；当前下一票为 `TORCH-OP-PROFILE-01`。PyTorch 算子研究只在 PC/CUDA 研究环境推进；不得改变 llama.cpp/GGUF 默认路径、Edge 无 Torch 边界或 Koakuma 正式 backend 枚举。
 
 ### 联合验收顺序
 

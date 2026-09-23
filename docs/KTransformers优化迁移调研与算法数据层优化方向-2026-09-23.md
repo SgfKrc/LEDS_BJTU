@@ -140,9 +140,9 @@ Gate/Up 融合实现、GPTQ/Marlin/FP8 依赖栈。它们可以作为外部对�
 | 0 | `REFACTOR-LARGEFILE-01` | 固化 scheduler/API OpenAPI、公共符号、monkeypatch 面、锁身份、导入/冷启动和全量定向测试基线 | 无 | 已完成 |
 | 1 | `REFACTOR-LARGEFILE-02` | 拆出 `scheduler_layer_plan` 与 `scheduler_sidecars`；保留兼容门面及侧车工厂 patch 点 | 01 | **已完成（2026-09-23）** |
 | 2 | `REFACTOR-LARGEFILE-03` | 拆出 task-worker、cluster/HA、pipeline mixin；保持实例私有属性、锁和调用点不变 | 02 | **已完成（2026-09-23）** |
-| 3 | `REFACTOR-LARGEFILE-04` | 以 APIRouter 拆分 api_server，先 health/device/logs，再 cluster/models/auth/sessions/tasks/chat | 01 | **下一票** |
-| 4 | `REFACTOR-LARGEFILE-05` | 重构收口：门面契约、OpenAPI 路径/方法集合、冷启动和完整回归，确认无逻辑夹带 | 03、04 | 排队 |
-| 5 | `TORCH-OP-PROFILE-01` | 对项目 PyTorch 上游建立按算子形状、dtype、设备、阶段的成本画像；修正“平均每层”口径 | 05 | 排队 |
+| 3 | `REFACTOR-LARGEFILE-04` | 以 APIRouter 按领域拆分全部 API handlers，端点和行为保持不变 | 01 | **已完成（2026-09-23）** |
+| 4 | `REFACTOR-LARGEFILE-05` | 重构收口：门面契约、OpenAPI 路径/方法集合、冷启动和完整回归，确认无逻辑夹带 | 03、04 | **已完成（990 passed, 4 skipped）** |
+| 5 | `TORCH-OP-PROFILE-01` | 对项目 PyTorch 上游建立按算子形状、dtype、设备、阶段的成本画像；修正“平均每层”口径 | 05 | **下一票** |
 | 6 | `TORCH-OP-REGISTRY-01` | 建立逻辑算子到 eager/compile/实验实现的注册、能力声明和 fail-closed 回退合同 | OP-PROFILE-01 | 排队 |
 | 7 | `TORCH-HETERO-PLAN-01` | 离线算子放置 planner：设备画像、内存、带宽、边界传输和正确性门；与连续层 planner 对照 | OP-REGISTRY-01 | 排队 |
 | 8 | `TORCH-PHASE-PLAN-01` | prefill/decode 双计划和受控状态切换；失败时回退单一 PyTorch 计划或 llama.cpp | HETERO-PLAN-01 | 科研排队 |
