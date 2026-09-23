@@ -182,6 +182,10 @@ def main() -> int:
     ap.add_argument("--gen", type=int, default=32)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--shim", default="build/keephead/build-cpu/bin/qlh_keep_head.dll")
+    ap.add_argument("--hidden-quant", default="none",
+                    choices=("none", "f16", "int8_block128", "int4_block128"),
+                    help="★ A5：上行（本机 → 远端段）的 hidden 压缩档。判据仍是 **per-token argmax**；"
+                         "远端段必须能处理同一档位（旧对端看到非零 flags 会 fail-closed 拒）")
     ap.add_argument("--json-out", default=None)
     ap.add_argument("--tail-ready-file", default=None,
                     help="★ 末段服务端的 ready 文件（内含构建标识）⇒ 记录里逐段写 runner/构建")
@@ -255,10 +259,12 @@ def main() -> int:
                 n_tok = int(hidden.shape[0])
             t_head = time.perf_counter()
             if middle is not None:
-                payload = middle.request_hidden(payload, n_tokens=n_tok)
+                # ★ A5：上行按档位压缩（远端解回 f32；旧对端会 fail-closed 拒非零 flags）。
+                payload = middle.request_hidden(payload, n_tokens=n_tok,
+                                                quant=args.hidden_quant)
                 used_middle += 1
             t_mid = time.perf_counter()
-            token = tail.request_token(payload, n_tokens=n_tok)
+            token = tail.request_token(payload, n_tokens=n_tok, quant=args.hidden_quant)
             t_tail = time.perf_counter()
             seg_ms["head"].append((t_head - t_step) * 1000.0)
             if middle is not None:
@@ -301,6 +307,8 @@ def main() -> int:
         "endpoints": {"tail": args.tail_endpoint, "middle": args.middle_endpoint},
         "load": {"prompt": args.prompt, "prefill_tokens": len(prompt), "gen_tokens": int(args.gen),
                  "n_embd": n_embd},
+        # ★ 2026-09-23（A5）：上行 hidden 压缩档（`none` = f32 原样）。判据仍是 per-token argmax。
+        "hidden_quant": args.hidden_quant,
         "tokens_relay": tokens,
         "tokens_baseline": baseline,
         "verdict": {"criterion": "per_token_argmax", "passed": passed,

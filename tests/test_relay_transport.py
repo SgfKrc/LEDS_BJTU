@@ -9,13 +9,17 @@ import threading
 import pytest
 
 from src.relay_transport import (
+    RELAY_QUANT_CODES,
     RELAY_WIRE_MAGIC,
+    RELAY_WIRE_VERSION,
     RelayFrame,
     RelayFrameKind,
     RelayProtocolError,
     RelayTcpClient,
     expected_hidden_bytes,
+    frame_hidden_bytes,
     open_loopback_listener,
+    quantize_upload,
     recv_frame,
     send_frame,
     serve_relay_connection,
@@ -231,3 +235,71 @@ def test_tokens_frame_kind_is_distinct():
     kinds = {RelayFrameKind.HIDDEN, RelayFrameKind.TOKEN, RelayFrameKind.CLOSE,
              RelayFrameKind.ERROR, RelayFrameKind.HIDDEN_SEQ, RelayFrameKind.TOKENS}
     assert len(kinds) == 6
+
+
+# ---------------------------------------------------------------- ★ A5：hidden 压缩档上 wire
+
+
+def test_quantized_hidden_round_trips_through_flags():
+    """★ A5：档位编码进 `flags` 低 3 位；发送端压、接收端解，解出的 f32 长度不变。"""
+    import numpy as np
+
+    tokens, width = 2, 256
+    values = (np.arange(tokens * width, dtype=np.float32) / 17.0)
+    raw = np.ascontiguousarray(values, dtype="<f4").tobytes()
+
+    left, right = socket.socketpair()
+    try:
+        for quant in ("none", "f16", "int8_block128", "int4_block128"):
+            payload = quantize_upload(raw, tokens, width, quant)
+            assert len(payload) == expected_hidden_bytes(tokens, width, quant)
+            send_frame(left, RelayFrame(RelayFrameKind.HIDDEN, 0, n_tokens=tokens,
+                                        payload=payload, quant=quant))
+            frame = recv_frame(right, max_payload_bytes=expected_hidden_bytes(tokens, width))
+            assert frame.quant == quant
+            assert frame.payload == payload
+            decoded = frame_hidden_bytes(frame, n_embd=width)
+            assert len(decoded) == tokens * width * 4
+            if quant == "none":
+                assert decoded == raw
+        # `none` 档 = flags 0 ⇒ 与旧对端的帧逐字节兼容
+        assert RELAY_QUANT_CODES["none"] == 0
+    finally:
+        left.close()
+        right.close()
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected_code"),
+    [(0b1000, "unsupported_flags"), (0b0111, "unsupported_hidden_quant")],
+)
+def test_reserved_flags_and_unknown_quant_codes_fail_closed(flags: int,
+                                                            expected_code: str) -> None:
+    """保留位（高位）与未知档位码都必须 fail-closed —— 旧对端行为不变、新对端不能瞎猜。"""
+    left, right = socket.socketpair()
+    try:
+        header = struct.pack("!4sBBHIIQ", RELAY_WIRE_MAGIC, RELAY_WIRE_VERSION,
+                             int(RelayFrameKind.HIDDEN), flags, 0, 1, 0)
+        left.sendall(header)
+        with pytest.raises(RelayProtocolError, match=expected_code):
+            recv_frame(right)
+    finally:
+        left.close()
+        right.close()
+
+
+def test_quantized_frame_size_mismatch_is_rejected():
+    """声明 f16 档却给 f32 长度的 payload ⇒ 必须拒（不能把未压缩数据当压缩帧解）。"""
+    tokens, width = 1, 128
+    left, right = socket.socketpair()
+    try:
+        raw = b"\x00" * (tokens * width * 4)
+        send_frame(left, RelayFrame(RelayFrameKind.HIDDEN, 0, n_tokens=tokens,
+                                    payload=raw, quant="f16"))
+        frame = recv_frame(right, max_payload_bytes=expected_hidden_bytes(tokens, width))
+        assert frame.quant == "f16"
+        with pytest.raises(RelayProtocolError, match="hidden_payload_size_mismatch"):
+            frame_hidden_bytes(frame, n_embd=width)
+    finally:
+        left.close()
+        right.close()
