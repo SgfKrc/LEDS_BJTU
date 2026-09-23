@@ -129,6 +129,40 @@ def _check_ready(alias: str, path: str, *, timeout: float, stale_seconds: float)
             "hint": None if fresh else "心跳过期 ⇒ 该段服务很可能已停止（或卡死）；重启前先确认进程"}
 
 
+def self_check() -> int:
+    """★ A10：用**本机 loopback** 验证 `_check_tcp` 的判定方向（CI 兜底，不需要真机 / 网络）。
+
+    活监听必须判健康、**已释放**的端口必须判死 —— 方向被改坏（该判死不判死）就返回非零 ⇒ CI 变红。
+    只覆盖 TCP 那一路：`--ssh-ready`（心跳新鲜度）依赖真实设备，不适合进 CI。
+    """
+    failures: list[str] = []
+    live = socket.socket()
+    live.bind(("127.0.0.1", 0))
+    live.listen(1)
+    live_endpoint = f"127.0.0.1:{int(live.getsockname()[1])}"
+
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    dead_endpoint = f"127.0.0.1:{int(probe.getsockname()[1])}"
+    probe.close()                     # 立刻释放 ⇒ 该端口上没有监听者
+
+    try:
+        live_result = _check_tcp(live_endpoint, timeout=2.0)
+    finally:
+        live.close()
+    dead_result = _check_tcp(dead_endpoint, timeout=2.0)
+
+    if live_result.get("ok") is not True:
+        failures.append(f"活监听被判为不健康：{live_result}")
+    if dead_result.get("ok") is not False:
+        failures.append(f"已释放端口被判为健康：{dead_result}")
+    for item in failures:
+        print(f"  - {item}")
+    print(f"[verdict] 健康检查自检{'失败' if failures else '通过'}"
+          f"（loopback：活={live_result.get('reason')} 死={dead_result.get('reason')}）")
+    return 1 if failures else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="跨机接力健康检查（TCP 探活 + 心跳新鲜度）")
     ap.add_argument("--check", action="append", default=[], metavar="NAME=tcp:HOST:PORT",
@@ -139,8 +173,15 @@ def main(argv: list[str] | None = None) -> int:
                     help=f"心跳过期阈值（秒，默认 {STALE_DEFAULT:g}）")
     ap.add_argument("--timeout", type=float, default=5.0, help="单项超时（秒）")
     ap.add_argument("--json", action="store_true", help="输出 JSON（供驱动 / CI 解析）")
+    ap.add_argument("--self-check", action="store_true",
+                    help="★ A10：CI 兜底自检 —— 用本机 loopback（活监听 + 已释放端口）验证判定方向，"
+                         "不需要真机 / 网络；失败返回 1")
     args = ap.parse_args(argv)
     _enable_utf8_stdout()
+
+    if args.self_check:
+        # ★ A10：CI 兜底自检 —— 不探任何真实目标。
+        return self_check()
 
     if not args.check and not args.ssh_ready:
         ap.error("至少给一个 --check 或 --ssh-ready")

@@ -11,8 +11,8 @@
 #
 # 注意：跨机接力健康检查（scripts/relay_health.py）**不在本 workflow 里** —— 真机检查需要
 # 真实服务/设备，属于运行期动作；其单元测试见 tests/test_relay_health.py（ssh 已 mock），
-# 而**闸门方向性的 CI 兜底**见 `.github/workflows/relay-gates.yml`（scripts/ci_relay_gates.py，
-# 用合成输入验证"该红会红"，不需要真机）。
+# 而**闸门方向性的 CI 兜底**见 `.github/workflows/relay-gates.yml`：两条脚本各自的
+# `--self-check` 用合成输入验证"该红会红"（不需要真机）。
 
 name: doc-checks
 

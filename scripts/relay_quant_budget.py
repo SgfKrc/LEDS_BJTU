@@ -38,6 +38,11 @@ HIDDEN_QUANTS = ("none", "f16", "bf16", "int8_block128", "int4_block128")
 #: ⇒ 与 `tight` 同级（保守）；`unsafe` = 有余量的 prompt 上仍出现翻转 ⇒ 最高。
 _VERDICT_RANK = {"safe": 0, "safe-headroom-only": 0, "tight": 1, "no-headroom": 1, "unsafe": 2}
 
+#: ★ A10：闸门默认值（`--flip-threshold` / `--safety-margin`）—— `self_check()` 与命令行**共用**，
+#: 避免两处阈值漂移导致"自检绿、真实闸门红"。
+FLIP_THRESHOLD_DEFAULT = 4.5
+SAFETY_MARGIN_DEFAULT = 0.5
+
 
 def _parse_case(stem: str) -> tuple[str, str, str] | None:
     """从文件名 stem 解析 `(prompt, upstream, hidden)`；不匹配返回 None。"""
@@ -164,6 +169,69 @@ def _aggregate(rows: list[dict[str, object]], gate: float) -> list[dict[str, obj
     return table
 
 
+def _verdict(entry: dict[str, object], gate: float) -> str:
+    """由聚合结果定档。
+
+    判定用"基线本身已低于闸门"的 prompt 的**互补子集**：那些 prompt 没有任何预算空间，
+    把它们算进来会让对照档也判 unsafe（实测：fp16×f16 因为 code 的基线只有 3.76 被判 tight）。
+
+    ★ A10：抽成函数是为了让 `main` 与 `self_check` 用**同一套**判定（自检才有意义）。
+    """
+    worst = entry.get("margin_min_headroom")
+    if worst is None:
+        return "no-headroom"          # 这一档遇到的全是无余量 prompt
+    if entry["n_headroom_flipped"]:
+        return "unsafe"
+    if float(worst) < gate:
+        return "tight"
+    if entry["n_flipped"]:
+        # Low-baseline prompts must be routed to full precision first.
+        return "safe-headroom-only"
+    return "safe"
+
+
+def _self_check_rows(relay_margin: float, *, passed: bool) -> list[dict[str, object]]:
+    """合成记录（★ A10）：基线 5.5 ≥ gate(5.0) ⇒ 这些 prompt 都算「有余量」。"""
+    return [{
+        "record": f"{prompt}.json", "prompt": prompt, "upstream": "fp16", "hidden": "f16",
+        "passed": passed, "matched": 8, "total": 8,
+        "relay_margin": relay_margin, "baseline_margin": 5.5, "delta_pct": -1.0,
+        "wire_bytes_per_token": 3584, "upstream_resident_bytes": 512_000_000,
+    } for prompt in ("p-alpha", "p-beta", "p-gamma")]
+
+
+def self_check() -> int:
+    """★ A10：用**合成记录**验证本脚本的判定方向（CI 兜底；不需要真实工件 / 模型）。
+
+    - 合格集（余量 5.2 ≥ gate 5.0）必须判 `safe`；
+    - 越线集（有余量的 prompt 却翻转）必须判 `unsafe`，且 `--fail-on unsafe` 必须**红**。
+
+    方向被改坏（最典型：该红不红）就返回非零 ⇒ CI 变红。
+    """
+    gate = FLIP_THRESHOLD_DEFAULT + SAFETY_MARGIN_DEFAULT
+    red_rank = _VERDICT_RANK["unsafe"]
+    failures: list[str] = []
+    cases = (("合格集（余量充足）", 5.2, True, "safe", False),
+             ("越线集（有余量却翻转）", 3.0, False, "unsafe", True))
+    for label, margin, passed, expected_verdict, expect_red in cases:
+        table = _aggregate(_self_check_rows(margin, passed=passed), gate)
+        # ⚠️ `_aggregate` 只做聚合；`verdict` 是 `main` 的循环里补上的 —— 这里必须补**同一套**判定。
+        for entry in table:
+            entry["verdict"] = _verdict(entry, gate)
+        got = str(table[0]["verdict"]) if table else "<空表>"
+        if got != expected_verdict:
+            failures.append(f"{label}：期望判定 {expected_verdict}，实得 {got}")
+        red = any(_VERDICT_RANK.get(str(entry["verdict"]), 2) >= red_rank for entry in table)
+        if red is not expect_red:
+            failures.append(f"{label}：`--fail-on unsafe` 应为"
+                            f"{'红' if expect_red else '绿'}，实得{'红' if red else '绿'}")
+    for item in failures:
+        print(f"  - {item}")
+    print(f"[verdict] 预算闸门自检{'失败' if failures else '通过'}"
+          f"（gate={gate:g}，合成记录）")
+    return 1 if failures else 0
+
+
 def main() -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -172,12 +240,18 @@ def main() -> int:
             pass
 
     ap = argparse.ArgumentParser(description="接力量化精度预算表（P4）")
-    ap.add_argument("--records", action="append", required=True,
-                    help="记录 glob，可重复（如 build/relay-records/p4b-*.json）")
-    ap.add_argument("--flip-threshold", type=float, default=4.5,
-                    help="margin 翻转分界（实测落点 4.0~4.8，默认取中点 4.5）")
-    ap.add_argument("--safety-margin", type=float, default=0.5,
-                    help="安全余量：要求 margin_min ≥ threshold + safety_margin")
+    ap.add_argument("--records", action="append", default=[],
+                    help="记录 glob，可重复（如 build/relay-records/p4b-*.json）；"
+                         "`--self-check` 模式下不需要")
+    ap.add_argument("--flip-threshold", type=float, default=FLIP_THRESHOLD_DEFAULT,
+                    help="margin 翻转分界（实测落点 4.0~4.8，"
+                         f"默认取中点 {FLIP_THRESHOLD_DEFAULT:g}）")
+    ap.add_argument("--safety-margin", type=float, default=SAFETY_MARGIN_DEFAULT,
+                    help="安全余量：要求 margin_min ≥ threshold + safety_margin"
+                         f"（默认 {SAFETY_MARGIN_DEFAULT:g}）")
+    ap.add_argument("--self-check", action="store_true",
+                    help="★ A10：CI 兜底自检 —— 用合成记录验证判定方向（合格集必须 safe、越线集必须 "
+                         "unsafe 且闸门必须红），不需要真实工件 / 模型；失败返回 1")
     ap.add_argument("--min-prompts", type=int, default=6,
                     help="每个量化档至少覆盖的 prompt 数；默认 6")
     ap.add_argument("--fail-on", choices=("off", "unsafe", "tight"), default="off",
@@ -186,6 +260,13 @@ def main() -> int:
                          "tight=连余量不足 / 无安全证据也红")
     ap.add_argument("--out", default=None, help="汇总 JSON 落盘路径")
     args = ap.parse_args()
+
+    if args.self_check:
+        # ★ A10：CI 兜底自检 —— 不读任何记录文件（`--records` 在该模式下不参与）。
+        return self_check()
+
+    if not args.records:
+        ap.error("--records 至少给一个（`--self-check` 模式除外）")
 
     rows = _load_records(args.records)
     if not rows:
@@ -201,21 +282,8 @@ def main() -> int:
     gate = args.flip_threshold + args.safety_margin
     table = _aggregate(rows, gate)
     for entry in table:
-        worst = entry.get("margin_min_headroom")
         entry["gate"] = gate
-        # 判定用"基线本身已低于闸门"的 prompt 的**互补子集**：那些 prompt 没有任何预算空间，
-        # 把它们算进来会让对照档也判 unsafe（实测：fp16×f16 因为 code 的基线只有 3.76 被判 tight）。
-        if worst is None:
-            entry["verdict"] = "no-headroom"      # 这一档遇到的全是无余量 prompt
-        elif entry["n_headroom_flipped"]:
-            entry["verdict"] = "unsafe"
-        elif float(worst) < gate:
-            entry["verdict"] = "tight"
-        elif entry["n_flipped"]:
-            # Low-baseline prompts must be routed to full precision first.
-            entry["verdict"] = "safe-headroom-only"
-        else:
-            entry["verdict"] = "safe"
+        entry["verdict"] = _verdict(entry, gate)
 
     header = (f"{'upstream':<7} {'hidden':<15} {'n':>3} {'flip':>5} {'no_hd':>6} "
               f"{'min(hd)':>9} {'median':>8} {'Δmin%':>7} {'wire B':>7} {'up MB':>7}  verdict")
