@@ -86,8 +86,14 @@ def test_missing_liveness_and_capability_fail_closed_without_hiding_reason():
 
 
 def test_management_score_is_registered_as_read_only_get_route():
-    from api_server import app
+    import api_server
+    from api import routes_cluster
 
-    routes = [route for route in app.routes if route.path == "/api/cluster/management-score"]
+    routes = [
+        route
+        for route in routes_cluster.router.routes
+        if route.path == "/api/cluster/management-score"
+    ]
     assert len(routes) == 1
     assert routes[0].methods == {"GET"}
+    assert api_server.get_cluster_management_score is routes[0].endpoint

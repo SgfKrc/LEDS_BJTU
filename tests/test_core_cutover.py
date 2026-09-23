@@ -9,9 +9,14 @@ import api_server
 
 
 def test_core_api_does_not_mount_a_product_frontend():
-    assert all(route.name != "frontend" for route in api_server.app.routes)
+    assert all(getattr(route, "name", None) != "frontend" for route in api_server.app.routes)
 
 
 def test_core_api_has_no_retired_image_generation_surface():
-    paths = {route.path for route in api_server.app.routes}
+    paths = set(api_server.app.openapi()["paths"])
+    paths.update(
+        route.path
+        for router in api_server._api_route_modules
+        for route in router.router.routes
+    )
     assert paths.isdisjoint({"/api/diffusion", "/v1/images/generations"})

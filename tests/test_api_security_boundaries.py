@@ -16,7 +16,7 @@ import api_server
 
 
 def test_retired_email_surface_has_no_api_routes():
-    paths = {route.path for route in api_server.app.routes}
+    paths = set(api_server.app.openapi()["paths"])
     assert paths.isdisjoint({
         "/api/cluster/email-test",
         "/api/cluster/email-config",
