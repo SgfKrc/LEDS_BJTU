@@ -396,7 +396,10 @@ class KeepHeadUpstream:
         """
         import numpy as np
 
-        if not hasattr(self._lib, "qlh_kh_forward_embd_token"):
+        # ⚠️ worker 隔离路径下符号在**子进程**里（`self._lib` 为 None）⇒ 本检查只对就地加载有意义。
+        #    漏掉这个前置条件会把「worker 模式」误判成「缺符号」（实测踩到：主进程一旦 import 过
+        #    llama_cpp / 或 shim 目录带同名 ggml，就会走 worker，然后这里必然抛"缺符号"）。
+        if self._worker is None and not hasattr(self._lib, "qlh_kh_forward_embd_token"):
             raise KeepHeadUnavailable(
                 f"{self.shim_path} 缺 qlh_kh_forward_embd_token（末段能力）"
                 "—— 需用含 P4.5 入口的 shim 重新编译")

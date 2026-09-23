@@ -105,6 +105,58 @@ def _stat(values: list[float]) -> dict[str, object]:
             "min": round(min(values), 3), "max": round(max(values), 3)}
 
 
+def _segment_builds(args) -> dict[str, object]:
+    """逐段收集**构建标识**（§10.2 待办）：本地段直接收集，远端段读 ready 文件，否则显式 unknown。
+
+    为什么必须落进记录：`engines` 过去是固定字符串 ⇒ 无法回答「这一段实际用哪套 llama.cpp 构建」，
+    而那正是同一 head 段下 **pip 末段 1/32 与 shim 末段 32/32** 的分界（见文档 §10.7）。
+    远端段没给 ready 文件时宁可写 `remote_unknown`，也不省略字段 —— 记录要能区分「未知」与「没写」。
+    """
+    from relay_segment_info import (  # noqa: PLC0415
+        collect_local_build,
+        load_ready_build,
+        unknown_remote_build,
+    )
+
+    digest = bool(getattr(args, "digest_artifacts", False))
+    segments: dict[str, object] = {}
+
+    if args.head_endpoint:
+        ready = getattr(args, "head_ready_file", None)
+        segments["head"] = {
+            "runner": "relay_mid_service --role head（远端）",
+            "endpoint": args.head_endpoint,
+            "build": (load_ready_build(ready) if ready
+                      else unknown_remote_build(args.head_endpoint)),
+        }
+    else:
+        segments["head"] = {
+            "runner": "llama_keep_head.KeepHeadUpstream",
+            "mode": "nextn",
+            "channel": "keep_head_layer_out",
+            "build": collect_local_build(shim=args.shim, model=args.head_model,
+                                         digest_artifacts=digest),
+        }
+
+    if getattr(args, "middle_endpoint", None):
+        ready = getattr(args, "middle_ready_file", None)
+        segments["middle"] = {
+            "runner": "relay_mid_service --role middle（远端）",
+            "endpoint": args.middle_endpoint,
+            "build": (load_ready_build(ready) if ready
+                      else unknown_remote_build(args.middle_endpoint)),
+        }
+
+    ready = getattr(args, "tail_ready_file", None)
+    segments["tail"] = {
+        "runner": "relay_mid_service --role tail（远端；shim 或 pip 绑定由该服务决定）",
+        "endpoint": args.tail_endpoint,
+        "build": (load_ready_build(ready) if ready
+                  else unknown_remote_build(args.tail_endpoint)),
+    }
+    return segments
+
+
 def main() -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -131,6 +183,12 @@ def main() -> int:
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--shim", default="build/keephead/build-cpu/bin/qlh_keep_head.dll")
     ap.add_argument("--json-out", default=None)
+    ap.add_argument("--tail-ready-file", default=None,
+                    help="★ 末段服务端的 ready 文件（内含构建标识）⇒ 记录里逐段写 runner/构建")
+    ap.add_argument("--middle-ready-file", default=None, help="★ 中段服务端的 ready 文件")
+    ap.add_argument("--head-ready-file", default=None, help="★ 远端 head 段的 ready 文件")
+    ap.add_argument("--digest-artifacts", action="store_true",
+                    help="★ 对段工件也算 sha256（GB 级文件会明显变慢；默认只记大小/名字）")
     args = ap.parse_args()
 
     # ★ P4.5 健康检查：**先探活** —— 放在最前面，避免为一次注定失败的运行白跑整模对照；
@@ -237,6 +295,9 @@ def main() -> int:
             "downstream": "relay_transport.RelayTcpClient.request_token",
         },
         "engines": "纯 llama.cpp（无 torch / 无 D 档组件参与推理）",
+        # ★ 2026-09-23（§10.2）：**逐段**写出实际 runner 与构建标识（shim/libllama 摘要、
+        #   pip llama_cpp 版本、段工件大小/摘要）。远端段没给 ready 文件时显式记 remote_unknown。
+        "segment_engines": _segment_builds(args),
         "endpoints": {"tail": args.tail_endpoint, "middle": args.middle_endpoint},
         "load": {"prompt": args.prompt, "prefill_tokens": len(prompt), "gen_tokens": int(args.gen),
                  "n_embd": n_embd},

@@ -106,3 +106,59 @@ def test_mid_service_exposes_heartbeat_option() -> None:
         capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=ROOT)
     assert done.returncode == 0, done.stderr
     assert "--heartbeat-interval" in done.stdout
+    # ★ 2026-09-23（§10.2）：ready 文件要能带构建标识 ⇒ 服务端必须有该开关
+    assert "--digest-artifacts" in done.stdout
+
+
+def test_segment_builds_records_local_head_and_unknown_remote() -> None:
+    """★ 2026-09-23（§10.2）：记录里逐段写 runner/构建；远端没给 ready 文件时**显式** unknown。"""
+    import argparse
+
+    module = _load()
+    args = argparse.Namespace(
+        head_endpoint=None,
+        head_model="head16.gguf",
+        shim="build/keephead/build-cpu/bin/qlh_keep_head.dll",
+        head_ready_file=None,
+        middle_endpoint=None,
+        middle_ready_file=None,
+        tail_endpoint="127.0.0.1:50188",
+        tail_ready_file=None,
+        digest_artifacts=False,
+    )
+    segments = module._segment_builds(args)
+
+    assert segments["head"]["runner"] == "llama_keep_head.KeepHeadUpstream"
+    assert segments["head"]["mode"] == "nextn"
+    assert segments["head"]["build"]["schema_version"] == "qlh.relay_segment_info.v1"
+    # 没有中间段 ⇒ 该段不出现（而不是给一个空对象）
+    assert "middle" not in segments
+    # 远端末段未提供 ready 文件 ⇒ 显式 remote_unknown（记录要能区分「未知」与「没写」）
+    assert segments["tail"]["build"]["source"] == "remote_unknown"
+    assert segments["tail"]["endpoint"] == "127.0.0.1:50188"
+
+
+def test_segment_builds_reads_ready_file_for_remote_segments(tmp_path: Path) -> None:
+    import argparse
+    import json
+
+    module = _load()
+    ready = tmp_path / "mid.ready"
+    ready.write_text(json.dumps({"role": "middle", "build": {"llama_cpp_version": "x"}}),
+                     encoding="utf-8")
+    args = argparse.Namespace(
+        head_endpoint="127.0.0.1:50185",
+        head_model=None,
+        shim="build/keephead/build-cpu/bin/qlh_keep_head.dll",
+        head_ready_file=None,
+        middle_endpoint="127.0.0.1:50190",
+        middle_ready_file=str(ready),
+        tail_endpoint="127.0.0.1:50188",
+        tail_ready_file=None,
+        digest_artifacts=False,
+    )
+    segments = module._segment_builds(args)
+
+    assert segments["head"]["build"]["source"] == "remote_unknown"     # head 也没给 ready 文件
+    assert segments["middle"]["build"]["source"] == "ready_file"
+    assert segments["middle"]["build"]["llama_cpp_version"] == "x"

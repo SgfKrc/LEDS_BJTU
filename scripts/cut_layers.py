@@ -86,26 +86,88 @@ def _read_identity(reader, source_path: Path) -> dict:
     }
 
 
-def _validate_cut(identity: dict, k: int) -> list[str]:
+def _cut_mode(k: int | None, end: int | None, keep_head: int | None) -> str:
+    """切分模式：`head`（保留前 N 层）/ `middle`（保留 blk.K..end-1）/ `tail`（保留 K..末尾）。"""
+    if keep_head is not None:
+        return "head"
+    return "middle" if (k is not None and end is not None) else "tail"
+
+
+def _validate_cut(identity: dict, k: int | None = None, *,
+                  end: int | None = None, keep_head: int | None = None) -> list[str]:
+    """校验切点；返回问题列表（空 = 通过）。
+
+    三种模式：
+      * `tail`   —— 丢弃前 K 层、保留 `blk.K..`（重编号为 `blk.0..`）—— 与
+        `relay_contract.RelayTrimPlan` 的语义一致（旧行为）；
+      * `middle` —— 再给 `--end K2` ⇒ 保留 `blk.K..blk.(K2-1)`（重编号）；
+      * `head`   —— 保留**前 N 层**（`blk.0..N-1`，**不重命名**），供「llama 当上游」使用。
+
+    ⚠️ hybrid（`full_attention_interval`）下，**切点与段内层数都必须是 interval 的整数倍**，
+    否则层类型错位、llama.cpp 报 missing tensor（实测）。
+    """
     problems: list[str] = []
     n_layer = identity["n_layer"]
+    interval = identity["full_attention_interval"]
+
+    def _check_multiple(value: int, label: str) -> None:
+        if interval and value % interval:
+            problems.append(
+                f"{label}={value} 不是 full_attention_interval({interval}) 的整数倍 —— "
+                "hybrid 架构会层类型错位、无法加载"
+            )
+
+    if keep_head is not None:
+        if not (0 < keep_head < n_layer):
+            problems.append(f"--keep-head N={keep_head} 不在 (0, {n_layer}) 内")
+        _check_multiple(keep_head, "--keep-head N")
+        return problems
+
+    if k is None:
+        problems.append("需要 --k（或 --keep-head N）")
+        return problems
     if not (0 < k < n_layer):
         problems.append(f"K={k} 不在 (0, {n_layer}) 内")
-    interval = identity["full_attention_interval"]
-    if interval and k % interval:
-        problems.append(
-            f"K={k} 不是 full_attention_interval({interval}) 的整数倍 —— "
-            "hybrid 架构会层类型错位、无法加载"
-        )
+    _check_multiple(k, "K")
+    if end is None:
+        return problems
+    if not (k < end <= n_layer):
+        problems.append(f"--end={end} 必须满足 K < end <= n_layer({n_layer})")
+    _check_multiple(end, "--end")
+    _check_multiple(end - k, "段内层数 end-K")
     return problems
 
 
-def _manifest(identity: dict, k: int, dst: Path, kept: int, dropped: int) -> dict:
-    """按 relay_contract 的 TrimPlan 语义产出 manifest。"""
-    kept_block_count = max(0, identity["block_count"] - k)
+def _manifest(identity: dict, k: int | None, dst: Path, kept: int, dropped: int, *,
+              end: int | None = None, keep_head: int | None = None) -> dict:
+    """产出一份可复算的 manifest（三种模式都覆盖）。
+
+    `mode=head` / `mode=middle` 时 `contract` 段**标记为不适用** —— `relay_contract.RelayTrimPlan`
+    只描述「丢弃前 K 层、保留到末尾」一种形态，用它描述上游段/中段会误导读者与下游校验。
+    """
+    mode = _cut_mode(k, end, keep_head)
+    if mode == "head":
+        assert keep_head is not None
+        kept_block_count = keep_head
+        source_layer_range = [0, keep_head]
+        first_local = 0
+        trim = 0
+    elif mode == "middle":
+        assert k is not None and end is not None
+        kept_block_count = end - k
+        source_layer_range = [k, end]
+        first_local = k
+        trim = k
+    else:
+        assert k is not None
+        kept_block_count = max(0, identity["block_count"] - k)
+        source_layer_range = [k, identity["n_layer"]]
+        first_local = k
+        trim = k
     result = {
         "generator": "scripts/cut_layers.py",
-        "generator_version": 1,
+        "generator_version": 2,
+        "mode": mode,
         "source": identity["source"],
         # Android workers use this logical-model digest to reject a crop from
         # another GGUF family. Keep the artifact digest separate below.
@@ -118,13 +180,19 @@ def _manifest(identity: dict, k: int, dst: Path, kept: int, dropped: int) -> dic
         "block_count": identity["block_count"],
         "n_layer": identity["n_layer"],
         "nextn_predict_layers": identity["nextn_predict_layers"],
-        "trim_layers": k,
+        # ★ 2026-09-23：段在**源模型**里的层区间（half-open）与本地映射起点。
+        "source_layer_range": source_layer_range,
+        "trim_layers": trim,
         "kept_block_count": kept_block_count,
         "tensors_kept": kept,
         "tensors_dropped": dropped,
-        "first_local_layer_maps_to": k,
+        "first_local_layer_maps_to": first_local,
         "artifact_sha256": _sha256(dst) if dst.exists() else "",
     }
+    if mode != "tail":
+        # `RelayTrimPlan` 只描述 tail 语义 ⇒ 上游段/中段**不给**可能误导的合同字段。
+        result["contract"] = {"skipped": f"mode={mode} 不由 RelayTrimPlan 描述"}
+        return result
     try:  # 与主仓合同字段对齐（缺失时不影响生成）
         from relay_contract import RelayModelIdentity, RelayTrimPlan  # noqa: PLC0415
 
@@ -185,8 +253,14 @@ def _copy_kv(gguf, reader, writer, overrides: dict) -> int:
     return count
 
 
-def _plan_tensors(reader, k: int) -> tuple[list, list]:
-    """返回 (保留张量及新名字, 将丢弃的张量名)。不做写入，便于 --dry-run。"""
+def _plan_tensors(reader, k: int | None = None, *, end: int | None = None,
+                  keep_head: int | None = None) -> tuple[list, list]:
+    """返回 (保留张量及新名字, 将丢弃的张量名)。不做写入，便于 --dry-run。
+
+    * `keep_head` 模式：保留 `blk.0..N-1`，**不重命名**（本就连续）；
+    * tail / middle 模式：丢掉区间外的层，并把 `blk.K..` 重编号为 `blk.0..`
+      （裁层工件的第一层必须叫 `blk.0`，下游 `embd` 注入才对齐）。
+    """
     keep: list[tuple] = []
     drop: list[str] = []
     for tensor in reader.tensors:
@@ -194,7 +268,14 @@ def _plan_tensors(reader, k: int) -> tuple[list, list]:
         if name.startswith("blk."):
             parts = name.split(".", 2)
             index = int(parts[1])
-            if index < k:
+            if keep_head is not None:
+                if index >= keep_head:
+                    drop.append(name)
+                    continue
+                keep.append((tensor, name))
+                continue
+            assert k is not None, "tail/middle 模式必须给 --k"
+            if index < k or (end is not None and index >= end):
                 drop.append(name)
                 continue
             keep.append((tensor, f"blk.{index - k}.{parts[2]}"))
@@ -208,6 +289,12 @@ def main() -> int:
     ap.add_argument("--src", required=True, help="源 GGUF（通常是整模）")
     ap.add_argument("--dst", help="输出裁层 GGUF")
     ap.add_argument("--k", type=int, help="丢弃前 K 层（保留 blk.K.. 起）")
+    ap.add_argument("--end", type=int, default=None,
+                    help="★ 与 --k 同用：只保留 blk.K..blk.(end-1)（**中段工件**）；"
+                         "缺省 = 保留到末尾（末段工件）")
+    ap.add_argument("--keep-head", type=int, default=None,
+                    help="★ 保留**前 N 层**（blk.0..N-1，**不重命名**）⇒ 供「llama 当上游」"
+                         "（上游段工件）。与 --k 互斥")
     ap.add_argument("--manifest", help="输出 manifest JSON 的路径")
     ap.add_argument("--verify-manifest", help="校验模式：对照该 manifest 检查 --src 工件")
     ap.add_argument("--dry-run", action="store_true", help="只列出影响，不写文件")
@@ -242,20 +329,38 @@ def main() -> int:
         print(f"     artifact_sha256={digest[:16]}…")
         return 0 if ok else 1
 
-    if args.k is None:
-        print("FAIL: 需要 --k（或使用 --verify-manifest）")
+    if args.end is not None and args.k is None:
+        print("FAIL: --end 只能与 --k 同用（中段工件）")
+        return 2
+    if args.keep_head is not None and args.k is not None:
+        print("FAIL: --keep-head（上游段）与 --k（末段/中段）互斥，二者只能给一个")
+        return 2
+    if args.keep_head is None and args.k is None:
+        print("FAIL: 需要 --k（或 --keep-head N / --verify-manifest）")
         return 2
 
-    problems = _validate_cut(identity, args.k)
-    keep, drop = _plan_tensors(reader, args.k)
-    kept_block_count = max(0, identity["block_count"] - args.k)
+    problems = _validate_cut(identity, args.k, end=args.end, keep_head=args.keep_head)
+    keep, drop = _plan_tensors(reader, args.k, end=args.end, keep_head=args.keep_head)
+    mode = _cut_mode(args.k, args.end, args.keep_head)
+    if mode == "head":
+        kept_block_count = int(args.keep_head)
+    elif mode == "middle":
+        kept_block_count = int(args.end) - int(args.k)
+    else:
+        kept_block_count = max(0, identity["block_count"] - args.k)
     print(f"[src] {src}")
     print(f"      architecture={identity['architecture']} block_count={identity['block_count']} "
           f"n_layer={identity['n_layer']} nextn={identity['nextn_predict_layers']} "
           f"full_attention_interval={identity['full_attention_interval']}")
-    print(f"[plan] 丢弃前 K={args.k} 层 ⇒ 保留 {len(keep)} 张量、丢弃 {len(drop)} 张量；"
-          f"block_count: {identity['block_count']} -> {kept_block_count}；"
-          f"原 blk.{args.k}.* 将变为 blk.0.*")
+    if mode == "head":
+        detail = f"保留前 {args.keep_head} 层（blk.0..blk.{int(args.keep_head) - 1}，不重命名）"
+    elif mode == "middle":
+        detail = (f"保留源模型 blk.{args.k}..blk.{int(args.end) - 1} 并重编号"
+                  f"（原 blk.{args.k}.* → blk.0.*）")
+    else:
+        detail = f"丢弃前 K={args.k} 层（原 blk.{args.k}.* → blk.0.*）"
+    print(f"[plan] mode={mode}：{detail} ⇒ 保留 {len(keep)} 张量、丢弃 {len(drop)} 张量；"
+          f"block_count: {identity['block_count']} -> {kept_block_count}")
     if problems:
         for problem in problems:
             print(f"FAIL: {problem}")
@@ -285,7 +390,8 @@ def main() -> int:
     writer.close()
     print(f"[done] {dst}：保留 {len(keep)} 张量、丢弃 {len(drop)}")
 
-    manifest = _manifest(identity, args.k, dst, len(keep), len(drop))
+    manifest = _manifest(identity, args.k, dst, len(keep), len(drop),
+                         end=args.end, keep_head=args.keep_head)
     if args.manifest:
         Path(args.manifest).write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
                                        encoding="utf-8")

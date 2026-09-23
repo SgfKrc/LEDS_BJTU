@@ -332,7 +332,10 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
                          "（与 shim 一致。pip 绑定默认 cpu_count()）")
     ap.add_argument("--max-tokens", type=int, default=RELAY_DEFAULT_MAX_TOKENS)
     ap.add_argument("--dll-dir", action="append", default=[])
-    ap.add_argument("--ready-file", default=None, help="写就绪标记（含实际端点），供驱动等待")
+    ap.add_argument("--ready-file", default=None,
+                    help="写就绪标记（含实际端点与**构建标识**），供驱动等待与逐段对账")
+    ap.add_argument("--digest-artifacts", action="store_true",
+                    help="★ ready 文件里对**段工件**也算 sha256（GB 级会明显变慢；默认只记大小/名字）")
     ap.add_argument("--max-connections", type=int, default=0, help="0 = 不限制")
     ap.add_argument("--heartbeat-interval", type=float, default=5.0,
                     help="★ P4.5 健康检查：定期刷新 ready 文件的时间戳（秒；0 = 关闭）。"
@@ -346,6 +349,28 @@ def _split_endpoint(endpoint: str) -> tuple[str, int]:
     if not host or not port.isdigit():
         raise SystemExit(f"FAIL: --listen 需要 host:port，实得 {endpoint!r}")
     return host, int(port)
+
+
+def _runner_build(runner: Any, *, digest_artifacts: bool = False) -> dict[str, Any]:
+    """收集**本段**构建标识，写进 ready 文件（供探针逐段对账；§10.2 待办）。
+
+    shim 路径的 runner（`KeepHeadMiddleRunner` / `HeadRunner` / `ShimTailRunner`）都持有 `_upstream`，
+    于是能记下 shim 与同目录 `libllama`/`ggml*` 的摘要；pip 的 `TailRunner` 没有 shim，
+    就记 `llama_cpp` 版本与它自带的 `lib/llama.dll` 摘要 —— 这正是 §10.7 里 1/32 vs 32/32 的分界。
+    """
+    from relay_segment_info import collect_local_build  # noqa: PLC0415
+
+    upstream = getattr(runner, "_upstream", None)
+    shim = getattr(upstream, "shim_path", None)
+    model = getattr(upstream, "model_path", None)
+    module = None
+    if upstream is None:  # pip 绑定路径：没有 shim
+        try:
+            import llama_cpp as module  # noqa: PLC0415
+        except Exception:  # noqa: BLE001 - 未安装不影响服务本身
+            module = None
+    return collect_local_build(shim=shim, model=model, llama_cpp_module=module,
+                               digest_artifacts=digest_artifacts)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -394,7 +419,11 @@ def main(argv: list[str] | None = None) -> int:
     listener = open_loopback_listener(host, port)
     utc_now = lambda: datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     ready = {"role": args.role, "host": host, "port": port, "n_embd": runner.n_embd,
-             "ready_at": utc_now()}
+             "ready_at": utc_now(),
+             # ★ 2026-09-23（§10.2）：把**本段构建标识**写进 ready 文件 —— 探针据此在记录里
+             #   逐段写出 runner/构建，避免「记录里看不出用的是 pip 绑定还是自建 shim」。
+             "build": _runner_build(runner,
+                                    digest_artifacts=bool(args.digest_artifacts))}
     if args.ready_file:
         target = Path(args.ready_file)
         target.parent.mkdir(parents=True, exist_ok=True)
