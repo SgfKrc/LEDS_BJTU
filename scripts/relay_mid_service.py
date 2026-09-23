@@ -331,6 +331,11 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
                     help="★ 仅 --role tail（pip llama_engine）：批处理线程数；缺省取 --threads "
                          "（与 shim 一致。pip 绑定默认 cpu_count()）")
     ap.add_argument("--max-tokens", type=int, default=RELAY_DEFAULT_MAX_TOKENS)
+    ap.add_argument("--hidden-quant", default="none",
+                    choices=("none", "f16", "int8_block128", "int4_block128"),
+                    help="★ A5：**下行**（本服务 → 客户端）的 hidden 压缩档。只有 --role head/middle "
+                         "会回 HIDDEN（tail 回 TOKEN，不受影响）；客户端按帧里的档位解压。"
+                         "实测判据见 docs/跨框架接力 §5.1③（f16 / int8 32/32 PASS，int4 FAIL）")
     ap.add_argument("--dll-dir", action="append", default=[])
     ap.add_argument("--ready-file", default=None,
                     help="写就绪标记（含实际端点与**构建标识**），供驱动等待与逐段对账")
@@ -420,6 +425,10 @@ def main(argv: list[str] | None = None) -> int:
     utc_now = lambda: datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     ready = {"role": args.role, "host": host, "port": port, "n_embd": runner.n_embd,
              "ready_at": utc_now(),
+             # ★ 2026-09-23（A5）：本服务**下行**（→ 客户端）的 hidden 压缩档。
+             #   tail 角色回 TOKEN、不回 HIDDEN ⇒ 记 `None`，避免记录里出现误导性档位。
+             "hidden_quant_downlink": (args.hidden_quant
+                                       if serve is serve_relay_middle_connection else None),
              # ★ 2026-09-23（§10.2）：把**本段构建标识**写进 ready 文件 —— 探针据此在记录里
              #   逐段写出 runner/构建，避免「记录里看不出用的是 pip 绑定还是自建 shim」。
              "build": _runner_build(runner,
@@ -460,8 +469,14 @@ def main(argv: list[str] | None = None) -> int:
             sock, _addr = listener.accept()
             try:
                 runner.reset()
-                result = serve(sock, runner, n_embd=int(runner.n_embd),
-                               max_tokens=int(args.max_tokens))
+                # ★ A5：只有 head/middle 角色会回 HIDDEN ⇒ 下行压缩档仅对它们有意义。
+                if serve is serve_relay_middle_connection:
+                    result = serve(sock, runner, n_embd=int(runner.n_embd),
+                                   max_tokens=int(args.max_tokens),
+                                   hidden_quant=args.hidden_quant)
+                else:
+                    result = serve(sock, runner, n_embd=int(runner.n_embd),
+                                   max_tokens=int(args.max_tokens))
                 print(f"[session] frames={result.frames} tokens={result.tokens} "
                       f"closed_cleanly={result.closed_cleanly} error={result.error or '-'}",
                       flush=True)

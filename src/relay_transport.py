@@ -471,10 +471,11 @@ class RelayTcpClient:
             raise RelayProtocolError("hidden_response_required")
         if response.n_tokens != count:
             raise RelayProtocolError("hidden_token_count_mismatch")
-        if len(response.payload) != expected_hidden_bytes(count, self.n_embd):
+        if len(response.payload) != expected_hidden_bytes(count, self.n_embd, response.quant):
             raise RelayProtocolError("hidden_payload_size_mismatch")
         self._sequence += 1
-        return bytes(response.payload)
+        # ★ A5：下行档位由**服务端**决定 ⇒ 按帧里的档位解回 f32（对调用方永远是 f32）。
+        return frame_hidden_bytes(response, n_embd=self.n_embd)
 
     def request_hidden(self, hidden: bytes, *, n_tokens: int, quant: str = "none") -> bytes:
         """★ 中间段往返：发 HIDDEN，收 HIDDEN（远端段交出它自己的 hidden）。
@@ -508,10 +509,11 @@ class RelayTcpClient:
             raise RelayProtocolError("hidden_response_required")
         if response.n_tokens != count:
             raise RelayProtocolError("hidden_token_count_mismatch")
-        if len(response.payload) != expected_hidden_bytes(count, self.n_embd):
+        if len(response.payload) != expected_hidden_bytes(count, self.n_embd, response.quant):
             raise RelayProtocolError("hidden_payload_size_mismatch")
         self._sequence += 1
-        return bytes(response.payload)
+        # ★ A5：下行档位由**服务端**决定 ⇒ 按帧里的档位解回 f32（对调用方永远是 f32）。
+        return frame_hidden_bytes(response, n_embd=self.n_embd)
 
     def request_hidden_seq(self, hidden: bytes, *, n_tokens: int,
                            meta: dict[str, object], quant: str = "none") -> bytes:
@@ -542,10 +544,11 @@ class RelayTcpClient:
             raise RelayProtocolError("hidden_response_required")
         if response.n_tokens != count:
             raise RelayProtocolError("hidden_token_count_mismatch")
-        if len(response.payload) != expected_hidden_bytes(count, self.n_embd):
+        if len(response.payload) != expected_hidden_bytes(count, self.n_embd, response.quant):
             raise RelayProtocolError("hidden_payload_size_mismatch")
         self._sequence += 1
-        return bytes(response.payload)
+        # ★ A5：下行档位由**服务端**决定 ⇒ 按帧里的档位解回 f32（对调用方永远是 f32）。
+        return frame_hidden_bytes(response, n_embd=self.n_embd)
 
     def close(self) -> None:
         if self._closed:
@@ -754,6 +757,7 @@ def serve_relay_middle_connection(
     *,
     n_embd: int,
     max_tokens: int = RELAY_DEFAULT_MAX_TOKENS,
+    hidden_quant: str = "none",
 ) -> RelayBridgeResult:
     """★ 中间段服务：HIDDEN → `runner.request_hidden()` → HIDDEN（末位 argmax 不传）。
 
@@ -761,6 +765,12 @@ def serve_relay_middle_connection(
     `request_hidden(hidden_bytes, n_tokens=...) -> bytes` 与 `close()`；
     主仓的 `llama_keep_head.KeepHeadUpstream`（经 `forward_hidden_to_hidden`）与
     Android 的 `nativeLayerForwardHiddenKeepHead` 语义一致。
+
+    ★ A5 两个方向：
+    * **上行**（客户端 → 本服务）：档位写在请求帧的 `flags` 低 3 位（`frame.quant`）——
+      本函数按它解回 f32 再喂 runner；
+    * **下行**（本服务 → 客户端）：档位由 `hidden_quant` 单方面决定（客户端只跟随解压）。
+      两端可以选不同档位（例如上行 `f16`、下行 `int8_block128`）。
     """
 
     width = int(n_embd)
@@ -818,7 +828,8 @@ def serve_relay_middle_connection(
                 send_frame(
                     sock,
                     RelayFrame(RelayFrameKind.HIDDEN, sequence, n_tokens=n_tokens,
-                               payload=produced),
+                               payload=quantize_upload(produced, n_tokens, width, hidden_quant),
+                               quant=hidden_quant or "none"),
                 )
                 frames += 1
                 tokens += n_tokens
@@ -846,7 +857,9 @@ def serve_relay_middle_connection(
                 send_frame(
                     sock,
                     RelayFrame(RelayFrameKind.HIDDEN, sequence, n_tokens=len(incoming),
-                               payload=produced),
+                               payload=quantize_upload(produced, len(incoming), width,
+                                                       hidden_quant),
+                               quant=hidden_quant or "none"),
                 )
                 frames += 1
                 tokens += len(incoming)
@@ -874,7 +887,9 @@ def serve_relay_middle_connection(
             send_frame(
                 sock,
                 RelayFrame(RelayFrameKind.HIDDEN, sequence, n_tokens=frame.n_tokens,
-                           payload=produced),
+                           payload=quantize_upload(produced, frame.n_tokens, width,
+                                                   hidden_quant),
+                           quant=hidden_quant or "none"),
             )
             frames += 1
             tokens += frame.n_tokens
