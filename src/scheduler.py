@@ -2385,7 +2385,12 @@ class Scheduler(
                 "location": "local" if node_id == local_node_id else f"node:{node_id}",
                 "kind": "local" if node_id == local_node_id else "remote_pipeline",
                 "federated": node_id != local_node_id,
-                "engine": "pytorch",
+                "engine": (
+                    "relay_middle"
+                    if callable(getattr(self, "_relay_segment_for_worker", None))
+                    and self._relay_segment_for_worker(node_id) is not None
+                    else "pytorch"
+                ),
             }
             for node_id, _node in snapshot
         }

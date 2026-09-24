@@ -34,6 +34,7 @@ from relay_transport import (  # noqa: E402
     serve_relay_middle_connection,
 )
 from scheduler_pipeline import SchedulerPipelineMixin  # noqa: E402
+from scheduler_pipeline import RELAY_HIDDEN_WIRE_FORMAT, _decode_relay_hidden, _encode_relay_hidden  # noqa: E402
 
 N_EMBD = 4
 N_TOKENS = 2
@@ -101,6 +102,27 @@ def _spec(port: int, **overrides) -> dict[str, object]:
             "timeout": 5.0}
     spec.update(overrides)
     return spec
+
+
+def test_relay_wire_format_is_raw_f32_and_shape_preserving():
+    import torch
+
+    value = torch.arange(8, dtype=torch.float16).reshape(1, 2, 4)
+    encoded, shape = _encode_relay_hidden(value)
+    raw = __import__("base64").b64decode(encoded)
+    assert shape == [1, 2, 4]
+    assert len(raw) == 1 * 2 * 4 * 4
+    assert _decode_relay_hidden(raw, shape).dtype == torch.float32
+    assert _decode_relay_hidden(raw, shape).shape == value.shape
+
+
+def test_relay_wire_format_rejects_shape_mismatch():
+    import torch
+
+    encoded, _ = _encode_relay_hidden(torch.zeros((1, 2, N_EMBD)))
+    raw = __import__("base64").b64decode(encoded)
+    with pytest.raises(ValueError, match="length mismatch"):
+        _decode_relay_hidden(raw, [1, 3, N_EMBD])
 
 
 # ---- _normalize_relay_segment：严格拒绝 ------------------------------------
@@ -193,6 +215,45 @@ def test_via_relay_passes_seq_meta():
     assert runner.meta is not None
     assert list(runner.meta["seq_ids"]) == [0, 1]
     assert list(runner.meta["n_seq_id"]) == [1, 1]
+
+
+def test_relay_session_is_reused_until_task_finish():
+    runner = _PlusOneRunner()
+    listener = open_loopback_listener("127.0.0.1", 0)
+    port = int(listener.getsockname()[1])
+    box: dict[str, object] = {}
+
+    def _run() -> None:
+        sock, _ = listener.accept()
+        try:
+            box["bridge"] = serve_relay_middle_connection(
+                sock, runner, n_embd=N_EMBD, max_tokens=64,
+            )
+        finally:
+            sock.close()
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    harness = _Harness()
+    try:
+        spec = _spec(port)
+        harness.obj._handle_layer_forward_via_relay(
+            spec, data={"hidden_states": _hidden(), "task_id": "reuse", "step": 0},
+            task_id="reuse", step=0, config_id="c1", model_sha256="sha",
+            model_type="qwen", received_chain_path=[],
+        )
+        harness.obj._handle_layer_forward_via_relay(
+            spec, data={"hidden_states": _hidden(1), "task_id": "reuse", "step": 1},
+            task_id="reuse", step=1, config_id="c1", model_sha256="sha",
+            model_type="qwen", received_chain_path=[],
+        )
+        assert len(runner.seen) == 2
+        assert "reuse" in harness.obj._relay_segment_clients
+        harness.obj._close_relay_segment_client("reuse")
+        assert "reuse" not in harness.obj._relay_segment_clients
+        thread.join(timeout=5)
+    finally:
+        listener.close()
 
 
 # ---- 失败/越界必须具名（绝不静默）-----------------------------------------

@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 import uuid
+import base64
 
 from koakuma_engine import Capability, backend_id_for, runtime_supports
 from config import (PIPELINE_MODEL_SYNC_TIMEOUT, PIPELINE_RELAY_ENABLED,
@@ -16,6 +17,36 @@ from scheduler_types import PreemptState
 from torch_runtime import require_torch
 
 logger = logging.getLogger("scheduler")
+
+
+RELAY_HIDDEN_WIRE_FORMAT = "qlh.relay_hidden.f32.v1"
+
+
+def _encode_relay_hidden(tensor) -> tuple[str, list[int]]:
+    """Encode relay input as the explicit raw-f32 wire contract."""
+    torch = require_torch()
+    cpu = tensor.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    return base64.b64encode(cpu.numpy().tobytes()).decode("ascii"), [
+        int(size) for size in cpu.shape
+    ]
+
+
+def _decode_relay_hidden(raw: bytes, shape: object):
+    """Decode and validate a relay raw-f32 payload on the Torch side."""
+    if not isinstance(shape, list) or not shape or any(
+        isinstance(size, bool) or not isinstance(size, int) or size <= 0
+        for size in shape
+    ):
+        raise ValueError("relay hidden_shape must be a non-empty positive integer list")
+    expected_items = 1
+    for size in shape:
+        expected_items *= size
+    if len(raw) != expected_items * 4:
+        raise ValueError(
+            f"relay raw f32 length mismatch: bytes={len(raw)} expected={expected_items * 4}"
+        )
+    torch = require_torch()
+    return torch.frombuffer(memoryview(raw), dtype=torch.float32).reshape(shape).clone()
 
 
 class SchedulerPipelineMixin:
@@ -214,13 +245,20 @@ class SchedulerPipelineMixin:
                 "model_type": model_type,
                 "total_layers": int(model_info["total_layers"]),
                 "master_quant_type": model_info.get("quant_type", ""),
-                "engine": "pytorch",
+                "engine": (
+                    "relay_middle"
+                    if self._relay_segment_for_worker(nid) is not None
+                    else "pytorch"
+                ),
                 "sync_policy": (
                     "master_authoritative" if authoritative_sync else "normal"
                 ),
                 "authoritative_sync": authoritative_sync,
                 "master_api_port": API_PORT,
             }
+            relay_segment = self._relay_segment_for_worker(nid)
+            if relay_segment is not None:
+                assignments[nid]["relay_segment"] = relay_segment
             if capacity_plan is not None:
                 assignments[nid].update({
                     "phase": "prepare",
@@ -563,6 +601,7 @@ class SchedulerPipelineMixin:
         """清理主节点侧单个流水线任务的等待结果与链路 ACK 状态。"""
         if not task_id:
             return
+        self._close_relay_segment_client(task_id)
         prefix = f"{task_id}:"
         with self._pipeline_lock:
             self._pipeline_active_tasks.discard(task_id)
@@ -633,10 +672,59 @@ class SchedulerPipelineMixin:
                 if not pending_config_id or pending_config_id not in self._layer_config_inflight:
                     pending = self._pending_layer_config
                     self._pending_layer_config = None
+        self._close_relay_segment_client(task_id)
         if pending is not None:
             client_id, data = pending
             logger.info("当前流水线任务已结束，开始应用延后的分层配置")
             self._schedule_layer_config(client_id, data)
+
+
+    def _relay_segment_client_for_task(
+        self, task_id: str, spec: dict[str, object], *, n_embd: int,
+    ) -> RelaySegmentClient:
+        """Reuse one relay TCP session for all steps in a pipeline task."""
+        cache = getattr(self, "_relay_segment_clients", None)
+        if cache is None:
+            cache = {}
+            self._relay_segment_clients = cache
+        key = (
+            str(spec["host"]), int(spec["port"]), int(n_embd),
+            float(spec["timeout"]),
+        )
+        current = cache.get(task_id)
+        if current is not None and current[0] == key:
+            return current[1]
+        if current is not None:
+            try:
+                current[1].close()
+            except Exception:
+                logger.debug("close stale relay session failed", exc_info=True)
+        client = RelaySegmentClient(
+            str(spec["host"]), int(spec["port"]), n_embd=int(n_embd),
+            role="middle", timeout=float(spec["timeout"]),
+        )
+        cache[task_id] = (key, client)
+        return client
+
+
+    def _close_relay_segment_client(self, task_id: str) -> None:
+        cache = getattr(self, "_relay_segment_clients", None)
+        if not cache:
+            return
+        current = cache.pop(task_id, None)
+        if current is not None:
+            try:
+                current[1].close()
+            except Exception:
+                logger.debug("close relay session failed: task=%s", task_id, exc_info=True)
+
+
+    def _close_all_relay_segment_clients(self) -> None:
+        cache = getattr(self, "_relay_segment_clients", None)
+        if not cache:
+            return
+        for task_id in list(cache):
+            self._close_relay_segment_client(task_id)
 
 
     def _mark_local_pipeline_cancelled(self, task_id: str) -> None:
@@ -1315,7 +1403,7 @@ class SchedulerPipelineMixin:
                 raise ValueError(f"层配置目标节点 {target_node_id} 与本节点 {node_id} 不一致")
             if expected_model_type not in {"qwen", "qwen2"}:
                 raise ValueError(f"不支持的流水线模型架构: {expected_model_type or 'unknown'}")
-            if expected_engine != "pytorch":
+            if expected_engine not in {"pytorch", "relay_middle"}:
                 raise ValueError(
                     f"分层配置引擎必须为 pytorch，实际为 {expected_engine}"
                 )
@@ -1336,6 +1424,45 @@ class SchedulerPipelineMixin:
                 raise ValueError(f"不支持的分层加载阶段: {phase}")
             if phase == "prepare" and (not plan_id or required_bytes <= 0):
                 raise ValueError("prepare 阶段缺少 plan_id 或 required_bytes")
+            if expected_engine == "relay_middle":
+                relay_spec = self._normalize_relay_segment(cfg.get("relay_segment"))
+                if not PIPELINE_RELAY_ENABLED or relay_spec is None:
+                    raise ValueError("relay_middle requires an enabled valid relay_segment")
+                mgr = self._host
+                if not mgr or not mgr.is_loaded:
+                    raise RuntimeError("relay worker local model is not loaded")
+                actual_engine = backend_id_for(mgr, default="pytorch") or "pytorch"
+                if actual_engine == "pytorch":
+                    raise RuntimeError("relay_middle requires a non-PyTorch worker backend")
+                loaded_config = getattr(getattr(mgr, "model", None), "config", None)
+                actual_model_type = str(getattr(loaded_config, "model_type", "") or "").lower()
+                if actual_model_type != expected_model_type:
+                    raise RuntimeError(
+                        f"worker model type changed: actual={actual_model_type}, expected={expected_model_type}"
+                    )
+                active_config = {
+                    "node_id": node_id, "config_id": config_id,
+                    "model_id": model_id, "model_sha256": expected_sha256,
+                    "model_type": actual_model_type, "layer_range": [start, end],
+                    "engine": expected_engine, "relay_segment": relay_spec,
+                }
+                with self._layer_config_lock:
+                    self._pipeline_worker_reserved = True
+                    self._active_layer_config = dict(active_config)
+                    self._local_pipeline_steps.clear()
+                    self._prepared_layer_configs.pop(config_id, None)
+                self._host.model_loaded = True
+                self._host.current_quant = getattr(mgr, "quant_type", None) or "runtime"
+                self._send_layer_config_ack({
+                    "node_id": node_id, "config_id": config_id,
+                    "generation": ack_generation, "status": "ready", "phase": phase,
+                    "plan_id": plan_id, "layer_range": [start, end],
+                    "has_embedding": has_embed, "has_lm_head": has_lm,
+                    "model_sha256": expected_sha256, "model_type": actual_model_type,
+                    "engine": expected_engine, "relay_segment": relay_spec,
+                    "timestamp": time.time(),
+                })
+                return
             prepared = {}
             if phase == "commit" and plan_id:
                 with self._layer_config_lock:
@@ -1646,7 +1773,7 @@ class SchedulerPipelineMixin:
                 "layer_range": [start, end],
                 "model_sha256": "",
                 "model_type": expected_model_type,
-                "engine": "pytorch",
+                "engine": expected_engine,
                 "error": str(e),
                 "timestamp": time.time(),
             })
@@ -1760,7 +1887,7 @@ class SchedulerPipelineMixin:
                     and data.get("layer_range") == expected_range
                     and data.get("model_sha256") == expected.get("model_sha256")
                     and data.get("model_type") == expected.get("model_type")
-                    and data.get("engine") == "pytorch"
+                    and data.get("engine") == expected.get("engine", "pytorch")
                     and int(data.get("available_bytes", 0) or 0)
                     >= int(expected.get("required_bytes", 0) or 0)
                 )
@@ -1775,7 +1902,7 @@ class SchedulerPipelineMixin:
                     and data.get("layer_range") == expected_range
                     and data.get("model_sha256") == expected.get("model_sha256")
                     and data.get("model_type") == expected.get("model_type")
-                    and data.get("engine") == "pytorch"
+                    and data.get("engine") == expected.get("engine", "pytorch")
                 )
                 ready = (
                     expected_phase == "commit"
@@ -1783,7 +1910,7 @@ class SchedulerPipelineMixin:
                     and data.get("layer_range") == expected_range
                     and data.get("model_sha256") == expected.get("model_sha256")
                     and data.get("model_type") == expected.get("model_type")
-                    and data.get("engine") == "pytorch"
+                    and data.get("engine") == expected.get("engine", "pytorch")
                     and (
                         "has_embedding" not in data
                         or bool(data.get("has_embedding"))
@@ -1981,8 +2108,7 @@ class SchedulerPipelineMixin:
             4. 序列化输出（hidden_states 或 logits，不含 KV cache）
             5. 发送 LAYER_RESULT 回主节点
         """
-        require_torch()
-        from transport_port import MessageType, serialize_tensor
+        from transport_port import MessageType
 
         data = msg.get("data", {})
         task_id = str(data.get("task_id", "unknown") or "unknown")
@@ -2054,8 +2180,6 @@ class SchedulerPipelineMixin:
                         f"流水线 step 越序: task={task_id}, step={step}, "
                         f"last_step={last_step}"
                     )
-            from transport_port import deserialize_tensor
-
             mgr = self._host
             if not mgr or not mgr.is_loaded:
                 layer_config_invalid = True
@@ -2072,11 +2196,16 @@ class SchedulerPipelineMixin:
                 if not PIPELINE_RELAY_ENABLED or relay_spec is None:
                     layer_config_invalid = True
                     raise RuntimeError(f"worker 引擎已变化: {backend_id_for(mgr)}")
+                if relay_spec != active_config.get("relay_segment"):
+                    layer_config_invalid = True
+                    raise RuntimeError("relay segment does not match active layer config")
                 return self._handle_layer_forward_via_relay(
                     relay_spec, data=data, task_id=task_id, step=step,
                     config_id=config_id, model_sha256=model_sha256,
                     model_type=model_type, received_chain_path=received_chain_path,
                 )
+            require_torch()
+            from transport_port import deserialize_tensor, serialize_tensor
             if actual_model_type != model_type:
                 layer_config_invalid = True
                 raise RuntimeError(
@@ -2408,6 +2537,20 @@ class SchedulerPipelineMixin:
         if not hidden_bytes or len(hidden_bytes) % (width * 4):
             raise RuntimeError("relay 段委托的 hidden 长度与 n_embd 不匹配（需 f32 且整除）")
         n_tokens = len(hidden_bytes) // (width * 4)
+        hidden_shape = data.get("hidden_shape")
+        if isinstance(hidden_shape, list):
+            if not hidden_shape or any(
+                isinstance(size, bool) or not isinstance(size, int) or size <= 0
+                for size in hidden_shape
+            ) or hidden_shape[-1] != width:
+                raise RuntimeError("relay hidden_shape must end in n_embd and contain positive integers")
+            shape_items = 1
+            for size in hidden_shape:
+                shape_items *= size
+            if shape_items != n_tokens * width:
+                raise RuntimeError("relay hidden_shape does not match raw f32 payload")
+        else:
+            hidden_shape = [n_tokens, width]
 
         # ★ P3：显式给了 seq_ids / positions 就走 `HIDDEN_SEQ`（多序列必须逐 token 绑定）。
         seq_ids = data.get("seq_ids")
@@ -2426,12 +2569,12 @@ class SchedulerPipelineMixin:
 
         self._begin_local_pipeline_task(task_id)   # 与既有执行路径对齐（保证 begin/finish 平衡）
         started = time.time()
-        client = RelaySegmentClient(str(spec["host"]), int(spec["port"]), n_embd=width,
-                                    role="middle", timeout=float(spec["timeout"]))
+        client = self._relay_segment_client_for_task(task_id, spec, n_embd=width)
         try:
             outcome = client.forward_hidden(hidden_bytes, n_tokens=n_tokens, seq_meta=seq_meta)
-        finally:
-            client.close()
+        except Exception:
+            self._close_relay_segment_client(task_id)
+            raise
         elapsed_ms = (time.time() - started) * 1000
 
         if not outcome.ok:
@@ -2441,6 +2584,17 @@ class SchedulerPipelineMixin:
             _code = outcome.error or "relay_internal_error"
             raise RelaySegmentError(_code, role="middle", endpoint=outcome.endpoint,
                                     detail=f"relay_segment_failed:{_code}")
+
+        layer_lock = getattr(self, "_layer_config_lock", None)
+        steps = getattr(self, "_local_pipeline_steps", None)
+        if steps is None:
+            steps = {}
+            self._local_pipeline_steps = steps
+        if layer_lock is None:
+            steps[task_id] = step
+        else:
+            with layer_lock:
+                steps[task_id] = step
 
         response = {
             "task_id": task_id,
@@ -2452,7 +2606,8 @@ class SchedulerPipelineMixin:
             "chain_path": [*[str(item) for item in received_chain_path],
                            self.get_effective_node_id()],
             "hidden_states": bytes(outcome.hidden),
-            "hidden_shape": [n_tokens, width],
+            "hidden_wire_format": RELAY_HIDDEN_WIRE_FORMAT,
+            "hidden_shape": hidden_shape,
             "metrics": {
                 "time_ms": round(elapsed_ms, 1),
                 "kv_cache": False,       # KV 在远端段，本节点没有本地 KV
@@ -2795,7 +2950,7 @@ class SchedulerPipelineMixin:
                 and ack.get("layer_range") == expected_range
                 and ack.get("model_sha256") == expected.get("model_sha256")
                 and ack.get("model_type") == expected.get("model_type")
-                and ack.get("engine") == "pytorch"
+                and ack.get("engine") == expected.get("engine", "pytorch")
             )
             layer_status = "ready" if layer_ready else (
                 "error" if ack.get("status") == "error" else
@@ -3088,7 +3243,7 @@ class SchedulerPipelineMixin:
                     and ack.get("layer_range") == expected_range
                     and ack.get("model_sha256") == expected.get("model_sha256")
                     and ack.get("model_type") == expected.get("model_type")
-                    and ack.get("engine") == "pytorch"
+                    and ack.get("engine") == expected.get("engine", "pytorch")
                 )
             if not layer_ready:
                 return False, f"节点 {node_id} 尚未确认层配置加载成功"
@@ -4034,10 +4189,20 @@ class SchedulerPipelineMixin:
                         raise RuntimeError("主节点首段未返回 hidden_states")
                     hs_cpu = local_result["hidden_states"].detach().cpu()
                     import base64 as _b64
-                    forward_data["hidden_states"] = _b64.b64encode(
-                        serialize_tensor(hs_cpu)
-                    ).decode("ascii")
-                    forward_data["hidden_shape"] = list(hs_cpu.shape)
+                    relay_segment = (
+                        self._relay_segment_for_worker(first_node_id)
+                        if master_participates else None
+                    )
+                    if relay_segment is not None:
+                        forward_data["hidden_states"], forward_data["hidden_shape"] = (
+                            _encode_relay_hidden(hs_cpu)
+                        )
+                        forward_data["hidden_wire_format"] = RELAY_HIDDEN_WIRE_FORMAT
+                    else:
+                        forward_data["hidden_states"] = _b64.b64encode(
+                            serialize_tensor(hs_cpu)
+                        ).decode("ascii")
+                        forward_data["hidden_shape"] = list(hs_cpu.shape)
                     logger.debug(
                         f"🏠 Master 本地 Step {step}: Layer "
                         f"{master_assignment['start_layer']}-{master_assignment['end_layer']} "
@@ -4071,7 +4236,10 @@ class SchedulerPipelineMixin:
 
             # ★ A1 / X 档（2026-09-24）：若该节点被配置为「由远端 relay 段代跑本段」，
             #   随 LAYER_FORWARD 下发规格；worker 侧仅在开关打开时才会认它（默认关 ⇒ 零影响）。
-            relay_segment = self._relay_segment_for_worker(first_node_id)
+            relay_segment = (
+                relay_segment if "relay_segment" in locals()
+                else self._relay_segment_for_worker(first_node_id)
+            )
             if relay_segment is not None:
                 forward_data["relay_segment"] = relay_segment
 
@@ -4133,7 +4301,17 @@ class SchedulerPipelineMixin:
             elif "hidden_states" in result and result["hidden_states"] is not None:
                 hidden_data = result["hidden_states"]
                 if isinstance(hidden_data, bytes):
-                    final_hidden = deserialize_tensor(hidden_data)
+                    if result.get("hidden_wire_format") == RELAY_HIDDEN_WIRE_FORMAT:
+                        try:
+                            final_hidden = _decode_relay_hidden(
+                                hidden_data, result.get("hidden_shape")
+                            )
+                        except Exception as exc:
+                            step_error = f"relay hidden 解码失败: {exc}"
+                            logger.error(step_error)
+                            final_hidden = None
+                    else:
+                        final_hidden = deserialize_tensor(hidden_data)
                 elif self._scheduler_facade_global('torch') is not None and isinstance(hidden_data, self._scheduler_facade_global('torch').Tensor):
                     final_hidden = hidden_data
                 else:
