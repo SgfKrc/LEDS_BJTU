@@ -458,17 +458,51 @@ def main(argv: list[str] | None = None) -> int:
                         pass
 
             threading.Thread(target=_beat, daemon=True).start()
+    # ★ 2026-09-24：把**每序列可用 ctx** 讲清楚 —— llama.cpp 会把 `n_ctx` 按 `n_seq_max`
+    #   **均分**；单序列长 decode 一旦超过 `n_ctx / n_seq_max` 就会在中途报 llama.cpp 的
+    #   "failed to find a memory slot for batch"（`llama_decode rc=1`）。
+    #   实测（tail 段）：`n_ctx=2048, n_seq_max=8` ⇒ 单序列仅 256 槽位，decode 到第 256 步即失败；
+    #   `4096/8=512` ⇒ ~481 步失败；`8192/8=1024` ⇒ ~1000 步失败（三者完全吻合）。
+    #   ⇒ 单序列用法请显式 `--n-seq-max 1`，或把 `--n-ctx` 放大到 `n_seq_max` 倍。
+    _per_seq = int(args.n_ctx) // max(1, int(args.n_seq_max))
+    if int(args.n_seq_max) > 1:
+        print(f"[warn] n_seq_max={args.n_seq_max} ⇒ 每序列 ctx ≈ {_per_seq}（单序列长 decode "
+              f"超过它会在中途 rc=1 失败）；单序列请用 --n-seq-max 1 或放大 --n-ctx", flush=True)
     print(f"[ready] role={args.role} listening {host}:{port} n_embd={runner.n_embd} "
-          f"(heartbeat={args.heartbeat_interval}s)", flush=True)
+          f"ctx_per_seq={_per_seq} (heartbeat={args.heartbeat_interval}s)", flush=True)
 
     served = 0
+    degraded: str | None = None
     try:
         while True:
             if args.max_connections and served >= int(args.max_connections):
                 break
             sock, _addr = listener.accept()
+            # ★ 2026-09-24：**fail-closed 但不退出** —— runner 一旦不可用（例如长 decode 触发
+            #   `llama_decode rc=1` 找不到 KV 槽位），后续会话必须**明确拒绝**，而不是让异常冒到
+            #   顶层把服务进程带走（那样现象与"模型算错"难以区分，实测踩到）。保持进程存活，
+            #   心跳与日志才继续可见。
+            if degraded is not None:
+                print(f"[reject] runner unavailable: {degraded}", flush=True)
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                served += 1
+                continue
             try:
-                runner.reset()
+                try:
+                    runner.reset()
+                except Exception as exc:  # noqa: BLE001 - 引擎已不可用
+                    degraded = f"{type(exc).__name__}: {exc}"
+                    print(f"[degraded] runner reset failed -> marking unavailable: {degraded}",
+                          flush=True)
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    served += 1
+                    continue
                 # ★ A5：只有 head/middle 角色会回 HIDDEN ⇒ 下行压缩档仅对它们有意义。
                 if serve is serve_relay_middle_connection:
                     result = serve(sock, runner, n_embd=int(runner.n_embd),

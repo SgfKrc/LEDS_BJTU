@@ -244,6 +244,10 @@ class KeepHeadUpstream:
         lib.qlh_kh_close.restype = None
         lib.qlh_kh_reset.argtypes = [ctypes.c_void_p]
         lib.qlh_kh_reset.restype = None
+        # ★ 2026-09-24：**可选**符号 —— 透出最近一次 `llama_decode` 的原始 rc（旧 shim 无此符号）。
+        if hasattr(lib, "qlh_kh_last_error"):
+            lib.qlh_kh_last_error.argtypes = [ctypes.c_void_p]
+            lib.qlh_kh_last_error.restype = ctypes.c_int32
 
         n_embd_out = ctypes.c_int32(0)
         n_layer_out = ctypes.c_int32(0)
@@ -360,6 +364,27 @@ class KeepHeadUpstream:
         except (KeyError, TypeError, ValueError) as exc:
             raise KeepHeadUnavailable("keep-head worker returned invalid hidden") from exc
 
+    def last_decode_error(self) -> int:
+        """★ 2026-09-24：最近一次 `llama_decode` 的**原始**返回码（0 = 无错误，或旧 shim）。
+
+        与 `qlh_kh_forward*` 的稳定返回码（-2 = "decode 失败"）不同，这里给的是 **llama.cpp 自己**
+        的错误码 —— 长时 decode 在特定 ctx 下失败时，只有它能区分"KV/ctx 相关"与"参数/状态相关"。
+        旧版 shim 没有 `qlh_kh_last_error` ⇒ 返回 0（向后兼容）。
+        """
+        if self._lib is None or self._handle is None:
+            return 0
+        if not hasattr(self._lib, "qlh_kh_last_error"):
+            return 0
+        try:
+            return int(self._lib.qlh_kh_last_error(self._handle))
+        except Exception:  # noqa: BLE001 - 诊断信息绝不能变成新的失败点
+            return 0
+
+    def _decode_error_suffix(self) -> str:
+        """把 `last_decode_error()` 渲染成可读后缀（为 0 时返回空串）。"""
+        value = self.last_decode_error()
+        return f"（shim 记录 llama_decode rc={value}）" if value else ""
+
     def forward_tokens_to_hidden(self, tokens: Sequence[int], *, n_past: int = 0):
         """跑模型（`nextn` 模式即前 K 层），返回 `[n_tokens, n_embd]` 的 f32 hidden。"""
         import numpy as np
@@ -378,7 +403,8 @@ class KeepHeadUpstream:
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
         if rc != 0:
             raise KeepHeadUnavailable(
-                f"keep-head 前向失败 rc={rc}：{FORWARD_ERRORS.get(rc, '未知错误码')}")
+                f"keep-head 前向失败 rc={rc}：{FORWARD_ERRORS.get(rc, '未知错误码')}"
+                f"{self._decode_error_suffix()}")
         return out
 
     def forward_hidden_to_token(self, hidden, *, n_past: int = 0,
@@ -447,7 +473,8 @@ class KeepHeadUpstream:
             ctypes.byref(out_token))
         if rc != 0:
             raise KeepHeadUnavailable(
-                f"keep-head 末段前向失败 rc={rc}：{FORWARD_ERRORS.get(rc, '未知错误码')}")
+                f"keep-head 末段前向失败 rc={rc}：{FORWARD_ERRORS.get(rc, '未知错误码')}"
+                f"{self._decode_error_suffix()}")
         return int(out_token.value)
 
     def forward_hidden_to_hidden(self, hidden, *, n_past: int = 0,
@@ -503,7 +530,8 @@ class KeepHeadUpstream:
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
         if rc != 0:
             raise KeepHeadUnavailable(
-                f"keep-head embd 前向失败 rc={rc}：{FORWARD_ERRORS.get(rc, '未知错误码')}")
+                f"keep-head embd 前向失败 rc={rc}：{FORWARD_ERRORS.get(rc, '未知错误码')}"
+                f"{self._decode_error_suffix()}")
         return out
 
     @staticmethod
