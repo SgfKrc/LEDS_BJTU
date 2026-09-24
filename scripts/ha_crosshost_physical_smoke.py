@@ -22,7 +22,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -229,6 +229,68 @@ def _inject_delay() -> None:
         time.sleep(_WEAKNET_DELAY_S)
 
 
+# ---------------------------------------------------------------- ★ R-R2（§26）：丢包下的重试/退避
+# §26 实测：丢包 5% 起冒烟即 failed，失败点是 `listener.accept()` 处**单次**连接不够 ——
+# 经同一代理的 SSH 单次成功率约 1/3。⇒ 修法是**重试 + 指数退避**，且退避要有上限
+# （弱网下"多试几次"胜过"一直等"，也不能让冒烟无限挂住）。
+SSH_RETRY_ATTEMPTS = 3
+SSH_RETRY_BASE_S = 0.5
+SSH_RETRY_MAX_S = 4.0
+
+
+def retry_delays(attempts: int, *, base_s: float = SSH_RETRY_BASE_S,
+                 max_s: float = SSH_RETRY_MAX_S) -> list[float]:
+    """指数退避序列（**纯函数**，便于单测）：`base, base*2, base*4, …` 截到 `max_s`。
+
+    返回长度 == `attempts`；**最后一次失败后不再睡**（调用方按 `index < len(delays)` 判）。
+    """
+    if attempts < 0:
+        raise ValueError("attempts must be >= 0")
+    return [min(base_s * (2 ** index), max_s) for index in range(int(attempts))]
+
+
+def _connect_with_retry(listener: socket.socket, start_worker: Callable[[], Any], *,
+                        attempts: int = SSH_RETRY_ATTEMPTS,
+                        first_frame_timeout_s: float = 15.0,
+                        sleeper: Callable[[float], None] | None = None) -> tuple[Any, Any]:
+    """**起 worker（SSH）+ 等它连回反向端口**，失败就重起重等（★ R-R2）。
+
+    为什么必须重试：丢包链路下 SSH 单次建连成功率约 1/3（§26）⇒ 反向 TCP 端口从未连通 ⇒
+    `listener.accept()` 干等超时 ⇒ 整个冒烟 failed。这里把「起进程 + accept」当作**一个可重试
+    单元**：单次 `accept()` 超时不够，必须**换一条新 SSH 连接**再等。
+
+    ⚠️ 每次失败都**回收**刚起的进程；全部失败时也**不留孤儿**（抛 `PhysicalSmokeError`）。
+    返回 `(进程, 已连上的 socket)` —— 成功那次的进程**不**回收。
+    """
+    sleeper = sleeper or time.sleep
+    total = max(1, int(attempts))
+    # 退避只发生在两次尝试之间 ⇒ 共 total-1 次（最后一次失败后立刻放弃）
+    delays = retry_delays(max(0, total - 1))
+    last_error: Exception | None = None
+    last_process: Any = None
+    for index in range(total):
+        process = last_process = start_worker()
+        try:
+            listener.settimeout(first_frame_timeout_s)
+            connection, _address = listener.accept()
+            return process, connection
+        except (TimeoutError, OSError) as exc:
+            last_error = exc
+            if index < total - 1:
+                # 中间失败：回收，再换一条新连接重试
+                try:
+                    process.kill()
+                except Exception:  # noqa: BLE001  # 回收失败不掩盖原始连接错误
+                    pass
+        if index < len(delays):
+            sleeper(delays[index])
+    error = PhysicalSmokeError(
+        f"worker_connect_retry_exhausted:{type(last_error).__name__}")
+    # 最后一次的进程**不回收**：调用方要用它的 stderr 诊断，并负责收尾
+    error.process = last_process  # type: ignore[attr-defined]
+    raise error
+
+
 def _send_line(sock: socket.socket, value: dict[str, Any]) -> None:
     sock.sendall((json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"))
 
@@ -428,14 +490,19 @@ def _run_quorum_exchange(target: str, remote_root: str, *,
             f"VOTER_SET_JSON = {voter_set_json!r}",
             f"LEDGER_PATH = {remote_state!r}",
         )))
-    worker = _ssh_worker(target, remote_root, remote_port, local_port, source)
     events: list[dict[str, Any]] = []
+    worker = None
     try:
         try:
-            connection, _ = listener.accept()
-        except OSError as exc:      # 远端 voter 没连上来 ⇒ 附上它的 stderr 便于诊断
+            # ★ R-R2：起 voter 同样走「重起 + 重等」（`accept()` 超时是这里最常见的失败点）
+            worker, connection = _connect_with_retry(
+                listener,
+                lambda: _ssh_worker(target, remote_root, remote_port, local_port, source))
+        except (OSError, PhysicalSmokeError) as exc:
+            # 远端 voter 没连上来 ⇒ 附上它的 stderr 便于诊断
+            worker = getattr(exc, "process", None)
             detail = ""
-            if worker.stderr is not None:
+            if worker is not None and worker.stderr is not None:
                 try:
                     detail = worker.stderr.read(2000).decode("utf-8", "replace").strip()
                 except OSError:
@@ -483,7 +550,8 @@ def _run_quorum_exchange(target: str, remote_root: str, *,
                            "digest_prefix": digest[:16]})
             _expect_ok(connection, {"op": "close"})
     finally:
-        _stop_ssh(worker)
+        if worker is not None:
+            _stop_ssh(worker)
         listener.close()
     return {
         "status": "passed",
@@ -513,10 +581,14 @@ def _run_surface(target: str, remote_root: str, *, long_steps: int = 1,
     events: list[dict[str, Any]] = []
     payload = b"physical-ha-control-metadata"
     now_ms = int(time.time() * 1000)
-    first_process = _ssh_process(target, remote_root, remote_port, local_port,
-                                 proxy_command=proxy_command)
+    # ★ R-R2：丢包链路上**单次** SSH 建连常失败（§26 实测成功率 ~1/3）⇒ 把
+    # 「起 worker + 等它连回反向端口」当作**可重试单元**（失败即换连接重来）。
+    first_process = None
     try:
-        connection, _ = listener.accept()
+        first_process, connection = _connect_with_retry(
+            listener,
+            lambda: _ssh_process(target, remote_root, remote_port, local_port,
+                                 proxy_command=proxy_command))
         connection.settimeout(15)
         with connection:
             ready = _recv_line(connection)
@@ -574,10 +646,13 @@ def _run_surface(target: str, remote_root: str, *, long_steps: int = 1,
         _stop_ssh(first_process)
         events.append({"event": "surface_worker_stopped", "reason": "simulated_crash"})
 
-        second_process = _ssh_process(target, remote_root, remote_port, local_port,
-                                      proxy_command=proxy_command)
+        # ★ R-R2：换新的 worker 同样走「重起 + 重等」
+        second_process = None
         try:
-            connection, _ = listener.accept()
+            second_process, connection = _connect_with_retry(
+                listener,
+                lambda: _ssh_process(target, remote_root, remote_port, local_port,
+                                     proxy_command=proxy_command))
             connection.settimeout(15)
             with connection:
                 ready = _recv_line(connection)
@@ -610,7 +685,8 @@ def _run_surface(target: str, remote_root: str, *, long_steps: int = 1,
                 })
                 events.append({"event": "surface_control_frame_accepted_after_reconnect", "generation": recovered["generation"]})
         finally:
-            _stop_ssh(second_process)
+            if second_process is not None:
+                _stop_ssh(second_process)
         return {
             "status": "passed",
             "target": "surface",
@@ -628,7 +704,8 @@ def _run_surface(target: str, remote_root: str, *, long_steps: int = 1,
             },
         }
     finally:
-        _stop_ssh(first_process)
+        if first_process is not None:
+            _stop_ssh(first_process)
         listener.close()
 
 
@@ -673,7 +750,34 @@ def _discover_y700_serial(adb: str, host: str) -> str | None:
     return None
 
 
-def _ssh_works(target: str, *, timeout: int = 6) -> bool:
+def _ssh_works(target: str, *, timeout: int = 6, attempts: int = SSH_RETRY_ATTEMPTS,
+               runner: Callable[..., Any] | None = None,
+               sleeper: Callable[[float], None] | None = None) -> bool:
+    """探测目标是否可用 SSH 登录 —— **带重试与指数退避**（★ R-R2，§26 丢包硬边界）。
+
+    `runner` / `sleeper` 可注入（单测用）；默认走真 `subprocess.run` + `time.sleep`。
+    """
+    runner = runner or subprocess.run
+    sleeper = sleeper or time.sleep
+    # 同上：退避只在两次尝试之间发生 ⇒ 最后一次失败后不睡
+    delays = retry_delays(max(0, int(attempts) - 1))
+    for index in range(max(1, int(attempts))):
+        try:
+            completed = runner(
+                ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}",
+                 "-o", "StrictHostKeyChecking=accept-new", target, "true"],
+                capture_output=True,
+                text=True,
+                timeout=timeout + 5,
+                check=False,
+            )
+            if completed.returncode == 0:
+                return True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if index < len(delays):
+            sleeper(delays[index])
+    return False
     """探测 Termux sshd 是否可达。
 
     为什么优先它：Android 无线调试的端口**每次都会变**（设备 `ro.debuggable=0`
