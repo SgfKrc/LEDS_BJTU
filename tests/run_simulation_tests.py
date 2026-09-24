@@ -120,6 +120,14 @@ async def run_test(scenario_name: str, test_type: str = "single", slave_count: i
 
 
 def main():
+    # Windows 控制台默认 GBK：打印 `✓`/`✗` 会抛 `UnicodeEncodeError` 并**中断整套仿真**
+    # （实测 `--all` 在第 1 个场景结束后即崩，后续场景一个都没跑）。降级为 replace。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
+
     """主函数"""
     parser = argparse.ArgumentParser(
         description="分布式推理仿真测试运行器",
