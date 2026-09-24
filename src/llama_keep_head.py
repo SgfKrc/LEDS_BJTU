@@ -72,6 +72,18 @@ FORWARD_ERRORS = {
 MODE_CODES = {"nextn": 0, "layer_inp": 1}
 
 
+def ctx_per_seq_for(n_ctx: int, n_seq_max: int) -> int:
+    """★ 2026-09-24：**每序列可用 ctx** = `n_ctx // n_seq_max`（`n_seq_max <= 0` 视为 1）。
+
+    llama.cpp 把 `n_ctx` 按 `n_seq_max` **均分**；单序列长 decode 一旦超过这个预算，就会在
+    **中途**报 "failed to find a memory slot for batch"（`llama_decode rc=1`）—— 症状是
+    `runner_failed`，与"模型算错"难以区分（实测：`n_ctx=2048 / n_seq_max=8` ⇒ 单序列仅 256
+    槽位，decode 到第 256 步即失败；`4096/8=512` ⇒ ~481 步；`8192/8=1024` ⇒ ~1000 步）。
+    抽成纯函数：既可单测，也便于调用方在启动前校验自己的 `prefill + gen` 预算。
+    """
+    return max(0, int(n_ctx)) // max(1, int(n_seq_max))
+
+
 class KeepHeadUnavailable(RuntimeError):
     """shim 缺失、符号不对或加载/初始化失败（都属于「不能用」，绝不降级成 embeddings 通道）。"""
 
@@ -169,6 +181,17 @@ class KeepHeadUpstream:
 
         self._worker = None
         self.n_seq_max = max(1, int(n_seq_max))
+        # ★ 2026-09-24：**每序列可用 ctx** —— llama.cpp 把 `n_ctx` 按 `n_seq_max` **均分**，
+        #   单序列长 decode 一旦超过 `n_ctx / n_seq_max` 就会在中途报 llama.cpp 的
+        #   "failed to find a memory slot for batch"（`llama_decode rc=1`），现象是 `runner_failed`，
+        #   与"模型算错"难以区分（实测：tail 段 `n_ctx=2048 / n_seq_max=8` ⇒ 单序列仅 **256** 槽位，
+        #   decode 到第 256 步即失败）。这里把不变式**显式暴露**出来，调用方应据此校验自己的
+        #   `prefill + gen` 预算；`n_seq_max > 1` 时额外给一行告警。
+        self.ctx_per_seq = ctx_per_seq_for(n_ctx, self.n_seq_max)
+        if self.n_seq_max > 1:
+            print(f"[keep-head][warn] n_seq_max={self.n_seq_max} ⇒ 每序列 ctx ≈ "
+                  f"{self.ctx_per_seq}（n_ctx={n_ctx} 被均分）；单序列长 decode 请用 n_seq_max=1 "
+                  f"或把 n_ctx 放大到 {self.n_seq_max} 倍", file=sys.stderr, flush=True)
         # ★ 隔离判据必须**顺序无关**（2026-09-23 修 `WinError 127`）：
         #   旧代码只判 `_llama_cpp_loaded()` ⇒ 「keep-head 先加载、llama_cpp 后导入」这一半
         #   会就地加载 shim，把 keep-head 的 ggml-base.dll/ggml.dll 永久绑进进程，

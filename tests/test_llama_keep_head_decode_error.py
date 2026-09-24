@@ -16,7 +16,21 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from llama_keep_head import KeepHeadUpstream  # noqa: E402
+from llama_keep_head import KeepHeadUpstream, ctx_per_seq_for  # noqa: E402
+
+
+def test_ctx_per_seq_matches_measured_behaviour() -> None:
+    """★ 本坑的核心不变式：`n_ctx` 按 `n_seq_max` **均分**。
+
+    三个断言取自实测（不是推算）：`2048/8 = 256`（decode 到第 256 步报 rc=1）、
+    `4096/8 = 512`（历史观测失败在 ~481，481+32 prefill ≈ 513）、`8192/8 = 1024`（~1000）。
+    """
+    assert ctx_per_seq_for(2048, 8) == 256
+    assert ctx_per_seq_for(4096, 8) == 512
+    assert ctx_per_seq_for(8192, 8) == 1024
+    assert ctx_per_seq_for(2048, 1) == 2048
+    assert ctx_per_seq_for(552, 0) == 552    # n_seq_max <= 0 视为 1
+    assert ctx_per_seq_for(0, 4) == 0
 
 
 class _LibWithoutLastError:
