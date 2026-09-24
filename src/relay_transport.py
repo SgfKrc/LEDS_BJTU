@@ -374,19 +374,30 @@ def decode_tokens(payload: bytes, *, limit: int) -> list[int]:
     return [int(_TOKEN.unpack_from(payload, i * size)[0]) for i in range(count)]
 
 
+def _error_code_from_frame(frame: RelayFrame, expected_sequence: int) -> str:
+    """从 `ERROR` 帧解出**稳定码**（不合法一律回落 `remote_error`）。
+
+    ★ 2026-09-24：此前只有 token 返回路径（`_decode_token`）解 ERROR 帧；三条 **hidden 返回路径**
+    （`request_hidden` / `request_hidden_seq` / `request_hidden_from_tokens`）直接把它当成
+    "非 HIDDEN 帧" ⇒ 抛 `hidden_response_required`，于是服务端**明明发来**的 `runner_failed`
+    / `hidden_payload_size_mismatch` 等稳定码被丢掉（而 `hidden_response_required` 本身不在
+    白名单 ⇒ 调用方最终只看到笼统的 `relay_protocol_error`）。这直接破坏"具名回退"：
+    `_fallback_reason` 写不出真实原因，失败会退化成"与模型算错难以区分"。三条路径现在共用本函数。
+    """
+    if frame.sequence != expected_sequence:
+        raise RelayProtocolError("response_sequence_mismatch")
+    if len(frame.payload) > _RELAY_ERROR_PAYLOAD_LIMIT:
+        return RELAY_REMOTE_ERROR
+    try:
+        code = frame.payload.decode("ascii")
+    except UnicodeDecodeError:
+        return RELAY_REMOTE_ERROR
+    return code if code in _RELAY_ERROR_CODES else RELAY_REMOTE_ERROR
+
+
 def _decode_token(frame: RelayFrame, expected_sequence: int) -> int:
     if frame.kind == RelayFrameKind.ERROR:
-        if frame.sequence != expected_sequence:
-            raise RelayProtocolError("response_sequence_mismatch")
-        if len(frame.payload) > _RELAY_ERROR_PAYLOAD_LIMIT:
-            raise RelayProtocolError(RELAY_REMOTE_ERROR)
-        try:
-            code = frame.payload.decode("ascii")
-        except UnicodeDecodeError:
-            code = RELAY_REMOTE_ERROR
-        if code not in _RELAY_ERROR_CODES:
-            code = RELAY_REMOTE_ERROR
-        raise RelayProtocolError(code)
+        raise RelayProtocolError(_error_code_from_frame(frame, expected_sequence))
     if frame.sequence != expected_sequence:
         raise RelayProtocolError("response_sequence_mismatch")
     if frame.kind != RelayFrameKind.TOKEN or frame.n_tokens != 1 or len(frame.payload) != 4:
@@ -465,6 +476,9 @@ class RelayTcpClient:
                        payload=encode_tokens(values)),
         )
         response = recv_frame(self._sock, max_payload_bytes=self.max_payload_bytes)
+        if response.kind == RelayFrameKind.ERROR:
+            # ★ 2026-09-24：ERROR 帧必须解出服务端的**稳定码**，不能笼统当成"非 HIDDEN"。
+            raise RelayProtocolError(_error_code_from_frame(response, sequence))
         if response.sequence != sequence:
             raise RelayProtocolError("response_sequence_mismatch")
         if response.kind != RelayFrameKind.HIDDEN:
@@ -503,6 +517,8 @@ class RelayTcpClient:
                        quant=quant or "none"),
         )
         response = recv_frame(self._sock, max_payload_bytes=self.max_payload_bytes)
+        if response.kind == RelayFrameKind.ERROR:
+            raise RelayProtocolError(_error_code_from_frame(response, sequence))
         if response.sequence != sequence:
             raise RelayProtocolError("response_sequence_mismatch")
         if response.kind != RelayFrameKind.HIDDEN:
@@ -538,6 +554,8 @@ class RelayTcpClient:
                        quant=quant or "none"),
         )
         response = recv_frame(self._sock, max_payload_bytes=self.max_payload_bytes)
+        if response.kind == RelayFrameKind.ERROR:
+            raise RelayProtocolError(_error_code_from_frame(response, sequence))
         if response.sequence != sequence:
             raise RelayProtocolError("response_sequence_mismatch")
         if response.kind != RelayFrameKind.HIDDEN:
