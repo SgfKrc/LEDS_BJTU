@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -106,3 +107,47 @@ def test_health_self_check_fails_when_relay_probe_is_neutered(tmp_path: Path) ->
     result = _run_self_check(tmp_path / "gates", HEALTH_SCRIPT)
     assert result.returncode == 1, result.stdout + result.stderr
     assert "假服务" in result.stdout, result.stdout
+
+
+def test_relay_driver_rejects_fake_segment_before_relaying(tmp_path: Path) -> None:
+    """★ R-R9：接力**前置探活**必须拦住「端口在监听但服务已死」的假段（§8.6 的现象）。
+
+    子进程里起一个「accept 后立刻 close」的假服务，再调驱动的 `_require_relay_alive` ⇒
+    必须 `SystemExit`（fail-loud），而不是把它放进接力、跑出一个**无法归因**的结果。
+    这也是"该红必须红"：把探活退回"只 connect"，本用例立刻红。
+    """
+    script = tmp_path / "fake_segment_probe.py"
+    script.write_text(textwrap.dedent(f'''
+        import socket, sys, threading
+        sys.path[:0] = [r"{REPO_ROOT / "scripts"}", r"{REPO_ROOT / "src"}", r"{REPO_ROOT}"]
+
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        port = int(srv.getsockname()[1])
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                conn.close()          # accept 后立刻 close => §8.6 的现象
+
+        threading.Thread(target=serve, daemon=True).start()
+
+        from relay_experiment import _require_relay_alive
+
+        try:
+            _require_relay_alive(f"127.0.0.1:{{port}}")
+        except SystemExit as exc:
+            print("REJECTED", exc)
+            raise SystemExit(0)
+        print("ACCEPTED")
+        raise SystemExit(1)
+    '''), encoding="utf-8")
+
+    result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", cwd=str(REPO_ROOT), check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "REJECTED" in result.stdout, result.stdout

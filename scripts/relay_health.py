@@ -172,6 +172,12 @@ def _probe_relay(endpoint: str, *, timeout: float) -> dict[str, Any]:
                 pass
 
 
+#: ★ R-R9：`_probe_relay` 的**公开别名** —— 驱动（`scripts/relay_experiment.py`）在接力开始前
+#: 调用它做前置探活。实现保持私有（工具内部一直用它），别名只是给"跨脚本复用"一个稳定入口，
+#: 免得驱动去 import 一个下划线名字。
+probe_relay = _probe_relay
+
+
 def _check_ready(alias: str, path: str, *, timeout: float, stale_seconds: float) -> dict[str, Any]:
     """经 ssh 读远端 ready 文件，检查**心跳新鲜度**。
 

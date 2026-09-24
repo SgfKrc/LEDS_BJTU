@@ -49,7 +49,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
-for _path in (str(ROOT), str(SRC)):
+SCRIPTS = ROOT / "scripts"   # ★ R-R9：本目录的 relay_health 要被 import（接力前置探活）
+for _path in (str(ROOT), str(SRC), str(SCRIPTS)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
@@ -453,6 +454,35 @@ def _load_upstream(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+#: ★ R-R9：本进程内已探活成功的远端端点 —— 同一端点只探一次，避免多段重复握手。
+_RELAY_PROBED: set[str] = set()
+
+
+def _require_relay_alive(endpoint: str) -> None:
+    """★ R-R9：接力**开始前**对远端段做一次**协议级**探活，不通就 fail-loud。
+
+    为什么不能只 `connect`：远端段跑在 ssh 会话里时，一次网络抖动会把会话带走、**服务随之退出**，
+    而隧道端口**仍在本机监听**、新连接被接受后立刻 reset ⇒ 那种失败看起来像"模型算错"，
+    会毁掉整轮实验的**可归因性**（`docs/跨框架接力-当前有效基线与后续优化计划-2026-09-21.md` §8.6）。
+    宁可开始前就报错，也不要跑出一个无法归因的结果。
+
+    `scripts/relay_health.py` 的 `probe_relay` 会真发一个 `CLOSE` 帧并等 `TOKEN(-1)` 应答
+    （不经 runner、不加载模型）。探活成功的端点会被记住，同一进程内不再重复。
+    """
+    if endpoint in _RELAY_PROBED:
+        return
+    from relay_health import probe_relay  # noqa: PLC0415 - 同目录工具脚本
+
+    result = probe_relay(endpoint, timeout=10.0)
+    if result.get("ok") is not True:
+        raise SystemExit(
+            f"FAIL: 远端段未通过协议级探活 {endpoint}：{result.get('reason')}"
+            f"（{result.get('detail')}）\n"
+            f"  hint: {result.get('hint') or '确认该段服务是否还在（例如随 ssh 会话被网络抖动静默带走）'}"
+        )
+    _RELAY_PROBED.add(endpoint)
+
+
 class _RemoteMiddleSegment:
     """跨机中间段代理：接口与 `KeepHeadUpstream.forward_hidden_to_hidden` 一致。
 
@@ -478,6 +508,8 @@ class _RemoteMiddleSegment:
         self.hidden_quant = str(hidden_quant or "none")
         self.uplink_bytes = 0        # Actual bytes passed to the Relay wire.
         self.downlink_bytes = 0
+        # ★ R-R9：连上之前先做一次**协议级**探活（fail-loud）—— 见 `_require_relay_alive` 的说明。
+        _require_relay_alive(self.endpoint)
         self._client = RelayTcpClient(host, int(port), n_embd=self.n_embd, timeout=timeout)
 
     def _simulate_link(self, n_bytes: int) -> None:
