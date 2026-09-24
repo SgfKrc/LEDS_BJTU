@@ -28,9 +28,152 @@ from src.torch_operator_registry import (
 
 INPUT_SCHEMA = "qlh.torch_hetero_plan_input.v1"
 REPORT_SCHEMA = "qlh.torch_hetero_plan_report.v1"
+OPERATOR_PROFILE_SCHEMA = "qlh.torch_operator_profile.v1"
+LAYER_PROFILE_SCHEMA = "qlh.torch_layer_profile.v1"
 SCHEDULE_MODEL = "topological_device_queue_and_link_fifo_v1"
 MIB = 1024 ** 2
 GIB = 1024 ** 3
+
+
+@dataclass(frozen=True)
+class OperatorProfileEvidence:
+    """Validated real operator-profile coverage for offline planner inputs.
+
+    The profile script records profiler-attributed operator times. Those values
+    are useful for coverage and shape inspection, but are intentionally not
+    accepted as planner costs because profiler instrumentation changes timing
+    semantics. Independent wall-clock costs remain a separate input contract.
+    """
+
+    profile_schema: str
+    phase: str
+    device_type: str
+    model_fingerprint: str
+    workload_fingerprint: str
+    profile_ref: str
+    operator_count: int
+    dispatch_call_count: int
+    unmatched_dispatch_calls: int
+    logical_operator_counts: Mapping[str, int]
+    unmapped_profile_operators: tuple[str, ...]
+    wall_samples_ms: tuple[float, ...]
+    warmup: Mapping[str, Any]
+    profiler_costs_usable: bool = False
+
+    def __post_init__(self) -> None:
+        if self.profile_schema != OPERATOR_PROFILE_SCHEMA:
+            raise ValueError("unsupported operator profile schema")
+        if self.phase not in {"prefill", "decode"}:
+            raise ValueError("operator profile phase must be prefill or decode")
+        if self.device_type not in {"cpu", "cuda"}:
+            raise ValueError("operator profile device must be cpu or cuda")
+        if not self.model_fingerprint or not self.workload_fingerprint or not self.profile_ref:
+            raise ValueError("operator profile identity and source are required")
+        _positive_int(self.operator_count, "operator profile operator_count")
+        _positive_int(self.dispatch_call_count, "operator profile dispatch_call_count")
+        _positive_int(self.unmatched_dispatch_calls, "operator profile unmatched calls", allow_zero=True)
+        if len(self.wall_samples_ms) < 3:
+            raise ValueError("operator profile needs at least three wall samples")
+        for sample in self.wall_samples_ms:
+            _finite(sample, "operator profile wall sample", minimum=0.000001)
+        if not isinstance(self.warmup, Mapping):
+            raise ValueError("operator profile warmup must be an object")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **asdict(self),
+            "logical_operator_counts": dict(self.logical_operator_counts),
+            "unmapped_profile_operators": list(self.unmapped_profile_operators),
+            "wall_samples_ms": list(self.wall_samples_ms),
+            "profiler_costs_usable": False,
+        }
+
+
+def _profile_operator_mapping(registry: OperatorRegistry) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for logical in registry.catalog()["logical_operators"]:
+        logical_id = logical["operator_id"]
+        for observed in logical.get("observed_profile_operators", ()):
+            previous = mapping.setdefault(observed, logical_id)
+            if previous != logical_id:
+                raise ValueError(f"profile operator maps to multiple logical operators: {observed}")
+    return mapping
+
+
+def load_operator_profile_evidence(
+    profile: Mapping[str, Any],
+    *,
+    phase: str,
+    device_id: str,
+    profile_ref: str,
+    model_fingerprint: str,
+    workload_fingerprint: str,
+    registry: OperatorRegistry = DEFAULT_TORCH_OPERATOR_REGISTRY,
+) -> OperatorProfileEvidence:
+    """Validate a real ``TORCH-OP-PROFILE-01`` phase without loading torch.
+
+    This is deliberately an evidence adapter, not a timing shortcut. The
+    profiler rows establish observed operator coverage and dispatch counts;
+    their attributed times remain ineligible for ``MeasuredOperatorCost``.
+    """
+    profile = _mapping(profile, "operator profile")
+    if profile.get("schema_version") != OPERATOR_PROFILE_SCHEMA:
+        raise ValueError(f"profile schema_version must be {OPERATOR_PROFILE_SCHEMA}")
+    phases = _mapping(profile.get("phases"), "operator profile.phases")
+    phase_data = _mapping(phases.get(phase), f"operator profile.phases.{phase}")
+    rows = phase_data.get("operators")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("operator profile phase must contain non-empty operators")
+    runtime = _mapping(profile.get("runtime"), "operator profile.runtime")
+    runtime_device = _mapping(runtime.get("device"), "operator profile.runtime.device")
+    runtime_type = str(runtime_device.get("type", ""))
+    if runtime_type != device_id.split(":", 1)[0]:
+        raise ValueError("operator profile device does not match requested device")
+    wall = _mapping(phase_data.get("uninstrumented_wall"), "operator profile wall")
+    samples = wall.get("samples_ms")
+    if not isinstance(samples, list):
+        raise ValueError("operator profile wall samples must be a list")
+    mapping = _profile_operator_mapping(registry)
+    logical_counts: dict[str, int] = {}
+    unmapped: set[str] = set()
+    dispatch_count = 0
+    for row in rows:
+        row = _mapping(row, "operator profile row")
+        operator = row.get("operator")
+        calls = row.get("calls")
+        if not isinstance(operator, str) or not operator.startswith("aten::"):
+            raise ValueError("operator profile row has invalid operator name")
+        _positive_int(calls, "operator profile row calls")
+        if row.get("phase") != phase:
+            raise ValueError("operator profile row phase mismatch")
+        dispatch_count += calls
+        logical_id = mapping.get(operator)
+        if logical_id is None:
+            unmapped.add(operator)
+        else:
+            logical_counts[logical_id] = logical_counts.get(logical_id, 0) + calls
+    declared_dispatch = phase_data.get("dispatch_call_count")
+    if declared_dispatch != dispatch_count:
+        raise ValueError("operator profile dispatch count does not match rows")
+    unmatched = phase_data.get("unmatched_dispatch_calls")
+    _positive_int(unmatched, "operator profile unmatched calls", allow_zero=True)
+    if unmatched:
+        raise ValueError("operator profile contains unmatched dispatch calls")
+    return OperatorProfileEvidence(
+        profile_schema=profile["schema_version"],
+        phase=phase,
+        device_type=runtime_type,
+        model_fingerprint=model_fingerprint,
+        workload_fingerprint=workload_fingerprint,
+        profile_ref=profile_ref,
+        operator_count=len(rows),
+        dispatch_call_count=dispatch_count,
+        unmatched_dispatch_calls=unmatched,
+        logical_operator_counts=logical_counts,
+        unmapped_profile_operators=tuple(sorted(unmapped)),
+        wall_samples_ms=tuple(float(value) for value in samples),
+        warmup=_mapping(phase_data.get("warmup", {}), "operator profile warmup"),
+    )
 
 
 def _finite(value: float, name: str, *, minimum: float = 0.0) -> None:
@@ -203,6 +346,89 @@ class MeasuredOperatorCost:
         if len(ordered) % 2:
             return ordered[middle]
         return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def load_layer_profile_parts(
+    profile: Mapping[str, Any],
+    *,
+    phase: str,
+    device_id: str,
+    profile_ref: str,
+) -> tuple[tuple[OperatorNode, ...], tuple[TensorEdge, ...], tuple[MeasuredOperatorCost, ...]]:
+    """Convert an isolated layer-profile phase into planner input parts.
+
+    The source report must carry one real node and >=3 independent wall samples
+    per layer. This function does not relax planner gates: instrumented or
+    warmup-inconsistent rows remain represented and are rejected later by the
+    planner rather than silently repaired here.
+    """
+    profile = _mapping(profile, "layer profile")
+    if profile.get("schema_version") != LAYER_PROFILE_SCHEMA:
+        raise ValueError(f"profile schema_version must be {LAYER_PROFILE_SCHEMA}")
+    if phase not in {"prefill", "decode"}:
+        raise ValueError("layer profile phase must be prefill or decode")
+    if not device_id or device_id not in {"cpu", "cuda"}:
+        raise ValueError("layer profile device_id must be cpu or cuda")
+    if not profile_ref:
+        raise ValueError("layer profile reference is required")
+    model_fingerprint = profile.get("model_fingerprint")
+    workload_fingerprint = profile.get("workload_fingerprint")
+    if not isinstance(model_fingerprint, str) or not isinstance(workload_fingerprint, str):
+        raise ValueError("layer profile fingerprints are required")
+    runtime = _mapping(profile.get("runtime"), "layer profile.runtime")
+    runtime_device = _mapping(runtime.get("device"), "layer profile.runtime.device")
+    if runtime_device.get("type") != device_id:
+        raise ValueError("layer profile device mismatch")
+    phase_data = _mapping(
+        _mapping(profile.get("phase_profiles"), "layer profile.phase_profiles").get(phase),
+        f"layer profile.phase_profiles.{phase}",
+    )
+    raw_nodes = phase_data.get("nodes")
+    raw_edges = phase_data.get("edges")
+    raw_costs = phase_data.get("costs")
+    if not isinstance(raw_nodes, list) or not raw_nodes:
+        raise ValueError("layer profile phase must contain nodes")
+    if not isinstance(raw_edges, list) or not isinstance(raw_costs, list):
+        raise ValueError("layer profile phase must contain edges and costs")
+    nodes = tuple(OperatorNode(**_mapping(item, "layer profile node")) for item in raw_nodes)
+    edges = tuple(TensorEdge(**_mapping(item, "layer profile edge")) for item in raw_edges)
+    node_ids = {node.node_id for node in nodes}
+    if len(node_ids) != len(nodes):
+        raise ValueError("layer profile contains duplicate node ids")
+    nodes_by_id = {node.node_id: node for node in nodes}
+    costs: list[MeasuredOperatorCost] = []
+    cost_node_ids: set[str] = set()
+    for item in raw_costs:
+        item = dict(_mapping(item, "layer profile cost"))
+        cost_node_id = item.get("node_id")
+        if cost_node_id in cost_node_ids:
+            raise ValueError("layer profile contains duplicate cost node ids")
+        cost_node_ids.add(cost_node_id)
+        node = nodes_by_id.get(cost_node_id)
+        if node is None:
+            raise ValueError("layer profile cost references an unknown node")
+        for field in ("operator_id", "dtype", "shape_fingerprint"):
+            if item.get(field) != getattr(node, field):
+                raise ValueError(f"layer profile cost {field} does not match node")
+        raw_device = str(item.get("device_id", ""))
+        if raw_device.split(":", 1)[0] != device_id:
+            raise ValueError("layer profile cost device mismatch")
+        if item.get("phase") != phase:
+            raise ValueError("layer profile cost phase mismatch")
+        if item.get("model_fingerprint") != model_fingerprint:
+            raise ValueError("layer profile cost model fingerprint mismatch")
+        if item.get("workload_fingerprint") != workload_fingerprint:
+            raise ValueError("layer profile cost workload fingerprint mismatch")
+        samples = item.get("samples_ms")
+        if not isinstance(samples, list):
+            raise ValueError("layer profile cost samples must be a list")
+        item["device_id"] = device_id
+        item["samples_ms"] = tuple(samples)
+        item["source_ref"] = f"{profile_ref}#{item.get('source_ref', 'cost')}"
+        costs.append(MeasuredOperatorCost(**item))
+    if cost_node_ids != node_ids:
+        raise ValueError("layer profile nodes and costs do not cover the same layers")
+    return nodes, edges, tuple(costs)
 
 
 @dataclass(frozen=True)
@@ -891,11 +1117,16 @@ __all__ = [
     "INPUT_SCHEMA",
     "LayerFitEvidence",
     "LinkProfile",
+    "LAYER_PROFILE_SCHEMA",
     "MeasuredOperatorCost",
+    "OPERATOR_PROFILE_SCHEMA",
     "OperatorNode",
+    "OperatorProfileEvidence",
     "REPORT_SCHEMA",
     "SCHEDULE_MODEL",
     "TensorEdge",
+    "load_operator_profile_evidence",
+    "load_layer_profile_parts",
     "main",
     "plan_operator_placement",
 ]

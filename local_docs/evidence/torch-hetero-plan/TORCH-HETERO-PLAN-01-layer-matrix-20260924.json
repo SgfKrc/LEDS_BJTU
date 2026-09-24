@@ -1,0 +1,35 @@
+{
+  "schema_version": "qlh.torch_hetero_plan_layer_matrix.v1",
+  "ticket": "TORCH-HETERO-PLAN-01",
+  "created_at": "2026-09-24",
+  "model": "qwen2.5-0.5b-instruct",
+  "runtime": {
+    "torch": "2.13.0+cu126",
+    "precision": "fp32",
+    "prompt_tokens": 64,
+    "warmup": 1,
+    "repeats": 5,
+    "layer_range": [0, 24]
+  },
+  "identity": {
+    "model_fingerprint_match": true,
+    "workload_fingerprint_match": true,
+    "prefill_shape_match": true,
+    "decode_shape_match": true
+  },
+  "coverage": {
+    "cpu": {"prefill_layers": 24, "prefill_stable": 20, "decode_layers": 24, "decode_stable": 6},
+    "cuda": {"prefill_layers": 24, "prefill_stable": 19, "decode_layers": 24, "decode_stable": 19},
+    "both_devices_stable": {"prefill_layers": 17, "decode_layers": 5}
+  },
+  "sources": {
+    "cpu": "local_docs/evidence/torch-hetero-plan/cpu-layer-profile-fp32-full-20260924.json",
+    "cuda": "local_docs/evidence/torch-hetero-plan/cuda-layer-profile-fp32-full-20260924.json"
+  },
+  "decision": {
+    "planner_parts_loaded": true,
+    "full_layer_plan_admitted": false,
+    "reason": "decode and prefill have unstable layer costs; no rows were synthesized or repaired",
+    "runtime_connected": false
+  }
+}

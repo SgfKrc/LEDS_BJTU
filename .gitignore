@@ -26,7 +26,12 @@ SMTP.md
 .codex/
 
 # Local-only documentation
-local_docs/
+local_docs/*
+!local_docs/evidence/
+local_docs/evidence/*
+!local_docs/evidence/torch-hetero-plan/
+local_docs/evidence/torch-hetero-plan/*
+!local_docs/evidence/torch-hetero-plan/TORCH-HETERO-PLAN-01-layer-matrix-20260924.json
 
 # OS
 .DS_Store
@@ -185,6 +190,7 @@ scripts/*
 !scripts/torch_hardware_admit.py
 !scripts/torch_lan_echo_probe.py
 !scripts/torch_cpu_jitter_diagnosis.py
+!scripts/torch_layer_profile.py
 !scripts/setup_envs.py
 !scripts/setup_test_env.py
 !scripts/setup_qwen3_sidecar_env.py
@@ -220,6 +226,7 @@ scripts/*
 !scripts/relay_sync_device.ps1
 !scripts/relay_health.py
 !scripts/run_doc_checks.py
+!scripts/tui_e2e_flow.py
 
 # 根目录：过时日志 / 备份（2026-09-20 剔除）
 # ⚠️ `bjtu.bat` / `bjtu.sh` **保留** —— 它们仍是活跃入口：
