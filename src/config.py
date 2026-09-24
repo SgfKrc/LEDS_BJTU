@@ -405,6 +405,13 @@ PIPELINE_ASSIGNMENT_STALE_SECONDS = _env_float(
 # `_handle_layer_forward_via_relay`。跨机通道仍只允许 loopback / 本地 SSH 隧道端点。
 PIPELINE_RELAY_ENABLED = _env_bool("QLH_RELAY_ENABLED", False)
 
+# ★ A1 / X 档（2026-09-24）：**哪些节点由远端 relay 段代跑本段**（主节点侧配置）。
+# 格式：`<node_id>=<role>@<host>:<port>#<n_embd>`，多条用 `;` 或 `,` 分隔，例如
+#   QLH_RELAY_SEGMENTS="worker-2=middle@127.0.0.1:50183#896;worker-3=middle@127.0.0.1:50184#896"
+# 只对 `QLH_RELAY_ENABLED=1` 生效；端点必须是 loopback（跨机走本地 SSH 隧道）。
+# 默认空 ⇒ 不下发任何 `relay_segment`，行为与接线前**完全一致**。不合法的条目整条丢弃。
+PIPELINE_RELAY_SEGMENTS = _env_first("QLH_RELAY_SEGMENTS", default="")
+
 # 图算法智能编排阈值：节点数超过此值（>5）时自动启用最大带宽生成树 + DFS，
 # 替代纯算力权重分配；节点数 ≤ 阈值时回退到简单排序（权重比例分配）
 GRAPH_ORCHESTRATOR_THRESHOLD = 5         # 节点数 > 5 启用图算法，≤ 5 使用简单排序

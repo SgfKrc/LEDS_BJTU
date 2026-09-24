@@ -57,14 +57,22 @@ def stable_error_code(value: object, *, fallback: str = RELAY_PROTOCOL_ERROR) ->
 
 
 class RelaySegmentError(RuntimeError):
-    """段调用失败。`code` 保证是稳定码；`str(exc)` 只由稳定码 + 端点组成，不含异常详情。"""
+    """段调用失败。`code` 保证是稳定码；`str(exc)` 由 `detail`（可选，**只给调度层读**）或 `code` 组成。
 
-    def __init__(self, code: object, *, role: str = "", endpoint: str = "") -> None:
+    `detail` 的用途：调度层要在 `_fallback_reason` 里写出可读原因（例如
+    `relay_segment_failed:runner_failed`），而这类"带前缀的可读文本"**不是**线上的稳定码 ——
+    所以它只进 `str(exc)`，**绝不**进 `code`（`code` 永远在白名单内，可安全上 wire）。
+    """
+
+    def __init__(self, code: object, *, role: str = "", endpoint: str = "",
+                 detail: object = "") -> None:
         self.code = stable_error_code(code)
         self.role = str(role)
         self.endpoint = str(endpoint)
+        self.detail = str(detail or "")
         label = f"{self.role}@{self.endpoint}" if self.role else self.endpoint
-        super().__init__(f"{self.code}#{label}" if label else self.code)
+        message = self.detail or self.code
+        super().__init__(f"{message}#{label}" if label else message)
 
 
 @dataclass(frozen=True)

@@ -259,6 +259,125 @@ def test_via_relay_rejects_missing_hidden():
     assert harness.sent == []
 
 
+# ---- 主节点侧：下发规格与具名回退 -----------------------------------------
+
+
+def test_parse_relay_segment_map_accepts_valid_and_drops_invalid():
+    """配置解析：只认 X 档范围内的条目，非法条目**整条丢弃**（绝不下发"半懂"规格）。"""
+    raw = ("worker-2=middle@127.0.0.1:50183#896;"           # 合法
+           "worker-3=head@127.0.0.1:50184#896;"            # head ⇒ Y 档，丢
+           "worker-4=middle@10.0.0.5:50185#896;"           # 非 loopback，丢
+           "broken;worker-5=middle@127.0.0.1:notaport#896;"  # 非法，丢
+           "worker-6=middle@127.0.0.1:50186#896")          # 合法
+    parsed = SchedulerPipelineMixin._parse_relay_segment_map(raw)
+
+    assert set(parsed) == {"worker-2", "worker-6"}
+    assert parsed["worker-2"] == {"role": "middle", "host": "127.0.0.1", "port": 50183,
+                                  "n_embd": 896, "timeout": 60.0}
+
+
+def test_parse_relay_segment_map_empty_is_empty():
+    assert SchedulerPipelineMixin._parse_relay_segment_map("") == {}
+    assert SchedulerPipelineMixin._parse_relay_segment_map("   ;  ") == {}
+
+
+def test_relay_segment_for_worker_respects_switch(monkeypatch: pytest.MonkeyPatch):
+    """★ 开关关闭 ⇒ **永远不下发**（对既有路径零影响）。"""
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_ENABLED", False)
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_SEGMENTS",
+                        "worker-2=middle@127.0.0.1:50183#896")
+    harness = _Harness()
+
+    assert harness.obj._relay_segment_for_worker("worker-2") is None
+
+
+def test_relay_segment_for_worker_returns_spec_and_caches(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_ENABLED", True)
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_SEGMENTS",
+                        "worker-2=middle@127.0.0.1:50183#896")
+    harness = _Harness()
+
+    spec = harness.obj._relay_segment_for_worker("worker-2")
+    assert spec is not None and spec["port"] == 50183
+    assert harness.obj._relay_segment_for_worker("worker-9") is None
+
+    # 缓存：解析一次后进程内稳定（改配置不影响已解析结果）
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_SEGMENTS",
+                        "worker-9=middle@127.0.0.1:50199#896")
+    assert harness.obj._relay_segment_for_worker("worker-9") is None
+
+
+def test_via_relay_failure_message_is_readable_for_fallback_reason():
+    """★ 失败消息必须能直接落进 `_fallback_reason`（带 `relay_segment_failed:` 前缀）。
+
+    「该红必须红」：把 `detail` 去掉（只留白名单码）会让这条红 —— 而主节点的
+    `_fallback_reason` 就只能写笼统码，正是我们要消灭的"与模型算错难以区分"。
+    """
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    dead_port = int(probe.getsockname()[1])
+    probe.close()
+
+    harness = _Harness()
+    with pytest.raises(RelaySegmentError) as excinfo:
+        harness.obj._handle_layer_forward_via_relay(
+            _spec(dead_port, timeout=1.0),
+            data={"hidden_states": _hidden(), "task_id": "t7", "step": 0},
+            task_id="t7", step=0, config_id="c1", model_sha256="sha",
+            model_type="qwen", received_chain_path=[],
+        )
+
+    message = str(excinfo.value)
+    assert message.startswith(f"relay_segment_failed:{RELAY_TRANSPORT_ERROR}")
+    assert "middle@127.0.0.1" in message
+    assert excinfo.value.code == RELAY_TRANSPORT_ERROR     # code 与可读消息解耦
+    assert harness.sent == []
+
+
+# ---- 接线闭环 -------------------------------------------------------------
+
+
+def test_end_to_end_config_to_worker_relay_roundtrip(monkeypatch: pytest.MonkeyPatch):
+    """★ 接线闭环：主节点配置 ⇒ 下发规格 ⇒ worker 认它 ⇒ 真 middle 服务跑通。
+
+    这是 X 档「本机可闭环」的核心证据：全链路（配置解析 → 两侧判据同源 → 段委托 →
+    逐字节往返）都在本进程内完成，**不需要模型、不需要多节点**。
+    """
+    runner = _PlusOneRunner()
+    listener, port, thread = _listen_middle(runner)
+    harness = _Harness()
+    try:
+        monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_ENABLED", True)
+        monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_SEGMENTS",
+                            f"worker-1=middle@127.0.0.1:{port}#{N_EMBD}")
+
+        # ① 主节点侧：解析配置并取该 worker 的规格（= 会随 LAYER_FORWARD 下发的那个 dict）
+        spec = harness.obj._relay_segment_for_worker("worker-1")
+        assert spec is not None
+
+        # ② worker 侧：收到的规格必须被 `_normalize_relay_segment` **原样**接受
+        #    （两侧判据同源 ⇒ 不会出现"主节点下发、worker 不认"的隐性不对称）
+        normalized = SchedulerPipelineMixin._normalize_relay_segment(spec)
+        assert normalized == spec
+
+        # ③ 执行：真 loopback 往返 ⇒ 逐字节正确
+        harness.obj._handle_layer_forward_via_relay(
+            normalized,
+            data={"hidden_states": _hidden(), "task_id": "e2e", "step": 0},
+            task_id="e2e", step=0, config_id="c1", model_sha256="sha",
+            model_type="qwen", received_chain_path=[],
+        )
+        thread.join(timeout=5)
+    finally:
+        listener.close()
+
+    result = harness.sent[0]["result_data"]
+    assert result["hidden_states"] == bytes((v + 1) % 256 for v in _hidden())
+    assert result["hidden_states"] != _hidden()
+    assert result["metrics"]["relay_executed"] is True
+    assert result["metrics"]["relay_tokens"] == N_TOKENS
+
+
 # ---- 「该红必须红」：开关默认必须关 ---------------------------------------
 
 

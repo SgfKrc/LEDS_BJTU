@@ -8,7 +8,8 @@ import time
 import uuid
 
 from koakuma_engine import Capability, backend_id_for, runtime_supports
-from config import PIPELINE_MODEL_SYNC_TIMEOUT, PIPELINE_RELAY_ENABLED
+from config import (PIPELINE_MODEL_SYNC_TIMEOUT, PIPELINE_RELAY_ENABLED,
+                    PIPELINE_RELAY_SEGMENTS)
 from relay_segment_client import RelaySegmentClient, RelaySegmentError
 from relay_transport import is_loopback_host
 from scheduler_types import PreemptState
@@ -2434,8 +2435,12 @@ class SchedulerPipelineMixin:
         elapsed_ms = (time.time() - started) * 1000
 
         if not outcome.ok:
-            raise RelaySegmentError(outcome.error or "relay_internal_error",
-                                    role="middle", endpoint=outcome.endpoint)
+            # ★ 这一层的语义是「**调度层的段委托**失败」⇒ 消息要能让主节点直接落进
+            #   `_fallback_reason`（形如 `pipeline_error_result: ... relay_segment_failed:runner_failed#...`）。
+            #   `detail` 只进可读消息；`RelaySegmentError.code` 仍是白名单码（可供线上/日志使用）。
+            _code = outcome.error or "relay_internal_error"
+            raise RelaySegmentError(_code, role="middle", endpoint=outcome.endpoint,
+                                    detail=f"relay_segment_failed:{_code}")
 
         response = {
             "task_id": task_id,
@@ -3247,6 +3252,50 @@ class SchedulerPipelineMixin:
             raise ConnectionError("TCP 服务端未运行")
         self._tcp_server.send_to_client(worker_id, data, msg_type)
 
+    @staticmethod
+    def _parse_relay_segment_map(raw: str) -> dict[str, dict[str, object]]:
+        """★ A1 / X 档：解析 `QLH_RELAY_SEGMENTS`（`node=role@host:port#n_embd`，`;`/`,` 分隔）。
+
+        只接受 **X 档范围内**的规格（`middle`、loopback、合法端口/宽度）—— 校验**复用**
+        `_normalize_relay_segment`（单一真源，避免两套判据漂移）。任何不合法的条目**整条丢弃**
+        （宁可不下发，也不下发"半懂"的规格）；空配置 ⇒ `{}`（行为与接线前一致）。
+        """
+        result: dict[str, dict[str, object]] = {}
+        for chunk in str(raw or "").replace(",", ";").split(";"):
+            chunk = chunk.strip()
+            if not chunk or "=" not in chunk or "@" not in chunk:
+                continue
+            name, _, value = chunk.partition("=")
+            body, _, n_embd_text = value.partition("#")
+            role, _, host_port = body.partition("@")
+            host, _, port_text = host_port.rpartition(":")
+            try:
+                spec = SchedulerPipelineMixin._normalize_relay_segment({
+                    "role": role.strip(),
+                    "host": host.strip(),
+                    "port": int(port_text),
+                    "n_embd": int(n_embd_text),
+                })
+            except ValueError:
+                continue
+            if name.strip() and spec is not None:
+                result[name.strip()] = spec
+        return result
+
+    def _relay_segment_for_worker(self, worker_id: str) -> Optional[dict]:
+        """★ A1 / X 档：该 worker 是否由远端 relay 段代跑本段（主节点侧配置，解析一次后缓存）。
+
+        开关关闭 ⇒ 直接 `None`（对既有路径零影响）。缓存用 `getattr` 惰性挂在实例上，
+        **不**改 `__init__`（本方法是 mixin 方法，实例可能来自多种构造路径）。
+        """
+        if not PIPELINE_RELAY_ENABLED:
+            return None
+        cache = getattr(self, "_relay_segment_map_cache", None)
+        if cache is None:
+            cache = self._parse_relay_segment_map(PIPELINE_RELAY_SEGMENTS)
+            self._relay_segment_map_cache = cache
+        return cache.get(str(worker_id))
+
 
     def _wait_for_layer_result(self, task_id: str, node_ids,
                                timeout: float = 30.0,
@@ -4019,6 +4068,12 @@ class SchedulerPipelineMixin:
             else:
                 forward_data["chain_next"] = None
                 forward_data["chain_remaining"] = []
+
+            # ★ A1 / X 档（2026-09-24）：若该节点被配置为「由远端 relay 段代跑本段」，
+            #   随 LAYER_FORWARD 下发规格；worker 侧仅在开关打开时才会认它（默认关 ⇒ 零影响）。
+            relay_segment = self._relay_segment_for_worker(first_node_id)
+            if relay_segment is not None:
+                forward_data["relay_segment"] = relay_segment
 
             # ---- 发送给首个 worker ----
             try:
