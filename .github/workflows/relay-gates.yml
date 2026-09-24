@@ -6,8 +6,11 @@
 #
 # 两者的 `--self-check` 用**合成输入**把判定方向钉死（不需要真机 / 工件 / 网络）：
 #   - 预算闸门：合格集必须 `safe`、越线集必须 `unsafe`，且 `--fail-on unsafe` 必须红；
-#   - 健康检查：活监听必须判健康、已释放端口必须判死。
-# 纯标准库、秒级、零依赖 ⇒ 与 doc-checks 同级的兜底检查；**改动判定方向（该红不红）会让 CI 变红**
+#   - 健康检查（★ R-R9 起为**五条**断言）：活监听判健康、已释放端口判死、
+#     **假服务**（accept 后立刻 close，复现 §8.6 现象）必须被判死、只监听不应答必须被判死、
+#     **协议活段必须被接受**（防"误杀真段"）。最后一条会真起一个最小协议服务
+#     （假 runner，**不需要模型 / shim / 段工件**）⇒ 复用 `src/relay_transport.py` ⇒ 需要 numpy。
+# 秒级、除 numpy 外零依赖 ⇒ 与 doc-checks 同级的兜底检查；**改动判定方向（该红不红 / 误杀）会让 CI 变红**
 # （负向回归见 tests/test_ci_relay_gates.py，用临时副本注入故障验证）。
 #
 # 注意：这**不是**真机检查 —— 跨机可用性（Surface / y700 / 隧道）仍需在本机跑
@@ -36,7 +39,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      # 两个脚本都只 import 标准库 ⇒ 无依赖安装步骤。
+      # 预算脚本只 import 标准库；health 脚本的自检（★ R-R9 第五条）会真起一个最小协议服务，
+      # 复用 `src/relay_transport.py` ⇒ 需要 numpy。除此之外无依赖。
+      - name: Install relay_health self-check dependency
+        run: python -m pip install --quiet numpy
+
       # 自检用**合成输入**钉住两条闸门的判定方向：该红的必须红（改坏判定方向 ⇒ CI 红）。
       - name: Budget gate self-check（判定方向）
         run: python scripts/relay_quant_budget.py --self-check

@@ -220,15 +220,22 @@ def _check_ready(alias: str, path: str, *, timeout: float, stale_seconds: float)
 
 
 def self_check() -> int:
-    """★ A10 + R-R9：用**本机 loopback** 验证判定方向（CI 兜底，不需要真机 / 网络）。
+    """★ A10 + R-R9：用**本机 loopback** 验证判定方向（CI 兜底，不需要真机 / 网络 / 段工件）。
 
-    四条方向断言：
+    **五条**方向断言（前三条防漏报，后两条防**误杀**）：
+
     1. **活监听**（有人 accept）⇒ `_check_tcp` 判健康；
     2. **已释放**端口 ⇒ `_check_tcp` 判死；
     3. ★ **假服务**（accept 后**立刻 close**，复现 §8.6 的「端口在监听但服务已死」）⇒
        `_check_tcp` **判健康**（如实复现**已知漏报**）、`_probe_relay` **判死** ⇒
        证明协议级探活真的补上了那一半；
-    4. **只监听但不应答** ⇒ `_probe_relay` 也必须判死（证明它真的在**等应答**，不是连上就算过）。
+    4. **只监听但不应答** ⇒ `_probe_relay` 也必须判死（证明它真的在**等应答**，不是连上就算过）；
+    5. ★ **协议活段必须被接受** —— 起一个最小**真协议**服务（`serve_relay_middle_connection`
+       + 假 runner，**不需要模型 / shim / 段工件**）⇒ `_probe_relay` 必须 `protocol_handshake_ok`。
+       只验"拒绝"会漏掉**误杀**：探活太严会把好段判死，接力直接起不来，比漏报更难查。
+
+    依赖：前四条纯标准库；第五条复用 `src/relay_transport.py` ⇒ **需要 numpy**
+    （CI 里由 `relay-gates.yml` 显式安装）。
 
     只覆盖本机可判定的两路：`--ssh-ready`（心跳新鲜度）依赖真实设备，不适合进 CI。
     """
@@ -300,12 +307,59 @@ def self_check() -> int:
     if silent_probe.get("ok") is not False:
         failures.append(f"只监听、不应答的端口必须被 _probe_relay 判死：{silent_probe}")
 
+    # ★ R-R9 断言 5：**协议活段必须被接受** —— 只验"拒绝"不够，还要验"**不误杀**"。
+    #   起一个最小**真协议**服务（`serve_relay_middle_connection` + 假 runner）：
+    #   **不需要模型、不需要 shim、不需要段工件** ⇒ 因此可以进 CI。
+    from relay_transport import serve_relay_middle_connection
+
+    class _AliveRunner:
+        """最小"活段"runner：只在有 hidden 请求时逐字节 +1（`CLOSE` 走不到它）。"""
+
+        def request_hidden(self, hidden: bytes, *, n_tokens: int) -> bytes:
+            return bytes((value + 1) % 256 for value in hidden)
+
+        def reset(self) -> None:
+            pass
+
+    alive_srv = socket.socket()
+    alive_srv.bind(("127.0.0.1", 0))
+    alive_srv.listen(4)
+    alive_endpoint = f"127.0.0.1:{int(alive_srv.getsockname()[1])}"
+    alive_stop = threading.Event()
+
+    def _serve_alive() -> None:
+        while not alive_stop.is_set():
+            try:
+                conn, _ = alive_srv.accept()
+            except OSError:
+                return
+            try:
+                serve_relay_middle_connection(conn, _AliveRunner(), n_embd=8, max_tokens=4)
+            except Exception:  # noqa: BLE001 - 自检里任何异常都不该把整个自检带塌
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    alive_thread = threading.Thread(target=_serve_alive, daemon=True)
+    alive_thread.start()
+    try:
+        alive_probe = _probe_relay(alive_endpoint, timeout=5.0)
+    finally:
+        alive_stop.set()
+        alive_srv.close()
+    alive_thread.join(timeout=3)
+    if alive_probe.get("ok") is not True:
+        failures.append(f"协议活段必须被 _probe_relay 接受（否则会**误杀真段**）：{alive_probe}")
+
     for item in failures:
         print(f"  - {item}")
     print(f"[verdict] 健康检查自检{'失败' if failures else '通过'}"
           f"（loopback：活={live_result.get('reason')} 死={dead_result.get('reason')} "
           f"假服务 tcp={fake_tcp.get('reason')}/probe={fake_probe.get('reason')} "
-          f"沉默={silent_probe.get('reason')}）")
+          f"沉默={silent_probe.get('reason')} 协议活段={alive_probe.get('reason')}）")
     return 1 if failures else 0
 
 

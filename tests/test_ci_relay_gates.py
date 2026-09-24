@@ -109,6 +109,26 @@ def test_health_self_check_fails_when_relay_probe_is_neutered(tmp_path: Path) ->
     assert "假服务" in result.stdout, result.stdout
 
 
+def test_health_self_check_fails_when_live_segment_is_rejected(tmp_path: Path) -> None:
+    """★ R-R9：把**活段**也判死（握手的成功分支被改坏）⇒ 自检必须失败。
+
+    这条防的是**误杀真段**：探活太严会把好端端的段判死 ⇒ 接力直接起不来，
+    比漏报更难查（链路上看不到任何"探活"字样）。「该红必须红」：改坏成功分支，本用例立刻红。
+    """
+    target = _copy(tmp_path / "gates", HEALTH_SCRIPT)
+    text = target.read_text(encoding="utf-8")
+    marker = '        return {"ok": True, "reason": "protocol_handshake_ok", "endpoint": endpoint}'
+    assert marker in text, "变异锚点变了：请同步更新本用例"
+    target.write_text(
+        text.replace(marker,
+                     '        return {"ok": False, "reason": "injected", "endpoint": endpoint}'),
+        encoding="utf-8")
+
+    result = _run_self_check(tmp_path / "gates", HEALTH_SCRIPT)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "协议活段" in result.stdout, result.stdout
+
+
 def test_relay_driver_rejects_fake_segment_before_relaying(tmp_path: Path) -> None:
     """★ R-R9：接力**前置探活**必须拦住「端口在监听但服务已死」的假段（§8.6 的现象）。
 
