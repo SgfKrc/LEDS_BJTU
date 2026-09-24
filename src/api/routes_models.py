@@ -53,7 +53,10 @@ async def get_current_model(request: Request = None):
         "loaded": True,
         "model_id": _api_module.model_manager.active_model_id,
         "quant_type": _api_module.model_host.current_quant,
-        "model_name": info.get("model_name", _api_module.MODEL_NAME),
+        # ★ 2026-09-24：**不再**兜底到静态 `MODEL_NAME`（默认模型 ⇒ 会张冠李戴，见
+        #   `docs/未完成工作备忘-2026-09-23.md` §4.8 B2）。按活跃模型 id 兜底。
+        "model_name": (info.get("model_name") or info.get("model_id")
+                       or _api_module.model_manager.active_model_id),
         "model_path": info.get("model_path", ""),
         "engine": info.get("engine", ""),
         "total_params": info.get("total_params", "N/A"),

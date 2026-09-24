@@ -1440,11 +1440,41 @@ class LlamaCppEngine:
             "system_percent": mem.percent,
         }
 
+    @property
+    def model_name(self) -> str:
+        """★ 2026-09-24：本引擎**实际加载的**模型名（供 `/status` 等消费者使用）。
+
+        取值顺序：GGUF 自带的 `general.name`（最真实；实测 `qwen35-2b-Q4_K_M.gguf`
+        ⇒ `"Qwen3 5 2b"`）→ GGUF **文件名**（去扩展名）→ 父目录名 → 空串。
+
+        ⚠️ **绝不**返回与"实际加载了什么"无关的静态默认值。此前的缺陷正是：
+        `get_model_info()` 不报 `model_name` ⇒ 消费方各自兜底到静态 `config.MODEL_NAME`
+        （= 默认 0.6B）⇒ 加载 2B 却对外报 `Qwen/Qwen3-0.6B`。
+        根因与实测证据见 `docs/未完成工作备忘-2026-09-23.md` §4.8 B2。
+        """
+        if not self._model_path:
+            return ""
+        model = getattr(self, "_model", None)
+        if model is not None:
+            try:
+                metadata = getattr(model, "metadata", None) or {}
+                name = str(metadata.get("general.name", "") or "").strip()
+                if name:
+                    return name
+            except Exception:  # noqa: BLE001 - 元数据读不到就回退，绝不因它报错
+                pass
+        try:
+            path = Path(self._model_path)
+            return path.stem or path.parent.name or ""
+        except Exception:  # noqa: BLE001
+            return ""
+
     def get_model_info(self) -> dict:
         """获取模型基本信息。"""
         info = {
             "engine": "llama.cpp",
             "model_path": self._model_path,
+            "model_name": self.model_name,
             "quant_type": self._quant_type,
             "n_ctx": self._n_ctx,
             "n_threads": self._n_threads,

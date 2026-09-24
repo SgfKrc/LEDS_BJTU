@@ -257,7 +257,13 @@ async def get_status():
         "pipeline_descriptor": pipeline_descriptor,
         "current_quant": _api_module.model_host.current_quant,
         "use_compile": _api_module.USE_COMPILE if _api_module.model_host.model_loaded else False,
-        "model_name": active_info.get("model_name", _api_module.MODEL_NAME),
+        # ★ 2026-09-24：**不再**兜底到静态 `MODEL_NAME`（那是默认模型，会张冠李戴 —— 见
+        #   `docs/未完成工作备忘-2026-09-23.md` §4.8 B2）。改为按活跃模型 id 兜底，
+        #   与同仓既有写法 `inference_service/engine_host.py:664` 同口径。
+        "model_name": active_info.get("model_name") or active_info.get("model_id") or (
+            _api_module.model_manager.active_model_id
+            if _api_module.model_host.model_loaded else ""
+        ),
         "model_path": active_info.get("model_path", _api_module.MODEL_PATH),
         "active_model_id": active_info.get("model_id", _api_module.model_manager.active_model_id if _api_module.model_host.model_loaded else None),
         "engine": active_info.get("engine", "") if _api_module.model_host.model_loaded else "",
