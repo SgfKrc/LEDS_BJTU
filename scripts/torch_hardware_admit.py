@@ -9,6 +9,7 @@ and (on CUDA hosts) both CPU<->CUDA 12/12 split directions.
 from __future__ import annotations
 
 import argparse
+import csv
 from datetime import datetime, timezone
 import gc
 import hashlib
@@ -42,6 +43,225 @@ DEFAULT_PROMPT = (
     "and falls back only by restarting the complete request. Hardware placement "
     "must be based on repeatable measurements rather than average per-layer cost."
 )
+
+
+def _parse_nvidia_smi_csv(output: str) -> dict[str, Any]:
+    """Parse one ``nvidia-smi --format=csv`` row without trusting locale text."""
+    rows = list(csv.reader(line for line in output.splitlines() if line.strip()))
+    if not rows:
+        raise ValueError("nvidia-smi returned no rows")
+    values = [item.strip() for item in rows[-1]]
+    if len(values) != 11:
+        raise ValueError(f"nvidia-smi returned {len(values)} columns, expected 11")
+    fields = (
+        "index", "name", "clock_sm_mhz", "clock_max_sm_mhz", "temperature_c",
+        "power_w", "power_limit_w", "utilization_gpu_pct", "memory_used_mib",
+        "event_reasons_active", "throttle_reasons_active",
+    )
+    result: dict[str, Any] = {"source": "nvidia-smi"}
+    for field, value in zip(fields, values):
+        if field in {"name", "event_reasons_active", "throttle_reasons_active"}:
+            result[field] = value
+        else:
+            result[field] = None if value in {"[N/A]", "N/A", ""} else float(value)
+    return result
+
+
+def _parse_typeperf_csv(output: str) -> dict[str, float]:
+    """Parse the last PDH CSV sample, retaining numeric counter values only."""
+    rows = list(csv.reader(line for line in output.splitlines() if line.strip()))
+    header_index = next(
+        (index for index, row in enumerate(rows) if any(cell.startswith("\\") for cell in row)),
+        None,
+    )
+    if header_index is None or header_index + 1 >= len(rows):
+        raise ValueError("typeperf returned no counter row")
+    headers = rows[header_index]
+    result: dict[str, float] = {}
+    for values in rows[header_index + 1:]:
+        if len(headers) != len(values):
+            continue
+        candidate: dict[str, float] = {}
+        for header, value in zip(headers, values):
+            if not header.startswith("\\"):
+                continue
+            try:
+                candidate[header] = float(value)
+            except ValueError:
+                continue
+        if candidate:
+            result = candidate
+            break
+    if not result:
+        raise ValueError("typeperf returned no numeric counters")
+    return result
+
+
+def _collect_nvidia_smi() -> dict[str, Any]:
+    completed = subprocess.run(
+        [
+            "nvidia-smi", "--query-gpu=index,name,clocks.sm,clocks.max.sm,temperature.gpu,"
+            "power.draw,power.limit,utilization.gpu,memory.used,clocks_event_reasons.active,"
+            "clocks_throttle_reasons.active",
+            "--format=csv,noheader,nounits",
+        ], capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=5, check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError((completed.stderr or "nvidia-smi failed").strip()[:300])
+    return _parse_nvidia_smi_csv(completed.stdout)
+
+
+def _collect_typeperf() -> dict[str, float]:
+    counters = [
+        r"\Processor(_Total)\% Processor Time",
+        r"\Processor Information(_Total)\% Processor Utility",
+        r"\Processor Information(_Total)\Processor Frequency",
+        r"\Thermal Zone Information(*)\Temperature",
+    ]
+    completed = subprocess.run(
+        ["typeperf", *counters, "-sc", "1", "-si", "1", "-y"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=8, check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError((completed.stderr or "typeperf failed").strip()[:300])
+    return _parse_typeperf_csv(completed.stdout)
+
+
+class _HardwareTelemetrySampler:
+    """Persistent sidecar samplers; they never participate in the timing path."""
+
+    def __init__(self, source: str, interval_s: float = 1.0) -> None:
+        self.source = source
+        self.interval_s = interval_s
+        self.samples: list[dict[str, Any]] = []
+        self.stream_samples: dict[str, list[dict[str, Any]]] = {"gpu": [], "system": []}
+        self.errors: list[dict[str, str]] = []
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._threads: list[threading.Thread] = []
+        self._processes: list[subprocess.Popen[str]] = []
+
+    def _append(self, source: str, payload: dict[str, Any]) -> None:
+        sample = {"observed_at_utc": datetime.now(timezone.utc).isoformat(), source: payload}
+        with self._lock:
+            self.samples.append(sample)
+            self.stream_samples[source].append(sample)
+
+    def _record_error(self, source: str, error: BaseException) -> None:
+        with self._lock:
+            self.errors.append({"source": source, "error": str(error)[:300]})
+
+    def _spawn(self, command: list[str]) -> subprocess.Popen[str]:
+        kwargs: dict[str, Any] = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.DEVNULL,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "bufsize": 1,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        process = subprocess.Popen(command, **kwargs)
+        self._processes.append(process)
+        return process
+
+    def _read_gpu(self) -> None:
+        command = [
+            "nvidia-smi", "--query-gpu=index,name,clocks.sm,clocks.max.sm,temperature.gpu,"
+            "power.draw,power.limit,utilization.gpu,memory.used,clocks_event_reasons.active,"
+            "clocks_throttle_reasons.active",
+            "--format=csv,noheader,nounits", "-l", str(max(1, int(self.interval_s))),
+        ]
+        try:
+            process = self._spawn(command)
+            assert process.stdout is not None
+            for line in process.stdout:
+                if self._stop.is_set():
+                    break
+                if not line.strip():
+                    continue
+                try:
+                    self._append("gpu", _parse_nvidia_smi_csv(line))
+                except ValueError as exc:
+                    self._record_error("gpu", exc)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._record_error("gpu", exc)
+
+    def _read_system(self) -> None:
+        if os.name != "nt":
+            self._record_error("system", RuntimeError("typeperf is only available on Windows"))
+            return
+        counters = [
+            r"\Processor(_Total)\% Processor Time",
+            r"\Processor Information(_Total)\% Processor Utility",
+            r"\Processor Information(_Total)\Processor Frequency",
+            r"\Thermal Zone Information(*)\Temperature",
+        ]
+        try:
+            process = self._spawn(["typeperf", *counters, "-si", str(max(1, int(self.interval_s))), "-y"])
+            assert process.stdout is not None
+            headers: list[str] | None = None
+            for line in process.stdout:
+                if self._stop.is_set():
+                    break
+                rows = list(csv.reader([line.rstrip("\r\n")]))
+                if not rows:
+                    continue
+                row = rows[0]
+                if any(cell.startswith("\\") for cell in row):
+                    headers = row
+                    continue
+                if headers is None or len(headers) != len(row):
+                    continue
+                values: dict[str, float] = {}
+                for header, value in zip(headers, row):
+                    if not header.startswith("\\"):
+                        continue
+                    try:
+                        values[header] = float(value)
+                    except ValueError:
+                        continue
+                if values:
+                    self._append("system", values)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._record_error("system", exc)
+
+    def start(self) -> None:
+        if self.source == "none":
+            return
+        targets = [("gpu", self._read_gpu)] if self.source == "cuda" else [
+            ("gpu", self._read_gpu), ("system", self._read_system),
+        ]
+        for name, target in targets:
+            thread = threading.Thread(target=target, name=f"torch-hw-telemetry-{name}", daemon=True)
+            self._threads.append(thread)
+            thread.start()
+
+    def stop(self) -> dict[str, Any]:
+        self._stop.set()
+        for process in self._processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in self._processes:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        for thread in self._threads:
+            thread.join(timeout=10)
+        return {
+            "source": self.source,
+            "interval_s": self.interval_s,
+            "sample_count": len(self.samples),
+            "samples": self.samples,
+            "streams": self.stream_samples,
+            "errors": self.errors,
+            "sampling_complete": all(not thread.is_alive() for thread in self._threads),
+        }
 
 
 def summarize_samples(samples_ms: list[float]) -> dict[str, Any]:
@@ -851,6 +1071,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--interop-threads", type=int, default=None, metavar="N",
         help="set Torch inter-op threads for controlled local probes (opt-in)",
     )
+    parser.add_argument(
+        "--telemetry", choices=("none", "cuda", "all"), default="none",
+        help="collect opt-in sidecar hardware telemetry without changing timing calls",
+    )
     parser.add_argument("--precision", choices=("fp32", "deployment_default"), default="fp32",
                         help="fp32 controls device comparison; deployment_default observes CPU FP32/CUDA FP16")
     return parser
@@ -960,6 +1184,12 @@ def main(argv: list[str] | None = None) -> int:
             "production_transport_tested": False,
         },
         "provenance": _git_provenance(),
+        "telemetry": {
+            "source": args.telemetry,
+            "status": "pending",
+            "window_scope": "range_profiles_and_heterogeneous_pairs",
+            "collection_errors_fail_closed": True,
+        },
     }
 
     full = _prepare_manager(
@@ -995,6 +1225,8 @@ def main(argv: list[str] | None = None) -> int:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
+    telemetry = _HardwareTelemetrySampler(args.telemetry)
+    telemetry.start()
     loopback_rows: dict[str, Any] = {}
     workload_measurement_order = list(workload_sizes)
     order_rng = random.Random(args.order_seed)
@@ -1016,12 +1248,17 @@ def main(argv: list[str] | None = None) -> int:
             if manager.get_device().type != device.type:
                 raise RuntimeError("layer range changed execution device")
             key = f"{token_count}:{layer_end}"
+            window_started = datetime.now(timezone.utc).isoformat()
             try:
                 row, link_hidden = _measure_segment(
                     torch, manager, device, prompt, reference,
                     layer_end=layer_end, total_layers=total_layers,
                     warmup=args.warmup, repeats=args.repeats, decode_steps=args.decode_steps,
                 )
+                row["telemetry_window"] = {
+                    "started_at_utc": window_started,
+                    "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+                }
                 row["loader_metrics"] = getattr(manager, "_layer_load_metrics", None)
                 report["range_profiles"][key] = row
                 if layer_end == 12 and link_hidden is not None:
@@ -1047,6 +1284,7 @@ def main(argv: list[str] | None = None) -> int:
                     ("cpu", "cuda:0") if direction == "cpu_to_cuda" else ("cuda:0", "cpu")
                 )
                 first = second = None
+                window_started = datetime.now(timezone.utc).isoformat()
                 try:
                     first = _prepare_manager(
                         model_module, args.model_dir, 0, total_layers // 2, total_layers,
@@ -1061,6 +1299,10 @@ def main(argv: list[str] | None = None) -> int:
                         decode_steps=args.decode_steps, warmup=args.warmup,
                         repeats=args.repeats, max_cv=args.max_cv,
                     )
+                    result["telemetry_window"] = {
+                        "started_at_utc": window_started,
+                        "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+                    }
                     row["directions"][direction] = {
                         "prefill_argmax_exact": result["prefill_argmax_exact"],
                         "generated_tokens_exact": result["generated_tokens_exact"],
@@ -1068,6 +1310,7 @@ def main(argv: list[str] | None = None) -> int:
                         "decode": result["decode"],
                         "boundary_copy": result["boundary_copy"],
                         "kv_cache_after_decode": result["kv_cache_after_decode"],
+                        "telemetry_window": result["telemetry_window"],
                     }
                 finally:
                     for manager in (first, second):
@@ -1076,6 +1319,8 @@ def main(argv: list[str] | None = None) -> int:
                     del first, second
                     torch.cuda.empty_cache()
             report["heterogeneous_pairs"][prompt_key] = row
+
+    report["telemetry"] = telemetry.stop()
 
     report["local_same_host_admission"] = {
         "same_device_phase_costs": "requires paired CPU and CUDA reports for matching artifact/input identity",

@@ -147,7 +147,7 @@ Gate/Up 融合实现、GPTQ/Marlin/FP8 依赖栈。它们可以作为外部对�
 | 7 | `TORCH-HETERO-PLAN-01` | 离线算子放置 planner：设备画像、内存、带宽、边界传输和正确性门；与连续层 planner 对照 | OP-REGISTRY-01 | **已完成（离线 planner 与 16 项合成测试；未接运行时）** |
 | 8 | `TORCH-PHASE-PLAN-01` | prefill/decode 双计划和受控状态切换；失败时回退单一 PyTorch 计划或 llama.cpp | HETERO-PLAN-01 | **离线合同完成（25 项合成测试；未做硬件准入/未接运行时）** |
 | 9 | `TORCH-ACT-COMPRESS-01` | PyTorch 双层段激活压缩；整模对拍、长 prompt 和逐 token 门禁 | HETERO-PLAN-01、PHASE-PLAN-01 | **离线实验完成（RTX 4060：f16 精确；int8/int4 分歧；未接运行时）** |
-| 10 | `TORCH-HW-ADMIT-01` | 同负载 CPU/CUDA、阶段成本、KV 身份与真实链路准入矩阵 | OP-PROFILE-01、HETERO-PLAN-01、PHASE-PLAN-01、ACT-COMPRESS-01 | **实测中（2026-09-24 本机复核：探针新增可追溯 CPU 亲和性/inter-op 控制；P-core/1-thread/20-repeat CPU 仍有 2/12 decode cell 超 CV 0.10，CPU↔CUDA 身份、KV 与正确性通过但异构时延门拒绝；跨机生产推理仍未准入）** |
+| 10 | `TORCH-HW-ADMIT-01` | 同负载 CPU/CUDA、阶段成本、KV 身份与真实链路准入矩阵 | OP-PROFILE-01、HETERO-PLAN-01、PHASE-PLAN-01、ACT-COMPRESS-01 | **实测中（2026-09-24 本机复核：已加入可追溯 CPU 亲和性/inter-op 与 CUDA/系统 telemetry；P-core/1-thread/20-repeat CPU 仍有 2/12 decode cell、CUDA 仍有 1/12 prefill cell 超 CV 0.10，CPU↔CUDA 身份/KV/正确性通过但异构时延门拒绝；跨机生产推理仍未准入）** |
 | 11 | `TORCH-RUNTIME-ADMIT-01` | 可验证准入证据、资源/KV 生命周期及默认关闭的阶段调度 | HW-ADMIT-01、PHASE-PLAN-01 | **锁定（HW-ADMIT-01 完整准入后方可排期）** |
 | 12 | `TORCH-MOE-PLACEMENT-01` | 以可运行 MoE 样本验证专家热度、复制、预取和故障回退；不进入默认 dense 路径 | OP-REGISTRY-01、HW-ADMIT-01、RUNTIME-ADMIT-01 | 排队 |
 
@@ -315,6 +315,13 @@ wall time 只作本机诊断，不作为准入结果：样本是单 GPU、单 pr
 - P-core 6 线程条件：仅绑 `0,2,4,6,8,10`（每个 P-core 取一个逻辑核）且 inter-op=1 后，短 cell 抖动下降但仍有 `64:4 prefill`、`256:12 prefill/decode` 超门；不把线程池控制误写成充分修复。
 - 证据：`cpu-fp32-pcore-t1-interop1-w20-20260924.json`、`cuda-fp32-pcore-t1-interop1-w20-20260924.json`、`cpu-cuda-pcore-t1-interop1-w20-comparison-20260924.json`，以及 6-thread 对照 `cpu-fp32-pcore-t6-w20-20260924.json`、`cpu-fp32-pcore-t6-interop1-w20-20260924.json`。
 - 结论：亲和性与 inter-op 控制已成为可复现实验能力，但本机 Torch CPU profile **仍未准入**；不得删异常样本、放宽 CV=0.10、或把 1-thread 作为默认运行时配置。下一步仍是隔离 ETW/频率/温度/后台负载并确认完整前向的长尾来源；`TORCH-RUNTIME-ADMIT-01` 继续锁定。
+
+**CUDA telemetry 隔离复测（2026-09-24）**：`torch_hardware_admit.py` 新增 opt-in `--telemetry {none,cuda,all}`。CUDA 侧由持久化 `nvidia-smi` 流采集 `clocks.sm`、温度、功耗、利用率、`clocks_event_reasons.active`/`clocks_throttle_reasons.active`；`all` 另由持久化 Windows `typeperf` 流采集 CPU utility/frequency/thermal zone。采样线程和子进程不进入 phase timing 调用，报告对每个 range/异构方向写入 UTC telemetry window；采样失败记录到 `errors`，不视为稳定。
+
+- 最终证据：`cuda-fp32-pcore-t1-interop1-telemetry-v3-w20-20260924.json`、`cpu-cuda-pcore-t1-telemetry-v3-comparison-20260924.json`。共 423 个 telemetry 样本（GPU 254、系统 169），错误 0，所有 6 个 range 和 4 个异构方向均有窗口边界。
+- CUDA timing：仅 `256:24 prefill` 超 CV 门（`0.1194`）；CPU 两格仍超门，异构 64/256 两组方向均有 timing 不稳，比较器结果 `matched_fp32_cpu_cuda_pair=true`、`phase_cost_matrix_admitted=false`、`same_host_cpu_cuda_split_admitted=false`、`production_runtime_enabled=false`。
+- GPU 状态旁证：`clocks.sm=210–2490 MHz`，温度 `58–73°C`；GPU 利用率从 0% 到 99%；active reason 位出现 `0x0/0x1/0x4/0x24`。其中 `0x1` 与 GPU idle 语义一致，但本轮不能仅凭同期变化断言某个 reason 是 timing 长尾的唯一根因；未取得管理员权限，未做 `nvidia-smi -lgc` 锁频对照。
+- 工具回归：`tests/test_torch_hardware_admit.py` **18 passed**，CPU 诊断 **3 passed**；telemetry 只诊断，不改 CV 门、不解锁运行时。下一步限定为管理员锁频或提高持续 GPU 利用率的受控对照；`TORCH-RUNTIME-ADMIT-01` 继续锁定。
 
 另跑部署默认精度观察（1 次 warmup、每格 3 次未插桩样本）：CUDA 整模 FP16 reference 下，CPU FP32→CUDA FP16 的 64-token prefill/decode exact，256-token prefill 不 exact；CUDA FP16→CPU FP32 的 64-token prefill 不 exact、256-token exact，所测 decode token 均 exact。边界张量分别为 `[1,64,896]`/`[1,256,896]`，CPU→CUDA FP32→FP16 转换最大绝对误差约 `0.115`。结果说明混合精度层段的 prefill 正确性受 prompt 影响，部署默认组合不准入；证据 `local_docs/evidence/torch-hardware-admit/cuda-deployment-default.json`。
 

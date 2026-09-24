@@ -133,6 +133,36 @@ def test_interop_thread_mismatch_fails_closed_when_both_reports_attest_it():
     assert "interop_thread_count_mismatch" in result["reasons"]
 
 
+def test_hardware_telemetry_parsers_accept_realistic_windows_outputs():
+    gpu = MODULE._parse_nvidia_smi_csv(
+        "0, NVIDIA GeForce RTX 4060 Laptop GPU, 780, 3105, 60, 22.4, [N/A], 45, 1234, 0x1, 0x1\n",
+    )
+    assert gpu["clock_sm_mhz"] == 780.0
+    assert gpu["temperature_c"] == 60.0
+    assert gpu["power_limit_w"] is None
+    assert gpu["event_reasons_active"] == "0x1"
+    assert gpu["throttle_reasons_active"] == "0x1"
+
+    system = MODULE._parse_typeperf_csv(
+        '"(PDH-CSV 4.0)","\\\\HOST\\Processor(_Total)\\% Processor Time",'
+        '"\\\\HOST\\Thermal Zone Information(\\_TZ.TZ00)\\Temperature"\n'
+        '"09/24/2026 12:00:00.000","12.5","301.0"\n',
+    )
+    assert system["\\\\HOST\\Processor(_Total)\\% Processor Time"] == 12.5
+    assert system["\\\\HOST\\Thermal Zone Information(\\_TZ.TZ00)\\Temperature"] == 301.0
+
+
+def test_hardware_telemetry_sampler_stops_and_records_empty_source():
+    sampler = MODULE._HardwareTelemetrySampler("none")
+
+    sampler.start()
+    result = sampler.stop()
+
+    assert result["source"] == "none"
+    assert result["sample_count"] == 0
+    assert result["sampling_complete"] is True
+
+
 def test_cache_summary_captures_actual_tensor_layout_and_bytes():
     torch = pytest.importorskip("torch")
     cache = SimpleNamespace(
