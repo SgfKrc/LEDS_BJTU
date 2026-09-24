@@ -42,6 +42,8 @@ DEFAULT_FRAMES_DIR = ROOT / "build" / "tui-e2e" / "frames"
 PASS = "PASS"
 DEGRADED = "DEGRADED"
 FAIL = "FAIL"
+#: ★ D-a 档：缺工件 ⇒ **SKIP**（等价 pytest 的 skip，既不计 PASS 也不计 FAIL）
+SKIP = "SKIP"
 
 #: 退出码（计划 §3.3 / §4.1，与剧本里的 `exit_codes` 对齐）
 EXIT_OK = 0
@@ -87,6 +89,11 @@ class FlowResult:
     def degraded(self) -> list:
         return [s for s in self.steps if s.status == DEGRADED]
 
+    @property
+    def skipped(self) -> list:
+        """因环境缺失跳过的步骤（D-a 档缺工件）—— **不计失败、也不计通过**。"""
+        return [s for s in self.steps if s.status == SKIP]
+
     def exit_code(self) -> int:
         if self.environment_missing:
             return EXIT_ENV_MISSING
@@ -110,6 +117,7 @@ class FlowResult:
                 "pass": len([s for s in self.steps if s.status == PASS]),
                 "degraded": len(self.degraded),
                 "fail": len(self.failed),
+                "skip": len(self.skipped),
             },
             "steps": [s.to_dict() for s in self.steps],
         }
@@ -292,6 +300,149 @@ async def _action_confirm(session, spec, flow, sink):
     await session.pilot.pause(0.2)
 
 
+# ---- D-a 档：本机 loopback 多段（演示降级）----
+#
+# 只**调用**既有脚本（`scripts/relay_mid_service.py` / `scripts/relay_health.py`），不改它们；
+# 段服务强制 loopback（脚本自身也强制）。用途与边界见
+# `docs/TUI端到端flow测试与答辩演示复用计划-2026-09-24.md` §4.2 D-a / §6.1 风险 6。
+
+
+def _free_loopback_port() -> int:
+    """取一个当前空闲的 loopback 端口，避免与开发中的后端或残留服务抢端口。"""
+    import socket as _socket
+
+    probe = _socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = int(probe.getsockname()[1])
+    probe.close()
+    return port
+
+
+def _read_ready_json(stream, timeout: float) -> dict:
+    """从子进程 stdout 读**一行** JSON（`relay_mid_service` 起服务后打印 ready 行）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        line = stream.readline() if stream is not None else ""
+        if not line:
+            time.sleep(0.05)
+            continue
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            return json.loads(line)
+        except ValueError:
+            continue        # 服务可能先打人类可读行，跳过
+    return {}
+
+
+async def _action_start_relay_service(session, spec, flow, sink):
+    """起一个本机 loopback relay 段服务；就绪后把句柄放进 `sink["state"]`。
+
+    ⚠️ 缺 shim / 段工件时**不建服务**并置 `sink["skip"]` ⇒ 整档记为 SKIP（**不判失败**，
+    与 `tests/test_real_model_smoke.py` 的开关式约定一致）。
+    """
+    import subprocess
+
+    shim = ROOT / str(spec["shim"])
+    model = ROOT / str(spec["model"])
+    missing = [str(path.relative_to(ROOT)) for path in (shim, model) if not path.is_file()]
+    if missing:
+        sink["skip"] = (f"缺 D-a 档工件 {missing}"
+                        "（段工件由 scripts/cut_layers.py --keep-head/--k/--end 生成）")
+        return
+
+    port = _free_loopback_port()
+    command = [
+        sys.executable, str(ROOT / "scripts" / "relay_mid_service.py"),
+        "--role", str(spec.get("role", "middle")),
+        "--listen", f"127.0.0.1:{port}",
+        "--keep-head-shim", str(shim),
+        "--model", str(model),
+    ]
+    if spec.get("n_embd"):
+        command += ["--n-embd", str(spec["n_embd"])]
+
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, encoding="utf-8", errors="replace", cwd=str(ROOT))
+    ready = _read_ready_json(process.stdout, timeout=180.0)
+    sink.setdefault("process", process)
+    sink["port"] = port
+    sink["ready"] = ready
+    sink["endpoint"] = f"127.0.0.1:{port}"
+
+
+async def _reap_relay_service(state: dict) -> None:
+    """兜底回收本档起的段服务（幂等）。
+
+    ⚠️ 必要性：`--mode assert` 停在**首个**失败步 ⇒ 若失败发生在 `da_service_down` 之前，
+    那个步骤不会执行 ⇒ 段服务可能变孤儿。这里放在 `finally` 里无条件收。
+    """
+    process = state.pop("process", None)
+    if process is None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=15)
+    except Exception:  # noqa: BLE001 - 停不掉就强杀
+        try:
+            process.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _action_stop_relay_service(session, spec, flow, sink):
+    """停掉本档起的段服务（幂等）。"""
+    await _reap_relay_service(sink)
+
+
+async def _action_relay_health_check(session, spec, flow, sink):
+    """用 `scripts/relay_health.py --check` 探该段 —— **真链路**证据（不是"进程起来了"）。"""
+    import subprocess
+
+    endpoint = sink.get("endpoint", "")
+    if not endpoint:
+        sink["skip"] = "D-a 档未起服务（见上一步）"
+        return
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "relay_health.py"),
+         "--check", f"middle=tcp:{endpoint}", "--json"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(ROOT),
+    )
+    sink["health"] = {"returncode": proc.returncode, "stdout": proc.stdout[-2000:]}
+
+
+async def _action_relay_hidden_roundtrip(session, spec, flow, sink):
+    """与该段做一次 hidden 往返，并**逐字节**校验。
+
+    要求"回来了但**不是原样**"——用于排除"段把输入原样回显"这类假通过。
+    宽度取自服务端 ready 行的 `n_embd`（或剧本 `n_embd`）。
+    """
+    from relay_transport import RelayTcpClient, expected_hidden_bytes
+
+    state = sink
+    endpoint = state.get("endpoint", "")
+    if not endpoint:
+        sink["skip"] = "D-a 档未起服务（见上一步）"
+        return
+    ready = state.get("ready") or {}
+    n_embd = int(spec.get("n_embd") or ready.get("n_embd") or 0)
+    if n_embd < 1:
+        sink["error"] = f"拿不到段宽度 n_embd（ready={ready!r}）"
+        return
+
+    n_tokens = 2
+    payload = bytes((index * 7 + 3) % 256
+                    for index in range(expected_hidden_bytes(n_tokens, n_embd)))
+    host, _, port_text = endpoint.partition(":")
+    client = RelayTcpClient(host, int(port_text), n_embd=n_embd, timeout=180.0)
+    try:
+        returned = client.request_hidden(payload, n_tokens=n_tokens)
+    finally:
+        client.close()
+    sink["roundtrip"] = {"sent": bytes(payload), "got": bytes(returned)}
+
+
 ACTIONS = {
     "enter_main": _action_enter_main,
     "click_nav": _action_click_nav,
@@ -301,6 +452,11 @@ ACTIONS = {
     "set_cluster_aux": _action_set_cluster_aux,
     "cluster_toggle": _action_cluster_toggle,
     "confirm": _action_confirm,
+    # D-a 档（本机 loopback 多段）
+    "start_relay_service": _action_start_relay_service,
+    "stop_relay_service": _action_stop_relay_service,
+    "relay_health_check": _action_relay_health_check,
+    "relay_hidden_roundtrip": _action_relay_hidden_roundtrip,
 }
 
 #: 特殊 action：不经过 handler，由执行器用来切分「会话」
@@ -383,6 +539,54 @@ async def _expect_app_exited(session, spec, flow):
     raise AssertionError("按 q 后应用仍在运行")
 
 
+# ---- D-a 档的 expect ----
+#
+# 持久状态挂在 `flow["_state"]`（由 `_run_steps` 注入），所以这里能跨步读到段服务句柄与往返结果。
+
+async def _expect_service_ready(session, spec, flow):
+    state = flow.get("_state") or {}
+    if state.get("skip"):
+        raise _StepSkipped(str(state["skip"]))
+    if not state.get("endpoint"):
+        raise AssertionError(f"relay 段未就绪：ready={state.get('ready')!r}")
+    ready = state.get("ready") or {}
+    if not ready:
+        raise AssertionError(f"未收到段服务的 ready 行（端口 {state.get('port')}）")
+
+
+async def _expect_health_ok(session, spec, flow):
+    state = flow.get("_state") or {}
+    if state.get("skip"):
+        raise _StepSkipped(str(state["skip"]))
+    health = state.get("health") or {}
+    if not health:
+        raise AssertionError("未执行健康检查")
+    if health.get("returncode") != 0:
+        raise AssertionError(
+            f"健康检查判定异常（rc={health.get('returncode')}）：{health.get('stdout', '')[:300]}")
+
+
+async def _expect_relay_roundtrip_ok(session, spec, flow):
+    state = flow.get("_state") or {}
+    if state.get("skip"):
+        raise _StepSkipped(str(state["skip"]))
+    result = state.get("roundtrip")
+    if result is None:
+        raise AssertionError(f"未完成 hidden 往返{state.get('error') or ''}")
+    sent, got = result["sent"], result["got"]
+    if len(got) != len(sent):
+        raise AssertionError(f"往返长度不符: 送 {len(sent)} 字节、回 {len(got)} 字节")
+    if got == sent:
+        raise AssertionError("段把 hidden **原样返回**了 —— 这不是有效往返（假通过）")
+
+
+async def _expect_service_stopped(session, spec, flow):
+    state = flow.get("_state") or {}
+    process = state.get("process")
+    if process is not None and process.poll() is None:
+        raise AssertionError(f"段服务仍在运行（pid={process.pid}）")
+
+
 EXPECTS = {
     "screen_is_main": _expect_screen_is_main,
     "nav_count": _expect_nav_count,
@@ -392,10 +596,23 @@ EXPECTS = {
     "api_called": _expect_api_called,
     "status_pane_contains_any": _expect_status_pane_contains_any,
     "app_exited": _expect_app_exited,
+    # D-a 档（本机 loopback 多段）
+    "service_ready": _expect_service_ready,
+    "health_ok": _expect_health_ok,
+    "relay_roundtrip_ok": _expect_relay_roundtrip_ok,
+    "service_stopped": _expect_service_stopped,
 }
 
 
 # ------------------------------------------------------------------ 执行器
+
+
+class _StepSkipped(Exception):
+    """该步因**环境缺失**跳过（例如 D-a 档缺 shim / 段工件）。
+
+    照 `tests/test_real_model_smoke.py` 的约定：**不判为失败**；报告里记 `SKIP`，
+    既不计入 PASS 也不计入 FAIL ⇒ 退出码不受影响。
+    """
 
 
 class _StepFailure(Exception):
@@ -434,6 +651,8 @@ async def _run_steps(flow, *, mode, pace, frames_dir, only_step=None) -> FlowRes
                         real_model_loaded=bool(flow.get("real_model_loaded", False)))
 
     replay = _select_replay(list(flow["steps"]), only_step)
+    #: ★ 跨步持久状态（段服务句柄 / 健康检查结果 / 往返结果）—— expect handler 也从这里读
+    flow.setdefault("_state", {})
 
     session: Session | None = None
     stack: AsyncExitStack | None = None
@@ -451,6 +670,11 @@ async def _run_steps(flow, *, mode, pace, frames_dir, only_step=None) -> FlowRes
                 frame = _frame_path(frames_dir, step_id)
                 if frame is not None:
                     record.frame = str(frame)
+            except _StepSkipped as exc:
+                record = StepResult(step_id, caption, SKIP, str(exc))
+                result.steps.append(record)
+                # 缺工件 ⇒ 后续同族步骤也会跳过：继续跑（它们是幂等的空操作），但**不**计失败
+                continue
             except _StepFailure as exc:
                 record = StepResult(step_id, caption,
                                     FAIL if mode == "assert" else DEGRADED, str(exc))
@@ -469,6 +693,8 @@ async def _run_steps(flow, *, mode, pace, frames_dir, only_step=None) -> FlowRes
                 continue
             result.steps.append(record)
     finally:
+        # ★ 兜底回收：D-a 档若中途失败（assert 模式停在首个失败步），`da_service_down` 不会执行
+        await _reap_relay_service(flow.get("_state") or {})
         if stack is not None:
             await stack.aclose()
     return result
@@ -479,11 +705,15 @@ async def _run_one_step(session, stack, step, flow, *, mode, pace, frames_dir):
 
     返回 `(session, stack)`：会话被重建时 `stack` 也随之更换，因此**必须**把它回传给调用方，
     否则外层 `finally` 关的是旧 stack ⇒ 新会话不会被回收（真 bug，已实测修掉）。
+
+    `step["needs_app"] = False` 的步骤（D-a 档的服务启停 / 健康检查 / 协议往返）**不建 app** ——
+    它们只驱动外部进程与协议，既拿不到也不需要 TUI 会话。
     """
     actions = list(step.get("actions", []))
     new_app_spec = next((a for a in actions if a.get("kind") == SESSION_ACTION), None)
+    needs_app = bool(step.get("needs_app", True))
 
-    if new_app_spec is not None or session is None:
+    if new_app_spec is not None or (session is None and needs_app):
         # 结束旧会话（`AsyncExitStack.aclose()` 才会真正退出 `run_test()` 上下文）
         if stack is not None:
             await stack.aclose()
@@ -503,10 +733,13 @@ async def _run_one_step(session, stack, step, flow, *, mode, pace, frames_dir):
         if handler is None:
             raise _StepFailure(f"未知 action kind={kind!r}")
         if mode == "demo":
-            _demo_caption(session, step.get("caption", ""))
-            await session.pilot.pause(pace)
+            if session is not None:      # D-a 档的无 app 步骤没有字幕可打、也没有 pilot
+                _demo_caption(session, step.get("caption", ""))
+                await session.pilot.pause(pace)
         try:
-            await handler(session, action, flow, {})
+            # ★ 第 4 个参数是**跨步持久状态**（`flow["_state"]`）：D-a 档用它传段服务句柄、
+            #   健康检查结果与往返结果，expect handler 也从同一处读。
+            await handler(session, action, flow, flow["_state"])
         except Exception as exc:  # noqa: BLE001 - 负向 action 的异常留给 expect 判定
             raised = exc
             break
@@ -580,6 +813,15 @@ def run_flow(*, mode: str = "assert", pace: float = 1.2, frames_dir=None,
 
 def main(argv=None) -> int:
     """CLI 入口（`scripts/tui_e2e_flow.py` 与 `python tests/tui_e2e_flow.py` 共用）。"""
+    # ★ 2026-09-24 修复：Windows 控制台默认 GBK，报告里的 `⇒` 等符号会让 `print(text)` 抛
+    #   `UnicodeEncodeError` ⇒ **整个报告打不出来**（实测：缺工件时 SKIP 原因含 `⇒` 即触发）。
+    #   这里把标准输出/错误改成 UTF-8 + 容错替换，报告永远打得出来。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 - 老环境没有 reconfigure 就照旧
+            pass
+
     parser = argparse.ArgumentParser(description="QLH TUI 端到端 flow（F1 档）")
     parser.add_argument("--mode", choices=("assert", "demo"), default="assert")
     parser.add_argument("--pace", type=float, default=1.2, help="demo 模式每步停顿秒数")

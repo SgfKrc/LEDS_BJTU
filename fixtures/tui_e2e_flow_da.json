@@ -1,0 +1,89 @@
+{
+  "schema": "qlh.tui.e2e.flow.v1",
+  "title": "QLH TUI 端到端 flow —— D-a 档：本机 loopback 多段（演示降级）",
+  "plan": "docs/TUI端到端flow测试与答辩演示复用计划-2026-09-24.md",
+  "ticket": "CORE-TUI-E2E-01",
+  "tier": "D-a",
+  "topology": "single_host_loopback",
+  "physical_dual_host": false,
+  "real_model_loaded": false,
+  "topology_note": "★ 单机多进程 loopback：relay 段跑在本机 127.0.0.1，**不是物理双机**。不得据此宣称跨机分布式或真模型已加载（计划 §6.1 风险 6 / §4.2 D-a）。本档只证明「TUI ↔ 本机 relay 段」这条链路可用，作为无多节点时的**演示降级**。",
+  "skippable": true,
+  "skip_note": "需 keep-head shim 与裁层段工件；缺失时整档 skip（不判失败，照 tests/test_real_model_smoke.py 的约定）",
+  "nav_ids": [
+    "nav-chat", "nav-status", "nav-models", "nav-cluster", "nav-nodes",
+    "nav-queue", "nav-logs", "nav-device", "nav-settings", "nav-api"
+  ],
+  "steps": [
+    {
+      "id": "da_service_up",
+      "caption": "起本机 loopback relay 中段服务（middle）",
+      "needs_app": false,
+      "actions": [
+        {
+          "kind": "start_relay_service",
+          "role": "middle",
+          "shim": "build/keephead/build-cpu/bin/qlh_keep_head.dll",
+          "model": "build/cross-framework-layer-poc/out/qwen25-05b-f16-mid8-12.gguf",
+          "n_embd": 896
+        }
+      ],
+      "expect": [
+        {"kind": "service_ready"}
+      ]
+    },
+    {
+      "id": "da_health_ok",
+      "caption": "健康检查：该段监听必须判健康（scripts/relay_health.py）",
+      "needs_app": false,
+      "actions": [
+        {"kind": "relay_health_check"}
+      ],
+      "expect": [
+        {"kind": "health_ok"}
+      ]
+    },
+    {
+      "id": "da_relay_hidden_roundtrip",
+      "caption": "真链路：与该段做一次 hidden 往返（逐字节、非恒等）",
+      "needs_app": false,
+      "actions": [
+        {"kind": "relay_hidden_roundtrip"}
+      ],
+      "expect": [
+        {"kind": "relay_roundtrip_ok"}
+      ]
+    },
+    {
+      "id": "da_tui_distributed_on",
+      "caption": "TUI：分布式开关走真实端点（PUT /cluster/config/distributed-inference）",
+      "actions": [
+        {"kind": "new_app", "api": "fake"},
+        {"kind": "enter_main"},
+        {"kind": "click_nav", "page": "cluster"},
+        {"kind": "set_cluster_aux", "data": {"distributed": {"enabled": false}}},
+        {"kind": "cluster_toggle"},
+        {"kind": "confirm", "key": "y"}
+      ],
+      "expect": [
+        {
+          "kind": "api_called",
+          "method": "PUT",
+          "path": "/cluster/config/distributed-inference",
+          "body": {"enabled": true}
+        }
+      ]
+    },
+    {
+      "id": "da_service_down",
+      "caption": "停服务（幂等）",
+      "needs_app": false,
+      "actions": [
+        {"kind": "stop_relay_service"}
+      ],
+      "expect": [
+        {"kind": "service_stopped"}
+      ]
+    }
+  ]
+}
