@@ -719,6 +719,18 @@ def _load_keep_head_segment(args: argparse.Namespace, model_path: str, *,
                                 # 直接拒绝该批次）。
                                 n_batch=max(512, int(args.batch) * max(1, int(args.prefill))),
                                 extra_dll_dirs=extra)
+    # ★ 2026-09-24：**前置**校验 ctx 预算（fail-closed）—— llama.cpp 把 `n_ctx` 按 `n_seq_max`
+    #   **均分**（见 `KeepHeadUpstream.ctx_per_seq`）。若 `batch × prefill + gen` 超过每序列可用
+    #   ctx，长 decode 会在**中途**报 `llama_decode rc=1`（"failed to find a memory slot for
+    #   batch"），表面表现为 `runner_failed`，极易被误读成"数值不一致"。这里直接拒绝启动。
+    _need = (max(1, int(args.batch)) * max(1, int(args.prefill))
+             + max(0, int(args.gen)) + 256)
+    if int(upstream.ctx_per_seq) < _need:
+        upstream.close()
+        raise SystemExit(
+            f"FAIL: 每序列 ctx 不足：n_ctx={args.n_ctx} / n_seq_max={upstream.n_seq_max} = "
+            f"{upstream.ctx_per_seq} < 需要 {_need}（batch×prefill + gen + 256 余量）；"
+            f"请提高 --n-ctx 到 ≥ {_need * upstream.n_seq_max}，或把 --batch 降到 1")
     return {
         "keep_head": upstream,
         "load_s": round(time.perf_counter() - started, 2),
@@ -832,6 +844,11 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
     mid_decode: list[float] = []
     margins: list[float] = []      # ★ P4：每步（每序列）的 top1-top2 边距
     failure: str | None = None
+    # ★ 2026-09-24：`middle` 只在**三段**分支（`else:`）里赋值，但函数尾部的 `mid_uplink_bytes` /
+    #   `mid_downlink_bytes`（以及 `close()`）会无条件引用它 ⇒ 走 2 段链路（`PATH_L2L` /
+    #   `PATH_L2L_KEEP_HEAD`）时必然 `UnboundLocalError: cannot access local variable 'middle'`。
+    #   既有 bug（与本轮余量改动无关，是在验证 l2l_keep_head 时撞上的），这里补默认值。
+    middle = None
     pos = 0
 
     if args.path in (PATH_L2L, PATH_L2L_KEEP_HEAD):

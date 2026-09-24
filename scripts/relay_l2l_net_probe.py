@@ -57,7 +57,10 @@ def _whole_tokens(whole: Path, prompt: list[int], gen: int, threads: int) -> lis
     import numpy as np
 
     params = M.llama_context_default_params()
-    params.n_ctx = len(prompt) + gen + 8
+    # ★ 2026-09-24：余量从 8 提到 256 —— 旧值紧贴 `len(prompt) + gen`，一旦 llama.cpp 的
+    #   ctx 分配/取整策略变化就会在长 decode 中途失败（同一类坑见
+    #   `KeepHeadUpstream.ctx_per_seq` 的说明）。
+    params.n_ctx = len(prompt) + gen + 256
     params.n_batch = max(512, len(prompt))
     params.n_ubatch = params.n_batch
     params.n_threads = int(threads)
@@ -230,7 +233,7 @@ def main() -> int:
         if not args.head_model:
             raise SystemExit("FAIL: 需要 --head-model（本地上游）或 --head-endpoint（远端上游）")
         upstream = KeepHeadUpstream(str(Path(args.shim).resolve()), args.head_model,
-                                    mode="nextn", n_ctx=len(prompt) + int(args.gen) + 8,
+                                    mode="nextn", n_ctx=len(prompt) + int(args.gen) + 256,
                                     n_threads=int(args.threads),
                                     n_batch=max(512, len(prompt)), n_seq_max=1)
         n_embd = int(upstream.n_embd)

@@ -312,7 +312,7 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--n-embd", type=int, default=None, help="可选：与本地期望宽度核对")
     ap.add_argument("--n-ctx", type=int, default=4096)
     ap.add_argument("--threads", type=int, default=8)
-    ap.add_argument("--n-seq-max", type=int, default=8,
+    ap.add_argument("--n-seq-max", type=int, default=1,
                     help="★ P3：允许的并行序列上限（跨机多序列要求 ≥ 调用方 batch）")
     ap.add_argument("--n-batch", type=int, default=1024,
                     help="★ P3：batch 容量下限（≥ 调用方 batch × prefill 长度）")
