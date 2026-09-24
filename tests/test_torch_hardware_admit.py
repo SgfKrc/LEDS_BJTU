@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import argparse
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -102,6 +103,34 @@ def test_diagnostic_clock_summary_accepts_quantized_zero_samples():
     assert result["samples_ms"] == [0.0, 0.0, 1.0]
     assert result["cv"] == pytest.approx(1.41421356237)
     assert MODULE.summarize_nonnegative_samples([0.0, 0.0])["cv"] is None
+
+
+def test_cpu_affinity_parser_rejects_duplicates_and_accepts_ordered_indices():
+    assert MODULE._parse_cpu_affinity("0, 2,10") == [0, 2, 10]
+    with pytest.raises(argparse.ArgumentTypeError, match="unique"):
+        MODULE._parse_cpu_affinity("0,0")
+
+
+def test_cpu_affinity_mismatch_fails_closed_when_both_reports_attest_it():
+    cpu, cuda = _paired_reports()
+    cpu["runtime"]["cpu_affinity"] = {"requested_logical_cpus": [0, 2], "mask": 5, "applied": True}
+    cuda["runtime"]["cpu_affinity"] = {"requested_logical_cpus": [0, 1], "mask": 3, "applied": True}
+
+    result = MODULE.compare_reports(cpu, cuda, max_cv=0.1)
+
+    assert not result["same_host_cpu_cuda_split_admitted"]
+    assert "cpu_affinity_mismatch" in result["reasons"]
+
+
+def test_interop_thread_mismatch_fails_closed_when_both_reports_attest_it():
+    cpu, cuda = _paired_reports()
+    cpu["runtime"]["interop_threads"] = 1
+    cuda["runtime"]["interop_threads"] = 2
+
+    result = MODULE.compare_reports(cpu, cuda, max_cv=0.1)
+
+    assert not result["same_host_cpu_cuda_split_admitted"]
+    assert "interop_thread_count_mismatch" in result["reasons"]
 
 
 def test_cache_summary_captures_actual_tensor_layout_and_bytes():

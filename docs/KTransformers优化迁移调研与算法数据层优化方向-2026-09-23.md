@@ -147,7 +147,7 @@ Gate/Up 融合实现、GPTQ/Marlin/FP8 依赖栈。它们可以作为外部对�
 | 7 | `TORCH-HETERO-PLAN-01` | 离线算子放置 planner：设备画像、内存、带宽、边界传输和正确性门；与连续层 planner 对照 | OP-REGISTRY-01 | **已完成（离线 planner 与 16 项合成测试；未接运行时）** |
 | 8 | `TORCH-PHASE-PLAN-01` | prefill/decode 双计划和受控状态切换；失败时回退单一 PyTorch 计划或 llama.cpp | HETERO-PLAN-01 | **离线合同完成（25 项合成测试；未做硬件准入/未接运行时）** |
 | 9 | `TORCH-ACT-COMPRESS-01` | PyTorch 双层段激活压缩；整模对拍、长 prompt 和逐 token 门禁 | HETERO-PLAN-01、PHASE-PLAN-01 | **离线实验完成（RTX 4060：f16 精确；int8/int4 分歧；未接运行时）** |
-| 10 | `TORCH-HW-ADMIT-01` | 同负载 CPU/CUDA、阶段成本、KV 身份与真实链路准入矩阵 | OP-PROFILE-01、HETERO-PLAN-01、PHASE-PLAN-01、ACT-COMPRESS-01 | **实测中（2026-09-24：控制复测仍有 CPU 4/12、CUDA 6/12 timing cell 超 CV 0.10；CPU/CUDA 正确性与 KV 结构通过；Surface 已对齐共同 Qwen2.5-0.5B 工件与 Torch/Transformers sidecar，但跨机生产推理和时延门仍未准入）** |
+| 10 | `TORCH-HW-ADMIT-01` | 同负载 CPU/CUDA、阶段成本、KV 身份与真实链路准入矩阵 | OP-PROFILE-01、HETERO-PLAN-01、PHASE-PLAN-01、ACT-COMPRESS-01 | **实测中（2026-09-24 本机复核：探针新增可追溯 CPU 亲和性/inter-op 控制；P-core/1-thread/20-repeat CPU 仍有 2/12 decode cell 超 CV 0.10，CPU↔CUDA 身份、KV 与正确性通过但异构时延门拒绝；跨机生产推理仍未准入）** |
 | 11 | `TORCH-RUNTIME-ADMIT-01` | 可验证准入证据、资源/KV 生命周期及默认关闭的阶段调度 | HW-ADMIT-01、PHASE-PLAN-01 | **锁定（HW-ADMIT-01 完整准入后方可排期）** |
 | 12 | `TORCH-MOE-PLACEMENT-01` | 以可运行 MoE 样本验证专家热度、复制、预取和故障回退；不进入默认 dense 路径 | OP-REGISTRY-01、HW-ADMIT-01、RUNTIME-ADMIT-01 | 排队 |
 
@@ -293,7 +293,7 @@ wall time 只作本机诊断，不作为准入结果：样本是单 GPU、单 pr
 
 **控制复测（2026-09-24，当前有效稳定性结论）**：并行弱网实验已结束后重新串行执行同一 Qwen2.5-0.5B 工件、FP32、8 线程、3 次预热/20 次计时和 seed `20260923`。CPU 仍有 **4/12** 格超限：`64:4` prefill/decode=`0.154/0.116`、`64:12` prefill/decode=`0.135/0.113`；CUDA 仍有 **6/12** 格超限：`64:24 prefill=0.189`、`64:12 decode=0.136`、`64:4 prefill/decode=0.171/0.144`、`256:4 decode=0.119`、`256:12 decode=0.130`。同机 CPU/CUDA 分段四个 workload-direction 的 greedy token 与 KV 结构仍 exact，但 `phase_cost_matrix_admitted=false`、`same_host_cpu_cuda_split_admitted=false`；增加样本和移除弱网并行干扰没有使时延门通过。新证据为 `cpu-fp32-interleaved-w20-post-weaknet-20260924.json`、`cuda-fp32-interleaved-w20-post-weaknet-20260924.json`、`cpu-cuda-interleaved-w20-post-weaknet-comparison-20260924.json`。
 
-**CPU 时延抖动诊断（2026-09-24，根因已定位）**：前两轮复测只能说明「重排与增加样本未消除抖动」，并因未采 ETW / 频率 / 温度而**不下根因断言**。新增诊断工具 `scripts/torch_cpu_jitter_diagnosis.py`（逐逻辑核画像 + 亲和性×线程数对照；**只诊断，不改 CV 门、不放宽阈值、不产出可进 planner 的成本**）补齐了这块证据：
+**CPU 时延抖动诊断（2026-09-24，矩阵诊断根因已定位，完整前向仍有残余）**：前两轮复测只能说明「重排与增加样本未消除抖动」，并因未采 ETW / 频率 / 温度而**不下根因断言**。新增诊断工具 `scripts/torch_cpu_jitter_diagnosis.py`（逐逻辑核画像 + 亲和性×线程数对照；**只诊断，不改 CV 门、不放宽阈值、不产出可进 planner 的成本**）补齐了这块证据：
 
 - **本机 CPU 为 `i9-13900H`：14 物理核 / 20 逻辑核 ⇒ Intel 混合架构（P-core + E-core）**。逐逻辑核画像（同一 matmul 负载、单核绑定、20 次/核）给出**完美双峰**：**12 个核 ≈ 14.5–16.0 ms**、**8 个核 ≈ 38.3–40.0 ms** ⇒ **P-core 比 E-core 快 2.76×**（12 = 6 物理核 × 2 HT；8 = 8 个 E 物理核）。
 - **线程数 × 亲和性矩阵**（8 线程即 HW-ADMIT 现状；CV = `population_stddev / mean`）：
@@ -308,6 +308,13 @@ wall time 只作本机诊断，不作为准入结果：样本是单 GPU、单 pr
 - **机制结论**：抖动来源是「**跨异构核域 + 超订物理核**」—— 默认核集上 8 线程会被调度到 P 或 E（或被迁移），P 域超订再叠加 HT 争用；而**同构域内且线程数 ≤ 域内物理核数**时 CV 稳定在 **0.027–0.041**，**远低于 0.10 门**。⇒ **门阈值本身没有问题，问题在测量流程**：CPU 标定应在**固定亲和性 + 线程数 == 该域物理核数**下进行（或按 P/E 域**分别标定**，并把核域写进 `device_profile`），否则同一份负载会同时混入两种量级的单核成本。这与本文档 P0 的「`-t` = 物理核（非超线程）、亲和性/NUMA 策略」建议相互印证，且**不涉及放宽阈值或只挑稳定格**。
 - 证据：`local_docs/evidence/torch-hardware-admit/cpu-jitter-diagnosis-cores-20260924T020328.json`、`cpu-jitter-diagnosis-threads-20260924T020420.json`、`cpu-jitter-diagnosis-threads-t{4,6,8,12}-20260924.json`（含逐核排序均值与每档 20 次原始样本）。
 - **诚实边界**：诊断负载是**矩阵乘同族**（非完整层前向）；未采 ETW/温度/频率计数器（改用亲和性实验**直接定位**核域异构，比频率采样更直接，但"频率/温控可能叠加"未被排除）；期间后台负载 21–38%（各档同条件对比，未做进程隔离）。
+
+**HW-ADMIT 本机控制复测（2026-09-24）**：为把上述诊断落实到真实层段探针，`scripts/torch_hardware_admit.py` 新增了 opt-in 的 `--cpu-affinity CPU[,CPU...]` 与 `--interop-threads N`，并将请求的逻辑核、mask、应用方式和实际 inter-op 线程数写入 `runtime`；比较器在两份新报告都提供这些字段时对亲和性/线程不一致 fail-closed。定向 `tests/test_torch_hardware_admit.py` 为 **16 passed**，CPU 诊断回归为 **3 passed**。
+
+- P-core 单线程条件：Qwen2.5-0.5B、FP32、`CPU 0`、Torch intra-op=1/inter-op=1、3 warmup/20 repeats；CPU 仅 `64:24 decode`（CV `0.2451`）和 `256:12 decode`（CV `0.1106`）超门。对应 CUDA 报告 12/12 timing cell 均过门，但完整比较仍因 CPU 两格和 `256` 两个异构方向不稳而拒绝 `same_host_cpu_cuda_split_admitted`。
+- P-core 6 线程条件：仅绑 `0,2,4,6,8,10`（每个 P-core 取一个逻辑核）且 inter-op=1 后，短 cell 抖动下降但仍有 `64:4 prefill`、`256:12 prefill/decode` 超门；不把线程池控制误写成充分修复。
+- 证据：`cpu-fp32-pcore-t1-interop1-w20-20260924.json`、`cuda-fp32-pcore-t1-interop1-w20-20260924.json`、`cpu-cuda-pcore-t1-interop1-w20-comparison-20260924.json`，以及 6-thread 对照 `cpu-fp32-pcore-t6-w20-20260924.json`、`cpu-fp32-pcore-t6-interop1-w20-20260924.json`。
+- 结论：亲和性与 inter-op 控制已成为可复现实验能力，但本机 Torch CPU profile **仍未准入**；不得删异常样本、放宽 CV=0.10、或把 1-thread 作为默认运行时配置。下一步仍是隔离 ETW/频率/温度/后台负载并确认完整前向的长尾来源；`TORCH-RUNTIME-ADMIT-01` 继续锁定。
 
 另跑部署默认精度观察（1 次 warmup、每格 3 次未插桩样本）：CUDA 整模 FP16 reference 下，CPU FP32→CUDA FP16 的 64-token prefill/decode exact，256-token prefill 不 exact；CUDA FP16→CPU FP32 的 64-token prefill 不 exact、256-token exact，所测 decode token 均 exact。边界张量分别为 `[1,64,896]`/`[1,256,896]`，CPU→CUDA FP32→FP16 转换最大绝对误差约 `0.115`。结果说明混合精度层段的 prefill 正确性受 prompt 影响，部署默认组合不准入；证据 `local_docs/evidence/torch-hardware-admit/cuda-deployment-default.json`。
 

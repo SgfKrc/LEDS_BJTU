@@ -81,6 +81,53 @@ def summarize_nonnegative_samples(samples_ms: list[float]) -> dict[str, Any]:
     }
 
 
+def _parse_cpu_affinity(value: str) -> list[int]:
+    """Parse a stable logical-CPU list used for reproducible local probes."""
+    try:
+        cpus = [int(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("cpu affinity must be comma-separated integers") from exc
+    if not cpus or any(cpu < 0 for cpu in cpus) or len(set(cpus)) != len(cpus):
+        raise argparse.ArgumentTypeError("cpu affinity must contain unique non-negative CPUs")
+    return cpus
+
+
+def _apply_cpu_affinity(cpus: list[int] | None) -> dict[str, Any]:
+    """Apply process affinity before Torch/model initialization and attest the result."""
+    if cpus is None:
+        return {"requested_logical_cpus": None, "mask": None, "applied": False, "method": "not_requested"}
+    logical_count = os.cpu_count() or 1
+    if any(cpu >= logical_count for cpu in cpus):
+        raise ValueError(f"cpu affinity contains CPU outside logical range 0..{logical_count - 1}")
+    mask = sum(1 << cpu for cpu in cpus)
+    method = "windows_SetProcessAffinityMask"
+    applied = False
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.SetProcessAffinityMask.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
+        kernel32.SetProcessAffinityMask.restype = ctypes.c_int
+        applied = bool(kernel32.SetProcessAffinityMask(
+            kernel32.GetCurrentProcess(), ctypes.c_size_t(mask),
+        ))
+    elif hasattr(os, "sched_setaffinity"):
+        os.sched_setaffinity(0, set(cpus))
+        applied = True
+        method = "sched_setaffinity"
+    else:
+        method = "unsupported"
+    if not applied:
+        raise RuntimeError(f"failed to apply CPU affinity mask {mask:#x}")
+    return {
+        "requested_logical_cpus": cpus,
+        "mask": mask,
+        "applied": True,
+        "method": method,
+    }
+
+
 def _phase_measurement_order(repeats: int) -> list[str]:
     """Balance phase order while keeping each prefill/decode pair adjacent."""
     order: list[str] = []
@@ -167,6 +214,16 @@ def compare_reports(cpu_report: dict[str, Any], cuda_report: dict[str, Any], *, 
         reasons.append("host_identity_mismatch")
     if cpu_runtime.get("threads") != cuda_runtime.get("threads"):
         reasons.append("thread_count_mismatch")
+    cpu_affinity = cpu_runtime.get("cpu_affinity")
+    cuda_affinity = cuda_runtime.get("cpu_affinity")
+    if cpu_affinity is not None and cuda_affinity is not None and cpu_affinity != cuda_affinity:
+        reasons.append("cpu_affinity_mismatch")
+    if (
+        cpu_runtime.get("interop_threads") is not None
+        and cuda_runtime.get("interop_threads") is not None
+        and cpu_runtime.get("interop_threads") != cuda_runtime.get("interop_threads")
+    ):
+        reasons.append("interop_thread_count_mismatch")
     if cpu_runtime.get("python") != cuda_runtime.get("python"):
         reasons.append("python_runtime_mismatch")
     if cpu_runtime.get("transformers") != cuda_runtime.get("transformers"):
@@ -269,7 +326,8 @@ def compare_reports(cpu_report: dict[str, Any], cuda_report: dict[str, Any], *, 
     pair_identity_ok = not any(reason in reasons for reason in (
         "report_schema_mismatch", "model_artifact_mismatch", "tokenizer_mismatch",
         "cpu_report_device_mismatch", "cuda_report_device_mismatch",
-        "host_identity_mismatch", "thread_count_mismatch",
+        "host_identity_mismatch", "thread_count_mismatch", "cpu_affinity_mismatch",
+        "interop_thread_count_mismatch",
         "python_runtime_mismatch", "transformers_runtime_mismatch",
         "torch_runtime_version_mismatch",
         "matched_fp32_control_missing", "workload_set_mismatch",
@@ -785,6 +843,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--order-seed", type=int, default=20260923,
                         help="fixed seed used to randomize workload and layer-range measurement order")
     parser.add_argument("--threads", type=int, default=max(1, min(8, os.cpu_count() or 1)))
+    parser.add_argument(
+        "--cpu-affinity", type=_parse_cpu_affinity, default=None, metavar="CPU[,CPU...]",
+        help="pin the probe process to logical CPUs before importing Torch (opt-in)",
+    )
+    parser.add_argument(
+        "--interop-threads", type=int, default=None, metavar="N",
+        help="set Torch inter-op threads for controlled local probes (opt-in)",
+    )
     parser.add_argument("--precision", choices=("fp32", "deployment_default"), default="fp32",
                         help="fp32 controls device comparison; deployment_default observes CPU FP32/CUDA FP16")
     return parser
@@ -799,9 +865,16 @@ def main(argv: list[str] | None = None) -> int:
         out = args.json_out or DEFAULT_REPORT_DIR / "cpu-cuda-comparison.json"
         return _compare_cli(args.compare[0], args.compare[1], out, args.max_cv)
     if (args.repeats < 3 or args.warmup < 0 or args.decode_steps < 1 or args.threads < 1
+            or (args.interop_threads is not None and args.interop_threads < 1)
             or not args.prefill_tokens or any(value < 1 for value in args.prefill_tokens)
             or any(value < 1 for value in args.ranges) or not args.model_dir.is_dir()):
         print("FAIL: invalid workload or model directory", file=sys.stderr)
+        return 2
+
+    try:
+        cpu_affinity = _apply_cpu_affinity(args.cpu_affinity)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
         return 2
 
     logging.basicConfig(level=logging.WARNING)
@@ -815,6 +888,8 @@ def main(argv: list[str] | None = None) -> int:
     qlh_config.TRUST_REMOTE_CODE = False
     model_module.TRUST_REMOTE_CODE = False
     model_module.USE_COMPILE = False
+    if args.interop_threads is not None:
+        torch.set_num_interop_threads(args.interop_threads)
     torch.set_num_threads(args.threads)
     torch.manual_seed(0)
     if torch.cuda.is_available():
@@ -859,6 +934,9 @@ def main(argv: list[str] | None = None) -> int:
             "host_identity": platform.node(),
             "operating_system": platform.platform(),
             "threads": args.threads,
+            "interop_threads": int(torch.get_num_interop_threads()),
+            "interop_threads_requested": args.interop_threads,
+            "cpu_affinity": cpu_affinity,
             "compile_enabled": False,
             "measurement_dtype": runtime_dtype,
         },
