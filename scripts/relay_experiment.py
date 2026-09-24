@@ -630,6 +630,58 @@ def _wire_hidden_bytes(n_embd: int | None) -> int | None:
     return width * 4 if width > 0 else None
 
 
+def _overlap_budget(
+    n_embd: int | None,
+    hidden_quant: str,
+    *,
+    bandwidth_mbps: float,
+    compute_ms_per_step: float,
+    latency_ms: float = 0.0,
+    hops: int = 1,
+) -> dict[str, float] | None:
+    """★ R-R8（§5.1④）：**传输-计算重叠**的可重叠窗口与理论上限（纯计算，不跑模型）。
+
+    背景（`docs/跨框架接力…` §4④ / §5.1④）：同机 loopback 下可重叠窗口 **< 1%** ⇒ 不值得做；
+    文档明确「**弱网下才值得做**预取/压缩-计算重叠，届时**先测网络与解码计算的实际重叠窗口**」。
+    本函数就是那个"先测"的**纯计算**部分：把已实测的 `compute_ms_per_step` 与按带宽算出的
+    通信时间放在一起给出上限。
+
+    模型（保守、按"每跳各传一次"记账）：
+
+    * `wire_bytes = 每 token 线上字节 × hops` —— 走 `_hidden_bytes`，**已含** int8/int4 的 scale 开销；
+    * `comm_ms = wire_bytes × 8 / (bandwidth × 1e6) × 1000 + latency_ms`（串行化 + 单程额外延迟）；
+    * `serial_ms = compute + comm`，完全重叠时最多省 `min(comm, compute)`。
+
+    ⚠️ **这是可达性上界，不是实测**：它假设"通信与计算能完全交叠且互不干扰"，真实流水线还要受
+    batch、依赖关系与内核争用限制 ⇒ 报告里必须写明是**上界**。
+    `bandwidth_mbps <= 0`（不限速 ⇒ 同机）或宽度非法时返回 `None`：那种场景无可谈论的重叠。
+    """
+    width = int(n_embd or 0)
+    step_count = int(hops)
+    if width <= 0 or step_count < 1 or float(bandwidth_mbps) <= 0:
+        return None
+    wire_bytes = _hidden_bytes(width, hidden_quant)
+    if wire_bytes is None:
+        return None
+
+    total_bytes = int(wire_bytes) * step_count
+    compute_ms = max(0.0, float(compute_ms_per_step))
+    comm_ms = (total_bytes * 8.0 / (float(bandwidth_mbps) * 1e6) * 1000.0
+               + max(0.0, float(latency_ms)))
+    serial_ms = compute_ms + comm_ms
+    overlap_ms = min(comm_ms, compute_ms)
+    return {
+        "wire_bytes_per_token_per_hop": float(wire_bytes),
+        "total_wire_bytes": float(total_bytes),
+        "comm_ms": comm_ms,
+        "compute_ms": compute_ms,
+        "serial_ms": serial_ms,
+        "overlap_gain_ms": overlap_ms,
+        "overlap_ceiling_pct": (100.0 * overlap_ms / serial_ms) if serial_ms > 0 else 0.0,
+        "speedup_ceiling": (serial_ms / (serial_ms - overlap_ms)) if serial_ms > overlap_ms else 1.0,
+    }
+
+
 class _QuantErrorTracker:
     """★ P3 误差测量（按用户裁定的"**先只测量，不改链路**"）：记录每次量化往返的误差量级。
 
@@ -1433,6 +1485,15 @@ def _dry_run_record(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # ★ R-R8 顺手修：Windows 控制台默认 GBK，报告里的 `⇒` 等符号会让 `print` 抛
+    #   `UnicodeEncodeError` ⇒ **整个报告打不出来**（`relay_health.py` / `tui_e2e_flow.py`
+    #   都踩过同一个坑）。这里统一降级为 replace，保证报告永远打得出来。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 - 老环境没有 reconfigure 就照旧
+            pass
+
     args = _parse(argv)
     record = _dry_run_record(args) if args.dry_run else _run(args)
 

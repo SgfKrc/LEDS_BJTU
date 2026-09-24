@@ -27,7 +27,10 @@ __all__ = [
     "QUANT_BLOCK",
     "decode_hidden",
     "encode_hidden",
+    "error_feedback_roundtrip",
     "expected_quantized_bytes",
+    "quant_error_stats",
+    "roundtrip_f32",
 ]
 
 #: 块大小（与实验驱动 `relay_experiment._quantize_hidden` 的 128 一致）。
@@ -166,3 +169,73 @@ def decode_hidden(payload: bytes, mode: str, n_tokens: int, n_embd: int) -> byte
     width_padded = blocks * QUANT_BLOCK
     out = flat.reshape(tokens, width_padded)[:, :width]
     return np.ascontiguousarray(out, dtype="<f4").tobytes()
+
+
+# ------------------------------------------------------------------ 误差反馈 / 残差补偿（R-R8）
+#
+# 背景（`docs/跨框架接力…` §5.1③ 与 §4）：`f16` / `int8_block128` 在 512 步内**既不累积误差、
+# 也不改变任何 token** ⇒ **当前不需要**误差反馈；**仍待做的是更激进档（int4 / 2bit）下的误差反馈**。
+# 本段给那条研究提供**可测基础**，并且**不改 wire**（残差留在发送侧，协议零变化）。
+
+
+def roundtrip_f32(hidden, mode: str, n_tokens: int, n_embd: int) -> np.ndarray:
+    """`encode_hidden` → `decode_hidden` 的**往返结果**（f32 数组，形状 `[n_tokens, n_embd]`）。
+
+    纯函数：让"本地模拟"与"真实 wire"走**同一套**编解码，避免两套口径漂移。
+    """
+    wire = encode_hidden(hidden, mode, n_tokens, n_embd)
+    return _as_f32(decode_hidden(wire, mode, n_tokens, n_embd), n_tokens, n_embd)
+
+
+def error_feedback_roundtrip(hidden, mode: str, n_tokens: int, n_embd: int,
+                             carry=None) -> tuple[np.ndarray, np.ndarray]:
+    """**残差补偿（error feedback / noise shaping）**的一步（发送侧，**不改 wire**）。
+
+    做法::
+
+        adjusted = x + carry            # 先把上一轮的量化残差加回来
+        y        = roundtrip(adjusted)  # 真正上 wire 并解回来
+        carry'   = adjusted - y         # 本轮残差留到下一轮
+
+    **为什么它有意义（有数学保证，不是玄学）**：设无补偿时第 i 步误差 `e_i = y_i - x_i`，
+    则 `Σ e_i` 是随机游走（约 `√N` 增长）；而带补偿时恒有
+
+        Σ (y_i - x_i) = carry_0 - carry_N
+
+    ⇒ **累积误差有界**（被 `carry` 吸收）。这正是 `tests/test_relay_hidden_quant.py` 里那条
+    **恒等式断言**与"有补偿的累积误差显著更小"断言的依据。
+
+    ⚠️ **它不改善单步精度**：`y - x = carry - carry'` 仍是同量级 ⇒ 对 **int4 这种"逐轮就失败"**
+    的档位（A5 实测 23/32），**不要指望它救回来** —— 那种失败来自块内 scale 太粗，不是累积。
+
+    返回 `(y, carry')`。
+    """
+    arr = _as_f32(hidden, n_tokens, n_embd)
+    previous = (np.zeros_like(arr) if carry is None
+                else np.ascontiguousarray(np.asarray(carry, dtype=np.float32)))
+    if previous.shape != arr.shape:
+        raise ValueError("error_feedback_carry_shape_mismatch")
+    adjusted = arr + previous
+    out = roundtrip_f32(adjusted, mode, n_tokens, n_embd)
+    return out, np.ascontiguousarray(adjusted - out, dtype=np.float32)
+
+
+def quant_error_stats(reference, actual) -> dict[str, float]:
+    """误差画像（供**归因**与报告）：`max_abs` / `rms` / `rel_rms`（`rms` 用参考的 RMS 归一）。
+
+    ⚠️ 只用于解释"哪一档误差多大、补偿后降了多少"；**验收判据仍只认 per-token argmax**，
+    不得拿这些数当准入依据（`docs/跨框架接力…` 的纪律）。
+    """
+    ref = np.asarray(reference, dtype=np.float32)
+    got = np.asarray(actual, dtype=np.float32)
+    if ref.shape != got.shape:
+        raise ValueError("quant_error_shape_mismatch")
+    diff = got - ref
+    size = int(diff.size)
+    rms = float(np.sqrt(np.mean(np.square(diff)))) if size else 0.0
+    base = float(np.sqrt(np.mean(np.square(ref)))) if size else 0.0
+    return {
+        "max_abs": float(np.abs(diff).max()) if size else 0.0,
+        "rms": rms,
+        "rel_rms": (rms / base) if base > 0 else 0.0,
+    }

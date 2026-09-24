@@ -435,6 +435,14 @@ def _detach_self(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # ★ R-R8 顺手修：服务端日志里含 `⇒` 等符号时，Windows GBK 控制台会让写日志抛
+    #   `UnicodeEncodeError`（同 `relay_health.py` 踩过的坑）。统一降级为 replace。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
+
     args = _parse(argv)
 
     # ★ R-R9：先处理"脱离会话"，再进入真正的服务流程。
