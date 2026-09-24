@@ -144,10 +144,10 @@ Gate/Up 融合实现、GPTQ/Marlin/FP8 依赖栈。它们可以作为外部对�
 | 4 | `REFACTOR-LARGEFILE-05` | 重构收口：门面契约、OpenAPI 路径/方法集合、冷启动和完整回归，确认无逻辑夹带 | 03、04 | **已完成（990 passed, 4 skipped）** |
 | 5 | `TORCH-OP-PROFILE-01` | 对项目 PyTorch 上游建立按算子形状、dtype、设备、阶段的成本画像；修正“平均每层”口径 | 05 | **已完成（CUDA profile，2026-09-23）** |
 | 6 | `TORCH-OP-REGISTRY-01` | 建立逻辑算子到 eager/compile/实验实现的注册、能力声明和 fail-closed 回退合同 | OP-PROFILE-01 | **已完成（离线合同与 23 项定向测试；未改运行时）** |
-| 7 | `TORCH-HETERO-PLAN-01` | 离线算子放置 planner：设备画像、内存、带宽、边界传输和正确性门；与连续层 planner 对照 | OP-REGISTRY-01 | **已完成（离线 planner 与 16 项合成测试；未接运行时）** |
+| 7 | `TORCH-HETERO-PLAN-01` | 离线算子放置 planner：设备画像、内存、带宽、边界传输和正确性门；与连续层 planner 对照 | OP-REGISTRY-01 | **真实 layer-level CPU/CUDA FP32 矩阵已接入（24 层、prefill/decode 各 5 样本，身份与 shape 匹配；两设备同时稳定覆盖 prefill 17/24、decode 5/24）；不稳定成本未修补，完整 planner 仍 fail-closed，未接运行时** |
 | 8 | `TORCH-PHASE-PLAN-01` | prefill/decode 双计划和受控状态切换；失败时回退单一 PyTorch 计划或 llama.cpp | HETERO-PLAN-01 | **离线合同完成（25 项合成测试；未做硬件准入/未接运行时）** |
 | 9 | `TORCH-ACT-COMPRESS-01` | PyTorch 双层段激活压缩；整模对拍、长 prompt 和逐 token 门禁 | HETERO-PLAN-01、PHASE-PLAN-01 | **离线实验完成（RTX 4060：f16 精确；int8/int4 分歧；未接运行时）** |
-| 10 | `TORCH-HW-ADMIT-01` | 同负载 CPU/CUDA、阶段成本、KV 身份与真实链路准入矩阵 | OP-PROFILE-01、HETERO-PLAN-01、PHASE-PLAN-01、ACT-COMPRESS-01 | **实测中（2026-09-24 本机复核：已加入可追溯 CPU 亲和性/inter-op 与 CUDA/系统 telemetry；P-core/1-thread/20-repeat CPU 仍有 2/12 decode cell、CUDA 仍有 1/12 prefill cell 超 CV 0.10，CPU↔CUDA 身份/KV/正确性通过但异构时延门拒绝；跨机生产推理仍未准入）** |
+| 10 | `TORCH-HW-ADMIT-01` | 同负载 CPU/CUDA、阶段成本、KV 身份与真实链路准入矩阵 | OP-PROFILE-01、HETERO-PLAN-01、PHASE-PLAN-01、ACT-COMPRESS-01 | **完整前向复测完成（2026-09-24，主运行时 `torch 2.13.0+cu126`，FP32，CPU/CUDA 各 2 prompt × 3 layer ranges × prefill/decode × 20 repeats；CPU 2 个 cell、CUDA 8 个 cell 超 CV 0.10；4 个同机异构方向均 exact，但 3 个时延不稳定，准入拒绝；跨机生产推理仍未准入）** |
 | 11 | `TORCH-RUNTIME-ADMIT-01` | 可验证准入证据、资源/KV 生命周期及默认关闭的阶段调度 | HW-ADMIT-01、PHASE-PLAN-01 | **锁定（HW-ADMIT-01 完整准入后方可排期）** |
 | 12 | `TORCH-MOE-PLACEMENT-01` | 以可运行 MoE 样本验证专家热度、复制、预取和故障回退；不进入默认 dense 路径 | OP-REGISTRY-01、HW-ADMIT-01、RUNTIME-ADMIT-01 | 排队 |
 
