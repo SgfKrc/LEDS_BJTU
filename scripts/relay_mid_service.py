@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -346,6 +347,15 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
                     help="★ P4.5 健康检查：定期刷新 ready 文件的时间戳（秒；0 = 关闭）。"
                          "外部据此判断服务是否还活着 —— 服务跑在 ssh 会话里时会被网络抖动静默带走，"
                          "没有心跳就分不清'服务已退出'与'模型算错'")
+    ap.add_argument("--detach", action="store_true",
+                    help="★ R-R9：**脱离发起会话**运行（重起为无终端子进程后父进程退出）—— "
+                         "§8.6 的实测教训：ssh 起的段会被网络抖动带走，而隧道端口仍在监听、"
+                         "新连接被接受后立刻 reset，与'模型层错误'难以区分。需配合 --log-file")
+    ap.add_argument("--log-file", default=None,
+                    help="★ R-R9：--detach 时 stdout/stderr 的落点（detach 后没有终端可写）")
+    ap.add_argument("--pid-file", default=None,
+                    help="★ R-R9：写入服务 PID，便于停止与对账（服务本身不删该文件："
+                         "判断活性请用 scripts/relay_health.py --probe）")
     return ap.parse_args(argv)
 
 
@@ -378,8 +388,66 @@ def _runner_build(runner: Any, *, digest_artifacts: bool = False) -> dict[str, A
                                digest_artifacts=digest_artifacts)
 
 
+def _detach_self(args: argparse.Namespace) -> int:
+    """★ R-R9：把本服务**重起为脱离会话的进程**，父进程随即退出。
+
+    ## 为什么需要（§8.6 的实测教训）
+
+    用 `ssh ... python3 relay_mid_service.py` 起的段，**网络抖动会把 ssh 会话带走、服务随之退出**；
+    此后隧道端口**仍在本机监听**，新连接被"接受"后立刻 reset（`ConnectionResetError`）——
+    现象与"模型层错误"**难以区分**。生产形态要求服务**不依赖发起会话**。
+
+    ## 做法（零依赖，不引入 `systemd` / `pywin32`）
+
+    - `subprocess.Popen` **重起自己**，并用 `QLH_RELAY_DETACHED=1` 防止无限递归；
+    - Windows：`CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS`；POSIX：`start_new_session=True`
+      （等效 `setsid`，Termux 无 `setsid` 也可用）；
+    - stdout/stderr 重定向到 `--log-file`（detach 后没有终端可写）；
+    - 打印子进程 PID（并按需写 `--pid-file`）后**父进程退出** —— 调用方会话断了也不影响服务。
+
+    ## 怎么停
+
+    先用 `scripts/relay_health.py --probe <name>=tcp:<host>:<port>` 确认该段是否真在服务
+    （**协议级**握手，能识别"端口在监听但对端已死"），再按 `--pid-file` 或 PID 停：
+    Windows `taskkill /PID <pid> /T /F`；POSIX `kill <pid>`。
+    """
+    if not args.log_file:
+        print("FAIL: --detach 需要 --log-file（detach 后没有终端可接管输出）", file=sys.stderr)
+        return 2
+
+    env = dict(os.environ, QLH_RELAY_DETACHED="1")
+    command = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
+    log_path = Path(args.log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as log:
+        if os.name == "nt":
+            flags = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                     | getattr(subprocess, "DETACHED_PROCESS", 0))
+            child = subprocess.Popen(command, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                                     env=env, creationflags=flags, close_fds=True)
+        else:
+            child = subprocess.Popen(command, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                                     env=env, start_new_session=True, close_fds=True)
+    print(f"[detached] pid={child.pid} log={log_path}")
+    if args.pid_file:
+        Path(args.pid_file).write_text(str(child.pid), encoding="utf-8")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
+
+    # ★ R-R9：先处理"脱离会话"，再进入真正的服务流程。
+    if args.detach and os.environ.get("QLH_RELAY_DETACHED") != "1":
+        return _detach_self(args)
+
+    if args.pid_file:
+        try:
+            Path(args.pid_file).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.pid_file).write_text(str(os.getpid()), encoding="utf-8")
+        except OSError:
+            pass        # 写不了 pid 文件不该让服务起不来；判断活性请用 relay_health --probe
+
     host, port = _split_endpoint(args.listen)
 
     if args.role == "middle":

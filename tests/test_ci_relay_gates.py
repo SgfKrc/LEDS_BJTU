@@ -85,3 +85,24 @@ def test_health_self_check_fails_when_dead_port_is_reported_healthy(tmp_path: Pa
     result = _run_self_check(tmp_path / "gates", HEALTH_SCRIPT)
     assert result.returncode == 1, result.stdout + result.stderr
     assert "已释放端口" in result.stdout
+
+
+def test_health_self_check_fails_when_relay_probe_is_neutered(tmp_path: Path) -> None:
+    """★ R-R9：把**协议级探活**的失败也判成健康（等价于"只测端口"）⇒ 自检必须失败。
+
+    这正是 §8.6 的坑：隧道端口**还在监听**、但对端已死（accept 后立刻 reset）。
+    若有人把 `_probe_relay` 的失败分支改坏（或干脆退回 `_check_tcp`），自检里
+    「假服务必须被 `_probe_relay` 判死」那条会立刻红。
+    """
+    target = _copy(tmp_path / "gates", HEALTH_SCRIPT)
+    text = target.read_text(encoding="utf-8")
+    marker = '        return {"ok": False, "reason": "handshake_failed", "endpoint": endpoint,'
+    assert marker in text, "变异锚点变了：请同步更新本用例"
+    target.write_text(
+        text.replace(marker,
+                     '        return {"ok": True, "reason": "injected", "endpoint": endpoint,'),
+        encoding="utf-8")
+
+    result = _run_self_check(tmp_path / "gates", HEALTH_SCRIPT)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "假服务" in result.stdout, result.stdout
