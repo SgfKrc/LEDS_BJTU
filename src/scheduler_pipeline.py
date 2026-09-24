@@ -8,7 +8,9 @@ import time
 import uuid
 
 from koakuma_engine import Capability, backend_id_for, runtime_supports
-from config import PIPELINE_MODEL_SYNC_TIMEOUT
+from config import PIPELINE_MODEL_SYNC_TIMEOUT, PIPELINE_RELAY_ENABLED
+from relay_segment_client import RelaySegmentClient, RelaySegmentError
+from relay_transport import is_loopback_host
 from scheduler_types import PreemptState
 from torch_runtime import require_torch
 
@@ -2062,8 +2064,18 @@ class SchedulerPipelineMixin:
                 getattr(loaded_config, "model_type", "") or ""
             ).lower()
             if backend_id_for(mgr) != "pytorch":
-                layer_config_invalid = True
-                raise RuntimeError(f"worker 引擎已变化: {backend_id_for(mgr)}")
+                # ★ A1 / X 档（2026-09-24）：本节点不跑 pytorch 层段时的**保守** Relay 委托。
+                #   仅当 ① 全局开关打开 且 ② 本步携带合法的 `relay_segment` 规格（middle 角色）
+                #   才把本段交给远端 relay 段；否则**保持原行为** —— 直接拒绝，绝不静默降级。
+                relay_spec = self._normalize_relay_segment(data.get("relay_segment"))
+                if not PIPELINE_RELAY_ENABLED or relay_spec is None:
+                    layer_config_invalid = True
+                    raise RuntimeError(f"worker 引擎已变化: {backend_id_for(mgr)}")
+                return self._handle_layer_forward_via_relay(
+                    relay_spec, data=data, task_id=task_id, step=step,
+                    config_id=config_id, model_sha256=model_sha256,
+                    model_type=model_type, received_chain_path=received_chain_path,
+                )
             if actual_model_type != model_type:
                 layer_config_invalid = True
                 raise RuntimeError(
@@ -2333,6 +2345,124 @@ class SchedulerPipelineMixin:
                 error=str(e),
             )
 
+
+    @staticmethod
+    def _normalize_relay_segment(raw: object) -> dict[str, object] | None:
+        """★ A1 / X 档：校验并规范化 `LAYER_FORWARD` 里**可选**的 `relay_segment` 规格。
+
+        返回 `None` 表示"不适用"（缺失 / 非法 / 超出 X 档范围）—— 调用方据此走**既有**拒绝路径。
+        严格到"多一个未知键就整条不认"，避免"半懂"的规格被误用。
+
+        **X 档只支持 `middle`**（hidden → hidden，与本节点"中间节点返回 hidden_states"的既有契约
+        完全对齐）；`head`（吃 token 列表）与 `tail`（吐 token）需要主节点侧接受 token 语义，
+        属 Y 档 ⇒ 这里**显式不认**（返回 `None` ⇒ 走原有拒绝，不会静默降级）。
+        """
+        if not isinstance(raw, dict):
+            return None
+        if set(raw) - {"role", "host", "port", "n_embd", "timeout"}:
+            return None
+        if str(raw.get("role", "")).strip().lower() != "middle":
+            return None
+        host = str(raw.get("host", "")).strip()
+        if not is_loopback_host(host):
+            return None     # 跨机必须走本地 SSH 隧道端点（Relay 传输层自身也强制 loopback）
+        try:
+            port = int(raw.get("port", 0))
+            n_embd = int(raw.get("n_embd", 0))
+            timeout = float(raw.get("timeout", 60.0))
+        except (TypeError, ValueError):
+            return None
+        if not (0 < port <= 65535) or n_embd < 1 or not (0.0 < timeout <= 3600.0):
+            return None
+        return {"role": "middle", "host": host, "port": port, "n_embd": n_embd,
+                "timeout": timeout}
+
+    def _handle_layer_forward_via_relay(self, spec: dict[str, object], *, data: dict,
+                                        task_id: str, step: int, config_id: str,
+                                        model_sha256: str, model_type: str,
+                                        received_chain_path: list) -> None:
+        """★ A1 / X 档：把本步委托给远端 **middle** relay 段（hidden → hidden），再回传主节点。
+
+        与中间节点语义对齐（吃 hidden、吐 hidden）；KV 由远端段自管，本节点**不碰**本地
+        `_kv_cache`（所以本分支在 KV 检查之前就 return，见 `_handle_layer_forward_locked`）。
+
+        范围：**只做 2 段拓扑** —— 请求里带 `chain_next` 时显式拒绝（>2 段属 Y 档）。
+        失败：抛 :class:`RelaySegmentError` ⇒ 被外层 `except` 捕获 ⇒ 经既有
+        `_send_layer_result(..., error=str(e))` 回传**具名**错误（形如
+        `relay_segment_failed:runner_failed#middle@127.0.0.1:50183`），**绝不**静默产出空 hidden
+        （那会退化成"模型算错"，无从区分）。
+        """
+        if data.get("chain_next"):
+            raise RuntimeError("relay 段委托不支持链式转发（>2 段拓扑属 Y 档）")
+
+        width = int(spec["n_embd"])
+        raw_hidden = data.get("hidden_states")
+        if isinstance(raw_hidden, str):
+            import base64
+            hidden_bytes = base64.b64decode(raw_hidden)
+        elif isinstance(raw_hidden, (bytes, bytearray)):
+            hidden_bytes = bytes(raw_hidden)
+        else:
+            raise RuntimeError("relay 段委托需要 hidden_states（token 输入不在 X 档范围）")
+        if not hidden_bytes or len(hidden_bytes) % (width * 4):
+            raise RuntimeError("relay 段委托的 hidden 长度与 n_embd 不匹配（需 f32 且整除）")
+        n_tokens = len(hidden_bytes) // (width * 4)
+
+        # ★ P3：显式给了 seq_ids / positions 就走 `HIDDEN_SEQ`（多序列必须逐 token 绑定）。
+        seq_ids = data.get("seq_ids")
+        positions = data.get("positions")
+        seq_meta = None
+        if seq_ids is not None or positions is not None:
+            if not (isinstance(seq_ids, list) and isinstance(positions, list)
+                    and len(seq_ids) == n_tokens and len(positions) == n_tokens):
+                raise RuntimeError("relay 段委托的 seq_ids/positions 必须与 token 数等长")
+            n_seq_id = data.get("n_seq_id")
+            seq_meta = {
+                "n_seq_id": [int(v) for v in (n_seq_id or [1] * n_tokens)],
+                "seq_ids": [int(v) for v in seq_ids],
+                "positions": [int(v) for v in positions],
+            }
+
+        self._begin_local_pipeline_task(task_id)   # 与既有执行路径对齐（保证 begin/finish 平衡）
+        started = time.time()
+        client = RelaySegmentClient(str(spec["host"]), int(spec["port"]), n_embd=width,
+                                    role="middle", timeout=float(spec["timeout"]))
+        try:
+            outcome = client.forward_hidden(hidden_bytes, n_tokens=n_tokens, seq_meta=seq_meta)
+        finally:
+            client.close()
+        elapsed_ms = (time.time() - started) * 1000
+
+        if not outcome.ok:
+            raise RelaySegmentError(outcome.error or "relay_internal_error",
+                                    role="middle", endpoint=outcome.endpoint)
+
+        response = {
+            "task_id": task_id,
+            "node_id": self.get_effective_node_id(),
+            "step": step,
+            "config_id": config_id,
+            "model_sha256": model_sha256,
+            "model_type": model_type,
+            "chain_path": [*[str(item) for item in received_chain_path],
+                           self.get_effective_node_id()],
+            "hidden_states": bytes(outcome.hidden),
+            "hidden_shape": [n_tokens, width],
+            "metrics": {
+                "time_ms": round(elapsed_ms, 1),
+                "kv_cache": False,       # KV 在远端段，本节点没有本地 KV
+                "kv_seq_len": 0,
+                "relay_executed": True,
+                # relay_segment / relay_frames / relay_tokens / relay_payload_bytes / relay_error
+                **outcome.to_metrics(),
+            },
+        }
+        logger.info(
+            f"🔁 relay 段委托完成: task={task_id}, step={step}, "
+            f"段={outcome.role}@{spec['host']}:{spec['port']}, tokens={n_tokens}, "
+            f"time={elapsed_ms:.0f}ms"
+        )
+        self._send_layer_result("master", task_id, result_data=response)
 
     def _handle_chain_forward(self, client_id: str, msg: dict) -> None:
         """

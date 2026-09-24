@@ -398,6 +398,13 @@ PIPELINE_ASSIGNMENT_STALE_SECONDS = _env_float(
     "QLH_PIPELINE_ASSIGNMENT_STALE_SECONDS", 86400.0, min_val=60.0, max_val=31536000.0,
 )
 
+# ★ A1 / X 档（2026-09-24）：**Relay 段委托总开关，默认关**。
+# 关闭时调度层完全走既有路径（pytorch-only 层流水线），Relay 调用次数为 0。
+# 开启后也只对"在 LAYER_FORWARD 里显式携带合法 `relay_segment` 规格（middle 角色）"
+# 的节点生效 —— 见 `scheduler_pipeline._normalize_relay_segment` 与
+# `_handle_layer_forward_via_relay`。跨机通道仍只允许 loopback / 本地 SSH 隧道端点。
+PIPELINE_RELAY_ENABLED = _env_bool("QLH_RELAY_ENABLED", False)
+
 # 图算法智能编排阈值：节点数超过此值（>5）时自动启用最大带宽生成树 + DFS，
 # 替代纯算力权重分配；节点数 ≤ 阈值时回退到简单排序（权重比例分配）
 GRAPH_ORCHESTRATOR_THRESHOLD = 5         # 节点数 > 5 启用图算法，≤ 5 使用简单排序
