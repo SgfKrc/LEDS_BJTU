@@ -171,6 +171,18 @@ USE_COMPILE = True                           # 算子融合（仅 FP16+CUDA 有�
 #: ⚠️ 不要改成「编译整个 Qwen2Model 再用于分段」：它的 forward 会 apply `self.norm`，与分段语义不符
 #:    （实测 B vs A 的逐 token argmax 从 decode 第 1 步就分叉）。
 USE_MONOLITHIC_FORWARD = False
+
+#: ★ R-R7 rank3（2026-09-24 实测）：把各层 `RMSNorm` 的
+#:   `.to(f32) → pow(2) → mean → rsqrt → weight* → .to(f16)` **六个算子**换成**一次 `F.rms_norm`**。
+#: 依据（`build/cross-framework-layer-poc/rank_ablation.py`，qwen2.5-0.5b / 12 层 / gen=40 / CUDA-f16）：
+#:   `ms/step` **13.389 → 12.358（−7.7 %）**；cProfile 计数 `Tensor.to` **2173 → 205（−91 %）**、
+#:   `Tensor.pow`/`mean`/`rsqrt` 各 984 → **0**。
+#: ⚠️ **收益主要来自「顺带消掉那 1968 次 `.to`」**，而不是融合 kernel 本身 —— 该路径是
+#:   CPU/launch-bound（cProfile 真算力仅 31 %），`.to` 本应是 no-op 却仍走 dispatch。
+#: **判据**：带 `lm_head` 的真 logits 下 **per-token argmax 完全一致**（含与「RoPE 免 cat」叠加）。
+#: 默认 **False** ⇒ 既有路径行为完全不变；置 True 或 `QLH_USE_FUSED_RMSNORM=1` 启用。
+#: ⚠️ 只按**实例**替换（不 patch transformers 的类）⇒ 不波及其他模型/用途。
+USE_FUSED_RMSNORM = _env_bool("QLH_USE_FUSED_RMSNORM", default=False)
 #: torch.compile 的序列长度上限（2026-09-18 实测）：compile 在短序列有收益，但随生成步数
 #: 变长而劣化 —— gen=24 1.904× → 64 1.372× → **141 步 0.672×（反而慢 1.49×）**，
 #: 根因是 KV 增长使形状反复变化、`torch._dynamo` 的 `recompile_limit` 被 hybrid KV 的
