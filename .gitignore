@@ -184,6 +184,7 @@ scripts/*
 !scripts/torch_activation_compress.py
 !scripts/torch_hardware_admit.py
 !scripts/torch_lan_echo_probe.py
+!scripts/torch_cpu_jitter_diagnosis.py
 !scripts/setup_envs.py
 !scripts/setup_test_env.py
 !scripts/setup_qwen3_sidecar_env.py

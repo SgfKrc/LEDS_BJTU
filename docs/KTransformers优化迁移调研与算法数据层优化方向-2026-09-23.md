@@ -293,6 +293,22 @@ wall time 只作本机诊断，不作为准入结果：样本是单 GPU、单 pr
 
 **控制复测（2026-09-24，当前有效稳定性结论）**：并行弱网实验已结束后重新串行执行同一 Qwen2.5-0.5B 工件、FP32、8 线程、3 次预热/20 次计时和 seed `20260923`。CPU 仍有 **4/12** 格超限：`64:4` prefill/decode=`0.154/0.116`、`64:12` prefill/decode=`0.135/0.113`；CUDA 仍有 **6/12** 格超限：`64:24 prefill=0.189`、`64:12 decode=0.136`、`64:4 prefill/decode=0.171/0.144`、`256:4 decode=0.119`、`256:12 decode=0.130`。同机 CPU/CUDA 分段四个 workload-direction 的 greedy token 与 KV 结构仍 exact，但 `phase_cost_matrix_admitted=false`、`same_host_cpu_cuda_split_admitted=false`；增加样本和移除弱网并行干扰没有使时延门通过。新证据为 `cpu-fp32-interleaved-w20-post-weaknet-20260924.json`、`cuda-fp32-interleaved-w20-post-weaknet-20260924.json`、`cpu-cuda-interleaved-w20-post-weaknet-comparison-20260924.json`。
 
+**CPU 时延抖动诊断（2026-09-24，根因已定位）**：前两轮复测只能说明「重排与增加样本未消除抖动」，并因未采 ETW / 频率 / 温度而**不下根因断言**。新增诊断工具 `scripts/torch_cpu_jitter_diagnosis.py`（逐逻辑核画像 + 亲和性×线程数对照；**只诊断，不改 CV 门、不放宽阈值、不产出可进 planner 的成本**）补齐了这块证据：
+
+- **本机 CPU 为 `i9-13900H`：14 物理核 / 20 逻辑核 ⇒ Intel 混合架构（P-core + E-core）**。逐逻辑核画像（同一 matmul 负载、单核绑定、20 次/核）给出**完美双峰**：**12 个核 ≈ 14.5–16.0 ms**、**8 个核 ≈ 38.3–40.0 ms** ⇒ **P-core 比 E-core 快 2.76×**（12 = 6 物理核 × 2 HT；8 = 8 个 E 物理核）。
+- **线程数 × 亲和性矩阵**（8 线程即 HW-ADMIT 现状；CV = `population_stddev / mean`）：
+
+  | 线程数 | 默认核集（跨 P/E） | 仅 P 域（前 12 逻辑核） | 仅 E 域（后 8 逻辑核） |
+  | --- | --- | --- | --- |
+  | 4 | 0.0925 | 0.1820 | **0.0315** |
+  | 6 | **0.3220** | 0.1153 | **0.0390** |
+  | 8 | 0.0891 | 0.0574 | **0.0410** |
+  | 12 | 0.0753 | 0.2615 | **0.0270** |
+
+- **机制结论**：抖动来源是「**跨异构核域 + 超订物理核**」—— 默认核集上 8 线程会被调度到 P 或 E（或被迁移），P 域超订再叠加 HT 争用；而**同构域内且线程数 ≤ 域内物理核数**时 CV 稳定在 **0.027–0.041**，**远低于 0.10 门**。⇒ **门阈值本身没有问题，问题在测量流程**：CPU 标定应在**固定亲和性 + 线程数 == 该域物理核数**下进行（或按 P/E 域**分别标定**，并把核域写进 `device_profile`），否则同一份负载会同时混入两种量级的单核成本。这与本文档 P0 的「`-t` = 物理核（非超线程）、亲和性/NUMA 策略」建议相互印证，且**不涉及放宽阈值或只挑稳定格**。
+- 证据：`local_docs/evidence/torch-hardware-admit/cpu-jitter-diagnosis-cores-20260924T020328.json`、`cpu-jitter-diagnosis-threads-20260924T020420.json`、`cpu-jitter-diagnosis-threads-t{4,6,8,12}-20260924.json`（含逐核排序均值与每档 20 次原始样本）。
+- **诚实边界**：诊断负载是**矩阵乘同族**（非完整层前向）；未采 ETW/温度/频率计数器（改用亲和性实验**直接定位**核域异构，比频率采样更直接，但"频率/温控可能叠加"未被排除）；期间后台负载 21–38%（各档同条件对比，未做进程隔离）。
+
 另跑部署默认精度观察（1 次 warmup、每格 3 次未插桩样本）：CUDA 整模 FP16 reference 下，CPU FP32→CUDA FP16 的 64-token prefill/decode exact，256-token prefill 不 exact；CUDA FP16→CPU FP32 的 64-token prefill 不 exact、256-token exact，所测 decode token 均 exact。边界张量分别为 `[1,64,896]`/`[1,256,896]`，CPU→CUDA FP32→FP16 转换最大绝对误差约 `0.115`。结果说明混合精度层段的 prefill 正确性受 prompt 影响，部署默认组合不准入；证据 `local_docs/evidence/torch-hardware-admit/cuda-deployment-default.json`。
 
 本机 QLH `serialize_tensor_fast` 经 loopback TCP echo exact；payload 为 230,957 / 919,085 bytes，但该旧样本是单机回环且不含生产认证/控制封套。**Surface 环境与资产复核（2026-09-24）**：`tailscale ping` 双向均显示经 WLAN 直连 underlay（本机看到 `192.168.0.100:41641`，Surface 看到 `192.168.0.101:41641`），控制面约 5–11 ms；但新开 Tailnet TCP 端口未获生产可达性证据，不能把控制 ping 当数据面时延。Surface 的隔离 `.venv-qwen3-sidecar` 已与主仓锁定版本对齐：Python `3.12.10`、Torch `2.13.0+cpu`、Transformers `5.17.0`、tokenizers `0.23.2`、safetensors `0.8.0`、accelerate `1.14.0`，`pip check` 通过；常驻 keep-head 服务使用的 `.venv-test` 未修改。主仓 Qwen2.5-0.5B 原生 Safetensors 工件已同步到 Surface，新目录的权重 SHA-256 `fdf756fa…fb7fe`、manifest SHA-256 `40133469…12a2b9` 与本机一致；Surface config/tokenizer 轻量探针通过（Qwen2Config、24 层、hidden 896），随后真实 CPU smoke 也完成 16 token greedy 输出，证据为 `surface-qwen25-0.5b-cpu-smoke-20260924.json`。Qwen1.8B 已按主仓裁决退役，只保留为历史/待清理资产，不再追 remote-code 补丁，也不作为硬件对照。两端主仓 revision 与 `model_module.py` 仍不同，故共同工件和依赖已对齐，但真实跨机 PyTorch peer 仍未宣称完成。
