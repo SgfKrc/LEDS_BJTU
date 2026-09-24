@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -81,6 +82,42 @@ def test_forbidden_state_cannot_claim_a_copy_strategy():
             sensitive=True,
             notes="bad",
         )
+
+
+def test_catalog_cli_survives_pythonpath_pointing_at_src():
+    """★ 回归：`PYTHONPATH` 已含 `src` 时，CLI 仍必须成功（exit 0）。
+
+    起因（2026-09-24 查证，`unit` 通道长期红灯的根因）：`scripts/run_test_channels.py`
+    的 `_pytest_env()`（`:34-41`）把 `src` **前置**进 `PYTHONPATH` 再启动 pytest ⇒ 本文件里的
+    子进程**继承**该变量 ⇒ 而 CLI 原先用 `if str(candidate) not in sys.path:` 守卫插入 ⇒
+    因此**跳过**插入 ⇒ `sys.path[0]` 仍是脚本自身目录 `scripts/` ⇒ 第 16 行的**裸名**
+    `import cluster_state_catalog` 命中**脚本自己** ⇒ 循环导入
+    （`ImportError: cannot import name 'build_state_catalog' from partially initialized module`）
+    ⇒ 表现为 `test_catalog_cli_emits_metadata_only_json` 在通道里**每次都失败**
+    （`subprocess.CalledProcessError`，且该用例丢弃 stderr ⇒ 根因不可观测）。
+
+    修法：CLI 改为**无条件**把 `src` 放到 `sys.path` 最前（不再因"已在 path 里"而跳过）。
+    本用例是"该红必须红"：修复前它必须失败。
+    """
+    env = dict(os.environ)
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(
+        value for value in (str(ROOT / "src"), existing) if value
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "cluster_state_catalog.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0, (
+        "PYTHONPATH 已含 src 时 CLI 仍应成功；"
+        f"实际 rc={result.returncode}，stderr={result.stderr[:500]!r}"
+    )
+    assert json.loads(result.stdout)["document_type"] == "cluster_state_catalog"
 
 
 def test_catalog_cli_emits_metadata_only_json():
