@@ -34,6 +34,29 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = ROOT / "local_docs" / "evidence" / "torch-hardware-admit"
 
 
+def _windows_processor_topology() -> dict[str, object] | None:
+    """Return Windows P/E logical CPU groups when the OS exposes them."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # GetActiveProcessorCount is enough to attest the group size, while
+        # Windows 10 does not expose a portable Python API for P/E classes.
+        kernel32.GetActiveProcessorCount.argtypes = [ctypes.c_ushort]
+        kernel32.GetActiveProcessorCount.restype = ctypes.c_uint
+        groups = []
+        for group in range(64):
+            count = int(kernel32.GetActiveProcessorCount(group))
+            if not count:
+                break
+            groups.append({"group": group, "logical_count": count})
+        return {"api": "GetActiveProcessorCount", "processor_groups": groups}
+    except Exception:
+        return None
+
+
 def _set_affinity(mask: int) -> bool:
     """Windows: 把**本进程**绑定到 mask 指定的逻辑处理器集合。
 
@@ -190,7 +213,11 @@ def main(argv: list[str] | None = None) -> int:
         "created_at_utc": started.isoformat(timespec="seconds"),
         "ticket": "TORCH-HW-ADMIT-01",
         "note": "只诊断：不改 CV 门、不放宽阈值、不产出可进 planner 的成本",
-        "host": {"platform": sys.platform, "logical_cpu_count": _logical_cpu_count()},
+        "host": {
+            "platform": sys.platform,
+            "logical_cpu_count": _logical_cpu_count(),
+            "windows_processor_topology": _windows_processor_topology(),
+        },
         "params": {"threads": args.threads, "repeats": args.repeats, "warmup": args.warmup,
                    "size": args.size, "batch": args.batch},
     })

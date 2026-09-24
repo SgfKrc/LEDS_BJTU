@@ -46,3 +46,8 @@ def test_tool_is_diagnostic_only():
     source = Path(diag.__file__).read_text(encoding="utf-8")
     assert "只诊断" in source
     assert "max_runtime_cv" not in source
+
+
+def test_windows_topology_probe_is_optional_and_structured(monkeypatch):
+    monkeypatch.setattr(diag.sys, "platform", "linux")
+    assert diag._windows_processor_topology() is None
