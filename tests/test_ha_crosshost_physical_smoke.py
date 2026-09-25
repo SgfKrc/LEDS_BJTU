@@ -186,6 +186,46 @@ def test_retry_defaults_are_bounded():
     assert max(smoke.retry_delays(smoke.SSH_RETRY_ATTEMPTS)) <= smoke.SSH_RETRY_MAX_S
 
 
+def test_retry_attempts_and_timeouts_are_env_configurable(monkeypatch):
+    """★ R-R2 物理复测：三个旋钮可由 env 调（**扫参不改代码**），且**默认值不变**。"""
+    import importlib
+
+    names = ("QLH_SSH_RETRY_ATTEMPTS", "QLH_SSH_CONTROL_TIMEOUT_S",
+             "QLH_SSH_FIRST_FRAME_TIMEOUT_S")
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+    reloaded = importlib.reload(smoke)
+    assert reloaded.SSH_RETRY_ATTEMPTS == 3                 # 默认与旧版一致
+    assert reloaded._control_timeout_from_env() == 15.0
+    assert reloaded._first_frame_timeout_from_env() == 15.0
+
+    monkeypatch.setenv("QLH_SSH_RETRY_ATTEMPTS", "6")
+    monkeypatch.setenv("QLH_SSH_CONTROL_TIMEOUT_S", "45")
+    monkeypatch.setenv("QLH_SSH_FIRST_FRAME_TIMEOUT_S", "60")
+    reloaded = importlib.reload(smoke)
+    assert reloaded.SSH_RETRY_ATTEMPTS == 6
+    assert reloaded._control_timeout_from_env() == 45.0
+    assert reloaded._first_frame_timeout_from_env() == 60.0
+
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+    importlib.reload(smoke)
+
+
+def test_env_knobs_reject_garbage_and_clamp(monkeypatch):
+    """非法值 ⇒ 回落默认（**不抛**）；越界值 ⇒ clamp 到安全区间。"""
+    monkeypatch.setenv("QLH_SSH_RETRY_ATTEMPTS", "not-a-number")
+    assert smoke._retry_attempts_from_env() == 3
+    monkeypatch.setenv("QLH_SSH_RETRY_ATTEMPTS", "999")
+    assert smoke._retry_attempts_from_env() == 16           # 上限
+    monkeypatch.setenv("QLH_SSH_RETRY_ATTEMPTS", "0")
+    assert smoke._retry_attempts_from_env() == 1            # 下限
+    monkeypatch.setenv("QLH_SSH_CONTROL_TIMEOUT_S", "abc")
+    assert smoke._control_timeout_from_env() == 15.0
+    monkeypatch.setenv("QLH_SSH_FIRST_FRAME_TIMEOUT_S", "-5")
+    assert smoke._first_frame_timeout_from_env() == 1.0
+
+
 def test_retry_delays_is_bounded_exponential_backoff():
     """★ 退避**有上限**且**严格不减**：弱网下"多试几次"胜过"一直等"（且不能让冒烟挂太久）。"""
     assert smoke.retry_delays(4, base_s=0.5, max_s=4.0) == [0.5, 1.0, 2.0, 4.0]

@@ -233,9 +233,41 @@ def _inject_delay() -> None:
 # §26 实测：丢包 5% 起冒烟即 failed，失败点是 `listener.accept()` 处**单次**连接不够 ——
 # 经同一代理的 SSH 单次成功率约 1/3。⇒ 修法是**重试 + 指数退避**，且退避要有上限
 # （弱网下"多试几次"胜过"一直等"，也不能让冒烟无限挂住）。
-SSH_RETRY_ATTEMPTS = 3
+# ★ 2026-09-24（R-R2 物理复测，Surface 上线后）：5% 丢包下**端到端冒烟**（含反向隧道 + 控制帧）
+#   的成功率**远低于** §26 记录的"SSH 单次建连 1/3"（实测 6 轮全失败）⇒ 3 次重试不足。
+#   次数改为**可配**，便于扫参而不必改代码：`QLH_SSH_RETRY_ATTEMPTS`（默认仍 3 ⇒ 行为与旧版一致）。
+def _retry_attempts_from_env(default: int = 3) -> int:
+    """读 `QLH_SSH_RETRY_ATTEMPTS`（非法或缺失 ⇒ 用默认值，不抛）。"""
+    raw = (os.environ.get("QLH_SSH_RETRY_ATTEMPTS") or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(1, min(value, 16))
+
+
+SSH_RETRY_ATTEMPTS = _retry_attempts_from_env()
 SSH_RETRY_BASE_S = 0.5
 SSH_RETRY_MAX_S = 4.0
+
+
+def _control_timeout_from_env(default: float = 15.0) -> float:
+    """读 `QLH_SSH_CONTROL_TIMEOUT_S`（**连上之后**等控制帧的秒数；非法或缺失 ⇒ 用默认值）。
+
+    ★ R-R2 物理复测（Surface 上线后）：把 `QLH_SSH_RETRY_ATTEMPTS` 抬到 8 后，失败点从
+    「建不起反向连」**后移**成「连上但控制帧超时」⇒ 弱网下真正偏紧的是**连上之后**的等待。
+    ⚠️ **默认值保持不变** —— 本仓纪律是不擅自放宽既有阈值，故只做成可配，由验收方决定何时放宽。
+    """
+    raw = (os.environ.get("QLH_SSH_CONTROL_TIMEOUT_S") or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(1.0, min(value, 600.0))
 
 
 def retry_delays(attempts: int, *, base_s: float = SSH_RETRY_BASE_S,
@@ -249,9 +281,25 @@ def retry_delays(attempts: int, *, base_s: float = SSH_RETRY_BASE_S,
     return [min(base_s * (2 ** index), max_s) for index in range(int(attempts))]
 
 
+def _first_frame_timeout_from_env(default: float = 15.0) -> float:
+    """读 `QLH_SSH_FIRST_FRAME_TIMEOUT_S`（首帧等待秒数；非法或缺失 ⇒ 用默认值，不抛）。
+
+    ★ R-R2 物理复测：`--weaknet-bridge` 的"整块丢弃交 TCP 重传"在 5% 丢包下会让**反向隧道建立**
+    显著变慢 ⇒ 15 s 可能偏紧。做成可配即可扫参，不必改代码。
+    """
+    raw = (os.environ.get("QLH_SSH_FIRST_FRAME_TIMEOUT_S") or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(1.0, min(value, 600.0))
+
+
 def _connect_with_retry(listener: socket.socket, start_worker: Callable[[], Any], *,
                         attempts: int = SSH_RETRY_ATTEMPTS,
-                        first_frame_timeout_s: float = 15.0,
+                        first_frame_timeout_s: float = None,
                         sleeper: Callable[[float], None] | None = None) -> tuple[Any, Any]:
     """**起 worker（SSH）+ 等它连回反向端口**，失败就重起重等（★ R-R2）。
 
@@ -262,6 +310,8 @@ def _connect_with_retry(listener: socket.socket, start_worker: Callable[[], Any]
     ⚠️ 每次失败都**回收**刚起的进程；全部失败时也**不留孤儿**（抛 `PhysicalSmokeError`）。
     返回 `(进程, 已连上的 socket)` —— 成功那次的进程**不**回收。
     """
+    first_frame_timeout_s = (first_frame_timeout_s if first_frame_timeout_s is not None
+                             else _first_frame_timeout_from_env())
     sleeper = sleeper or time.sleep
     total = max(1, int(attempts))
     # 退避只发生在两次尝试之间 ⇒ 共 total-1 次（最后一次失败后立刻放弃）
@@ -589,7 +639,7 @@ def _run_surface(target: str, remote_root: str, *, long_steps: int = 1,
             listener,
             lambda: _ssh_process(target, remote_root, remote_port, local_port,
                                  proxy_command=proxy_command))
-        connection.settimeout(15)
+        connection.settimeout(_control_timeout_from_env())
         with connection:
             ready = _recv_line(connection)
             if not ready.get("ok") or ready.get("event") != "ready":
@@ -653,7 +703,7 @@ def _run_surface(target: str, remote_root: str, *, long_steps: int = 1,
                 listener,
                 lambda: _ssh_process(target, remote_root, remote_port, local_port,
                                      proxy_command=proxy_command))
-            connection.settimeout(15)
+            connection.settimeout(_control_timeout_from_env())
             with connection:
                 ready = _recv_line(connection)
                 if not ready.get("ok"):
