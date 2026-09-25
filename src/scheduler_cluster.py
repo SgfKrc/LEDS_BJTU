@@ -3220,16 +3220,22 @@ class SchedulerClusterMixin:
             return {"status": "denied", "reason": "仅主节点可重置身份标识"}
 
         try:
+            # ★ R-R4（B5 / #8）：重置的语义是「**强制回到物理真相**」⇒ 必须以**实时探测的物理 MAC**
+            #   为准，**不能**优先沿用 `self._mac_addresses` —— 那是启动时写入、也可能被别处改过的
+            #   内存缓存；实测把缓存污染成错值后重置，会把**错值固化**进 SQLite，而本方法的 docstring
+            #   明说「立即把当前**物理** MAC 绑定到主节点 SQLite」。
+            #   ⚠️ 仍保留一层回落：**探测不到**物理网卡时才用缓存，避免探测失败把身份清空。
+            from transport_port import get_mac_addresses
+
             macs = sorted({
                 str(mac).strip().lower()
-                for mac in getattr(self, "_mac_addresses", [])
+                for mac in get_mac_addresses()
                 if str(mac).strip()
             })
             if not macs:
-                from transport_port import get_mac_addresses
                 macs = sorted({
                     str(mac).strip().lower()
-                    for mac in get_mac_addresses()
+                    for mac in getattr(self, "_mac_addresses", [])
                     if str(mac).strip()
                 })
             if not macs:

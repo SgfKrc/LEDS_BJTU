@@ -5755,6 +5755,11 @@ class TestLocalMasterIdentity:
         monkeypatch.setenv("QLH_SQLITE_PATH", str(sqlite_path))
         monkeypatch.setattr(local_store, "_initialized_paths", set())
 
+        # ★ R-R4（用户裁定 A，`dec-e31b944dfde347ef`）：`reset_master_identity()` 以**物理 MAC** 为准
+        #   ⇒ 这里把物理探测固定成可预测值，使「重置绑定物理值」这一契约可以被断言。
+        monkeypatch.setattr("transport_port.get_mac_addresses",
+                            lambda: ["AA-BB-CC-DD-EE-FF"], raising=False)
+
         sched = Scheduler()
         sched._role_override = "master"
         sched._mac_addresses = ["AA-BB-CC-DD-EE-FF"]
@@ -5781,8 +5786,10 @@ class TestLocalMasterIdentity:
         result = sched.reset_master_identity()
         assert result["status"] == "ok"
         assert sched.get_invite_info()["identity_reason"] == "reset"
+        # ★ 重置绑的是**物理** MAC，而**不是**上面被改成 `11:22:33:44:55:66` 的内存缓存 ——
+        #   用户裁定 A：重置 = 强制回到物理真相，缓存陈旧/被污染时不得被固化。
         assert local_store.get_local_master_identity()["mac_addresses"] == [
-            "11:22:33:44:55:66",
+            "aa-bb-cc-dd-ee-ff",
         ]
 
     def test_invite_reports_tailnet_address_source(self):
@@ -5790,6 +5797,50 @@ class TestLocalMasterIdentity:
         sched._lan_ip = "100.88.9.10"
 
         assert sched.get_invite_info()["master_host_source"] == "tailnet"
+
+
+class TestMasterIdentityAdvertiseAndReset:
+    """★ R-R4（B5 / #8）实机复验补的回归：重置必须绑**物理** MAC；host_source 要区分 tailnet/LAN。"""
+
+    def test_reset_binds_physical_mac_not_stale_cache(self, monkeypatch, tmp_path):
+        """★ 重置的语义 = 「强制回到物理真相」⇒ **不得**沿用内存里可能陈旧/被污染的缓存。
+
+        实机复验发现：`reset_master_identity()` 原先**优先**用 `self._mac_addresses`；把该缓存污染成
+        `de-ad-be-ef-00-01` 后重置，会把**错值固化**进 SQLite —— 而它的 docstring 明说
+        「立即把当前**物理** MAC 绑定到主节点 SQLite」。
+        """
+        import local_store
+        from scheduler import Scheduler
+
+        monkeypatch.setenv("QLH_SQLITE_PATH", str(tmp_path / "qlh-control.sqlite3"))
+        monkeypatch.setattr(local_store, "_initialized_paths", set())
+        monkeypatch.setattr(
+            "transport_port.get_mac_addresses",
+            lambda: ["AA-BB-CC-DD-EE-FF", "11-22-33-44-55-66"],
+            raising=False,
+        )
+
+        sched = Scheduler()
+        sched._role_override = "master"
+        sched._mac_addresses = ["de-ad-be-ef-00-01"]          # 陈旧 / 被污染的缓存
+
+        result = sched.reset_master_identity()
+
+        assert result["status"] == "ok"
+        stored = local_store.get_local_master_identity()["mac_addresses"]
+        assert stored == ["11-22-33-44-55-66", "aa-bb-cc-dd-ee-ff"]     # 物理值（已排序）
+        assert "de-ad-be-ef-00-01" not in stored
+
+    def test_invite_reports_lan_source_when_not_on_tailnet(self):
+        """③ 的另一半：不在 Tailnet 上时 `master_host_source` 必须是 `lan`（B5 的「LAN 回退」）。"""
+        from scheduler import Scheduler
+
+        sched = Scheduler()
+        sched._lan_ip = "192.168.1.61"
+
+        invite = sched.get_invite_info()
+        assert invite["master_host_source"] == "lan"
+        assert invite["master_host"] == "192.168.1.61"
 
 
 class TestSchedulerHighAvailabilitySQLite:
