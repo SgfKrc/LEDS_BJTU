@@ -48,11 +48,24 @@ from scripts.llama_rpc_sim import (
 )
 
 
-DEFAULT_LOCAL_MODEL = ROOT / "models" / "Qwen-1_8B-Chat.Q4_K_M.gguf"
+#: 默认本地模型：**现行**模型（历史默认是已退役的 `Qwen-1_8B-Chat.Q4_K_M.gguf`，见 R-R6）。
+DEFAULT_LOCAL_MODEL = ROOT / "models" / "qwen3-0.6b-q8_0.gguf"
 DEFAULT_REMOTE_ROOT = r"C:\Users\surface\Documents\LEDS_BJTU"
 DEFAULT_REMOTE_RUNTIME = DEFAULT_REMOTE_ROOT + r"\runtime\llama-cpp\b10964"
-DEFAULT_REMOTE_MODEL = DEFAULT_REMOTE_ROOT + r"\models\Qwen-1_8B-Chat.Q4_K_M.gguf"
 DEFAULT_REMOTE_LOG_DIR = DEFAULT_REMOTE_ROOT + r"\local_docs\rpc_probe"
+
+
+def default_remote_model(local_model: str | Path | None = None) -> str:
+    """远端模型路径 = `<remote_root>\\models\\<**本地模型文件名**>`（★ R-R6 复盘，2026-09-25）。
+
+    旧行为**写死** `...\\models\\Qwen-1_8B-Chat.Q4_K_M.gguf`（已退役模型的遗留路径）⇒ 同步任何
+    别的模型都会**覆盖那一个文件**，于是出现「文件名说 1.8B、内容是 2b」的名实不符，并且
+    **多个模型在远端无法共存**（每次同步互相顶掉）。改为跟随本地文件名后：文件名即内容，
+    0.6b 与 2b 各自独立存在。
+    ⚠️ 仍可用显式 `--remote-model` 覆盖（例如刻意复用某个固定远端路径）。
+    """
+    name = Path(local_model).name if local_model else Path(DEFAULT_LOCAL_MODEL).name
+    return DEFAULT_REMOTE_ROOT + "\\models\\" + name
 
 
 @dataclass(frozen=True)
@@ -139,7 +152,7 @@ def build_plan(
     remote_user: str = "surface",
     remote_host: str = "100.100.52.106",
     remote_runtime_dir: str = DEFAULT_REMOTE_RUNTIME,
-    remote_model: str = DEFAULT_REMOTE_MODEL,
+    remote_model: str | None = None,   # None ⇒ 由 default_remote_model(model) 推导（★ R-R6）
     remote_log_dir: str = DEFAULT_REMOTE_LOG_DIR,
     rpc_port: int = 50163,
     http_port: int = 18093,
@@ -162,7 +175,7 @@ def build_plan(
         remote_user=remote_user,
         remote_host=remote_host,
         remote_runtime_dir=remote_runtime_dir,
-        remote_model=remote_model,
+        remote_model=remote_model or default_remote_model(model),
         remote_log_dir=remote_log_dir,
         rpc_port=rpc_port,
         http_port=http_port,
@@ -1229,7 +1242,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--remote-user", default="surface")
     parser.add_argument("--remote-host", default="100.100.52.106")
     parser.add_argument("--remote-runtime-dir", default=DEFAULT_REMOTE_RUNTIME)
-    parser.add_argument("--remote-model", default=DEFAULT_REMOTE_MODEL)
+    parser.add_argument("--remote-model", default=None,
+                        help="远端模型路径；缺省 ⇒ 按**本地模型文件名**推导"
+                             "（`default_remote_model()`，★ R-R6）")
     parser.add_argument("--remote-log-dir", default=DEFAULT_REMOTE_LOG_DIR)
     parser.add_argument("--rpc-port", type=int, default=50163)
     parser.add_argument("--http-port", type=int, default=18093)

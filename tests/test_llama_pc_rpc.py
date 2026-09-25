@@ -5,8 +5,10 @@ from pathlib import Path
 import pytest
 
 from scripts.llama_pc_rpc import (
+    DEFAULT_LOCAL_MODEL,
     build_plan,
     build_remote_asset_sync_plan,
+    default_remote_model,
     plan_report,
     sync_remote_model,
 )
@@ -30,10 +32,25 @@ def test_pc_rpc_plan_targets_tailscale_worker_without_model_argument(tmp_path: P
     assert "--model" in report["host_command"]
 
 
-def test_pc_rpc_defaults_pin_qwen_18b_identity_path():
+def test_pc_rpc_defaults_derive_remote_model_from_local_name():
+    """★ R-R6 复盘（2026-09-25）：远端模型路径**跟随本地文件名**，不再写死已退役的 1.8B 路径。
+
+    旧契约（原名 `...pin_qwen_18b_identity_path`）把 `...\\models\\Qwen-1_8B-Chat.Q4_K_M.gguf`
+    钉死，后果：同步任何别的模型都**覆盖那一个文件** ⇒ 出现「文件名说 1.8B、内容是 2b」的名实
+    不符，而且**多个模型在远端无法共存**。1.8B 已退役 ⇒ 该契约同步废除。
+    """
     plan = build_plan()
 
-    assert plan.remote_model.endswith(r"models\Qwen-1_8B-Chat.Q4_K_M.gguf")
+    # 缺省 ⇒ 跟随 default_local_model 的文件名
+    assert plan.remote_model == default_remote_model(DEFAULT_LOCAL_MODEL)
+    assert plan.remote_model.endswith(r"models\qwen3-0.6b-q8_0.gguf")
+    # 换本地模型 ⇒ 远端路径跟着变（这才是「多模型可共存」的关键）
+    other = build_plan(model="models/qwen3-5-2b-gguf/qwen35-2b-Q4_K_M.gguf")
+    assert other.remote_model.endswith(r"models\qwen35-2b-Q4_K_M.gguf")
+    # 显式 --remote-model 仍可覆盖
+    pinned = build_plan(remote_model=r"C:\anywhere\pinned.gguf")
+    assert pinned.remote_model == r"C:\anywhere\pinned.gguf"
+
     assert plan.worker_budget_mib == 512
     assert plan.gpu_layers is None
     assert plan.auto_split is True
