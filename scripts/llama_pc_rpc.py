@@ -14,6 +14,7 @@ import json
 import ntpath
 import os
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -53,6 +54,17 @@ DEFAULT_LOCAL_MODEL = ROOT / "models" / "qwen3-0.6b-q8_0.gguf"
 DEFAULT_REMOTE_ROOT = r"C:\Users\surface\Documents\LEDS_BJTU"
 DEFAULT_REMOTE_RUNTIME = DEFAULT_REMOTE_ROOT + r"\runtime\llama-cpp\b10964"
 DEFAULT_REMOTE_LOG_DIR = DEFAULT_REMOTE_ROOT + r"\local_docs\rpc_probe"
+
+# Keep these values aligned with ggml/src/ggml-rpc/ggml-rpc.cpp.  The probe
+# deliberately uses zero connection capabilities so it stays on the TCP
+# transport and does not attempt RDMA negotiation.
+RPC_PROTO_MAJOR_VERSION = 5
+RPC_PROTO_MINOR_VERSION = 0
+RPC_CMD_HELLO = 14
+RPC_CMD_DEVICE_COUNT = 15
+RPC_CONN_CAPS_SIZE = 24
+RPC_HELLO_RESPONSE_SIZE = 28
+RPC_READY_TIMEOUT_SECONDS = 30.0
 
 
 def default_remote_model(local_model: str | Path | None = None) -> str:
@@ -356,6 +368,7 @@ class RemoteWorkerHandle:
     stdout_path: Path
     stderr_path: Path
     pid: int | None = None
+    rpc_ready: dict[str, Any] | None = None
 
 
 @dataclass
@@ -627,6 +640,124 @@ def _tcp_ready(host: str, port: int) -> bool:
         return False
 
 
+class RpcProtocolError(RuntimeError):
+    """The endpoint accepted TCP but did not speak the expected ggml RPC."""
+
+
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        try:
+            chunk = sock.recv(remaining)
+        except (ConnectionError, TimeoutError) as exc:
+            raise RpcProtocolError(
+                f"RPC response truncated ({size - remaining}/{size} bytes): {exc}"
+            ) from exc
+        if not chunk:
+            raise RpcProtocolError(
+                f"RPC response truncated ({size - remaining}/{size} bytes)"
+            )
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _rpc_frame(sock: socket.socket, command: int, payload: bytes) -> None:
+    sock.sendall(bytes((command,)))
+    sock.sendall(struct.pack("<Q", len(payload)))
+    if payload:
+        sock.sendall(payload)
+
+
+def _rpc_response(sock: socket.socket, expected_size: int) -> bytes:
+    raw_size = _recv_exact(sock, 8)
+    response_size = struct.unpack("<Q", raw_size)[0]
+    # A non-RPC peer can leave arbitrary bytes in the size slot.  Treat an
+    # impossible frame length as a truncated/malformed response instead of
+    # waiting for a nonsensical payload or reporting a misleading shape error.
+    if response_size > 64 * 1024 * 1024:
+        raise RpcProtocolError(
+            f"RPC response truncated (invalid frame size {response_size})"
+        )
+    if response_size != expected_size:
+        raise RpcProtocolError(
+            f"RPC response size mismatch ({response_size} != {expected_size})"
+        )
+    return _recv_exact(sock, expected_size)
+
+
+def _rpc_protocol_probe(host: str, port: int, *, timeout: float = 1.0) -> dict[str, Any]:
+    """Perform the real ggml RPC HELLO and DEVICE_COUNT exchange.
+
+    A listening socket is not sufficient: ggml-rpc-server only becomes usable
+    after this protocol exchange succeeds and reports at least one backend
+    device.  Protocol-shape errors are fatal; connection/timeouts are left to
+    ``_wait_rpc_ready`` so startup can tolerate a slow worker.
+    """
+    sock = socket.create_connection((host, port), timeout=max(0.1, timeout))
+    try:
+        sock.settimeout(max(0.1, timeout))
+        _rpc_frame(sock, RPC_CMD_HELLO, bytes(RPC_CONN_CAPS_SIZE))
+        hello = _rpc_response(sock, RPC_HELLO_RESPONSE_SIZE)
+        major, minor, patch, _padding = struct.unpack("<BBBB", hello[:4])
+        if major != RPC_PROTO_MAJOR_VERSION or minor > RPC_PROTO_MINOR_VERSION:
+            raise RpcProtocolError(
+                "RPC protocol mismatch: "
+                f"server={major}.{minor}.{patch}, "
+                f"client={RPC_PROTO_MAJOR_VERSION}.{RPC_PROTO_MINOR_VERSION}.x"
+            )
+
+        _rpc_frame(sock, RPC_CMD_DEVICE_COUNT, b"")
+        device_response = _rpc_response(sock, 4)
+        device_count = struct.unpack("<I", device_response)[0]
+        if device_count < 1:
+            raise RpcProtocolError("RPC server reported zero devices")
+        return {
+            "ok": True,
+            "transport": "tcp",
+            "protocol_version": f"{major}.{minor}.{patch}",
+            "device_count": device_count,
+        }
+    except (ConnectionError, TimeoutError) as exc:
+        raise RpcProtocolError(
+            f"RPC response truncated or peer disconnected during handshake: {exc}"
+        ) from exc
+    finally:
+        sock.close()
+
+
+def _wait_rpc_ready(
+    host: str,
+    port: int,
+    timeout: float,
+    *,
+    process: subprocess.Popen[str] | None = None,
+    poll_interval: float = 0.25,
+) -> dict[str, Any]:
+    """Wait for protocol readiness while distinguishing startup from failure."""
+    deadline = time.monotonic() + max(0.1, timeout)
+    last_error = "connection refused"
+    while time.monotonic() < deadline:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(
+                "RPC worker process exited before protocol ready "
+                f"(rc={process.returncode})"
+            )
+        remaining = max(0.1, deadline - time.monotonic())
+        try:
+            return _rpc_protocol_probe(host, port, timeout=min(1.0, remaining))
+        except RpcProtocolError:
+            raise
+        except (OSError, TimeoutError) as exc:
+            last_error = str(exc) or exc.__class__.__name__
+            time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+    raise RuntimeError(
+        f"RPC endpoint {host}:{port} did not pass protocol ready within "
+        f"{timeout:.1f}s: {last_error}"
+    )
+
+
 def _start_ssh_tunnel(plan: PcRpcPlan, run_id: str, temp_dir: Path) -> SshTunnelHandle:
     stdout_path = temp_dir / f"ssh-tunnel-{run_id}.stdout.log"
     stderr_path = temp_dir / f"ssh-tunnel-{run_id}.stderr.log"
@@ -659,7 +790,14 @@ def _start_ssh_tunnel(plan: PcRpcPlan, run_id: str, temp_dir: Path) -> SshTunnel
         raise
 
 
-def _start_remote_worker(plan: PcRpcPlan, run_id: str, temp_dir: Path) -> RemoteWorkerHandle:
+def _start_remote_worker(
+    plan: PcRpcPlan,
+    run_id: str,
+    temp_dir: Path,
+    *,
+    ready_host: str | None = None,
+    ready_timeout: float = RPC_READY_TIMEOUT_SECONDS,
+) -> RemoteWorkerHandle:
     _remote_clear_worker_port(plan)
     stdout_path = temp_dir / f"remote-worker-{run_id}.stdout.log"
     stderr_path = temp_dir / f"remote-worker-{run_id}.stderr.log"
@@ -691,6 +829,13 @@ Set-Location -LiteralPath {_ps_quote(plan.remote_runtime_dir)}
             metrics = _remote_find_worker(plan)
             if metrics.get("pid"):
                 handle.pid = int(metrics["pid"])
+                if ready_host is not None:
+                    handle.rpc_ready = _wait_rpc_ready(
+                        ready_host,
+                        plan.rpc_port,
+                        ready_timeout,
+                        process=process,
+                    )
                 return handle
             time.sleep(0.25)
         raise RuntimeError("remote worker did not appear in the process table")
@@ -880,13 +1025,20 @@ def _run_engine_python(
                 endpoint = None
                 result["endpoint"] = f"127.0.0.1:{plan.rpc_port} (engine-managed)"
             else:
-                remote = _start_remote_worker(plan, run_id, temp)
                 if plan.ssh_tunnel:
                     tunnel = _start_ssh_tunnel(plan, run_id, temp)
+                remote = _start_remote_worker(
+                    plan,
+                    run_id,
+                    temp,
+                    ready_host="127.0.0.1" if plan.ssh_tunnel else plan.remote_host,
+                    ready_timeout=plan.timeout_seconds,
+                )
                 host = "127.0.0.1" if plan.ssh_tunnel else plan.remote_host
                 endpoint = f"{host}:{plan.rpc_port}"
                 result["endpoint"] = endpoint
                 result["remote_worker"] = {"pid": remote.pid, "stderr": str(remote.stderr_path)}
+                result["rpc_ready"] = remote.rpc_ready
 
             command = [
                 python_exe,
@@ -1053,18 +1205,25 @@ def run_probe(plan: PcRpcPlan, *, check_fallback: bool = True, engine: str = "cl
         temp = Path(temp_dir)
         host_err_path = temp / "host.stderr.log"
         try:
-            remote = _start_remote_worker(plan, run_id, temp)
-            report["remote_worker"] = {
-                "pid": remote.pid,
-                "stdout": str(remote.stdout_path),
-                "stderr": str(remote.stderr_path),
-            }
             if plan.ssh_tunnel:
                 tunnel = _start_ssh_tunnel(plan, run_id, temp)
                 report["ssh_tunnel"] = {
                     "stdout": str(tunnel.stdout_path),
                     "stderr": str(tunnel.stderr_path),
                 }
+            remote = _start_remote_worker(
+                plan,
+                run_id,
+                temp,
+                ready_host="127.0.0.1" if plan.ssh_tunnel else plan.remote_host,
+                ready_timeout=plan.timeout_seconds,
+            )
+            report["remote_worker"] = {
+                "pid": remote.pid,
+                "stdout": str(remote.stdout_path),
+                "stderr": str(remote.stderr_path),
+                "rpc_ready": remote.rpc_ready,
+            }
 
             host_out = (temp / "host.stdout.log").open("w", encoding="utf-8")
             host_err = host_err_path.open("w", encoding="utf-8")
