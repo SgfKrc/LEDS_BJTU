@@ -25,6 +25,9 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
+# ★ #31 M2：层流水线支持的架构走**单一事实来源**（此前硬编码 `{"qwen","qwen2"}`）
+from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
+
 logger = logging.getLogger("inference_service.peer")
 
 
@@ -252,7 +255,8 @@ class PeerClient:
         try:
             if target_node_id != node_id:
                 raise ValueError(f"层配置目标节点 {target_node_id} 与本节点 {node_id} 不一致")
-            if expected_model_type not in {"qwen", "qwen2"}:
+            # ★ #31 M2：同上，走单一事实来源
+            if expected_model_type not in PIPELINE_RUNTIME_MODEL_TYPES:
                 raise ValueError(f"不支持的流水线模型架构: {expected_model_type or 'unknown'}")
             missing_contract = [
                 name for name, value in (

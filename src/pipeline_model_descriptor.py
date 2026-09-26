@@ -19,7 +19,13 @@ DESCRIPTOR_SCHEMA_VERSION = 1
 # These model types have an in-process loader and forward executor.  Architectures
 # may still have a metadata/assignment layout below while remaining fail-closed
 # here when they require an isolated runtime.
-PIPELINE_RUNTIME_MODEL_TYPES = frozenset({"qwen", "qwen2"})
+#
+# ★ #31 M1（2026-09-26）：加入 hybrid。**两个名字都要** —— `qwen3-5-2b` 的外层 config 是
+#   `model_type=qwen3_5`（多模态包装 `Qwen3_5ForConditionalGeneration`），而**文本子 config**
+#   是 `qwen3_5_text`；主仓的层加载路径与 `forward_lm_head` 报出来的正是 **`qwen3_5_text`**
+#   （实测 `RuntimeError: 模型架构 qwen3_5_text 缺少最终 Norm`）。两者共用
+#   `model.language_model.*` 前缀（实测真工件 318 个层 key 全部匹配）。
+PIPELINE_RUNTIME_MODEL_TYPES = frozenset({"qwen", "qwen2", "qwen3_5", "qwen3_5_text"})
 _MAX_JSON_BYTES = 64 * 1024 * 1024
 _DTYPE_BYTES = {
     "BOOL": 1,
@@ -94,6 +100,22 @@ _ARCHITECTURE_LAYOUTS = {
         "visual_prefixes": ("model.visual.", "visual."),
         "mtp_prefixes": ("mtp.",),
         "multimodal_prefixes": (),
+    },
+    # ★ #31 M1：`qwen3-5-2b` 的**文本子 config** 用的就是这个 model_type
+    #   （主仓层加载路径与 `forward_lm_head` 报出来的都是它）⇒ 必须单独登记，
+    #   否则"只加白名单不生效"（`_ARCHITECTURE_LAYOUTS.get(model_type)` 返回 None）。
+    #   前缀与 `qwen3_5` **共用** —— 真工件 318 个层 key 全在 `model.language_model.*` 下（实测）；
+    #   作为**纯文本**架构，visual / mtp 前缀为空（那些分量的 key 只在外层多模态口径里）。
+    "qwen3_5_text": {
+        "layer_pattern": re.compile(
+            r"^model\.language_model\.layers\.(\d+)\."
+        ),
+        "layer_prefix": "model.language_model.layers.",
+        "embedding_prefixes": ("model.language_model.embed_tokens.",),
+        "final_norm_prefixes": ("model.language_model.norm.",),
+        "lm_head_prefixes": ("lm_head.",),
+        "visual_prefixes": (),
+        "mtp_prefixes": (),
     },
     "gemma4_unified": {
         "layer_pattern": re.compile(

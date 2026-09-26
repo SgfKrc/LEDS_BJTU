@@ -25,6 +25,9 @@ import time
 import uuid
 from enum import Enum
 from typing import Any, Mapping, Optional, Callable, Sequence, TYPE_CHECKING
+
+# ★ #31 M2：层流水线支持的架构走**单一事实来源**（此前这里硬编码 `{"qwen","qwen2"}`）
+from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
 from dataclasses import dataclass, field
 
 if TYPE_CHECKING:
@@ -1800,7 +1803,8 @@ class Scheduler(
         if not model_path or not os.path.isdir(model_path):
             return {}
         model_type = str(descriptor.get("model_type", "") or "").lower()
-        if model_type not in {"qwen", "qwen2"}:
+        # ★ #31 M2：走单一事实来源（硬编码会让 hybrid 在这里返回 `{}` ⇒ master 静默不推层配置）
+        if model_type not in PIPELINE_RUNTIME_MODEL_TYPES:
             return {}
         return {
             "model_id": descriptor.get("model_id")

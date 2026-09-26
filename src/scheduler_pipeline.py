@@ -11,6 +11,8 @@ import base64
 from koakuma_engine import Capability, backend_id_for, runtime_supports
 from config import (PIPELINE_MODEL_SYNC_TIMEOUT, PIPELINE_RELAY_ENABLED,
                     PIPELINE_RELAY_SEGMENTS)
+# ★ #31 M2：层流水线支持的架构**单一事实来源**（此前在 4 处各写了一份 `{"qwen","qwen2"}`）
+from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
 from relay_segment_client import RelaySegmentClient, RelaySegmentError
 from relay_transport import is_loopback_host
 from scheduler_types import PreemptState
@@ -191,7 +193,10 @@ class SchedulerPipelineMixin:
         master_sha256 = model_info.get("model_sha256", "")
         model_id = model_info.get("model_id", "")
         model_type = model_info.get("model_type", "")
-        if not master_sha256 or not model_id or model_type not in {"qwen", "qwen2"}:
+        # ★ #31 M2：走**单一事实来源**（此前这里硬编码 `{"qwen","qwen2"}`
+        #   ⇒ hybrid 会被静默拦掉，master **不推层配置**）
+        if (not master_sha256 or not model_id
+                or model_type not in PIPELINE_RUNTIME_MODEL_TYPES):
             releases = {
                 node_id: {
                     "node_id": node_id,
@@ -1446,7 +1451,8 @@ class SchedulerPipelineMixin:
         try:
             if target_node_id != node_id:
                 raise ValueError(f"层配置目标节点 {target_node_id} 与本节点 {node_id} 不一致")
-            if expected_model_type not in {"qwen", "qwen2"}:
+            # ★ #31 M2：同上，走单一事实来源
+            if expected_model_type not in PIPELINE_RUNTIME_MODEL_TYPES:
                 raise ValueError(f"不支持的流水线模型架构: {expected_model_type or 'unknown'}")
             if expected_engine not in {"pytorch", "relay_middle"}:
                 raise ValueError(
