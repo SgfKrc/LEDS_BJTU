@@ -7015,3 +7015,82 @@ class TestSchedulerStartupDecisions:
         sched._preempting = preempting
         sched._preempt_last_time = last_time
         assert sched._check_preempt_conditions(current_step) is expected
+
+
+class TestLayerConfigReleaseRefreshesCapabilities:
+    """★ #28 回归：层段角色变化（加载 / 释放）必须让 worker 快照随真实状态更新。
+
+    实机复验（R-R3）暴露：层段加载/释放路径**从不**调用
+    `refresh_task_worker_capabilities()`，主节点会长期沿用旧的「完整模型」快照，
+    而本机其实已变成层段（`layer_range` 非 None ⇒ 实时 `models` 为空）⇒ 远端 Stage
+    被拒 `model_identity_mismatch`（`distributed_used` 被误打成 false）。
+    同时 `release` 分支原先不清 `layer_range`（只有 `abort` 才碰模型）⇒ 残留会一直存在。
+    """
+
+    class _HostStub:
+        """最小 host 桩：只暴露 #28 涉及的 `layer_range` 与 `unload_model`。"""
+
+        def __init__(self, layer_range=(15, 24), fail_unload=False):
+            self.layer_range = layer_range
+            self._fail_unload = fail_unload
+            self.unload_calls = 0
+
+        def unload_model(self):
+            self.unload_calls += 1
+            if self._fail_unload:
+                raise RuntimeError("unload failed")
+            self.layer_range = None
+
+    def _prepare(self, monkeypatch, node_id="worker-a", **host_kwargs):
+        from scheduler import Scheduler
+
+        sched = Scheduler()
+        sched._role_override = "client"
+        sched._host = self._HostStub(**host_kwargs)
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: node_id)
+        acks = []
+        monkeypatch.setattr(sched, "_send_layer_config_ack", acks.append)
+        refreshes = []
+        monkeypatch.setattr(
+            sched, "refresh_task_worker_capabilities",
+            lambda: refreshes.append(True),
+        )
+        return sched, acks, refreshes
+
+    def test_release_unloads_layer_segment_and_refreshes_capabilities(self, monkeypatch):
+        """B：release 必须清掉层段模型；A：必须重发 hello 快照。"""
+        sched, acks, refreshes = self._prepare(monkeypatch)
+
+        sched._handle_layer_config(
+            "worker-a", {"release": True, "node_id": "worker-a", "config_id": "cfg-1"},
+        )
+
+        assert sched._host.unload_calls == 1
+        assert sched._host.layer_range is None
+        assert refreshes, "层段释放后必须刷新 task worker capabilities"
+        assert [ack["status"] for ack in acks] == ["released"]
+
+    def test_release_does_not_fake_consistency_when_unload_fails(self, monkeypatch):
+        """卸载失败时**不得**把 layer_range 抹成 None —— 那会伪装成「完整模型」。"""
+        sched, acks, refreshes = self._prepare(monkeypatch, fail_unload=True)
+
+        sched._handle_layer_config(
+            "worker-a", {"release": True, "node_id": "worker-a", "config_id": "cfg-1"},
+        )
+
+        assert sched._host.layer_range == (15, 24)   # 保留真相
+        assert refreshes                             # 仍要让主节点看到真实状态
+        assert [ack["status"] for ack in acks] == ["released"]
+
+    def test_release_for_other_node_is_ignored(self, monkeypatch):
+        """目标节点不匹配时必须原样返回，不得动本机模型。"""
+        sched, acks, refreshes = self._prepare(monkeypatch, node_id="worker-a")
+
+        sched._handle_layer_config(
+            "worker-b", {"release": True, "node_id": "worker-b", "config_id": "cfg-1"},
+        )
+
+        assert sched._host.unload_calls == 0
+        assert sched._host.layer_range == (15, 24)
+        assert acks == []
+        assert refreshes == []

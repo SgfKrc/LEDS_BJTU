@@ -1295,6 +1295,24 @@ class SchedulerPipelineMixin:
                 aborted_config_id = str(data.get("aborted_config_id", "") or "")
                 if aborted_config_id:
                     self._prepared_layer_configs.pop(aborted_config_id, None)
+            # 退出分层角色时本机可能仍驻留"某个层段"的模型。若不清掉，worker
+            # 上报的 capabilities 会与真实状态不符：残留 layer_range 让实时
+            # models 为空（远端 Stage 被误拒），或在 layer_range 被清但模型仍是
+            # 层段时误报为完整模型（已知问题 #28）。层段模型本身无独立用处，
+            # 因此这里显式卸载；卸载失败则保持原状态，不制造假一致。
+            if getattr(self._host, "layer_range", None) is not None:
+                unload_model = getattr(self._host, "unload_model", None)
+                if callable(unload_model):
+                    try:
+                        unload_model()
+                        logger.info(
+                            "已卸载层段模型并退出分层 worker: node=%s", node_id,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "退出分层 worker 时卸载层段模型失败，保留原状态",
+                            exc_info=True,
+                        )
             if data.get("abort"):
                 abort_materialization = getattr(
                     self._host, "abort_pipeline_materialization", None
@@ -1320,6 +1338,9 @@ class SchedulerPipelineMixin:
                 "release": True,
                 "timestamp": time.time(),
             })
+            # 层段角色已退出 ⇒ 必须让主节点的 worker 快照随真实状态更新
+            # （层段加载/释放路径此前从不调用本方法，是 #28 的根因之一）。
+            self.refresh_task_worker_capabilities()
             logger.info("主节点已释放本设备的分层 worker 预留")
             return
         # TP 孤岛网关节点不参与 PyTorch 层拆分：直接拒绝分层配置并退出
@@ -1757,6 +1778,11 @@ class SchedulerPipelineMixin:
                 f"✅ 模型层加载完成并已确认: node={node_id}, "
                 f"Layer {start}-{end}, config_id={config_id or 'legacy'}"
             )
+            # 层段加载改变了本机模型形态（layer_range 非 None ⇒ 实时 models 为空）
+            # ⇒ 必须让主节点的 worker 快照随之更新。此前该路径从不刷新
+            # capabilities，主节点会长期沿用旧的"完整模型"快照而本机已是层段，
+            # 造成准入放行、执行被拒（已知问题 #28）。
+            self.refresh_task_worker_capabilities()
         except Exception as e:
             if configuration_invalidated:
                 with self._layer_config_lock:
