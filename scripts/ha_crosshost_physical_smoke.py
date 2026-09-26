@@ -869,6 +869,42 @@ def _termux_ssh_works(target: str, *, port: int | None = None, timeout: int = 6,
     return completed.returncode == 0
 
 
+def _discover_ssh_port(target: str, *, runner: Callable[..., Any] | None = None,
+                       ) -> int | None:
+    """**端口自动发现**：用 `ssh -G <target>` 读出该目标**有效**的 SSH 端口。
+
+    为什么用它：`ssh -G` 走的就是 OpenSSH 自己的解析链（命令行 → `~/.ssh/config`
+    的 `Host`/`Port` → 默认 22），所以它给出的端口与真正建连时**完全一致** —— 不必猜、
+    也不必去解析 `~/.ssh/config` 文本。返回 `None` 表示无法确定（`ssh -G` 不可用或
+    输出异常），调用方应回落为"不传 `-p`"的旧行为。
+
+    解决的是：SSH 端口此前只能藏在仓库外的 ssh 别名里，证据里也没有端口字段，
+    一旦设备侧端口变化（或要跨设备用不同端口）就无从判断。
+    """
+    runner = runner or subprocess.run
+    try:
+        completed = runner(
+            ["ssh", "-G", target],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if getattr(completed, "returncode", 1) != 0:
+        return None
+    for line in (getattr(completed, "stdout", "") or "").splitlines():
+        key, _, value = line.strip().partition(" ")
+        if key == "port":
+            try:
+                discovered = int(value.strip())
+            except (TypeError, ValueError):
+                return None
+            return discovered if 1 <= discovered <= 65535 else None
+    return None
+
+
 # 探针命令与传输方式无关（`adb shell` 与 `ssh` 都能跑），因此两条路径共用同一份。
 Y700_PROBE_COMMAND = (
     "printf 'model=%s\\n' \"$(getprop ro.product.model)\"; "
@@ -923,9 +959,11 @@ def _y700_report(
 def _run_y700_ssh(target: str, *, port: int | None = None) -> dict[str, Any]:
     """走 Termux sshd 的 y700 探针（推荐路径）。
 
-    `port` 给出时**显式传 `-p`**（支持非 8022 的 / 动态分配的端口）；`None` 时端口
-    由 `~/.ssh/config` 别名解析（Termux 默认 8022）。
+    `port` 给出时**显式传 `-p`**；`None` 时端口由 `~/.ssh/config` 别名解析
+    （Termux 默认 8022），同时用 `ssh -G` **自动发现**实际端口并写进结果，
+    使证据可自证端口来源。
     """
+    effective_port = port if port else _discover_ssh_port(target)
     try:
         completed = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
@@ -937,22 +975,30 @@ def _run_y700_ssh(target: str, *, port: int | None = None) -> dict[str, Any]:
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        port_hint = f"端口 {port}" if port else "该别名对应的端口"
+        port_hint = f"端口 {port}" if port else (
+            f"端口 {effective_port}（由 ssh -G 发现）" if effective_port
+            else "该别名对应的端口")
         return {
             "status": "failed",
             "target": "y700",
             "physical_nodes": True,
             "transport": "termux_ssh",
             "serial": target,
-            "ssh_port": port,
+            "ssh_port": effective_port,
+            "ssh_port_source": "explicit" if port else (
+                "ssh -G" if effective_port else "unknown"),
             "error_code": "termux_ssh_unreachable",
             "model_gate": "blocked_no_gguf",
             "hint": (f"Termux sshd 不可达：{port_hint} 无监听通常意味着 Termux 进程被系统回收，"
                      "在设备上重新执行 `sshd` 即可（装 Termux:Boot 可开机自启）；"
                      "若端口已被改为动态分配，用 `--y700-ssh-port` 显式指定"),
         }
-    return _y700_report(transport="termux_ssh", serial=target, completed=completed,
-                        failure_code="ssh_probe_failed")
+    result = _y700_report(transport="termux_ssh", serial=target, completed=completed,
+                          failure_code="ssh_probe_failed")
+    result["ssh_port"] = effective_port
+    result["ssh_port_source"] = "explicit" if port else (
+        "ssh -G" if effective_port else "unknown")
+    return result
 
 
 def _run_y700_probe(

@@ -566,3 +566,91 @@ class TestExplicitSshPort:
         source = inspect.getsource(smoke.main)
         assert "{surface_host}:22" not in source            # 不得再有硬编码
         assert "{surface_host}:{surface_port}" in source
+
+
+class TestSshPortDiscovery:
+    """★ 端口自动发现（`ssh -G`）：让"实际用了哪个端口"可被证据自证。
+
+    背景：SSH 端口此前只能藏在仓库外的 `~/.ssh/config` 别名里，证据 JSON 里也没有
+    端口字段 ⇒ 一旦设备侧端口变化，事后无法判断当时连的是哪个端口。现在用
+    `ssh -G <target>`（走 OpenSSH 自己的解析链，与实际建连**完全一致**）读出端口，
+    写进结果的 `ssh_port` / `ssh_port_source`。
+    """
+
+    def test_discover_ssh_port_parses_ssh_dash_g(self):
+        captured = []
+
+        def _runner(argv, **kwargs):
+            captured.append(argv)
+            return SimpleNamespace(returncode=0, stdout=(
+                "host y700-ip\n"
+                "user u0_a250\n"
+                "hostname 100.99.211.13\n"
+                "port 8022\n"
+            ))
+
+        assert smoke._discover_ssh_port("y700-ip", runner=_runner) == 8022
+        assert captured[0][:2] == ["ssh", "-G"]
+
+    def test_discover_ssh_port_is_total_on_bad_input(self):
+        """异常输入一律返回 None（**不抛**）⇒ 调用方回落为「不传 -p」的旧行为。"""
+        def _bad_returncode(argv, **kwargs):
+            return SimpleNamespace(returncode=255, stdout="")
+
+        def _no_port_line(argv, **kwargs):
+            return SimpleNamespace(returncode=0, stdout="host x\nuser y\n")
+
+        def _garbage_port(argv, **kwargs):
+            return SimpleNamespace(returncode=0, stdout="port not-a-number\n")
+
+        def _out_of_range(argv, **kwargs):
+            return SimpleNamespace(returncode=0, stdout="port 70000\n")
+
+        def _boom(argv, **kwargs):
+            raise OSError("ssh not found")
+
+        assert smoke._discover_ssh_port("x", runner=_bad_returncode) is None
+        assert smoke._discover_ssh_port("x", runner=_no_port_line) is None
+        assert smoke._discover_ssh_port("x", runner=_garbage_port) is None
+        assert smoke._discover_ssh_port("x", runner=_out_of_range) is None
+        assert smoke._discover_ssh_port("x", runner=_boom) is None
+
+    def test_run_y700_ssh_records_discovered_port_and_source(self, monkeypatch):
+        def _runner(argv, **kwargs):
+            if argv[:2] == ["ssh", "-G"]:
+                return SimpleNamespace(returncode=0, stdout="port 8022\n")
+            return SimpleNamespace(returncode=0, stdout="abi=arm64-v8a\n", stderr="")
+
+        monkeypatch.setattr(smoke.subprocess, "run", _runner)
+        result = smoke._run_y700_ssh("y700-ip")          # 不给端口 ⇒ 走发现
+
+        assert result["ssh_port"] == 8022
+        assert result["ssh_port_source"] == "ssh -G"
+
+    def test_run_y700_ssh_marks_explicit_port_source(self, monkeypatch):
+        def _runner(argv, **kwargs):
+            return SimpleNamespace(returncode=0, stdout="abi=arm64-v8a\n", stderr="")
+
+        monkeypatch.setattr(smoke.subprocess, "run", _runner)
+        result = smoke._run_y700_ssh("y700-ip", port=2222)   # 显式 ⇒ 不调用 ssh -G
+
+        assert result["ssh_port"] == 2222
+        assert result["ssh_port_source"] == "explicit"
+
+    def test_discovery_failure_falls_back_without_changing_argv(self, monkeypatch):
+        """发现失败 ⇒ 仍**不传 `-p`**（旧行为），结果把来源标为 unknown。"""
+        seen = []
+
+        def _runner(argv, **kwargs):
+            seen.append(argv)
+            if argv[:2] == ["ssh", "-G"]:
+                return SimpleNamespace(returncode=255, stdout="")
+            return SimpleNamespace(returncode=0, stdout="abi=arm64-v8a\n", stderr="")
+
+        monkeypatch.setattr(smoke.subprocess, "run", _runner)
+        result = smoke._run_y700_ssh("y700-ip")
+
+        probe_argv = [argv for argv in seen if argv[:2] != ["ssh", "-G"]][0]
+        assert "-p" not in probe_argv
+        assert result["ssh_port"] is None
+        assert result["ssh_port_source"] == "unknown"
