@@ -32,6 +32,10 @@ local_docs/evidence/*
 !local_docs/evidence/torch-hetero-plan/
 local_docs/evidence/torch-hetero-plan/*
 !local_docs/evidence/torch-hetero-plan/TORCH-HETERO-PLAN-01-layer-matrix-20260924.json
+!local_docs/evidence/torch-hetero-plan/TORCH-HETERO-PLAN-01-stability-20260926.json
+!local_docs/audits/
+local_docs/audits/*
+!local_docs/audits/2026-09-26-r-rx-rr3-commit-review.md
 
 # OS
 .DS_Store
@@ -223,6 +227,7 @@ scripts/*
 !scripts/relay_quant_budget.py
 !scripts/relay_cut_model_analysis.py
 !scripts/relay_l2l_net_probe.py
+!scripts/relay_artifact_manifest.py
 !scripts/relay_sync_device.ps1
 !scripts/relay_health.py
 !scripts/run_doc_checks.py
