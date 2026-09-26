@@ -60,6 +60,10 @@ from tui_e2e_flow import wait_for  # noqa: E402
 
 MODEL_ID = (os.environ.get("QLH_TUI_E2E_MODEL") or "qwen3-5-2b").strip()
 ENGINE = (os.environ.get("QLH_TUI_E2E_ENGINE") or "llama_cpp").strip()
+#: ★ 工件目录名可能**不等于**业务层注册的 `model_id`：例如业务 id `qwen2.5-0.5b`
+#: 对应的 `model_path` 是 `models/qwen2.5-0.5b-instruct`。默认沿用 `MODEL_ID`
+#: （旧行为不变），需要时用 `QLH_TUI_E2E_ARTIFACT` 显式给出目录名 / gguf 前缀。
+ARTIFACT = (os.environ.get("QLH_TUI_E2E_ARTIFACT") or MODEL_ID).strip()
 HOST = "127.0.0.1"
 #: 默认用**独占端口**（8231）而不是生产默认 8000：避免"复用开发时已在跑的后端"而
 #: 让"F2 真起后端 + 真加载模型"这一步被静默跳过（那会让断言失去意义）。
@@ -88,16 +92,35 @@ def _model_artifact_present(model_id: str) -> bool:
     return any(models_dir.glob(f"{model_id}*.gguf"))
 
 
+def _runtime_import_hint(engine: str) -> str:
+    """按 engine 只检查**它真正需要**的运行时，避免"engine 无关的硬依赖"。
+
+    ★ 2026-09-26（Surface 实测暴露）：原实现**无条件** `import llama_cpp`，于是
+    `QLH_TUI_E2E_ENGINE=pytorch` 这一合法组合也被判"缺依赖"而 skip —— 而它的提示语
+    自己写的却是"（**engine=llama_cpp** 的真模型档）"。没有 GGUF/llama.cpp 的机器
+    （例如 Surface：PyPI 上 `llama-cpp-python` 只有 sdist，需编译）因此永远跑不到 F2。
+    """
+    if engine == "llama_cpp":
+        try:
+            import llama_cpp  # noqa: F401
+        except ImportError:
+            return "需要 llama_cpp（engine=llama_cpp 的真模型档）"
+        return ""
+    if engine == "pytorch":
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            return "需要 torch（engine=pytorch 的真模型档）"
+        return ""
+    return ""
+
+
 def _skip_reason() -> str:
     if not _enabled():
         return "设置 QLH_RUN_REAL_MODEL_SMOKE=1 才运行真模型 TUI E2E（F2 档）"
-    if not _model_artifact_present(MODEL_ID):
-        return f"需要真实模型工件 models/{MODEL_ID}(-gguf)（真机工件门，不虚构证据）"
-    try:
-        import llama_cpp  # noqa: F401
-    except ImportError:
-        return "需要 llama_cpp（engine=llama_cpp 的真模型档）"
-    return ""
+    if not _model_artifact_present(ARTIFACT):
+        return f"需要真实模型工件 models/{ARTIFACT}(-gguf)（真机工件门，不虚构证据）"
+    return _runtime_import_hint(ENGINE)
 
 
 def _run(coro):
