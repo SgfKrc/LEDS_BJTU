@@ -1320,9 +1320,6 @@ class SchedulerPipelineMixin:
                 "release": True,
                 "timestamp": time.time(),
             })
-            # 层段角色已退出 ⇒ 必须让主节点的 worker 快照随真实状态更新
-            # （层段加载/释放路径此前从不调用本方法，是 #28 的根因之一）。
-            self.refresh_task_worker_capabilities()
             logger.info("主节点已释放本设备的分层 worker 预留")
             return
         # TP 孤岛网关节点不参与 PyTorch 层拆分：直接拒绝分层配置并退出
@@ -1760,11 +1757,6 @@ class SchedulerPipelineMixin:
                 f"✅ 模型层加载完成并已确认: node={node_id}, "
                 f"Layer {start}-{end}, config_id={config_id or 'legacy'}"
             )
-            # 层段加载改变了本机模型形态（layer_range 非 None ⇒ 实时 models 为空）
-            # ⇒ 必须让主节点的 worker 快照随之更新。此前该路径从不刷新
-            # capabilities，主节点会长期沿用旧的"完整模型"快照而本机已是层段，
-            # 造成准入放行、执行被拒（已知问题 #28）。
-            self.refresh_task_worker_capabilities()
         except Exception as e:
             if configuration_invalidated:
                 with self._layer_config_lock:
