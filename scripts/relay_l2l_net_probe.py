@@ -160,6 +160,91 @@ def _segment_builds(args) -> dict[str, object]:
     return segments
 
 
+def _parse_mid_layers(raw: str | None) -> tuple[int, int] | None:
+    """★ #30：解析 `--mid-layers` 的 `K1-K2`（与工件文件名同义，如 `8-16`）。非法 ⇒ `None`。"""
+    if not raw:
+        return None
+    text = str(raw).strip().replace("_", "-")
+    left, _, right = text.partition("-")
+    if not left.isdigit() or not right.isdigit():
+        return None
+    start, end = int(left), int(right)
+    return (start, end) if 0 <= start < end else None
+
+
+def _layer_coverage(args) -> dict[str, object]:
+    """★ #30：校验各段层覆盖**恰好铺满 `[0,total)` 且不重叠**，并给出可落进证据的结论。
+
+    为什么需要它：L→L 路径此前**不校验**「head 工件覆盖 + 中段来源起点 == 末段起点」，也没有任何东西
+    要求各段恰好铺满 ⇒ **缺层 / 重复层静默通过**，只在 `per-token argmax` 上表现为不一致
+    （与"代码算错"同型）。2026-09-26 已因"端点实际载的工件与记录不符"误判过一次。
+
+    返回值（写进证据的 `layer_coverage` 字段）：
+    - `status="verified"`：四元组齐全且**恰好铺满**，附 `segments` 明细；
+    - `status="invalid"`：齐全但**不衔接 / 重叠 / 越界**，`detail` 说明原因；
+    - `status="unverified"`：参数不全或格式非法 ⇒ **不拦**（默认只 WARN），但证据里明确标出。
+    """
+    head_layers = getattr(args, "head_layers", None)
+    mid_raw = getattr(args, "mid_layers", None)
+    tail_start = getattr(args, "tail_start", None)
+    total = getattr(args, "total_layers", None)
+    spec = {
+        "head_layers": head_layers, "mid_layers": mid_raw,
+        "tail_start": tail_start, "total_layers": total,
+    }
+
+    if not head_layers or tail_start is None or not total:
+        return {"status": "unverified", "spec": spec,
+                "detail": "缺少 --head-layers / --tail-start / --total-layers"}
+
+    try:
+        head_end = int(head_layers)
+        total = int(total)
+        tail_start = int(tail_start)
+    except (TypeError, ValueError):
+        return {"status": "unverified", "spec": spec, "detail": "层数参数非整数"}
+
+    mid = _parse_mid_layers(mid_raw)
+    if mid_raw and mid is None:
+        return {"status": "unverified", "spec": spec, "detail": f"--mid-layers 非法: {mid_raw!r}"}
+
+    if getattr(args, "middle_endpoint", None):
+        # 三段：head [0,K) + middle [K1,K2) + tail [K2,N)
+        if mid is None:
+            return {"status": "unverified", "spec": spec,
+                    "detail": "三段拓扑需要 --mid-layers（如 `8-16`）"}
+        mid_start, mid_end = mid
+        if head_end != mid_start:
+            detail = f"head 终点 {head_end} != middle 起点 {mid_start}（缺口或重叠）"
+        elif mid_end != tail_start:
+            detail = f"middle 终点 {mid_end} != tail 起点 {tail_start}（缺口或重叠）"
+        elif not (0 < head_end < total) or not (mid_end < total):
+            detail = f"切点越界：head_end={head_end} mid_end={mid_end} total={total}"
+        else:
+            detail = ""
+        return {
+            "status": "verified" if not detail else "invalid",
+            "detail": detail,
+            "spec": spec,
+            "segments": {"head": [0, head_end], "middle": [mid_start, mid_end],
+                         "tail": [tail_start, total]},
+        }
+
+    # 两段：head [0,K) + tail [K,N)
+    if head_end != tail_start:
+        detail = f"head 终点 {head_end} != tail 起点 {tail_start}（缺口或重叠）"
+    elif not (0 < head_end < total):
+        detail = f"切点越界：head_end={head_end} total={total}"
+    else:
+        detail = ""
+    return {
+        "status": "verified" if not detail else "invalid",
+        "detail": detail,
+        "spec": spec,
+        "segments": {"head": [0, head_end], "tail": [tail_start, total]},
+    }
+
+
 def main() -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -196,7 +281,36 @@ def main() -> int:
     ap.add_argument("--head-ready-file", default=None, help="★ 远端 head 段的 ready 文件")
     ap.add_argument("--digest-artifacts", action="store_true",
                     help="★ 对段工件也算 sha256（GB 级文件会明显变慢；默认只记大小/名字）")
+    # ★ #30（2026-09-26）：**层覆盖校验** —— 工件名自带的层范围**不可自证**
+    #   （`head*/mid*/tail*` 这批无 manifest；裁层生成器只覆盖 `block_count`、不记录层号重命名），
+    #   而 L→L 路径此前**完全不做**覆盖校验 ⇒ 缺层 / 重复层会静默通过、只表现为数值不一致
+    #   （与"代码算错"同型，实测已误判过一次）。这里要求显式给出每段层区间，校验
+    #   **恰好铺满 `[0, total)` 且不重叠**；参数不全时不拦、只标 `unverified`（加 `--strict-coverage` 才失败）。
+    ap.add_argument("--head-layers", default=None,
+                    help="★ #30：上游 head 段覆盖层数 K（区间 `[0,K)`）；不给则记 unverified")
+    ap.add_argument("--mid-layers", default=None,
+                    help="★ #30：中段覆盖区间 `K1-K2`（与文件名同义，如 `8-16`）")
+    ap.add_argument("--tail-start", type=int, default=None,
+                    help="★ #30：末段起点 K2（区间 `[K2,total)`）")
+    ap.add_argument("--total-layers", type=int, default=None,
+                    help="★ #30：整模层数 N（应与 --whole-model 一致）")
+    ap.add_argument("--strict-coverage", action="store_true",
+                    help="★ #30：层覆盖参数不全或校验不通过时**直接失败**（默认只 WARN + 记 unverified）")
     args = ap.parse_args()
+
+    coverage = _layer_coverage(args)
+    if coverage["status"] == "invalid":
+        detail = f"层覆盖校验不通过：{coverage['detail']}"
+        if args.strict_coverage:
+            raise SystemExit(f"FAIL: {detail}")
+        print(f"[warn] {detail}", file=sys.stderr)
+    elif coverage["status"] == "unverified":
+        detail = ("未提供完整层覆盖参数"
+                  "（--head-layers / --mid-layers / --tail-start / --total-layers）"
+                  "⇒ 证据记 unverified，**无法排除载错工件**")
+        if args.strict_coverage:
+            raise SystemExit(f"FAIL: {detail}")
+        print(f"[warn] {detail}", file=sys.stderr)
 
     # ★ P4.5 健康检查：**先探活** —— 放在最前面，避免为一次注定失败的运行白跑整模对照；
     # 也把"远端段已退出"与"模型算错"分开（见 `_preflight` docstring）。
@@ -307,6 +421,9 @@ def main() -> int:
         # ★ 2026-09-23（§10.2）：**逐段**写出实际 runner 与构建标识（shim/libllama 摘要、
         #   pip llama_cpp 版本、段工件大小/摘要）。远端段没给 ready 文件时显式记 remote_unknown。
         "segment_engines": _segment_builds(args),
+        # ★ #30（2026-09-26）：**层覆盖**是否已校验（`verified` / `invalid` / `unverified`）。
+        #   此前证据里既没有层号、也不校验各段衔接 ⇒ 载错工件**无法自证**（见 `docs/已知问题记录.md` #30）。
+        "layer_coverage": coverage,
         "endpoints": {"tail": args.tail_endpoint, "middle": args.middle_endpoint},
         "load": {"prompt": args.prompt, "prefill_tokens": len(prompt), "gen_tokens": int(args.gen),
                  "n_embd": n_embd},

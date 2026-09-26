@@ -162,3 +162,71 @@ def test_segment_builds_reads_ready_file_for_remote_segments(tmp_path: Path) -> 
     assert segments["head"]["build"]["source"] == "remote_unknown"     # head 也没给 ready 文件
     assert segments["middle"]["build"]["source"] == "ready_file"
     assert segments["middle"]["build"]["llama_cpp_version"] == "x"
+
+
+def _coverage_args(**overrides):
+    """★ #30 的层覆盖参数默认全空，逐个用例按需覆盖（`argparse` 按本文件既有风格就近 import）。"""
+    import argparse
+
+    base = {
+        "head_layers": None, "mid_layers": None, "tail_start": None,
+        "total_layers": None, "middle_endpoint": None,
+    }
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def test_layer_coverage_accepts_exact_three_segment_tiling() -> None:
+    """三段恰好铺满 0..23 ⇒ verified（`head8` + `mid8-16` + `cut-k16`）。"""
+    module = _load()
+    args = _coverage_args(head_layers="8", mid_layers="8-16", tail_start=16,
+                          total_layers=24, middle_endpoint="127.0.0.1:50161")
+    result = module._layer_coverage(args)
+
+    assert result["status"] == "verified"
+    assert result["segments"] == {"head": [0, 8], "middle": [8, 16], "tail": [16, 24]}
+
+
+def test_layer_coverage_rejects_layers_missing_in_the_middle() -> None:
+    """★ 这正是 2026-09-26 误判的形态：`head4` + `mid8-16` ⇒ 缺 4..7，**必须** invalid。
+
+    当时端点实际载的是 `mid8-16`（而记录写成 `mid4-16`）⇒ 覆盖缺 4..7 ⇒ 逐 token 不一致被误判成
+    "代码缺陷"。本用例把这个形态钉成回归（见 `docs/已知问题记录.md` #30）。
+    """
+    module = _load()
+    args = _coverage_args(head_layers="4", mid_layers="8-16", tail_start=16,
+                          total_layers=24, middle_endpoint="127.0.0.1:50161")
+    result = module._layer_coverage(args)
+
+    assert result["status"] == "invalid"
+    assert "缺口或重叠" in result["detail"]
+
+
+def test_layer_coverage_rejects_overlap() -> None:
+    """中段起点早于 head 终点 ⇒ 重叠，**必须** invalid。"""
+    module = _load()
+    args = _coverage_args(head_layers="8", mid_layers="4-16", tail_start=16,
+                          total_layers=24, middle_endpoint="127.0.0.1:50161")
+    assert module._layer_coverage(args)["status"] == "invalid"
+
+
+def test_layer_coverage_accepts_exact_two_segment_tiling() -> None:
+    """两段恰好铺满（`head8` + `tail8`）⇒ verified；`head8` + 起点 12 ⇒ invalid。"""
+    module = _load()
+    ok = _coverage_args(head_layers="8", tail_start=8, total_layers=24)
+    assert module._layer_coverage(ok)["status"] == "verified"
+
+    gap = _coverage_args(head_layers="8", tail_start=12, total_layers=24)
+    assert module._layer_coverage(gap)["status"] == "invalid"
+
+
+def test_layer_coverage_is_unverified_without_full_arguments() -> None:
+    """参数不全 ⇒ unverified（**默认不拦**）；三段缺 `--mid-layers` 同样是 unverified。"""
+    module = _load()
+    assert module._layer_coverage(_coverage_args(head_layers="8"))["status"] == "unverified"
+    assert module._layer_coverage(_coverage_args(
+        head_layers="8", tail_start=16, total_layers=24,
+        middle_endpoint="127.0.0.1:50161"))["status"] == "unverified"
+    assert module._layer_coverage(_coverage_args(
+        head_layers="8", tail_start=16, total_layers=24,
+        middle_endpoint="127.0.0.1:50161"))["status"] == "unverified"
