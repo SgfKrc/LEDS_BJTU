@@ -16,6 +16,13 @@
  *   mode 1 = layer_inp → **第 cut_layer 层的输入**（= 前 cut_layer 层的输出）。配整模工件
  *                      可验证语义，但会跑满全部层。
  *
+ * ⚠️ 2026-09-23：`mode 0` 不再走 `llama_set_embeddings_nextn` —— 各架构把 `t_h_nextn` 挂在不同
+ *   位置（qwen2 在 `output_norm` 之前、qwen35 在之后），拿它当上游会随架构而变（Qwen3.5 上多一次
+ *   RMSNorm ⇒ 接力数值分叉）。现统一改用 `layer_inp` 的 `lid == n_layer` 槽位（"第 n_layer 层的
+ *   输入" = 末层输出）；该槽位由 `llama-context.cpp` 多分配一个、由各架构 graph 在 `output_norm`
+ *   之前登记。**目前登记该槽位的架构：`qwen2`、`qwen35`**（其他架构会因槽位为空而在 decode 时报
+ *   `layer input tensor not null` 断言）。
+ *
  * 编译（Windows / MinGW，见 scripts/model_tools/build_keep_head_shim.ps1）：
  *   gcc -shared -O2 -o qlh_keep_head.dll qlh_keep_head.c \
  *       -I<llama.cpp>/include -L<llama.cpp>/build/src -lllama
@@ -40,6 +47,11 @@ typedef struct qlh_keep_head {
     int n_layer;
     int mode;        /* 0 = nextn, 1 = layer_inp */
     int cut_layer;
+    int n_pos_per_embd;  /* ★ M-RoPE 模型 = 4（每个 token 的位置分量数），否则 1 */
+    /* ★ 2026-09-24：最近一次 `llama_decode` 的**原始**返回码（0 = 无错误）。
+     * 此前 decode 失败一律折成 -2，把 llama.cpp 的具体错误码丢了 ⇒ 长时 decode 的 ctx 边界
+     * 问题无法定位。每次 forward 入口清零（读到的就是本次错误），`qlh_kh_reset` 也清零。 */
+    int32_t last_error;
 } qlh_keep_head;
 
 static void qlh_set_err(char *err, size_t errlen, const char *msg) {
@@ -88,6 +100,12 @@ void * qlh_kh_load(const char * model_path,
         qlh_set_err(err, errlen, "llama_init_from_model failed");
         return NULL;
     }
+    /* ★ 2026-09-24：把**实际生效**的 ctx 参数打出来。长时 decode 在 ~481 帧报
+     * `llama_decode rc=1`（llama.cpp 的 "failed to find a memory slot for batch"）时，必须能
+     * 一眼看出 llama.cpp 是否真按我们请求的 `n_ctx` / `n_batch` 分配了 KV。 */
+    fprintf(stderr, "[qlh_keep_head] ctx ready: n_ctx=%u n_batch=%u "
+                    "(requested n_ctx=%d n_batch=%d n_seq_max=%d)\n",
+            llama_n_ctx(ctx), llama_n_batch(ctx), n_ctx, n_batch, n_seq_max);
 
     const int n_layer = llama_model_n_layer(model);
     if (mode == 1 && (cut_layer < 0 || cut_layer >= n_layer)) {
@@ -110,9 +128,26 @@ void * qlh_kh_load(const char * model_path,
     handle->n_layer   = n_layer;
     handle->mode      = mode;
     handle->cut_layer = cut_layer;
+    /* ★ M-RoPE（Qwen3.5 等）：每个 token 有 4 个位置分量，**embd 通道**下必须按 planar 提供
+     * （见 `qlh_fill_pos_planar`）。按模型实际 rope 类型判定，不对架构硬编码。 */
+    {
+        const enum llama_rope_type rope = llama_model_rope_type(model);
+        handle->n_pos_per_embd = (rope == LLAMA_ROPE_TYPE_MROPE ||
+                                  rope == LLAMA_ROPE_TYPE_IMROPE) ? 4 : 1;
+    }
 
+    /* ★ 2026-09-23：两个模式现在走**同一条** `layer_inp` 通道（只有槽位不同，见
+     * `qlh_extract_hidden`）：
+     *   mode 0 ⇒ lid = n_layer = 「第 n_layer 层的输入」= **末层输出（`output_norm` 之前）**
+     *   mode 1 ⇒ lid = cut_layer = 「第 cut_layer 层的输入」
+     * 为什么不再用 `llama_set_embeddings_nextn`：各架构把 `t_h_nextn` 挂在不同位置 ——
+     * qwen2 在 `output_norm` **之前**（QLH 2026-09-20 补丁），而 qwen35 在**之后**
+     * （那里的消费方是 MTP head）⇒ 同一个 `mode 0` 在 Qwen3.5 上拿到的不是层输出，接力
+     * 数值首步即分叉（实测 9B）。`layer_inp` 的 `n_layer` 槽位在语义上**只会**是"末层输出"，
+     * 与架构无关（槽位由 llama-context.cpp 多分配一个，由各架构 graph 在 `output_norm`
+     * 之前登记）。 */
     if (mode == 0) {
-        llama_set_embeddings_nextn(ctx, true, false);   /* unmasked: rows 按 token 稠密 */
+        llama_set_embeddings_layer_inp(ctx, (uint32_t) n_layer, true);
     } else {
         llama_set_embeddings_layer_inp(ctx, (uint32_t) cut_layer, true);
     }
@@ -122,32 +157,28 @@ void * qlh_kh_load(const char * model_path,
     return handle;
 }
 
-/* 从当前 batch 结果里取出本次前向的 hidden（按模式），写进 out。返回 0 或负错误码。 */
+/* 从当前 batch 结果里取出本次前向的 hidden（按模式），写进 out。返回 0 或负错误码。
+ *
+ * ★ 2026-09-23：两个模式统一走 `layer_inp` 通道，差别只是槽位号 ——
+ *   mode 0（nextn，语义 = **末层输出 / output_norm 之前**）⇒ lid = n_layer
+ *   mode 1（layer_inp，语义 = 第 cut_layer 层的输入）⇒ lid = cut_layer
+ * 这样既不依赖各架构 `t_h_nextn` 的挂点差异，返回值也天然是**稠密的 `[n_tokens, n_embd]`**
+ * （旧实现按 token 逐个取 `llama_get_embeddings_nextn_ith`）。 */
 static int32_t qlh_extract_hidden(qlh_keep_head * handle, int32_t n_tokens, float * out) {
-    if (handle->mode == 1) {
-        const float * ptr = llama_get_embeddings_layer_inp(handle->ctx,
-                                                          (uint32_t) handle->cut_layer);
-        if (ptr == NULL) {
-            return -3;
-        }
-        memcpy(out, ptr, (size_t) n_tokens * (size_t) handle->n_embd * sizeof(float));
-        return 0;
+    const uint32_t lid = (uint32_t) ((handle->mode == 0) ? handle->n_layer : handle->cut_layer);
+    const float * ptr = llama_get_embeddings_layer_inp(handle->ctx, lid);
+    if (ptr == NULL) {
+        return -3;
     }
-
-    for (int32_t i = 0; i < n_tokens; ++i) {
-        const float * ptr = llama_get_embeddings_nextn_ith(handle->ctx, i);
-        if (ptr == NULL) {
-            return -4;
-        }
-        memcpy(out + (size_t) i * (size_t) handle->n_embd, ptr,
-               (size_t) handle->n_embd * sizeof(float));
-    }
+    memcpy(out, ptr, (size_t) n_tokens * (size_t) handle->n_embd * sizeof(float));
     return 0;
 }
 
 /* 统一标注：**每个 token 都要标输出**。
- * 末层 hidden（`t_h_nextn`）只对「有输出的行」计算，若只标最后一行，取 n_tokens 行就会踩到
- * GGML_ASSERT "tensor read out of bounds"（实测踩过）。上游不需要 logits，但需要行数完整。 */
+ * 历史原因：旧的 nextn 通道只对「有输出的行」计算末层 hidden，若只标最后一行，取 n_tokens 行
+ * 就会踩到 GGML_ASSERT "tensor read out of bounds"（实测踩过）。现在两个模式都走 layer_inp
+ * 通道，这条约束不再是硬性的，但保持"全行标输出"可以不必依赖具体的 sched 行为 ——
+ * 上游不需要 logits，只需要**行数完整**。 */
 static void qlh_fill_common(struct llama_batch * batch, int32_t n_tokens, int32_t n_past) {
     for (int32_t i = 0; i < n_tokens; ++i) {
         batch->pos[i]       = n_past + i;
@@ -177,6 +208,49 @@ static void qlh_fill_explicit(struct llama_batch * batch, int32_t n_tokens, int3
     batch->n_tokens = n_tokens;
 }
 
+/* ★ M-RoPE 的 **embd 通道**位置布局（真 bug 修复，2026-09-23）：
+ *
+ * `llama-batch.cpp::llama_batch_allocr::ubatch_add` 里取位置的写法是
+ *
+ *     size_t src_off = batch.token ? 0 : j*batch.n_tokens;      // j = 0 .. n_pos_per_embd-1
+ *     udata->pos[j*n_tokens + i] = batch.pos[src_off + idxs[i]];
+ *
+ * ⇒ **token 通道**（`batch.token != NULL`）把同一个位置**广播**到全部 RoPE 分量（文本语义）；
+ *    **embd 通道**（`batch.token == NULL`）按 **planar**（分量分块）读，要求调用方给出
+ *    `n_tokens * n_pos_per_embd` 个位置。
+ *
+ * 而 `llama_batch_init(n_tokens, ...)` **只分配 n_tokens 个** `pos`。于是对 M-RoPE 模型
+ * （`n_pos_per_embd() == 4`：Qwen3.5 的 `rope type = 40 = IMROPE`）走 embd 通道时，
+ * j=1..3 会读到缓冲区之外 ⇒ 位置语义错 ⇒ 层段接力数值错。
+ * 实测症状：0.5B（`LLAMA_ROPE_TYPE_NORM`，n_pos_per_embd=1）历史记录 32/32 PASS；
+ * Qwen3.5-9B（IMROPE）两段接力首步即分叉（`l2l-net-local-9b-2seg*.json`）。
+ *
+ * 本函数把单分量 `positions`（`NULL` ⇒ `n_past + i`）广播成 planar 布局，与 token 通道的
+ * 语义对齐。返回 0 成功，-5 表示分配失败（调用方按参数错处理）。 */
+static int32_t qlh_fill_pos_planar(struct llama_batch * batch, int32_t n_tokens, int32_t n_past,
+                                   const int32_t * positions, int32_t n_pos_per_embd) {
+    if (batch == NULL || n_tokens <= 0) {
+        return -5;
+    }
+    if (n_pos_per_embd <= 1) {
+        return 0;   /* 单分量：qlh_fill_explicit 填的就是正确布局 */
+    }
+    llama_pos * pos_full = (llama_pos *) malloc(
+        sizeof(llama_pos) * (size_t) n_tokens * (size_t) n_pos_per_embd);
+    if (pos_full == NULL) {
+        return -5;
+    }
+    for (int32_t j = 0; j < n_pos_per_embd; ++j) {
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            pos_full[(size_t) j * (size_t) n_tokens + (size_t) i] =
+                (llama_pos) ((positions == NULL) ? (n_past + i) : positions[i]);
+        }
+    }
+    free(batch->pos);       /* 旧的 n_tokens 缓冲；llama_batch_free 释放的是我们替换后的指针 */
+    batch->pos = pos_full;
+    return 0;
+}
+
 /* 前向：跑 tokens（从 n_past 起），把结果写进 out（容量 n_tokens * n_embd 个 float）。
  * 返回 0 成功；否则为负的错误码（-1 参数错，-2 decode 失败，-3/-4 取 hidden 失败）。 */
 int32_t qlh_kh_forward(void * handle_void,
@@ -186,6 +260,7 @@ int32_t qlh_kh_forward(void * handle_void,
     if (handle == NULL || tokens == NULL || out == NULL || n_tokens <= 0) {
         return -1;
     }
+    handle->last_error = 0;   /* ★ 本次 forward 的错误从这里重新计 */
 
     struct llama_batch batch = llama_batch_init(n_tokens, 0, 1);
     for (int32_t i = 0; i < n_tokens; ++i) {
@@ -196,6 +271,11 @@ int32_t qlh_kh_forward(void * handle_void,
     const int32_t rc = llama_decode(handle->ctx, batch);
     llama_batch_free(batch);
     if (rc != 0) {
+        /* ★ 2026-09-24：把原始 rc 透出给调用方（**返回码仍是 -2，不破坏既有契约**）。 */
+        handle->last_error = rc;
+        fprintf(stderr,
+                "[qlh_keep_head] llama_decode failed rc=%d (tokens: n_tokens=%d, n_past=%d)\n",
+                rc, n_tokens, n_past);
         return -2;
     }
     return qlh_extract_hidden(handle, n_tokens, out);
@@ -237,14 +317,24 @@ int32_t qlh_kh_forward_embd_seq(void * handle_void,
     if (handle == NULL || embd == NULL || out == NULL || n_tokens <= 0) {
         return -5;
     }
+    handle->last_error = 0;
 
     struct llama_batch batch = llama_batch_init(n_tokens, handle->n_embd, 1);
     qlh_fill_explicit(&batch, n_tokens, n_past, n_seq_id, seq_ids, positions);
+    if (qlh_fill_pos_planar(&batch, n_tokens, n_past, positions,
+                            handle->n_pos_per_embd) != 0) {
+        llama_batch_free(batch);
+        return -5;
+    }
     memcpy(batch.embd, embd, (size_t) n_tokens * (size_t) handle->n_embd * sizeof(float));
 
     const int32_t rc = llama_decode(handle->ctx, batch);
     llama_batch_free(batch);
     if (rc != 0) {
+        handle->last_error = rc;
+        fprintf(stderr,
+                "[qlh_keep_head] llama_decode failed rc=%d (embd: n_tokens=%d, n_past=%d)\n",
+                rc, n_tokens, n_past);
         return -2;
     }
     return qlh_extract_hidden(handle, n_tokens, out);
@@ -260,14 +350,24 @@ int32_t qlh_kh_forward_embd_token(void * handle_void,
     if (handle == NULL || embd == NULL || out_token == NULL || n_tokens <= 0) {
         return -5;
     }
+    handle->last_error = 0;
 
     struct llama_batch batch = llama_batch_init(n_tokens, handle->n_embd, 1);
     qlh_fill_explicit(&batch, n_tokens, n_past, n_seq_id, seq_ids, positions);
+    if (qlh_fill_pos_planar(&batch, n_tokens, n_past, positions,
+                            handle->n_pos_per_embd) != 0) {
+        llama_batch_free(batch);
+        return -5;
+    }
     memcpy(batch.embd, embd, (size_t) n_tokens * (size_t) handle->n_embd * sizeof(float));
 
     const int32_t rc = llama_decode(handle->ctx, batch);
     llama_batch_free(batch);
     if (rc != 0) {
+        handle->last_error = rc;
+        fprintf(stderr,
+                "[qlh_keep_head] llama_decode failed rc=%d (embd_token: n_tokens=%d, n_past=%d)\n",
+                rc, n_tokens, n_past);
         return -2;
     }
 
@@ -304,6 +404,20 @@ int32_t qlh_kh_n_layer(void * handle_void) {
     return handle == NULL ? 0 : handle->n_layer;
 }
 
+/* ★ 2026-09-24：把**最近一次** `llama_decode` 的原始返回码透出（0 = 本轮无错误）。
+ *
+ * 动机：`qlh_kh_forward*` 的返回码是稳定的负值（-2 = decode 失败），但 llama.cpp 的具体
+ * 错误码（例如显存/ctx 相关）以前被丢掉 ⇒ 长时 decode 在特定 ctx 下失败时无法定位。
+ * 约定：每次 forward 入口清零，因此调用方在收到 -2 之后立刻读到的就是**本次**的 rc。
+ * 旧版 shim 没有这个符号 ⇒ 调用方**必须**按 optional 处理（`hasattr`），缺了就走旧路径。 */
+int32_t qlh_kh_last_error(void * handle_void) {
+    qlh_keep_head * handle = (qlh_keep_head *) handle_void;
+    if (handle == NULL) {
+        return 0;
+    }
+    return handle->last_error;
+}
+
 /* ★ P3：清空 KV / recurrent 记忆。跨机服务在**同一进程**里服务多条连接时必须调用 ——
  * 否则新连接从位置 0 开始会与上一条连接留下的位置冲突（llama.cpp 报
  * "tokens ... have inconsistent sequence positions"，实测表现为远端 runner_failed）。 */
@@ -312,6 +426,7 @@ void qlh_kh_reset(void * handle_void) {
     if (handle == NULL || handle->ctx == NULL) {
         return;
     }
+    handle->last_error = 0;
     llama_memory_t mem = llama_get_memory(handle->ctx);
     if (mem != NULL) {
         llama_memory_clear(mem, true);

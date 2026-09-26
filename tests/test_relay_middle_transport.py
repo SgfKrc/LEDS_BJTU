@@ -58,14 +58,16 @@ class _FakeSeqMiddleRunner(_FakeMiddleRunner):
         return bytes((value + 1) % 256 for value in hidden)
 
 
-def _serve_once(listener: socket.socket, runner, n_embd: int):
+def _serve_once(listener: socket.socket, runner, n_embd: int, *,
+                hidden_quant: str = "none"):
     result: dict[str, object] = {}
 
     def _run() -> None:
         sock, _ = listener.accept()
         try:
             result["bridge"] = serve_relay_middle_connection(sock, runner, n_embd=n_embd,
-                                                             max_tokens=64)
+                                                             max_tokens=64,
+                                                             hidden_quant=hidden_quant)
         finally:
             sock.close()
 
@@ -92,6 +94,44 @@ def test_middle_round_trip_returns_hidden_and_closes_cleanly():
         assert bridge.frames == 1 and bridge.tokens == n_tokens and bridge.closed_cleanly
     finally:
         listener.close()
+
+
+class _IdentityMiddleRunner(_FakeMiddleRunner):
+    """原样返回 hidden —— 这样"下行压缩 + 客户端解压"的误差只可能来自压缩档本身。"""
+
+    def request_hidden(self, hidden: bytes, *, n_tokens: int) -> bytes:
+        self.requests.append((n_tokens, hidden))
+        return bytes(hidden)
+
+
+@pytest.mark.parametrize(("quant", "max_rel"), [("f16", 1e-3), ("int8_block128", 2e-2)])
+def test_middle_downlink_quant_round_trips_to_f32_on_client_side(quant: str,
+                                                                 max_rel: float) -> None:
+    """★ A5 下行：档位由**服务端**决定（`hidden_quant=`），客户端按帧里的档位解回 f32。
+
+    用恒等 runner ⇒ 客户端拿到的误差**只可能**来自下行压缩。断言 `0 < 误差 ≤ 档位量级`：
+    上界验证解压正确，下界证明服务端**确实压了**（否则"忘了压缩"会让用例假通过）。
+    """
+    import numpy as np
+
+    n_embd, n_tokens = 32, 2
+    values = (np.arange(n_tokens * n_embd, dtype=np.float32) / 7.0)
+    payload = np.ascontiguousarray(values, dtype="<f4").tobytes()
+    runner = _IdentityMiddleRunner()
+    listener = open_loopback_listener("127.0.0.1", 0)
+    port = listener.getsockname()[1]
+    try:
+        thread, _result = _serve_once(listener, runner, n_embd, hidden_quant=quant)
+        with RelayTcpClient("127.0.0.1", port, n_embd=n_embd) as client:
+            produced = client.request_hidden(payload, n_tokens=n_tokens)
+        thread.join(timeout=10)
+    finally:
+        listener.close()
+
+    assert len(produced) == len(payload)          # 对调用方永远是 f32
+    out = np.frombuffer(produced, dtype="<f4")
+    relative = float(np.abs(out - values).max()) / max(float(np.abs(values).max()), 1e-6)
+    assert 0.0 < relative <= max_rel
 
 
 def test_middle_handles_multiple_rounds_in_one_session():

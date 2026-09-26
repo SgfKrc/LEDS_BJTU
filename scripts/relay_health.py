@@ -43,7 +43,35 @@ import shlex
 import socket
 import subprocess
 import sys
+import threading
+from pathlib import Path
 from typing import Any
+
+def _ensure_transport_importable() -> None:
+    """把本仓的 `src/` 放进 `sys.path` —— **多点探索**，不假定脚本一定在 `scripts/` 下。
+
+    为什么不能只写 `parents[1] / "src"`：脚本被复制/搬迁时（例如
+    `tests/test_ci_relay_gates.py` 用 `tmp_path` 副本做**变异测试**）那一条会**指飞** ⇒
+    `import relay_transport` 失败 ⇒ 探活退化成 `relay_transport_unavailable` ——
+    看着"判死"，其实**什么都没测**。候选按"离得近"排，且只在真看到 `relay_transport.py`
+    时才插入条目。
+    """
+    here = Path(__file__).resolve()
+    candidates = [
+        here.parents[1] / "src",   # 常规：脚本在 <repo>/scripts/ 下
+        here.parents[1],
+        Path.cwd() / "src",        # 从仓库根调用（测试与 CI 的 cwd 都是仓库根）
+        Path.cwd(),
+    ]
+    for candidate in candidates:
+        try:
+            if (candidate / "relay_transport.py").is_file() and str(candidate) not in sys.path:
+                sys.path.insert(0, str(candidate))
+        except OSError:
+            continue
+
+
+_ensure_transport_importable()
 
 STALE_DEFAULT = 30.0
 _SAFE_REMOTE_PATH = re.compile(r"^[A-Za-z0-9_./:\\-]+$")
@@ -88,6 +116,68 @@ def _check_tcp(endpoint: str, *, timeout: float) -> dict[str, Any]:
                 "hint": "远端服务可能已退出（例如随 ssh 会话被网络抖动静默带走），或隧道已断"}
 
 
+def _probe_relay(endpoint: str, *, timeout: float) -> dict[str, Any]:
+    """★ R-R9：**协议级**探活 —— 真做一次最小 Relay 握手（`CLOSE` → 服务端回 `TOKEN(-1)`）。
+
+    ## 为什么 `_check_tcp` 不够（§8.6 的实测教训）
+
+    远端段跑在 ssh 会话里时，一次网络抖动会把会话带走、**服务随之退出**，而**隧道端口仍在本机
+    监听** ⇒ 新连接被"接受"后**立刻 reset**。此时 `_check_tcp`（只 `connect`、**不发送任何帧**）
+    **会判健康** ⇒ 漏报；而现象与「模型层错误」难以区分（`docs/跨框架接力-当前有效基线与后续
+    优化计划-2026-09-21.md` §8.6 末段）。
+
+    补上这一半的手段是：**真的按协议问一句**。握手用 `CLOSE` —— 服务端只做会话收尾
+    （**不经 runner、不加载模型**），却足以证明"对端真的在按协议服务"。帧格式**不在这里重复
+    实现**（与 `src/relay_transport.py` 同源），避免两套 wire 定义漂移。
+
+    与 `_check_ready`（心跳新鲜度）互补：后者发现"进程还在但引擎已废"，本函数发现
+    "端口通但对端已死/已废"。
+    """
+    host, _, port_text = endpoint.rpartition(":")
+    if not host or not port_text.isdigit():
+        return {"ok": False, "reason": "bad_endpoint", "detail": f"需要 host:port，实得 {endpoint!r}"}
+
+    sock = None
+    try:
+        from relay_transport import (
+            RelayFrame,
+            RelayFrameKind,
+            _decode_token,
+            recv_frame,
+            send_frame,
+        )
+
+        sock = socket.create_connection((host, int(port_text)), timeout=timeout)
+        sock.settimeout(timeout)
+        send_frame(sock, RelayFrame(RelayFrameKind.CLOSE, 0))
+        response = recv_frame(sock, max_payload_bytes=64)
+        token = _decode_token(response, 0)
+        if token != -1:
+            return {"ok": False, "reason": "unexpected_close_ack", "endpoint": endpoint,
+                    "detail": f"CLOSE 的应答应为 -1，实得 {token}"}
+        return {"ok": True, "reason": "protocol_handshake_ok", "endpoint": endpoint}
+    except ImportError as exc:      # 缺 src/relay_transport ⇒ 不谎报健康
+        return {"ok": False, "reason": "relay_transport_unavailable", "endpoint": endpoint,
+                "detail": str(exc)}
+    except Exception as exc:  # noqa: BLE001 - 任何协议/网络异常都意味着"该段不在服务"
+        return {"ok": False, "reason": "handshake_failed", "endpoint": endpoint,
+                "detail": f"{type(exc).__name__}: {exc}",
+                "hint": "端口能连上但握手失败 => 对端很可能已退出（§8.6 的「接受后立即 reset」）；"
+                        "注意这会与「模型层错误」现象相似"}
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+#: ★ R-R9：`_probe_relay` 的**公开别名** —— 驱动（`scripts/relay_experiment.py`）在接力开始前
+#: 调用它做前置探活。实现保持私有（工具内部一直用它），别名只是给"跨脚本复用"一个稳定入口，
+#: 免得驱动去 import 一个下划线名字。
+probe_relay = _probe_relay
+
+
 def _check_ready(alias: str, path: str, *, timeout: float, stale_seconds: float) -> dict[str, Any]:
     """经 ssh 读远端 ready 文件，检查**心跳新鲜度**。
 
@@ -129,21 +219,176 @@ def _check_ready(alias: str, path: str, *, timeout: float, stale_seconds: float)
             "hint": None if fresh else "心跳过期 ⇒ 该段服务很可能已停止（或卡死）；重启前先确认进程"}
 
 
+def self_check() -> int:
+    """★ A10 + R-R9：用**本机 loopback** 验证判定方向（CI 兜底，不需要真机 / 网络 / 段工件）。
+
+    **五条**方向断言（前三条防漏报，后两条防**误杀**）：
+
+    1. **活监听**（有人 accept）⇒ `_check_tcp` 判健康；
+    2. **已释放**端口 ⇒ `_check_tcp` 判死；
+    3. ★ **假服务**（accept 后**立刻 close**，复现 §8.6 的「端口在监听但服务已死」）⇒
+       `_check_tcp` **判健康**（如实复现**已知漏报**）、`_probe_relay` **判死** ⇒
+       证明协议级探活真的补上了那一半；
+    4. **只监听但不应答** ⇒ `_probe_relay` 也必须判死（证明它真的在**等应答**，不是连上就算过）；
+    5. ★ **协议活段必须被接受** —— 起一个最小**真协议**服务（`serve_relay_middle_connection`
+       + 假 runner，**不需要模型 / shim / 段工件**）⇒ `_probe_relay` 必须 `protocol_handshake_ok`。
+       只验"拒绝"会漏掉**误杀**：探活太严会把好段判死，接力直接起不来，比漏报更难查。
+
+    依赖：前四条纯标准库；第五条复用 `src/relay_transport.py` ⇒ **需要 numpy**
+    （CI 里由 `relay-gates.yml` 显式安装）。
+
+    只覆盖本机可判定的两路：`--ssh-ready`（心跳新鲜度）依赖真实设备，不适合进 CI。
+    """
+    failures: list[str] = []
+    live = socket.socket()
+    live.bind(("127.0.0.1", 0))
+    live.listen(1)
+    live_endpoint = f"127.0.0.1:{int(live.getsockname()[1])}"
+
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    dead_endpoint = f"127.0.0.1:{int(probe.getsockname()[1])}"
+    probe.close()                     # 立刻释放 ⇒ 该端口上没有监听者
+
+    try:
+        live_result = _check_tcp(live_endpoint, timeout=2.0)
+    finally:
+        live.close()
+    dead_result = _check_tcp(dead_endpoint, timeout=2.0)
+
+    if live_result.get("ok") is not True:
+        failures.append(f"活监听被判为不健康：{live_result}")
+    if dead_result.get("ok") is not False:
+        failures.append(f"已释放端口被判为健康：{dead_result}")
+
+    # ★ R-R9 断言 3 + 4：一个「接受后立刻 close」的假服务 —— 正是 §8.6 描述的现象。
+    fake = socket.socket()
+    fake.bind(("127.0.0.1", 0))
+    fake.listen(8)
+    fake_endpoint = f"127.0.0.1:{int(fake.getsockname()[1])}"
+    stop = threading.Event()
+
+    def _serve_fake() -> None:
+        while not stop.is_set():
+            try:
+                conn, _ = fake.accept()
+            except OSError:
+                return
+            try:
+                conn.close()          # 接受后立刻关闭 ⇒ §8.6 的「accept 后 reset」
+            except OSError:
+                pass
+
+    thread = threading.Thread(target=_serve_fake, daemon=True)
+    thread.start()
+    try:
+        fake_tcp = _check_tcp(fake_endpoint, timeout=2.0)
+        fake_probe = _probe_relay(fake_endpoint, timeout=2.0)
+    finally:
+        stop.set()
+        fake.close()
+    thread.join(timeout=3)
+
+    if fake_tcp.get("ok") is not True:
+        failures.append(f"假服务应让 _check_tcp 判健康（这是**已知漏报**，用于证明它不够）："
+                        f"{fake_tcp}")
+    if fake_probe.get("ok") is not False:
+        failures.append(f"假服务必须被 _probe_relay 判死（否则协议级探活失效）：{fake_probe}")
+
+    # 断言 4：只监听、不应答（`live.listen` 但不 accept/不回帧）⇒ 握手必须失败
+    silent = socket.socket()
+    silent.bind(("127.0.0.1", 0))
+    silent.listen(1)                 # 监听但从不 accept ⇒ 连接能建立、却永远等不到应答
+    silent_endpoint = f"127.0.0.1:{int(silent.getsockname()[1])}"
+    try:
+        silent_probe = _probe_relay(silent_endpoint, timeout=1.0)
+    finally:
+        silent.close()
+    if silent_probe.get("ok") is not False:
+        failures.append(f"只监听、不应答的端口必须被 _probe_relay 判死：{silent_probe}")
+
+    # ★ R-R9 断言 5：**协议活段必须被接受** —— 只验"拒绝"不够，还要验"**不误杀**"。
+    #   起一个最小**真协议**服务（`serve_relay_middle_connection` + 假 runner）：
+    #   **不需要模型、不需要 shim、不需要段工件** ⇒ 因此可以进 CI。
+    from relay_transport import serve_relay_middle_connection
+
+    class _AliveRunner:
+        """最小"活段"runner：只在有 hidden 请求时逐字节 +1（`CLOSE` 走不到它）。"""
+
+        def request_hidden(self, hidden: bytes, *, n_tokens: int) -> bytes:
+            return bytes((value + 1) % 256 for value in hidden)
+
+        def reset(self) -> None:
+            pass
+
+    alive_srv = socket.socket()
+    alive_srv.bind(("127.0.0.1", 0))
+    alive_srv.listen(4)
+    alive_endpoint = f"127.0.0.1:{int(alive_srv.getsockname()[1])}"
+    alive_stop = threading.Event()
+
+    def _serve_alive() -> None:
+        while not alive_stop.is_set():
+            try:
+                conn, _ = alive_srv.accept()
+            except OSError:
+                return
+            try:
+                serve_relay_middle_connection(conn, _AliveRunner(), n_embd=8, max_tokens=4)
+            except Exception:  # noqa: BLE001 - 自检里任何异常都不该把整个自检带塌
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    alive_thread = threading.Thread(target=_serve_alive, daemon=True)
+    alive_thread.start()
+    try:
+        alive_probe = _probe_relay(alive_endpoint, timeout=5.0)
+    finally:
+        alive_stop.set()
+        alive_srv.close()
+    alive_thread.join(timeout=3)
+    if alive_probe.get("ok") is not True:
+        failures.append(f"协议活段必须被 _probe_relay 接受（否则会**误杀真段**）：{alive_probe}")
+
+    for item in failures:
+        print(f"  - {item}")
+    print(f"[verdict] 健康检查自检{'失败' if failures else '通过'}"
+          f"（loopback：活={live_result.get('reason')} 死={dead_result.get('reason')} "
+          f"假服务 tcp={fake_tcp.get('reason')}/probe={fake_probe.get('reason')} "
+          f"沉默={silent_probe.get('reason')} 协议活段={alive_probe.get('reason')}）")
+    return 1 if failures else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="跨机接力健康检查（TCP 探活 + 心跳新鲜度）")
     ap.add_argument("--check", action="append", default=[], metavar="NAME=tcp:HOST:PORT",
                     help="TCP 探活一项，可重复")
+    ap.add_argument("--probe", action="append", default=[], metavar="NAME=tcp:HOST:PORT",
+                    help="★ R-R9：**协议级**探活（真做一次 Relay 握手，不经 runner、不加载模型）—— "
+                         "能发现 §8.6 那种「端口还在监听但对端已死」的情形；可重复")
     ap.add_argument("--ssh-ready", action="append", default=[], metavar="NAME=ALIAS:PATH",
                     help="经 ssh 读远端 ready 文件并检查心跳新鲜度，可重复")
     ap.add_argument("--stale-seconds", type=float, default=STALE_DEFAULT,
                     help=f"心跳过期阈值（秒，默认 {STALE_DEFAULT:g}）")
     ap.add_argument("--timeout", type=float, default=5.0, help="单项超时（秒）")
     ap.add_argument("--json", action="store_true", help="输出 JSON（供驱动 / CI 解析）")
+    ap.add_argument("--self-check", action="store_true",
+                    help="★ A10 + R-R9：CI 兜底自检 —— 用本机 loopback（活监听 / 已释放端口 / "
+                         "「接受后立刻 close」的假服务 / 只监听不应答）验证判定方向，"
+                         "不需要真机 / 网络；失败返回 1")
     args = ap.parse_args(argv)
     _enable_utf8_stdout()
 
-    if not args.check and not args.ssh_ready:
-        ap.error("至少给一个 --check 或 --ssh-ready")
+    if args.self_check:
+        # ★ A10：CI 兜底自检 —— 不探任何真实目标。
+        return self_check()
+
+    if not args.check and not args.ssh_ready and not args.probe:
+        ap.error("至少给一个 --check / --probe / --ssh-ready")
 
     results: list[dict[str, Any]] = []
     for item in args.check:
@@ -152,6 +397,12 @@ def main(argv: list[str] | None = None) -> int:
             ap.error(f"--check 需要 NAME=tcp:HOST:PORT，实得 {item!r}")
         results.append({"name": name, "kind": "tcp",
                         **_check_tcp(endpoint.removeprefix("tcp:"), timeout=args.timeout)})
+    for item in args.probe:
+        name, _, endpoint = item.partition("=")
+        if not name or not endpoint:
+            ap.error(f"--probe 需要 NAME=tcp:HOST:PORT，实得 {item!r}")
+        results.append({"name": name, "kind": "probe",
+                        **_probe_relay(endpoint.removeprefix("tcp:"), timeout=args.timeout)})
     for item in args.ssh_ready:
         name, _, target = item.partition("=")
         alias, _, path = target.partition(":")

@@ -15,6 +15,7 @@ pip 绑定的 `embeddings` 通道返回 `output_norm(H)`，**不能**当层接�
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from src.llama_keep_head import (  # noqa: E402
     KeepHeadUnavailable,
     KeepHeadUpstream,
     _add_dll_dirs,
+    _shim_abi_collides_with_llama_cpp,
 )
 
 SHIM = ROOT / "build" / "keephead" / "build-cpu" / "bin" / "qlh_keep_head.dll"
@@ -66,6 +68,136 @@ def test_dll_directory_handles_are_retained(monkeypatch, tmp_path):
 
     assert dirs == [str(dll_dir)]
     assert handles == [handle]
+
+
+# --------------------------------------------- ★ DLL basename 冲突（WinError 127 回归）
+def test_shim_dir_with_same_named_ggml_is_judged_colliding(tmp_path):
+    """★ 回归（2026-09-23，`WinError 127`）：带同名 `ggml-base.dll`/`ggml.dll` 的 shim 目录
+    必须被判为「与 pip llama_cpp 冲突」。
+
+    背景：keep-head 的 shim 经 `libllama.dll` 依赖**按 basename** 解析的 `ggml-base.dll`；
+    pip 的 `llama_cpp/lib` 用同名但更新的构建。Windows loader 对同一 basename 在进程内
+    **只认第一个加载的模块且不可撤销** ⇒ 谁先加载谁说了算。
+
+    实测差异（.venv-test / llama_cpp_python 0.3.35）——`llama_cpp/lib/ggml-base.dll` 导出，
+    而 `build/keephead/build-cpu/bin/ggml-base.dll` **不**导出：
+        `ggml_dsv4_hc_comb` / `ggml_dsv4_hc_pre` / `ggml_dsv4_hc_post` / `ggml_lightning_indexer`
+    ⇒ keep-head 先加载时，`CDLL(llama_cpp/lib/llama.dll)` 抛
+    `[WinError 127] 找不到指定的程序`；xdist worker 更早一步 `0xc0000139`
+    （＝STATUS_ENTRYPOINT_NOT_FOUND）。
+    """
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+    assert _shim_abi_collides_with_llama_cpp(shim_dir) is False, "空目录不应判为冲突"
+    (shim_dir / "ggml-base.dll").write_bytes(b"")
+    assert _shim_abi_collides_with_llama_cpp(shim_dir) is True, (
+        "带同名 ggml-base.dll 的 shim 目录必须判为冲突（否则就地加载会污染进程）")
+    (shim_dir / "ggml-base.dll").unlink()
+    (shim_dir / "ggml.dll").write_bytes(b"")
+    assert _shim_abi_collides_with_llama_cpp(shim_dir) is True, (
+        "带同名 ggml.dll 的 shim 目录必须判为冲突")
+
+
+def test_isolation_decision_is_order_independent(monkeypatch, tmp_path):
+    """★ 回归：隔离判据必须**顺序无关** —— 「keep-head 先加载、llama_cpp 后导入」也要隔离。
+
+    旧实现只判 `_llama_cpp_loaded()`（「pip llama_cpp 是否已导入」），只覆盖了一半方向：
+    llama_cpp 先导入 ⇒ 走 worker（安全）；keep-head 先导入 ⇒ **就地加载 shim**，
+    把 keep-head 的 ggml DLL 永久绑进进程 ⇒ 后续任何
+    `import llama_cpp.llama_cpp`（如 `tests/test_llama_relay_entry.py`）都以 WinError 127 失败。
+
+    本用例在「llama_cpp 未导入」的前提下，直接验证冲突目录会走 worker 分支 ——
+    即**不再**依赖导入顺序。
+    """
+    import src.llama_keep_head as kh
+
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+    (shim_dir / "ggml-base.dll").write_bytes(b"")
+    shim = shim_dir / "qlh_keep_head.dll"
+    shim.write_bytes(b"")
+    model = tmp_path / "m.gguf"
+    model.write_bytes(b"")
+
+    # 前置条件：pip llama_cpp **尚未**导入（正是旧实现漏掉的那一半）
+    monkeypatch.setattr(kh, "_llama_cpp_loaded", lambda: False)
+    went_to_worker = []
+    monkeypatch.setattr(kh.KeepHeadUpstream, "_init_isolated_worker",
+                        lambda self, **kw: went_to_worker.append(kw))
+
+    kh.KeepHeadUpstream(shim, model)
+    assert went_to_worker, (
+        "llama_cpp 未导入 + shim 目录有同名 ggml 时也必须走隔离 worker；"
+        "就地加载会把 keep-head 的 ggml 绑进进程，令后续 import llama_cpp 报 WinError 127")
+
+
+def test_isolated_worker_does_not_respawn_itself(monkeypatch, tmp_path):
+    """回归：worker 通过私有构造参数在子进程里直接加载 shim，不能递归 spawn。"""
+    import src.llama_keep_head as kh
+
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+    (shim_dir / "ggml-base.dll").write_bytes(b"")
+    shim = shim_dir / "qlh_keep_head.dll"
+    shim.write_bytes(b"")
+    model = tmp_path / "m.gguf"
+    model.write_bytes(b"")
+
+    monkeypatch.setattr(kh, "_llama_cpp_loaded", lambda: False)
+    spawned = []
+    monkeypatch.setattr(kh.KeepHeadUpstream, "_init_isolated_worker",
+                        lambda self, **kw: spawned.append(kw))
+
+    # worker 内不走继续隔离分支，而是落到就地 CDLL(shim)（此处 shim 是空文件 ⇒ 抛错即可）
+    with pytest.raises(KeepHeadUnavailable):
+        kh.KeepHeadUpstream(shim, model, _worker_process=True)
+    assert not spawned, "worker 进程内不得再次 spawn worker（会递归）"
+
+
+def test_worker_entry_opts_into_local_load_mode():
+    """Worker 只通过内部构造参数选择进程内加载。"""
+    source = (ROOT / "src" / "llama_keep_head_worker.py").read_text(encoding="utf-8")
+    call = source.index("upstream = KeepHeadUpstream(")
+    flag = source.index("_worker_process=True", call)
+    assert flag < source.index(")", call)
+
+
+def test_real_shim_isolated_before_host_llama_cpp_import(tmp_path):
+    """加载真实 keep-head shim 后，宿主进程仍可导入 pip llama.cpp。"""
+    if not SHIM.is_file() or not HEAD12.is_file():
+        pytest.skip("真实 keep-head shim/head 模型工件不齐全")
+
+    probe = r"""
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / "src"))
+from llama_keep_head import KeepHeadUpstream
+
+upstream = KeepHeadUpstream(
+    sys.argv[2], sys.argv[3], n_ctx=512, n_threads=2, n_batch=128,
+)
+assert upstream._worker is not None
+upstream.close()
+import llama_cpp.llama_cpp
+print("keep-head worker isolated; host llama_cpp import succeeded")
+"""
+    env = os.environ.copy()
+    env["QLH_KEEP_HEAD_IS_WORKER"] = "1"
+    env["QLH_KEEP_HEAD_WORKER_LOG"] = str(tmp_path / "keephead-worker.stderr.log")
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(ROOT), str(SHIM), str(HEAD12)],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, (
+        f"真实 shim worker 隔离回归失败。\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert "host llama_cpp import succeeded" in result.stdout
 
 
 # ------------------------------------------------------------------ 失败路径（不需要模型）
@@ -236,18 +368,38 @@ def test_token_entry_requires_shim_symbol():
 def test_token_symbol_argtypes_are_set():
     """★ 符号存在时**必须**设置 `argtypes`：否则 ctypes 把 64 位句柄按 `c_int` 处理 ⇒
     `OverflowError: int too long to convert`（实测踩到：服务端每次连接都失败）。"""
-    import ctypes
-
     shim = ROOT / "build" / "keephead" / "build-cpu" / "bin" / "qlh_keep_head.dll"
     if not shim.exists():
         pytest.skip("缺本机 shim（先跑 scripts/model_tools/build_keep_head_shim.ps1）")
-    lib = ctypes.CDLL(str(shim))
-    if not hasattr(lib, "qlh_kh_forward_embd_token"):
+    probe = r"""
+import ctypes
+import sys
+from pathlib import Path
+from src.llama_keep_head import _add_dll_dirs
+
+shim_path = Path(sys.argv[1])
+_, dll_dir_handles = _add_dll_dirs(shim_path.parent, sys.argv[2:])
+lib = ctypes.CDLL(str(shim_path))
+symbol = getattr(lib, "qlh_kh_forward_embd_token", None)
+if symbol is None:
+    raise SystemExit(77)
+symbol.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32, ctypes.c_int32,
+    ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
+    ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
+]
+assert symbol.argtypes[0] is ctypes.c_void_p
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(shim), *EXTRA_DLL_DIRS],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode == 77:
         pytest.skip("本机 shim 尚未包含 P4.5 末段入口")
-    lib.qlh_kh_forward_embd_token.argtypes = [
-        ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32, ctypes.c_int32,
-        ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
-        ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
-    ]
-    # 第一参数必须是 c_void_p（而不是 ctypes 的默认 c_int），否则 64 位句柄会溢出
-    assert lib.qlh_kh_forward_embd_token.argtypes[0] is ctypes.c_void_p
+    assert result.returncode == 0, (
+        "真实 keep-head shim ABI 检查失败；DLL 必须在子进程加载以避免污染 pytest worker。\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )

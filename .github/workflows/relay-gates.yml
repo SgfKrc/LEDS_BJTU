@@ -1,0 +1,52 @@
+# 接力闸门自检（CI 兜底）
+#
+# 为什么有它：`scripts/relay_quant_budget.py`（精度预算闸门）与 `scripts/relay_health.py`
+# （跨机健康检查）此前只在**本机有工件 / 有真机**时才跑 —— CI 里没有兜底，于是"闸门逻辑被改坏"
+# （最典型的一种：记录明明越线却不报红）只能靠人发现。
+#
+# 两者的 `--self-check` 用**合成输入**把判定方向钉死（不需要真机 / 工件 / 网络）：
+#   - 预算闸门：合格集必须 `safe`、越线集必须 `unsafe`，且 `--fail-on unsafe` 必须红；
+#   - 健康检查（★ R-R9 起为**五条**断言）：活监听判健康、已释放端口判死、
+#     **假服务**（accept 后立刻 close，复现 §8.6 现象）必须被判死、只监听不应答必须被判死、
+#     **协议活段必须被接受**（防"误杀真段"）。最后一条会真起一个最小协议服务
+#     （假 runner，**不需要模型 / shim / 段工件**）⇒ 复用 `src/relay_transport.py` ⇒ 需要 numpy。
+# 秒级、除 numpy 外零依赖 ⇒ 与 doc-checks 同级的兜底检查；**改动判定方向（该红不红 / 误杀）会让 CI 变红**
+# （负向回归见 tests/test_ci_relay_gates.py，用临时副本注入故障验证）。
+#
+# 注意：这**不是**真机检查 —— 跨机可用性（Surface / y700 / 隧道）仍需在本机跑
+# `relay_health.py --ssh-ready ...`（见 docs/跨框架接力-当前有效基线与后续优化计划-2026-09-21.md §8.5）。
+
+name: relay-gates
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  relay-gates:
+    runs-on: ubuntu-latest
+    env:
+      # 仓库里有中文输出；显式 UTF-8 避免平台差异带来的解码问题
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 闸门自检不读大文件，跳过 LFS smudge 以加快速度
+          lfs: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 预算脚本只 import 标准库；health 脚本的自检（★ R-R9 第五条）会真起一个最小协议服务，
+      # 复用 `src/relay_transport.py` ⇒ 需要 numpy。除此之外无依赖。
+      - name: Install relay_health self-check dependency
+        run: python -m pip install --quiet numpy
+
+      # 自检用**合成输入**钉住两条闸门的判定方向：该红的必须红（改坏判定方向 ⇒ CI 红）。
+      - name: Budget gate self-check（判定方向）
+        run: python scripts/relay_quant_budget.py --self-check
+
+      - name: Health gate self-check（判定方向）
+        run: python scripts/relay_health.py --self-check

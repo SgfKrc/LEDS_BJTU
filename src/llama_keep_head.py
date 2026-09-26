@@ -26,6 +26,15 @@ Python 侧**不直接 ctypes 调 libllama**：`llama_context_params` 是按值�
 * ``mode="layer_inp"``：配**整模工件** + `cut_layer=K`，取第 K 层输入（语义等价，
   但会跑满全部层，只适合数值对照）。
 
+⚠️ **层输出的实现通道（2026-09-23 起）**：上面两个模式现在都走 llama.cpp 的 `layer_inp`
+通道（shim 的 `qlh_kh_load` 里 `mode 0` ⇒ `lid = n_layer`，`mode 1` ⇒ `lid = cut_layer`）。
+`lid == n_layer` 是「第 n_layer 层的输入」= **末层输出（`output_norm` 之前）**，由 llama.cpp
+侧多分配一个槽位实现（见 `scripts/model_tools/patches/llama-cpp-layer-forward-api.patch`）。
+为什么不能继续用 `llama_set_embeddings_nextn`：各架构的 `t_h_nextn` 挂点不同（qwen2 在
+`output_norm` **之前**，qwen35 在**之后** —— 后者多一次 RMSNorm，实测会让 9B 接力首步分叉）。
+**目前登记该槽位的架构只有 `qwen2` 与 `qwen35`**；其他架构会因槽位为空而在 decode 时触发
+GGML_ASSERT（fail-closed，不会静默给出错值）。
+
 ⚠️ 运行时依赖：shim 由 MinGW 构建 ⇒ 除同目录的 `libllama.dll` / `ggml*.dll` 外还需要
 `libgcc_s_seh-1.dll` / `libstdc++-6.dll` / `libwinpthread-1.dll` 与 MSYS 的
 `api-ms-win-crt-*` 副本。本模块会依次把「shim 所在目录」与
@@ -55,12 +64,24 @@ SHIM_SYMBOLS = ("qlh_kh_load", "qlh_kh_forward", "qlh_kh_forward_embd",
 FORWARD_ERRORS = {
     -1: "参数非法（句柄 / tokens / 输出缓冲）",
     -2: "llama_decode 失败",
-    -3: "llama_get_embeddings_layer_inp 返回空（该层导出没打开？）",
-    -4: "llama_get_embeddings_nextn_ith 返回空（nextn 导出没打开，或该架构没把末层输出挂上？）",
+    -3: "llama_get_embeddings_layer_inp 返回空（该槽位导出没打开，或架构没登记该槽位）",
+    -4: "保留（旧 nextn 通道已停用：现统一走 layer_inp 的 n_layer 槽位）",
     -5: "参数非法（句柄 / embd / 输出缓冲）",
 }
 
 MODE_CODES = {"nextn": 0, "layer_inp": 1}
+
+
+def ctx_per_seq_for(n_ctx: int, n_seq_max: int) -> int:
+    """★ 2026-09-24：**每序列可用 ctx** = `n_ctx // n_seq_max`（`n_seq_max <= 0` 视为 1）。
+
+    llama.cpp 把 `n_ctx` 按 `n_seq_max` **均分**；单序列长 decode 一旦超过这个预算，就会在
+    **中途**报 "failed to find a memory slot for batch"（`llama_decode rc=1`）—— 症状是
+    `runner_failed`，与"模型算错"难以区分（实测：`n_ctx=2048 / n_seq_max=8` ⇒ 单序列仅 256
+    槽位，decode 到第 256 步即失败；`4096/8=512` ⇒ ~481 步；`8192/8=1024` ⇒ ~1000 步）。
+    抽成纯函数：既可单测，也便于调用方在启动前校验自己的 `prefill + gen` 预算。
+    """
+    return max(0, int(n_ctx)) // max(1, int(n_seq_max))
 
 
 class KeepHeadUnavailable(RuntimeError):
@@ -90,6 +111,38 @@ def _llama_cpp_loaded() -> bool:
                for name in sys.modules)
 
 
+def _shim_abi_collides_with_llama_cpp(shim_dir: Path) -> bool:
+    """shim 所在目录是否带**与 pip llama_cpp 同名**的 ggml DLL（⇒ 必须隔离进程）。
+
+    ★ 2026-09-23：这是 `WinError 127` 的根因所在，别退回「只在 llama_cpp 已加载时隔离」。
+
+    `qlh_keep_head.dll` 经 `libllama.dll` 依赖 **按 basename** 解析的 `ggml-base.dll` /
+    `ggml.dll`；而 pip 的 `llama_cpp/lib` 用的是**同名**文件但是**更新的** llama.cpp 构建。
+    Windows 的 loader 对同一 basename 在**进程生命周期内只认第一个加载的模块**，
+    且该绑定**不可撤销** —— `os.add_dll_directory` / `PATH` 之后怎么改都换不回来。
+
+    实测（.venv-test，llama_cpp_python 0.3.35）：
+      * `llama_cpp/lib/ggml-base.dll` 导出 `ggml_dsv4_hc_comb` / `_pre` / `_post` /
+        `ggml_lightning_indexer`；
+      * `build/keephead/build-cpu/bin/ggml-base.dll`（更早的构建）**不导出**这 4 个符号；
+      * 只要 keep-head 的 ggml 先被加载，随后 `import llama_cpp.llama_cpp` 就在
+        `CDLL(llama_cpp/lib/llama.dll)` 处抛
+        `RuntimeError: ... [WinError 127] 找不到指定的程序`
+        （xdist worker 更早一步：进程绑定期直接 `0xc0000139`＝STATUS_ENTRYPOINT_NOT_FOUND）。
+
+    ⚠️ 因此隔离判据**不能**是「llama_cpp 是否已导入」—— 那个方向只覆盖了一半：
+    llama_cpp 先导入 ⇒ 走 worker（安全）；keep-head 先导入 ⇒ 就地加载 shim（污染进程，
+    后续 `tests/test_llama_relay_entry.py` 的 `import llama_cpp.llama_cpp` 必炸）。
+    判据必须是「**同名依赖是否真的冲突**」这个**顺序无关**的事实。
+
+    没有同名 ggml 的 shim 目录（例如只带 MinGW 运行时的目录）不冲突 ⇒ 允许就地加载。
+    """
+    for name in ("ggml-base.dll", "ggml.dll"):
+        if (shim_dir / name).is_file():
+            return True
+    return False
+
+
 class KeepHeadUpstream:
     """最小 keep-head 上游：吃 token → 吐「前 K 层输出」`[n_tokens, n_embd]` f32。
 
@@ -109,6 +162,7 @@ class KeepHeadUpstream:
         n_batch: int = 512,
         n_seq_max: int = 1,
         extra_dll_dirs: Sequence[str] = (),
+        _worker_process: bool = False,
     ) -> None:
         if mode not in MODE_CODES:
             raise KeepHeadUnavailable(f"mode 必须是 {sorted(MODE_CODES)}，实得 {mode!r}")
@@ -127,7 +181,29 @@ class KeepHeadUpstream:
 
         self._worker = None
         self.n_seq_max = max(1, int(n_seq_max))
-        if _llama_cpp_loaded():
+        # ★ 2026-09-24：**每序列可用 ctx** —— llama.cpp 把 `n_ctx` 按 `n_seq_max` **均分**，
+        #   单序列长 decode 一旦超过 `n_ctx / n_seq_max` 就会在中途报 llama.cpp 的
+        #   "failed to find a memory slot for batch"（`llama_decode rc=1`），现象是 `runner_failed`，
+        #   与"模型算错"难以区分（实测：tail 段 `n_ctx=2048 / n_seq_max=8` ⇒ 单序列仅 **256** 槽位，
+        #   decode 到第 256 步即失败）。这里把不变式**显式暴露**出来，调用方应据此校验自己的
+        #   `prefill + gen` 预算；`n_seq_max > 1` 时额外给一行告警。
+        self.ctx_per_seq = ctx_per_seq_for(n_ctx, self.n_seq_max)
+        if self.n_seq_max > 1:
+            print(f"[keep-head][warn] n_seq_max={self.n_seq_max} ⇒ 每序列 ctx ≈ "
+                  f"{self.ctx_per_seq}（n_ctx={n_ctx} 被均分）；单序列长 decode 请用 n_seq_max=1 "
+                  f"或把 n_ctx 放大到 {self.n_seq_max} 倍", file=sys.stderr, flush=True)
+        # ★ 隔离判据必须**顺序无关**（2026-09-23 修 `WinError 127`）：
+        #   旧代码只判 `_llama_cpp_loaded()` ⇒ 「keep-head 先加载、llama_cpp 后导入」这一半
+        #   会就地加载 shim，把 keep-head 的 ggml-base.dll/ggml.dll 永久绑进进程，
+        #   后续 `import llama_cpp.llama_cpp` 便以 WinError 127 失败（详见
+        #   `_shim_abi_collides_with_llama_cpp` 的实测说明）。
+        #   现在：同名的 shim 目录**一律**走独立 worker（两个方向都安全）；
+        #   llama_cpp 已导入时也仍然走 worker（保持原有行为与理由）。
+        #   ⚠️ 但 worker 进程自身必须**就地**加载 shim —— 它就是隔离边界，再隔离就是递归。
+        shim_dir = self.shim_path.parent
+        needs_isolation = (_llama_cpp_loaded()
+                           or _shim_abi_collides_with_llama_cpp(shim_dir))
+        if needs_isolation and not _worker_process:
             self._init_isolated_worker(
                 n_ctx=n_ctx, n_threads=n_threads, n_batch=n_batch,
                 n_seq_max=self.n_seq_max,
@@ -191,6 +267,10 @@ class KeepHeadUpstream:
         lib.qlh_kh_close.restype = None
         lib.qlh_kh_reset.argtypes = [ctypes.c_void_p]
         lib.qlh_kh_reset.restype = None
+        # ★ 2026-09-24：**可选**符号 —— 透出最近一次 `llama_decode` 的原始 rc（旧 shim 无此符号）。
+        if hasattr(lib, "qlh_kh_last_error"):
+            lib.qlh_kh_last_error.argtypes = [ctypes.c_void_p]
+            lib.qlh_kh_last_error.restype = ctypes.c_int32
 
         n_embd_out = ctypes.c_int32(0)
         n_layer_out = ctypes.c_int32(0)
@@ -307,6 +387,27 @@ class KeepHeadUpstream:
         except (KeyError, TypeError, ValueError) as exc:
             raise KeepHeadUnavailable("keep-head worker returned invalid hidden") from exc
 
+    def last_decode_error(self) -> int:
+        """★ 2026-09-24：最近一次 `llama_decode` 的**原始**返回码（0 = 无错误，或旧 shim）。
+
+        与 `qlh_kh_forward*` 的稳定返回码（-2 = "decode 失败"）不同，这里给的是 **llama.cpp 自己**
+        的错误码 —— 长时 decode 在特定 ctx 下失败时，只有它能区分"KV/ctx 相关"与"参数/状态相关"。
+        旧版 shim 没有 `qlh_kh_last_error` ⇒ 返回 0（向后兼容）。
+        """
+        if self._lib is None or self._handle is None:
+            return 0
+        if not hasattr(self._lib, "qlh_kh_last_error"):
+            return 0
+        try:
+            return int(self._lib.qlh_kh_last_error(self._handle))
+        except Exception:  # noqa: BLE001 - 诊断信息绝不能变成新的失败点
+            return 0
+
+    def _decode_error_suffix(self) -> str:
+        """把 `last_decode_error()` 渲染成可读后缀（为 0 时返回空串）。"""
+        value = self.last_decode_error()
+        return f"（shim 记录 llama_decode rc={value}）" if value else ""
+
     def forward_tokens_to_hidden(self, tokens: Sequence[int], *, n_past: int = 0):
         """跑模型（`nextn` 模式即前 K 层），返回 `[n_tokens, n_embd]` 的 f32 hidden。"""
         import numpy as np
@@ -325,7 +426,8 @@ class KeepHeadUpstream:
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
         if rc != 0:
             raise KeepHeadUnavailable(
-                f"keep-head 前向失败 rc={rc}：{FORWARD_ERRORS.get(rc, '未知错误码')}")
+                f"keep-head 前向失败 rc={rc}：{FORWARD_ERRORS.get(rc, '未知错误码')}"
+                f"{self._decode_error_suffix()}")
         return out
 
     def forward_hidden_to_token(self, hidden, *, n_past: int = 0,
@@ -343,7 +445,10 @@ class KeepHeadUpstream:
         """
         import numpy as np
 
-        if not hasattr(self._lib, "qlh_kh_forward_embd_token"):
+        # ⚠️ worker 隔离路径下符号在**子进程**里（`self._lib` 为 None）⇒ 本检查只对就地加载有意义。
+        #    漏掉这个前置条件会把「worker 模式」误判成「缺符号」（实测踩到：主进程一旦 import 过
+        #    llama_cpp / 或 shim 目录带同名 ggml，就会走 worker，然后这里必然抛"缺符号"）。
+        if self._worker is None and not hasattr(self._lib, "qlh_kh_forward_embd_token"):
             raise KeepHeadUnavailable(
                 f"{self.shim_path} 缺 qlh_kh_forward_embd_token（末段能力）"
                 "—— 需用含 P4.5 入口的 shim 重新编译")
@@ -391,7 +496,8 @@ class KeepHeadUpstream:
             ctypes.byref(out_token))
         if rc != 0:
             raise KeepHeadUnavailable(
-                f"keep-head 末段前向失败 rc={rc}：{FORWARD_ERRORS.get(rc, '未知错误码')}")
+                f"keep-head 末段前向失败 rc={rc}：{FORWARD_ERRORS.get(rc, '未知错误码')}"
+                f"{self._decode_error_suffix()}")
         return int(out_token.value)
 
     def forward_hidden_to_hidden(self, hidden, *, n_past: int = 0,
@@ -447,7 +553,8 @@ class KeepHeadUpstream:
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
         if rc != 0:
             raise KeepHeadUnavailable(
-                f"keep-head embd 前向失败 rc={rc}：{FORWARD_ERRORS.get(rc, '未知错误码')}")
+                f"keep-head embd 前向失败 rc={rc}：{FORWARD_ERRORS.get(rc, '未知错误码')}"
+                f"{self._decode_error_suffix()}")
         return out
 
     @staticmethod

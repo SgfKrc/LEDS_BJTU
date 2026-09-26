@@ -57,7 +57,10 @@ def _whole_tokens(whole: Path, prompt: list[int], gen: int, threads: int) -> lis
     import numpy as np
 
     params = M.llama_context_default_params()
-    params.n_ctx = len(prompt) + gen + 8
+    # ★ 2026-09-24：余量从 8 提到 256 —— 旧值紧贴 `len(prompt) + gen`，一旦 llama.cpp 的
+    #   ctx 分配/取整策略变化就会在长 decode 中途失败（同一类坑见
+    #   `KeepHeadUpstream.ctx_per_seq` 的说明）。
+    params.n_ctx = len(prompt) + gen + 256
     params.n_batch = max(512, len(prompt))
     params.n_ubatch = params.n_batch
     params.n_threads = int(threads)
@@ -105,6 +108,207 @@ def _stat(values: list[float]) -> dict[str, object]:
             "min": round(min(values), 3), "max": round(max(values), 3)}
 
 
+def _segment_builds(args) -> dict[str, object]:
+    """逐段收集**构建标识**（§10.2 待办）：本地段直接收集，远端段读 ready 文件，否则显式 unknown。
+
+    为什么必须落进记录：`engines` 过去是固定字符串 ⇒ 无法回答「这一段实际用哪套 llama.cpp 构建」，
+    而那正是同一 head 段下 **pip 末段 1/32 与 shim 末段 32/32** 的分界（见文档 §10.7）。
+    远端段没给 ready 文件时宁可写 `remote_unknown`，也不省略字段 —— 记录要能区分「未知」与「没写」。
+    """
+    from relay_segment_info import (  # noqa: PLC0415
+        collect_local_build,
+        load_ready_build,
+        unknown_remote_build,
+    )
+
+    digest = bool(getattr(args, "digest_artifacts", False))
+    segments: dict[str, object] = {}
+
+    if args.head_endpoint:
+        ready = getattr(args, "head_ready_file", None)
+        segments["head"] = {
+            "runner": "relay_mid_service --role head（远端）",
+            "endpoint": args.head_endpoint,
+            "build": (load_ready_build(ready) if ready
+                      else unknown_remote_build(args.head_endpoint)),
+        }
+    else:
+        segments["head"] = {
+            "runner": "llama_keep_head.KeepHeadUpstream",
+            "mode": "nextn",
+            "channel": "keep_head_layer_out",
+            "build": collect_local_build(shim=args.shim, model=args.head_model,
+                                         digest_artifacts=digest),
+        }
+
+    if getattr(args, "middle_endpoint", None):
+        ready = getattr(args, "middle_ready_file", None)
+        segments["middle"] = {
+            "runner": "relay_mid_service --role middle（远端）",
+            "endpoint": args.middle_endpoint,
+            "build": (load_ready_build(ready) if ready
+                      else unknown_remote_build(args.middle_endpoint)),
+        }
+
+    ready = getattr(args, "tail_ready_file", None)
+    segments["tail"] = {
+        "runner": "relay_mid_service --role tail（远端；shim 或 pip 绑定由该服务决定）",
+        "endpoint": args.tail_endpoint,
+        "build": (load_ready_build(ready) if ready
+                  else unknown_remote_build(args.tail_endpoint)),
+    }
+    return segments
+
+
+def _parse_mid_layers(raw: str | None) -> tuple[int, int] | None:
+    """★ #30：解析 `--mid-layers` 的 `K1-K2`（与工件文件名同义，如 `8-16`）。非法 ⇒ `None`。"""
+    if not raw:
+        return None
+    text = str(raw).strip().replace("_", "-")
+    left, _, right = text.partition("-")
+    if not left.isdigit() or not right.isdigit():
+        return None
+    start, end = int(left), int(right)
+    return (start, end) if 0 <= start < end else None
+
+
+def _manifest_layers(path) -> tuple[int, int] | None:
+    """★ #30：从段工件的 manifest 读 `source_layer_range`（区间 `[start,end)`）。
+
+    manifest 由 `scripts/cut_layers.py`（生成时自带）或 `scripts/relay_artifact_manifest.py`
+    （对早期工件**事后补录**）产出 ⇒ 工件**从此可自证**自己覆盖哪几层。
+    读不到 / 格式非法一律返回 `None`（调用方据此回落到显式参数或 `unverified`，**不猜**）。
+    """
+    if not path:
+        return None
+    try:
+        payload = json.loads(Path(str(path)).read_text(encoding="utf-8"))
+        span = payload.get("source_layer_range")
+        start, end = int(span[0]), int(span[1])
+    except (OSError, ValueError, TypeError, KeyError, IndexError):
+        return None
+    return (start, end) if 0 <= start < end else None
+
+
+def _discover_manifest(path) -> str | None:
+    """★ #30：`<artifact>.gguf` ⇒ 试 `<artifact>.gguf.manifest.json`（`relay_artifact_manifest.py` 的默认落点）。
+
+    找不到就返回 `None`（**不报错** —— 缺 manifest 是常态，只意味着退回到"人填层范围"）。
+    """
+    if not path:
+        return None
+    candidate = Path(str(path) + ".manifest.json")
+    return str(candidate) if candidate.is_file() else None
+
+
+def _respect_manifests(args) -> dict[str, str]:
+    """★ #30：用 manifest 补齐**未显式给出**的层覆盖参数（显式参数永远优先）。
+
+    优先级：显式 `--*-layers` > 显式 `--*-manifest` > 自动发现（`<head-model>.manifest.json`）。
+    只补空位，**绝不覆盖**已经由人显式给出的值。返回实际用到的 manifest 路径（写进证据）。
+    """
+    used: dict[str, str] = {}
+
+    # head：[0, K) —— 显式 `--head-manifest` 优先；否则自动试 `<head-model>.manifest.json`
+    head_manifest = getattr(args, "head_manifest", None)
+    if not head_manifest and getattr(args, "head_model", None):
+        head_manifest = _discover_manifest(args.head_model)
+    if head_manifest and not getattr(args, "head_layers", None):
+        span = _manifest_layers(head_manifest)
+        if span:
+            args.head_layers = str(span[1])
+            used["head"] = str(head_manifest)
+
+    # middle：[K1, K2)
+    if getattr(args, "mid_manifest", None) and not getattr(args, "mid_layers", None):
+        span = _manifest_layers(args.mid_manifest)
+        if span:
+            args.mid_layers = f"{span[0]}-{span[1]}"
+            used["middle"] = str(args.mid_manifest)
+
+    # tail：[K2, N)
+    if getattr(args, "tail_manifest", None) and getattr(args, "tail_start", None) is None:
+        span = _manifest_layers(args.tail_manifest)
+        if span:
+            args.tail_start = span[0]
+            used["tail"] = str(args.tail_manifest)
+
+    return used
+
+
+def _layer_coverage(args) -> dict[str, object]:
+    """★ #30：校验各段层覆盖**恰好铺满 `[0,total)` 且不重叠**，并给出可落进证据的结论。
+
+    为什么需要它：L→L 路径此前**不校验**「head 工件覆盖 + 中段来源起点 == 末段起点」，也没有任何东西
+    要求各段恰好铺满 ⇒ **缺层 / 重复层静默通过**，只在 `per-token argmax` 上表现为不一致
+    （与"代码算错"同型）。2026-09-26 已因"端点实际载的工件与记录不符"误判过一次。
+
+    返回值（写进证据的 `layer_coverage` 字段）：
+    - `status="verified"`：四元组齐全且**恰好铺满**，附 `segments` 明细；
+    - `status="invalid"`：齐全但**不衔接 / 重叠 / 越界**，`detail` 说明原因；
+    - `status="unverified"`：参数不全或格式非法 ⇒ **不拦**（默认只 WARN），但证据里明确标出。
+    """
+    head_layers = getattr(args, "head_layers", None)
+    mid_raw = getattr(args, "mid_layers", None)
+    tail_start = getattr(args, "tail_start", None)
+    total = getattr(args, "total_layers", None)
+    spec = {
+        "head_layers": head_layers, "mid_layers": mid_raw,
+        "tail_start": tail_start, "total_layers": total,
+    }
+
+    if not head_layers or tail_start is None or not total:
+        return {"status": "unverified", "spec": spec,
+                "detail": "缺少 --head-layers / --tail-start / --total-layers"}
+
+    try:
+        head_end = int(head_layers)
+        total = int(total)
+        tail_start = int(tail_start)
+    except (TypeError, ValueError):
+        return {"status": "unverified", "spec": spec, "detail": "层数参数非整数"}
+
+    mid = _parse_mid_layers(mid_raw)
+    if mid_raw and mid is None:
+        return {"status": "unverified", "spec": spec, "detail": f"--mid-layers 非法: {mid_raw!r}"}
+
+    if getattr(args, "middle_endpoint", None):
+        # 三段：head [0,K) + middle [K1,K2) + tail [K2,N)
+        if mid is None:
+            return {"status": "unverified", "spec": spec,
+                    "detail": "三段拓扑需要 --mid-layers（如 `8-16`）"}
+        mid_start, mid_end = mid
+        if head_end != mid_start:
+            detail = f"head 终点 {head_end} != middle 起点 {mid_start}（缺口或重叠）"
+        elif mid_end != tail_start:
+            detail = f"middle 终点 {mid_end} != tail 起点 {tail_start}（缺口或重叠）"
+        elif not (0 < head_end < total) or not (mid_end < total):
+            detail = f"切点越界：head_end={head_end} mid_end={mid_end} total={total}"
+        else:
+            detail = ""
+        return {
+            "status": "verified" if not detail else "invalid",
+            "detail": detail,
+            "spec": spec,
+            "segments": {"head": [0, head_end], "middle": [mid_start, mid_end],
+                         "tail": [tail_start, total]},
+        }
+
+    # 两段：head [0,K) + tail [K,N)
+    if head_end != tail_start:
+        detail = f"head 终点 {head_end} != tail 起点 {tail_start}（缺口或重叠）"
+    elif not (0 < head_end < total):
+        detail = f"切点越界：head_end={head_end} total={total}"
+    else:
+        detail = ""
+    return {
+        "status": "verified" if not detail else "invalid",
+        "detail": detail,
+        "spec": spec,
+        "segments": {"head": [0, head_end], "tail": [tail_start, total]},
+    }
+
+
 def main() -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -130,8 +334,61 @@ def main() -> int:
     ap.add_argument("--gen", type=int, default=32)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--shim", default="build/keephead/build-cpu/bin/qlh_keep_head.dll")
+    ap.add_argument("--hidden-quant", default="none",
+                    choices=("none", "f16", "int8_block128", "int4_block128"),
+                    help="★ A5：上行（本机 → 远端段）的 hidden 压缩档。判据仍是 **per-token argmax**；"
+                         "远端段必须能处理同一档位（旧对端看到非零 flags 会 fail-closed 拒）")
     ap.add_argument("--json-out", default=None)
+    ap.add_argument("--tail-ready-file", default=None,
+                    help="★ 末段服务端的 ready 文件（内含构建标识）⇒ 记录里逐段写 runner/构建")
+    ap.add_argument("--middle-ready-file", default=None, help="★ 中段服务端的 ready 文件")
+    ap.add_argument("--head-ready-file", default=None, help="★ 远端 head 段的 ready 文件")
+    ap.add_argument("--digest-artifacts", action="store_true",
+                    help="★ 对段工件也算 sha256（GB 级文件会明显变慢；默认只记大小/名字）")
+    # ★ #30（2026-09-26）：**层覆盖校验** —— 工件名自带的层范围**不可自证**
+    #   （`head*/mid*/tail*` 这批无 manifest；裁层生成器只覆盖 `block_count`、不记录层号重命名），
+    #   而 L→L 路径此前**完全不做**覆盖校验 ⇒ 缺层 / 重复层会静默通过、只表现为数值不一致
+    #   （与"代码算错"同型，实测已误判过一次）。这里要求显式给出每段层区间，校验
+    #   **恰好铺满 `[0, total)` 且不重叠**；参数不全时不拦、只标 `unverified`（加 `--strict-coverage` 才失败）。
+    ap.add_argument("--head-manifest", default=None,
+                    help="★ #30：head 段工件的 manifest（据 `source_layer_range` 自动填 `--head-layers`）；"
+                         "缺省时自动试 `<--head-model>.manifest.json`")
+    ap.add_argument("--mid-manifest", default=None,
+                    help="★ #30：middle 段工件的 manifest（自动填 `--mid-layers`）")
+    ap.add_argument("--tail-manifest", default=None,
+                    help="★ #30：tail 段工件的 manifest（自动填 `--tail-start`）")
+    ap.add_argument("--head-layers", default=None,
+                    help="★ #30：上游 head 段覆盖层数 K（区间 `[0,K)`）；不给则记 unverified")
+    ap.add_argument("--mid-layers", default=None,
+                    help="★ #30：中段覆盖区间 `K1-K2`（与文件名同义，如 `8-16`）")
+    ap.add_argument("--tail-start", type=int, default=None,
+                    help="★ #30：末段起点 K2（区间 `[K2,total)`）")
+    ap.add_argument("--total-layers", type=int, default=None,
+                    help="★ #30：整模层数 N（应与 --whole-model 一致）")
+    ap.add_argument("--strict-coverage", action="store_true",
+                    help="★ #30：层覆盖参数不全或校验不通过时**直接失败**（默认只 WARN + 记 unverified）")
     args = ap.parse_args()
+
+    # ★ #30：先用 manifest 补齐**未显式给出**的层覆盖参数（显式参数永远优先），再做校验。
+    used_manifests = _respect_manifests(args)
+    if used_manifests:
+        print(f"[coverage] 从 manifest 自动读入层范围：{used_manifests}", file=sys.stderr)
+
+    coverage = _layer_coverage(args)
+    # ★ #30：证据里留痕 —— 这些层范围是**从哪个 manifest 读来的**（便于事后自证）。
+    coverage["manifests"] = used_manifests
+    if coverage["status"] == "invalid":
+        detail = f"层覆盖校验不通过：{coverage['detail']}"
+        if args.strict_coverage:
+            raise SystemExit(f"FAIL: {detail}")
+        print(f"[warn] {detail}", file=sys.stderr)
+    elif coverage["status"] == "unverified":
+        detail = ("未提供完整层覆盖参数"
+                  "（--head-layers / --mid-layers / --tail-start / --total-layers）"
+                  "⇒ 证据记 unverified，**无法排除载错工件**")
+        if args.strict_coverage:
+            raise SystemExit(f"FAIL: {detail}")
+        print(f"[warn] {detail}", file=sys.stderr)
 
     # ★ P4.5 健康检查：**先探活** —— 放在最前面，避免为一次注定失败的运行白跑整模对照；
     # 也把"远端段已退出"与"模型算错"分开（见 `_preflight` docstring）。
@@ -168,7 +425,7 @@ def main() -> int:
         if not args.head_model:
             raise SystemExit("FAIL: 需要 --head-model（本地上游）或 --head-endpoint（远端上游）")
         upstream = KeepHeadUpstream(str(Path(args.shim).resolve()), args.head_model,
-                                    mode="nextn", n_ctx=len(prompt) + int(args.gen) + 8,
+                                    mode="nextn", n_ctx=len(prompt) + int(args.gen) + 256,
                                     n_threads=int(args.threads),
                                     n_batch=max(512, len(prompt)), n_seq_max=1)
         n_embd = int(upstream.n_embd)
@@ -197,10 +454,12 @@ def main() -> int:
                 n_tok = int(hidden.shape[0])
             t_head = time.perf_counter()
             if middle is not None:
-                payload = middle.request_hidden(payload, n_tokens=n_tok)
+                # ★ A5：上行按档位压缩（远端解回 f32；旧对端会 fail-closed 拒非零 flags）。
+                payload = middle.request_hidden(payload, n_tokens=n_tok,
+                                                quant=args.hidden_quant)
                 used_middle += 1
             t_mid = time.perf_counter()
-            token = tail.request_token(payload, n_tokens=n_tok)
+            token = tail.request_token(payload, n_tokens=n_tok, quant=args.hidden_quant)
             t_tail = time.perf_counter()
             seg_ms["head"].append((t_head - t_step) * 1000.0)
             if middle is not None:
@@ -237,9 +496,17 @@ def main() -> int:
             "downstream": "relay_transport.RelayTcpClient.request_token",
         },
         "engines": "纯 llama.cpp（无 torch / 无 D 档组件参与推理）",
+        # ★ 2026-09-23（§10.2）：**逐段**写出实际 runner 与构建标识（shim/libllama 摘要、
+        #   pip llama_cpp 版本、段工件大小/摘要）。远端段没给 ready 文件时显式记 remote_unknown。
+        "segment_engines": _segment_builds(args),
+        # ★ #30（2026-09-26）：**层覆盖**是否已校验（`verified` / `invalid` / `unverified`）。
+        #   此前证据里既没有层号、也不校验各段衔接 ⇒ 载错工件**无法自证**（见 `docs/已知问题记录.md` #30）。
+        "layer_coverage": coverage,
         "endpoints": {"tail": args.tail_endpoint, "middle": args.middle_endpoint},
         "load": {"prompt": args.prompt, "prefill_tokens": len(prompt), "gen_tokens": int(args.gen),
                  "n_embd": n_embd},
+        # ★ 2026-09-23（A5）：上行 hidden 压缩档（`none` = f32 原样）。判据仍是 per-token argmax。
+        "hidden_quant": args.hidden_quant,
         "tokens_relay": tokens,
         "tokens_baseline": baseline,
         "verdict": {"criterion": "per_token_argmax", "passed": passed,

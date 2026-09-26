@@ -1,8 +1,8 @@
-# Kllama
+# K-Llama
 
-Kllama (Llama for Koakuma) is a distributed inference core for heterogeneous edge devices. The mainline is the lightweight GGUF/llama.cpp engine; the repository also owns a PyTorch layered-distribution engine plus a **layer pipeline** (including cross-framework layer relay), and the user-facing entry point is a cross-platform TUI.
+K-Llama (Llama for Koakuma) is a distributed inference core for heterogeneous edge devices. The mainline is the lightweight GGUF/llama.cpp engine; the repository also owns a PyTorch layered-distribution engine plus a **layer pipeline** (including cross-framework layer relay), and the user-facing entry point is a cross-platform TUI.
 
-> **Independent project · not official**: Kllama is an **independent** student innovation project (Beijing Jiaotong University, 2026) with **no affiliation, sponsorship or endorsement from the llama.cpp project**, and it does not represent that project's position. It is **built on llama.cpp** (a **descriptive reference** only — no ownership of or trademark claim to "llama.cpp", "llama" or any upstream name is asserted). Upstream components keep their own licenses and version pins, unchanged by this project's use of them.
+> **Independent project · not official**: K-Llama is an **independent** student innovation project (Beijing Jiaotong University, 2026) with **no affiliation, sponsorship or endorsement from the llama.cpp project**, and it does not represent that project's position. It is **built on llama.cpp** (a **descriptive reference** only — no ownership of or trademark claim to "llama.cpp", "llama" or any upstream name is asserted). Upstream components keep their own licenses and version pins, unchanged by this project's use of them.
 
 > Status: the main-repository baseline is being reorganized (2026-09-21, baseline `610f4b3`)
 >
@@ -30,7 +30,7 @@ The engine is **dual-track**, and both tracks live in the main repository - this
 
 ## Architecture Overview
 
-Kllama is **two layers in one process**: a control plane aimed at people, and an engine layer aimed at
+K-Llama is **two layers in one process**: a control plane aimed at people, and an engine layer aimed at
 machines and protocols. There is exactly one boundary between them — the layer-range contract
 `(layer_range, engine, location)`.
 
@@ -71,7 +71,7 @@ approximation".
 
 ## Is This System Software or User Software?
 
-**Layered answer**: Kllama ships as **a system-software core plus a user-software shell**.
+**Layered answer**: K-Llama ships as **a system-software core plus a user-software shell**.
 
 - **Control plane ≈ user software**: TUI, model assets, node/layout/queue/log/settings pages, HTTP API.
   Its users are **people**; the failure mode is degraded experience (retry, switch model, switch
@@ -302,7 +302,7 @@ The main project keeps no image-generation runtime or assets; image generation b
 
 | Path | Content |
 | --- | --- |
-| `src/` | Kllama main code: control plane, engines, layer-segment/layer-pipeline contracts, TUI (grouped below) |
+| `src/` | K-Llama main code: control plane, engines, layer-segment/layer-pipeline contracts, TUI (grouped below) |
 | `tests/` | pytest suite (TUI, RPC/layer-segment, scheduling, contracts, doc gates) |
 | `scripts/` | Verification, experiment, environment and documentation tools (`edge_preflight.py`, `android_validation.py`, `llama_rpc_*.py`, `doc_maintenance_audit.py`, ...) |
 | `docs/` | Current documents; historical and migrated content lives in `docs/archive/` |
@@ -311,7 +311,7 @@ The main project keeps no image-generation runtime or assets; image generation b
 | `local_docs/` | Local experiment and acceptance raw records; not a public source interface |
 | `runtime/` | Runtime logs and the llama.cpp runtime directory |
 | `qlh.py` / `qlh_edge.py` | Interactive TUI/CLI entry point and Edge entry point |
-| `qlh.bat` / `qlh.sh` / `kllama.*` / `bjtu.*` / `koakuma.*` | Launchers; `kllama` is the **recommended alias**, `bjtu`/`koakuma` are compatibility aliases, and the canonical entry script is still `qlh.py` |
+| `qlh.bat` / `qlh.sh` / `K-Llama.*` / `bjtu.*` / `koakuma.*` | Launchers; `K-Llama` is the **recommended alias**, `bjtu`/`koakuma` are compatibility aliases, and the canonical entry script is still `qlh.py` |
 | `start_tui.*` / `start_backend.bat` / `setup_all_envs.*` | One-click start and multi-environment install scripts |
 | `requirements*.txt` / `pytest.ini` / `pyrightconfig.json` / `reasonix.toml` | Dependency lists and tool configuration |
 | `models/`, `chat_history/`, `dist/`, `build/`, `test-results/`, `logs/`, `_to_delete/` | Local artifacts or archive areas, not in Git (`logs/`, `_to_delete/` are gitignored) |
@@ -421,7 +421,7 @@ When the local backend is not running, `qlh chat` starts it in a daemon thread o
 
 Write operations are initiated from the shell: the models screen uses `L` to load / `U` to unload, the queue screen uses `P` pause-resume / `S` policy / `C` clear queued, and the chat screen supports `/model`, `/queue`, `/new`, `/resume`, `/rename`, `/sessions`, `/delete-session`, `/reset`; destructive and long-running operations first show a confirmation box. Model control endpoints are allowed by default on loopback; to control a main node remotely the main node must configure `QLH_MODEL_API_TRUSTED_CIDRS`.
 
-On Windows you can use `qlh.bat` (or `kllama.bat`) directly; on Linux/macOS use `qlh.sh` (or `kllama.sh`). `kllama` is the recommended alias and `bjtu`/`koakuma` are compatibility launchers; all of them forward to the same entry script `qlh.py`. The unified repository entry point is still `qlh`.
+On Windows you can use `qlh.bat` (or `K-Llama.bat`) directly; on Linux/macOS use `qlh.sh` (or `K-Llama.sh`). `K-Llama` is the recommended alias and `bjtu`/`koakuma` are compatibility launchers; all of them forward to the same entry script `qlh.py`. The unified repository entry point is still `qlh`.
 
 The TUI's 9 feature screens are the main interaction and acceptance boundary:
 
@@ -496,7 +496,8 @@ The very same suite runs twice — in **CI** ([`.github/workflows/checks.yml`](.
 
 - [Current D-to-L Baseline and Optimization Plan (2026-09-21)](跨框架接力-当前有效基线与后续优化计划-2026-09-21.md)
 - [KTransformers optimization-transfer research and algorithmic/data-layer directions](KTransformers优化迁移调研与算法数据层优化方向-2026-09-23.md)
-- [Large-file split plan: scheduler.py and api_server.py](大文件拆解计划-scheduler与api_server-2026-09-23.md)
+- [Large-file split plan (archived): scheduler.py and api_server.py](archive/refactor/大文件拆解计划-scheduler与api_server-2026-09-23.md)
+- [Open Work Memo (non-parallel group)](未完成工作备忘-2026-09-23.md)
 - [Test Quality Audit (2026-09-21): Parallel Flakiness and Race-Coverage Gaps](archive/misc/测试质量审计-2026-09-21.md)
 - [P4.5 Proposal: Dynamic Master Election and Distributed Management](主节点动态选举与分布式管理-P4.5立项-2026-09-21.md)
 - [Mainline Development Plan: Distributed Inference and Edge Optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md)

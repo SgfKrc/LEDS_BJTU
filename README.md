@@ -1,8 +1,8 @@
-# Kllama
+# K-Llama
 
-Kllama（Llama for Koakuma）是一个面向异构边缘设备的分布式推理核心：主线是 GGUF/llama.cpp 轻量引擎，主仓同样拥有 PyTorch 分层分布式引擎与**层流水线**（含跨框架逐层接力），用户交互入口是跨平台 TUI。
+K-Llama（Llama for Koakuma）是一个面向异构边缘设备的分布式推理核心：主线是 GGUF/llama.cpp 轻量引擎，主仓同样拥有 PyTorch 分层分布式引擎与**层流水线**（含跨框架逐层接力），用户交互入口是跨平台 TUI。
 
-> **独立项目 · 非官方**：Kllama 是一个**独立的**学生创新项目（北京交通大学 2026 大创），**与 llama.cpp 项目没有隶属、赞助或背书关系**，也不代表其官方立场。项目**基于 llama.cpp 构建**（在此作**描述性引用**，不主张对 "llama.cpp"、"llama" 或任何上游名称的所有权或商标权）。上游组件保留其自身许可证与版本锁定，不因本项目的引用而改变。
+> **独立项目 · 非官方**：K-Llama 是一个**独立的**学生创新项目（北京交通大学 2026 大创），**与 llama.cpp 项目没有隶属、赞助或背书关系**，也不代表其官方立场。项目**基于 llama.cpp 构建**（在此作**描述性引用**，不主张对 "llama.cpp"、"llama" 或任何上游名称的所有权或商标权）。上游组件保留其自身许可证与版本锁定，不因本项目的引用而改变。
 
 > 状态：主仓基线重整中（2026-09-21）
 >
@@ -31,7 +31,7 @@ Kllama（Llama for Koakuma）是一个面向异构边缘设备的分布式推理
 
 ## 架构总览
 
-Kllama 是**一个进程里的两层**：面向人的控制面，以及面向机器与协议的引擎层。两层之间只有一条
+K-Llama 是**一个进程里的两层**：面向人的控制面，以及面向机器与协议的引擎层。两层之间只有一条
 边界 —— 层段合同 `(layer_range, engine, location)`。
 
 ```
@@ -68,7 +68,7 @@ prompt → torch(0..7) →hidden→ Surface(8..15) →hidden→ y700(16..19) →
 
 ## 这是什么软件：系统软件还是用户软件？
 
-**分层回答**：Kllama 是**系统软件内核 + 用户软件外壳**的同体交付。
+**分层回答**：K-Llama 是**系统软件内核 + 用户软件外壳**的同体交付。
 
 - **控制面 ≈ 用户软件**：TUI、模型资产、节点/布局/队列/日志/设置页面、HTTP API。使用者是**人**，
   失败模式是"体验退化"（重试、换模型、换布局），接口可以演进。
@@ -299,7 +299,7 @@ TUI 与 API 顶层只需知道**聚合资源**（GPU/CPU/内存）和"是否分�
 
 | 路径 | 内容 |
 | --- | --- |
-| `src/` | Kllama 主代码：控制面、引擎、层段/层流水线合同、TUI（分组见下） |
+| `src/` | K-Llama 主代码：控制面、引擎、层段/层流水线合同、TUI（分组见下） |
 | `tests/` | pytest 套件（TUI、RPC/层段、调度、合同、文档门） |
 | `scripts/` | 验证、实验、环境与文档工具（`edge_preflight.py`、`android_validation.py`、`llama_rpc_*.py`、`doc_maintenance_audit.py` 等） |
 | `docs/` | 现行文档；历史与已迁移内容在 `docs/archive/` |
@@ -308,7 +308,7 @@ TUI 与 API 顶层只需知道**聚合资源**（GPU/CPU/内存）和"是否分�
 | `local_docs/` | 本地实验与验收原始记录；不作为公开源码接口 |
 | `runtime/` | 运行期日志与 llama.cpp 运行时目录 |
 | `qlh.py` / `qlh_edge.py` | 交互 TUI/CLI 入口与 Edge 入口 |
-| `qlh.bat` / `qlh.sh` / `kllama.*` / `bjtu.*` / `koakuma.*` | 启动器；`kllama` 为**推荐别名**，`bjtu`、`koakuma` 为兼容别名，统一入口脚本仍是 `qlh.py` |
+| `qlh.bat` / `qlh.sh` / `K-Llama.*` / `bjtu.*` / `koakuma.*` | 启动器；`K-Llama` 为**推荐别名**，`bjtu`、`koakuma` 为兼容别名，统一入口脚本仍是 `qlh.py` |
 | `start_tui.*` / `start_backend.bat` / `setup_all_envs.*` | 一键启动与多环境安装脚本 |
 | `requirements*.txt` / `pytest.ini` / `pyrightconfig.json` / `reasonix.toml` | 依赖清单与工具配置 |
 | `models/`、`chat_history/`、`dist/`、`build/`、`test-results/`、`logs/`、`_to_delete/` | 本地产物或归档区，不入 Git（`logs/`、`_to_delete/` 已 gitignore） |
@@ -416,7 +416,7 @@ python qlh.py models
 
 写操作从外壳发起：模型屏 `L` 加载 / `U` 卸载，队列屏 `P` 暂停-恢复 / `S` 策略 / `C` 清空排队，聊天屏可用 `/model`、`/queue`、`/new`、`/resume`、`/rename`、`/sessions`、`/delete-session`、`/reset`；破坏性与长耗时操作都会先弹确认框。模型控制接口按 loopback 默认放行，远程控制主节点需主节点配置 `QLH_MODEL_API_TRUSTED_CIDRS`。
 
-Windows 可直接使用 `qlh.bat`（或 `kllama.bat`），Linux/macOS 可使用 `qlh.sh`（或 `kllama.sh`）。`kllama` 是推荐别名，`bjtu`/`koakuma` 是兼容启动器；三者都转发到同一个入口脚本 `qlh.py`。
+Windows 可直接使用 `qlh.bat`（或 `K-Llama.bat`），Linux/macOS 可使用 `qlh.sh`（或 `K-Llama.sh`）。`K-Llama` 是推荐别名，`bjtu`/`koakuma` 是兼容启动器；三者都转发到同一个入口脚本 `qlh.py`。
 
 TUI 的 9 个功能屏是主交互和验收边界：
 
@@ -498,7 +498,8 @@ python -m venv .venv-test
 - [同进程双后端接力实现与性能](docs/archive/relay/同进程双后端接力实现与性能-2026-09-16.md)
 - [跨框架接力当前有效基线与后续优化计划](docs/跨框架接力-当前有效基线与后续优化计划-2026-09-21.md)
 - [KTransformers 优化迁移调研与算法数据层优化方向](docs/KTransformers优化迁移调研与算法数据层优化方向-2026-09-23.md)
-- [大文件拆解计划：scheduler.py 与 api_server.py](docs/大文件拆解计划-scheduler与api_server-2026-09-23.md)
+- [大文件拆解计划（已归档）：scheduler.py 与 api_server.py](docs/archive/refactor/大文件拆解计划-scheduler与api_server-2026-09-23.md)
+- [未完成工作备忘（非并行组）](docs/未完成工作备忘-2026-09-23.md)
 - [测试质量审计（2026-09-21）：并行 flaky 实测与竞态覆盖差距](docs/archive/misc/测试质量审计-2026-09-21.md)
 - [P4.5 立项：主节点动态选举与配套分布式管理](docs/主节点动态选举与分布式管理-P4.5立项-2026-09-21.md)
 - [引擎单序列与并发性能对比](docs/archive/relay/引擎单序列与并发性能对比-2026-09-16.md)

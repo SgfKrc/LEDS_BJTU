@@ -171,6 +171,18 @@ USE_COMPILE = True                           # 算子融合（仅 FP16+CUDA 有�
 #: ⚠️ 不要改成「编译整个 Qwen2Model 再用于分段」：它的 forward 会 apply `self.norm`，与分段语义不符
 #:    （实测 B vs A 的逐 token argmax 从 decode 第 1 步就分叉）。
 USE_MONOLITHIC_FORWARD = False
+
+#: ★ R-R7 rank3（2026-09-24 实测）：把各层 `RMSNorm` 的
+#:   `.to(f32) → pow(2) → mean → rsqrt → weight* → .to(f16)` **六个算子**换成**一次 `F.rms_norm`**。
+#: 依据（`build/cross-framework-layer-poc/rank_ablation.py`，qwen2.5-0.5b / 12 层 / gen=40 / CUDA-f16）：
+#:   `ms/step` **13.389 → 12.358（−7.7 %）**；cProfile 计数 `Tensor.to` **2173 → 205（−91 %）**、
+#:   `Tensor.pow`/`mean`/`rsqrt` 各 984 → **0**。
+#: ⚠️ **收益主要来自「顺带消掉那 1968 次 `.to`」**，而不是融合 kernel 本身 —— 该路径是
+#:   CPU/launch-bound（cProfile 真算力仅 31 %），`.to` 本应是 no-op 却仍走 dispatch。
+#: **判据**：带 `lm_head` 的真 logits 下 **per-token argmax 完全一致**（含与「RoPE 免 cat」叠加）。
+#: 默认 **False** ⇒ 既有路径行为完全不变；置 True 或 `QLH_USE_FUSED_RMSNORM=1` 启用。
+#: ⚠️ 只按**实例**替换（不 patch transformers 的类）⇒ 不波及其他模型/用途。
+USE_FUSED_RMSNORM = _env_bool("QLH_USE_FUSED_RMSNORM", default=False)
 #: torch.compile 的序列长度上限（2026-09-18 实测）：compile 在短序列有收益，但随生成步数
 #: 变长而劣化 —— gen=24 1.904× → 64 1.372× → **141 步 0.672×（反而慢 1.49×）**，
 #: 根因是 KV 增长使形状反复变化、`torch._dynamo` 的 `recompile_limit` 被 hybrid KV 的
@@ -398,6 +410,20 @@ PIPELINE_ASSIGNMENT_STALE_SECONDS = _env_float(
     "QLH_PIPELINE_ASSIGNMENT_STALE_SECONDS", 86400.0, min_val=60.0, max_val=31536000.0,
 )
 
+# ★ A1 / X 档（2026-09-24）：**Relay 段委托总开关，默认关**。
+# 关闭时调度层完全走既有路径（pytorch-only 层流水线），Relay 调用次数为 0。
+# 开启后也只对"在 LAYER_FORWARD 里显式携带合法 `relay_segment` 规格（middle 角色）"
+# 的节点生效 —— 见 `scheduler_pipeline._normalize_relay_segment` 与
+# `_handle_layer_forward_via_relay`。跨机通道仍只允许 loopback / 本地 SSH 隧道端点。
+PIPELINE_RELAY_ENABLED = _env_bool("QLH_RELAY_ENABLED", False)
+
+# ★ A1 / X 档（2026-09-24）：**哪些节点由远端 relay 段代跑本段**（主节点侧配置）。
+# 格式：`<node_id>=<role>@<host>:<port>#<n_embd>`，多条用 `;` 或 `,` 分隔，例如
+#   QLH_RELAY_SEGMENTS="worker-2=middle@127.0.0.1:50183#896;worker-3=middle@127.0.0.1:50184#896"
+# 只对 `QLH_RELAY_ENABLED=1` 生效；端点必须是 loopback（跨机走本地 SSH 隧道）。
+# 默认空 ⇒ 不下发任何 `relay_segment`，行为与接线前**完全一致**。不合法的条目整条丢弃。
+PIPELINE_RELAY_SEGMENTS = _env_first("QLH_RELAY_SEGMENTS", default="")
+
 # 图算法智能编排阈值：节点数超过此值（>5）时自动启用最大带宽生成树 + DFS，
 # 替代纯算力权重分配；节点数 ≤ 阈值时回退到简单排序（权重比例分配）
 GRAPH_ORCHESTRATOR_THRESHOLD = 5         # 节点数 > 5 启用图算法，≤ 5 使用简单排序
@@ -407,7 +433,11 @@ PIPELINE_TIMEOUT = 120                   # 流水线单步超时（秒），含�
 PIPELINE_MODEL_SYNC_TIMEOUT = _env_float(
     "QLH_PIPELINE_MODEL_SYNC_TIMEOUT", 60.0, min_val=1.0, max_val=600.0,
 )                                           # 等待从节点同步模型和分层 ACK
-PIPELINE_MAX_CONCURRENT = 1              # 最大并发流水线任务数（当前仅支持 1，串行执行）
+# ⚠️ **未接线**（全仓仅此一处定义、**无消费者**）：它只说明「D 档层流水线是串行的」，
+# 真正的串行由 `src/scheduler.py` 的 `_pipeline_lock` 保证。多请求交叠落地后再接线
+# （并行组 P1「多请求/多序列交叠」），在那之前**不要**把它当生效配置读。
+# 见 docs/未完成工作备忘-2026-09-23.md 的 A3。
+PIPELINE_MAX_CONCURRENT = 1              # 最大并发流水线任务数（当前仅支持 1，串行执行；**未接线**）
 # CPU-only workers may need tens of seconds for the first layer forward over
 # a DERP/Tailscale path.  Keep this configurable so deployments can tune it
 # to their slowest participating node without changing source code.

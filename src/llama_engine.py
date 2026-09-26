@@ -105,6 +105,25 @@ def _new_llama_with_seq_max(load_kwargs: Dict[str, Any], n_seq_max: Optional[int
         _lc.llama_context_default_params = original_default_params
 
 
+def _model_n_pos_per_embd(native_model, llama_cpp_module) -> int:
+    """每个 token 的**位置分量数**（M-RoPE 模型为 4，其余为 1）。
+
+    与 llama.cpp 的 `llama_hparams::n_pos_per_embd()` 对齐：`MROPE` / `IMROPE` ⇒ 4。
+    为什么需要它：`embd` 注入通道下 llama.cpp 按 **planar** 布局取 `pos`
+    （`llama-batch.cpp::llama_batch_allocr::ubatch_add`：
+    `src_off = batch.token ? 0 : j*batch.n_tokens`）⇒ 调用方必须提供
+    `n_tokens * n_pos_per_embd` 个位置；只给 n_tokens 个会让 M-RoPE 模型读到越界位置。
+    见 `forward_layers_from_hidden()`（层段接力的下游入口）。
+    """
+    try:
+        rope = int(llama_cpp_module.llama_model_rope_type(native_model))
+    except AttributeError:   # 老绑定没有该 API ⇒ 只能按单分量处理（等价于修复前的行为）
+        return 1
+    mrope = int(getattr(llama_cpp_module, "LLAMA_ROPE_TYPE_MROPE", 8))
+    imrope = int(getattr(llama_cpp_module, "LLAMA_ROPE_TYPE_IMROPE", 40))
+    return 4 if rope in (mrope, imrope) else 1
+
+
 class LlamaCppEngine:
     """
     llama.cpp 推理引擎 — 面向 CPU / 集显环境优化。
@@ -1421,11 +1440,41 @@ class LlamaCppEngine:
             "system_percent": mem.percent,
         }
 
+    @property
+    def model_name(self) -> str:
+        """★ 2026-09-24：本引擎**实际加载的**模型名（供 `/status` 等消费者使用）。
+
+        取值顺序：GGUF 自带的 `general.name`（最真实；实测 `qwen35-2b-Q4_K_M.gguf`
+        ⇒ `"Qwen3 5 2b"`）→ GGUF **文件名**（去扩展名）→ 父目录名 → 空串。
+
+        ⚠️ **绝不**返回与"实际加载了什么"无关的静态默认值。此前的缺陷正是：
+        `get_model_info()` 不报 `model_name` ⇒ 消费方各自兜底到静态 `config.MODEL_NAME`
+        （= 默认 0.6B）⇒ 加载 2B 却对外报 `Qwen/Qwen3-0.6B`。
+        根因与实测证据见 `docs/未完成工作备忘-2026-09-23.md` §4.8 B2。
+        """
+        if not self._model_path:
+            return ""
+        model = getattr(self, "_model", None)
+        if model is not None:
+            try:
+                metadata = getattr(model, "metadata", None) or {}
+                name = str(metadata.get("general.name", "") or "").strip()
+                if name:
+                    return name
+            except Exception:  # noqa: BLE001 - 元数据读不到就回退，绝不因它报错
+                pass
+        try:
+            path = Path(self._model_path)
+            return path.stem or path.parent.name or ""
+        except Exception:  # noqa: BLE001
+            return ""
+
     def get_model_info(self) -> dict:
         """获取模型基本信息。"""
         info = {
             "engine": "llama.cpp",
             "model_path": self._model_path,
+            "model_name": self.model_name,
             "quant_type": self._quant_type,
             "n_ctx": self._n_ctx,
             "n_threads": self._n_threads,
@@ -1573,14 +1622,19 @@ class LlamaCppEngine:
             if len(pos_list) != n_tokens:
                 raise ValueError(f"positions 长度 {len(pos_list)} != n_tokens {n_tokens}")
 
-        batch = M.llama_batch_init(n_tokens, n_embd, 1)
+        # ★ M-RoPE（Qwen3.5 等，n_pos_per_embd = 4）：**embd 注入通道**下 llama.cpp 按 planar 取
+        #   位置 ⇒ 必须先用倍数分配、再把同一位置广播到各分量（与 token 通道语义一致）。
+        #   只填 n_tokens 个会让 M-RoPE 模型读到越界位置 ⇒ 位置语义错、argmax 首步即分叉。
+        n_pos_per_embd = _model_n_pos_per_embd(native_model, M)
+        batch = M.llama_batch_init(n_tokens * n_pos_per_embd, n_embd, 1)
         try:
             for i in range(n_tokens):
                 batch.n_seq_id[i] = 1
                 batch.seq_id[i][0] = seq_list[i]
                 # ★ 每个 token 都可能是「某条序列的末位」⇒ logits 全开（下游只跑少数 token，开销可接受）
                 batch.logits[i] = 1
-                batch.pos[i] = pos_list[i]
+                for j in range(n_pos_per_embd):
+                    batch.pos[j * n_tokens + i] = pos_list[i]
             batch.n_tokens = n_tokens
             ctypes.memmove(batch.embd, h.ctypes.data, h.nbytes)
             rc = M.llama_decode(native_ctx, batch)

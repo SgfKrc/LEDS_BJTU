@@ -69,6 +69,20 @@ _LAYER_FORWARD_OFFER_FIELDS = {
     "hidden_spec",
 }
 
+#: ★ 2026-09-23：层段 offer 的**可选**字段（出现才允许；缺省 = 旧行为）。
+#: * `middle_channel` —— 中间段取 hidden 的通道，允许值见 `_LAYER_FORWARD_MIDDLE_CHANNELS`，
+#:   与 Android JNI 能力上报的同名键**同值**：`keep_head_layer_out` = 末层输出
+#:   （`output_norm` **之前**，层段接力所需的形态）；`extract_hidden` = `output_norm(H)`（旧默认）。
+#: ⚠️ **不能**并入 `_LAYER_FORWARD_OFFER_FIELDS`：那里的字段集合是**精确**校验（缺失即
+#: `field_mismatch`）⇒ 会把可选字段变成必填、破坏既有对端（实测踩到）。可选字段在
+#: `_validate_payload` 里按「payload 是否真的出现」动态放宽。
+_LAYER_FORWARD_OPTIONAL_FIELDS = {"middle_channel", "seq_ids", "positions"}
+
+#: `middle_channel` 的允许值（协议两侧必须同集合）。
+#: * `extract_hidden` —— `llama_get_embeddings_ith` 通道，返回 `output_norm(H)`（旧默认）；
+#: * `keep_head_layer_out` —— `layer_inp` 的 `lid == n_layer` 槽位，返回**末层输出**。
+_LAYER_FORWARD_MIDDLE_CHANNELS = {"extract_hidden", "keep_head_layer_out"}
+
 #: 层段 `stage_result` 的结果字段：**放在 `output` 或 `metadata` 对象内**，不扩顶层。
 #: 原因：`stage_result` 的 payload 里没有 `stage_type`，无法按类型做动态字段校验；
 #: 而 `output` / `metadata` 本就是自由对象（仅校验类型与摘要一致性），可安全承载。
@@ -347,11 +361,37 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
         expected_fields.add("resource_gate")
     if "layer_ranges" in capabilities:
         expected_fields.add("layer_ranges")
+    # ★ 2026-09-23：中间段通道能力（可选，向后兼容）—— 让调度侧知道该节点中间段
+    #   实际能走哪条通道（值域同 `_LAYER_FORWARD_MIDDLE_CHANNELS`）；缺失 = 未声明。
+    if "middle_channel" in capabilities:
+        expected_fields.add("middle_channel")
+    # ★ 2026-09-23：M-RoPE 模型的位置分量数（1 或 4）—— 供调度侧构造 hidden spec / 判据用。
+    if "n_pos_per_embd" in capabilities:
+        expected_fields.add("n_pos_per_embd")
     _require_exact_fields(
         capabilities,
         expected_fields,
         "payload.capabilities",
     )
+    if "middle_channel" in capabilities:
+        channel = _require_string(
+            capabilities["middle_channel"], "payload.capabilities.middle_channel",
+        )
+        if channel not in _LAYER_FORWARD_MIDDLE_CHANNELS:
+            raise _error(
+                "invalid_capabilities", "payload.capabilities.middle_channel",
+                "middle_channel must be one of "
+                + ", ".join(sorted(_LAYER_FORWARD_MIDDLE_CHANNELS)),
+            )
+    if "n_pos_per_embd" in capabilities:
+        n_pos = _require_int(
+            capabilities["n_pos_per_embd"], "payload.capabilities.n_pos_per_embd", minimum=1,
+        )
+        if n_pos not in {1, 4}:
+            raise _error(
+                "invalid_capabilities", "payload.capabilities.n_pos_per_embd",
+                "n_pos_per_embd must be 1 or 4",
+            )
     stage_types = capabilities["stage_types"]
     if not isinstance(stage_types, list) or not stage_types:
         raise _error(
@@ -517,6 +557,9 @@ def _validate_payload(
         and payload.get("stage_type") == "layer_forward"
     ):
         required = required | _LAYER_FORWARD_OFFER_FIELDS
+        # ★ 2026-09-23：**可选**层段字段只在 payload 里**真的出现**时放宽 —— 精确校验是双向的，
+        #   提前并入会把它们变成必填、破坏既有对端（实测踩到）。
+        required = required | (_LAYER_FORWARD_OPTIONAL_FIELDS & set(payload))
     _require_exact_fields(payload, required, "payload")
     if message_type == "hello":
         _require_string(payload["node_id"], "payload.node_id", pattern=_SAFE_ID)
@@ -625,6 +668,39 @@ def _validate_payload(
                     "unsupported_hidden_dtype", "payload.hidden_spec.dtype",
                     "hidden dtype must be float32 or float16",
                 )
+            # ★ 2026-09-23：`middle_channel` 可选；一旦出现必须落在允许集合内（fail-closed）。
+            #   字段不存在 = `extract_hidden`（旧行为），因此不破坏既有对端。
+            if "middle_channel" in payload:
+                channel = _require_string(
+                    payload["middle_channel"], "payload.middle_channel",
+                )
+                if channel not in _LAYER_FORWARD_MIDDLE_CHANNELS:
+                    raise _error(
+                        "unsupported_middle_channel", "payload.middle_channel",
+                        "middle_channel must be one of "
+                        + ", ".join(sorted(_LAYER_FORWARD_MIDDLE_CHANNELS)),
+                    )
+            # ★ 2026-09-23（A12）：**多序列显式位置**（可选）—— `seq_ids` / `positions`
+            #   长度必须等于 `hidden_spec.n_tokens`，且每个元素是非负整数；与 Android 侧
+            #   `layerForward(seqIds=…, positions=…)` 同一契约（多序列交错推进时必需）。
+            n_tokens = int(hidden_spec["n_tokens"])
+            for field in ("seq_ids", "positions"):
+                if field not in payload:
+                    continue
+                values = payload[field]
+                if not isinstance(values, (list, tuple)) or len(values) != n_tokens:
+                    raise _error(
+                        f"invalid_{field}", f"payload.{field}",
+                        f"{field} must be a list of length n_tokens ({n_tokens})",
+                    )
+                for index, item in enumerate(values):
+                    # 错误码与 Android 侧一致（`invalid_<field>`）：长度与取值问题都归同一码，
+                    # 便于两侧对账；不用通用 `_require_int`（那会抛 `invalid_integer`）。
+                    if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                        raise _error(
+                            f"invalid_{field}", f"payload.{field}[{index}]",
+                            f"{field} entries must be non-negative integers",
+                        )
         elif "layer_range" in payload or "handoff_at" in payload:
             # 非层段 stage 不得携带层段字段（精确字段集已拦，这里是双保险）
             raise _error(

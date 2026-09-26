@@ -19,6 +19,22 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import api_server  # noqa: E402
 import scheduler  # noqa: E402
+from api import (  # noqa: E402
+    routes_auth,
+    routes_chat,
+    routes_cluster,
+    routes_device,
+    routes_health,
+    routes_logs,
+    routes_models,
+    routes_sessions,
+    routes_system,
+    routes_tasks,
+)
+from scheduler_cluster import SchedulerClusterMixin  # noqa: E402
+from scheduler_pipeline import SchedulerPipelineMixin  # noqa: E402
+from scheduler_sidecars import SchedulerSidecarMixin  # noqa: E402
+from scheduler_task_worker import SchedulerTaskWorkerMixin  # noqa: E402
 from scheduler import (  # noqa: E402
     NodeInfo,
     NodeRole,
@@ -118,6 +134,34 @@ def test_scheduler_source_scan_covers_current_and_split_modules() -> None:
     sources = _scheduler_sources()
     assert sources
     assert all(path.exists() and path.read_text(encoding="utf-8") for path in sources)
+
+
+def test_scheduler_sidecars_are_mixin_methods_with_facade_factory() -> None:
+    assert issubclass(Scheduler, SchedulerSidecarMixin)
+    assert Scheduler.configure_gemma4_pipeline_sidecar is (
+        SchedulerSidecarMixin.configure_gemma4_pipeline_sidecar
+    )
+    instance = Scheduler()
+    assert instance._qwen3_multisidecar_factory() is scheduler.Qwen3PipelineMultiSidecar
+
+
+def test_scheduler_split_mixins_preserve_facade_patch_points(monkeypatch) -> None:
+    instance = Scheduler()
+    assert issubclass(Scheduler, SchedulerTaskWorkerMixin)
+    assert issubclass(Scheduler, SchedulerClusterMixin)
+    assert issubclass(Scheduler, SchedulerPipelineMixin)
+    assert "_effective_role" not in SchedulerClusterMixin.__dict__
+    assert Scheduler._on_tcp_message.__qualname__.startswith("Scheduler.")
+    assert Scheduler.register_node is SchedulerClusterMixin.register_node
+    assert Scheduler._run_pipeline is SchedulerPipelineMixin._run_pipeline
+    assert Scheduler._send_task_worker_hello is SchedulerTaskWorkerMixin._send_task_worker_hello
+
+    monkeypatch.setattr(scheduler, "RUN_MODE", "facade-patch-probe")
+    assert instance.get_status()["run_mode"] == "facade-patch-probe"
+
+    enabled = scheduler.TASK_WORKER_EXPERIMENTAL_ENABLED
+    monkeypatch.setattr(scheduler, "TASK_WORKER_EXPERIMENTAL_ENABLED", not enabled)
+    assert instance.get_task_worker_protocol_status()["experiment_enabled"] is not enabled
 
 
 def test_effective_role_reads_scheduler_runtime_global(monkeypatch) -> None:
@@ -287,7 +331,7 @@ def test_api_openapi_path_method_snapshot_is_stable() -> None:
 
 
 def test_api_log_route_order_keeps_literal_routes_before_path_parameter() -> None:
-    routes = list(api_server.app.routes)
+    routes = list(routes_logs.router.routes)
     recent = [
         index for index, route in enumerate(routes)
         if route.path == "/api/logs/recent" and "GET" in (route.methods or set())
@@ -299,6 +343,82 @@ def test_api_log_route_order_keeps_literal_routes_before_path_parameter() -> Non
 
     assert recent and wildcard
     assert max(recent) < min(wildcard)
+
+
+def test_api_router_slice_preserves_facade_handlers_and_route_order() -> None:
+    expected = {
+        routes_health: 4,
+        routes_device: 3,
+        routes_cluster: 66,
+        routes_models: 23,
+        routes_auth: 12,
+        routes_sessions: 10,
+        routes_tasks: 4,
+        routes_chat: 7,
+        routes_system: 3,
+        routes_logs: 12,
+    }
+    assert api_server._api_route_modules == tuple(expected)
+    for module, count in expected.items():
+        assert module._api_module is api_server
+        assert len(module.router.routes) == count
+        for route in module.router.routes:
+            assert getattr(api_server, route.endpoint.__name__) is route.endpoint
+
+    assert api_server.health is routes_health.health
+    assert api_server.get_status is routes_health.get_status
+    assert api_server.get_device_profile is routes_device.get_device_profile
+    assert api_server.get_recent_logs is routes_logs.get_recent_logs
+    assert api_server.read_log_file is routes_logs.read_log_file
+    assert api_server.get_cluster_status is routes_cluster.get_cluster_status
+    assert api_server.list_models is routes_models.list_models
+    assert api_server.auth_login is routes_auth.auth_login
+    assert api_server.create_session is routes_sessions.create_session
+    assert api_server.list_workflows is routes_tasks.list_workflows
+    assert api_server.chat is routes_chat.chat
+    assert api_server.system_shutdown is routes_system.system_shutdown
+
+
+def test_api_routers_cover_every_openapi_operation() -> None:
+    from collections import Counter
+
+    def normalize_route_path(path: str) -> str:
+        return path.replace(":path}", "}")
+
+    routed = Counter(
+        (normalize_route_path(route.path), method.lower())
+        for module in api_server._api_route_modules
+        for route in module.router.routes
+        if route.include_in_schema
+        for method in route.methods or ()
+    )
+    openapi = Counter(
+        (path, method)
+        for path, operations in api_server.app.openapi()["paths"].items()
+        for method in operations
+    )
+    assert sum(routed.values()) == 144
+    assert routed == openapi
+
+
+def test_api_facade_no_longer_owns_endpoint_definitions() -> None:
+    tree = ast.parse((ROOT / "src" / "api_server.py").read_text(encoding="utf-8"))
+    route_methods = {"get", "post", "put", "patch", "delete", "api_route"}
+    remaining = [
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(
+            isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Attribute)
+            and isinstance(decorator.func.value, ast.Name)
+            and decorator.func.value.id == "app"
+            and decorator.func.attr in route_methods
+            for decorator in node.decorator_list
+        )
+    ]
+    assert remaining == []
+
 
 
 @pytest.mark.parametrize(

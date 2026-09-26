@@ -74,7 +74,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         raise SystemExit(f"FAIL: 输入形状必须是非空二维数组，实得 {hidden.shape}")
 
     up = KeepHeadUpstream(args.shim, args.model, mode=args.mode, cut_layer=args.cut_layer,
-                          n_ctx=int(hidden.shape[0]) + 8, n_threads=args.threads,
+                          n_ctx=int(hidden.shape[0]) + 256, n_threads=args.threads,
                           n_seq_max=1, n_batch=max(512, int(hidden.shape[0])))
     try:
         out = up.forward_hidden_to_hidden(hidden, n_past=0)

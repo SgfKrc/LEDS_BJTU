@@ -2586,6 +2586,109 @@ class TestP6SameModelSwitchShortCircuit:
         assert len(calls) == 3
 
 
+class TestFusedRMSNorm:
+    """★ R-R7 rank3：`_apply_fused_rmsnorm`（`F.rms_norm` 融合）的语义与**作用范围**回归。
+
+    判据纪律：这里只验「替换谁 / 数值是否等价 / 默认是否零副作用」；**端到端收益与 per-token
+    argmax 一致性**已在真模型上实测（`build/cross-framework-layer-poc/rank_ablation.py`：
+    qwen2.5-0.5b / 12 层 / gen=40，`ms/step` **13.389 → 12.358（−7.7%）**、带 `lm_head` 的
+    真 logits **argmax 逐 token 完全一致**；cProfile `Tensor.to` 2173 → 205）。
+    """
+
+    class _RMSNorm(nn.Module):
+        """与 `transformers` 的 `Qwen2RMSNorm` 同形（6 算子版）。"""
+
+        def __init__(self, size: int, eps: float = 1e-6):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(size))
+            self.variance_epsilon = eps
+
+        def forward(self, x):
+            dtype = x.dtype
+            x = x.to(torch.float32)
+            variance = x.pow(2).mean(-1, keepdim=True)
+            return self.weight * (x * torch.rsqrt(variance + self.variance_epsilon)).to(dtype)
+
+    def test_replaces_only_rmsnorm_with_weight_and_eps(self):
+        from model_module import _apply_fused_rmsnorm
+
+        class RMSNormWithoutWeight(nn.Module):
+            def forward(self, x):
+                return x
+
+        class MyLayerNorm(nn.Module):          # 名字不含 RMSNorm ⇒ 必须不动
+            def __init__(self, size):
+                super().__init__()
+                self.weight = nn.Parameter(torch.ones(size))
+
+            def forward(self, x):
+                return x
+
+        model = nn.Sequential(self._RMSNorm(8), RMSNormWithoutWeight(), MyLayerNorm(8))
+        target, skipped, untouched = model[0], model[1], model[2]
+        untouched_before = untouched.forward
+        skipped_before = skipped.forward
+
+        assert _apply_fused_rmsnorm(model) == 1
+
+        assert target.forward is not self._RMSNorm.forward    # 被换成闭包
+        assert untouched.forward == untouched_before          # LayerNorm 原样
+        assert skipped.forward == skipped_before              # 缺 weight 的跳过
+
+    def test_fused_numerics_match_reference(self):
+        from model_module import _apply_fused_rmsnorm
+
+        torch.manual_seed(0)
+        model = nn.Sequential(self._RMSNorm(16, eps=1e-5))
+        module = model[0]
+        with torch.no_grad():
+            module.weight.copy_(torch.rand(16) + 0.5)
+
+        x = torch.randn(2, 3, 16) * 3
+        reference = module(x)                    # 替换前的原实现
+        _apply_fused_rmsnorm(model)
+        fused = module(x)
+        assert torch.allclose(reference, fused, atol=1e-6, rtol=1e-5)
+
+    def test_switch_is_noop_by_default(self, monkeypatch):
+        """默认 `USE_FUSED_RMSNORM=False` ⇒ **零副作用**；置 True 才替换。"""
+        import model_module as mm
+        from types import SimpleNamespace
+
+        holder = nn.Sequential(self._RMSNorm(8))
+        target = holder[0]
+        before = target.forward
+        fake_manager = SimpleNamespace(model=holder)          # 只需 `.model`
+
+        monkeypatch.setattr(mm, "USE_FUSED_RMSNORM", False, raising=False)
+        mm.ModelManager._maybe_apply_fused_rmsnorm(fake_manager)
+        assert target.forward == before, "默认关闭时不得替换任何模块"
+
+        monkeypatch.setattr(mm, "USE_FUSED_RMSNORM", True, raising=False)
+        mm.ModelManager._maybe_apply_fused_rmsnorm(fake_manager)
+        assert target.forward != before, "开启后应替换"
+
+    def test_switch_without_model_is_safe(self, monkeypatch):
+        """未加载模型（`model is None`）时开开关也不得抛异常。"""
+        import model_module as mm
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(mm, "USE_FUSED_RMSNORM", True, raising=False)
+        mm.ModelManager._maybe_apply_fused_rmsnorm(SimpleNamespace(model=None))
+
+    def test_returns_zero_when_op_missing(self, monkeypatch):
+        """torch 无 `F.rms_norm`（旧版）⇒ 返回 0、行为不变（降级而非报错）。"""
+        import model_module as mm
+
+        model = nn.Sequential(self._RMSNorm(8))
+        target = model[0]
+        before = target.forward
+        monkeypatch.delattr(mm.torch.nn.functional, "rms_norm", raising=False)
+
+        assert mm._apply_fused_rmsnorm(model) == 0
+        assert target.forward == before
+
+
 class TestGemmaLayerRangeAdapter:
     """Gemma 4 must not enter the legacy in-process Qwen2 executor."""
 

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -106,3 +107,218 @@ def test_mid_service_exposes_heartbeat_option() -> None:
         capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=ROOT)
     assert done.returncode == 0, done.stderr
     assert "--heartbeat-interval" in done.stdout
+    # ★ 2026-09-23（§10.2）：ready 文件要能带构建标识 ⇒ 服务端必须有该开关
+    assert "--digest-artifacts" in done.stdout
+
+
+def test_segment_builds_records_local_head_and_unknown_remote() -> None:
+    """★ 2026-09-23（§10.2）：记录里逐段写 runner/构建；远端没给 ready 文件时**显式** unknown。"""
+    import argparse
+
+    module = _load()
+    args = argparse.Namespace(
+        head_endpoint=None,
+        head_model="head16.gguf",
+        shim="build/keephead/build-cpu/bin/qlh_keep_head.dll",
+        head_ready_file=None,
+        middle_endpoint=None,
+        middle_ready_file=None,
+        tail_endpoint="127.0.0.1:50188",
+        tail_ready_file=None,
+        digest_artifacts=False,
+    )
+    segments = module._segment_builds(args)
+
+    assert segments["head"]["runner"] == "llama_keep_head.KeepHeadUpstream"
+    assert segments["head"]["mode"] == "nextn"
+    assert segments["head"]["build"]["schema_version"] == "qlh.relay_segment_info.v1"
+    # 没有中间段 ⇒ 该段不出现（而不是给一个空对象）
+    assert "middle" not in segments
+    # 远端末段未提供 ready 文件 ⇒ 显式 remote_unknown（记录要能区分「未知」与「没写」）
+    assert segments["tail"]["build"]["source"] == "remote_unknown"
+    assert segments["tail"]["endpoint"] == "127.0.0.1:50188"
+
+
+def test_segment_builds_reads_ready_file_for_remote_segments(tmp_path: Path) -> None:
+    import argparse
+    import json
+
+    module = _load()
+    ready = tmp_path / "mid.ready"
+    ready.write_text(json.dumps({"role": "middle", "build": {"llama_cpp_version": "x"}}),
+                     encoding="utf-8")
+    args = argparse.Namespace(
+        head_endpoint="127.0.0.1:50185",
+        head_model=None,
+        shim="build/keephead/build-cpu/bin/qlh_keep_head.dll",
+        head_ready_file=None,
+        middle_endpoint="127.0.0.1:50190",
+        middle_ready_file=str(ready),
+        tail_endpoint="127.0.0.1:50188",
+        tail_ready_file=None,
+        digest_artifacts=False,
+    )
+    segments = module._segment_builds(args)
+
+    assert segments["head"]["build"]["source"] == "remote_unknown"     # head 也没给 ready 文件
+    assert segments["middle"]["build"]["source"] == "ready_file"
+    assert segments["middle"]["build"]["llama_cpp_version"] == "x"
+
+
+def _coverage_args(**overrides):
+    """★ #30 的层覆盖参数默认全空，逐个用例按需覆盖（`argparse` 按本文件既有风格就近 import）。"""
+    import argparse
+
+    base = {
+        "head_layers": None, "mid_layers": None, "tail_start": None,
+        "total_layers": None, "middle_endpoint": None,
+    }
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def test_layer_coverage_accepts_exact_three_segment_tiling() -> None:
+    """三段恰好铺满 0..23 ⇒ verified（`head8` + `mid8-16` + `cut-k16`）。"""
+    module = _load()
+    args = _coverage_args(head_layers="8", mid_layers="8-16", tail_start=16,
+                          total_layers=24, middle_endpoint="127.0.0.1:50161")
+    result = module._layer_coverage(args)
+
+    assert result["status"] == "verified"
+    assert result["segments"] == {"head": [0, 8], "middle": [8, 16], "tail": [16, 24]}
+
+
+def test_layer_coverage_rejects_layers_missing_in_the_middle() -> None:
+    """★ 这正是 2026-09-26 误判的形态：`head4` + `mid8-16` ⇒ 缺 4..7，**必须** invalid。
+
+    当时端点实际载的是 `mid8-16`（而记录写成 `mid4-16`）⇒ 覆盖缺 4..7 ⇒ 逐 token 不一致被误判成
+    "代码缺陷"。本用例把这个形态钉成回归（见 `docs/已知问题记录.md` #30）。
+    """
+    module = _load()
+    args = _coverage_args(head_layers="4", mid_layers="8-16", tail_start=16,
+                          total_layers=24, middle_endpoint="127.0.0.1:50161")
+    result = module._layer_coverage(args)
+
+    assert result["status"] == "invalid"
+    assert "缺口或重叠" in result["detail"]
+
+
+def test_layer_coverage_rejects_overlap() -> None:
+    """中段起点早于 head 终点 ⇒ 重叠，**必须** invalid。"""
+    module = _load()
+    args = _coverage_args(head_layers="8", mid_layers="4-16", tail_start=16,
+                          total_layers=24, middle_endpoint="127.0.0.1:50161")
+    assert module._layer_coverage(args)["status"] == "invalid"
+
+
+def test_layer_coverage_accepts_exact_two_segment_tiling() -> None:
+    """两段恰好铺满（`head8` + `tail8`）⇒ verified；`head8` + 起点 12 ⇒ invalid。"""
+    module = _load()
+    ok = _coverage_args(head_layers="8", tail_start=8, total_layers=24)
+    assert module._layer_coverage(ok)["status"] == "verified"
+
+    gap = _coverage_args(head_layers="8", tail_start=12, total_layers=24)
+    assert module._layer_coverage(gap)["status"] == "invalid"
+
+
+def test_layer_coverage_is_unverified_without_full_arguments() -> None:
+    """参数不全 ⇒ unverified（**默认不拦**）；三段缺 `--mid-layers` 同样是 unverified。"""
+    module = _load()
+    assert module._layer_coverage(_coverage_args(head_layers="8"))["status"] == "unverified"
+    assert module._layer_coverage(_coverage_args(
+        head_layers="8", tail_start=16, total_layers=24,
+        middle_endpoint="127.0.0.1:50161"))["status"] == "unverified"
+    assert module._layer_coverage(_coverage_args(
+        head_layers="8", tail_start=16, total_layers=24,
+        middle_endpoint="127.0.0.1:50161"))["status"] == "unverified"
+
+
+# ── ★ #30：从 manifest 自动读层范围（免手打那 4 个参数）────────────────────────
+
+
+def _manifest_file(tmp_path, name, *, start, end, n_layer=24):
+    """写一个最小 manifest（只含 `_manifest_layers` 真正读的字段）。"""
+    path = tmp_path / name
+    path.write_text(json.dumps({"source_layer_range": [start, end], "n_layer": n_layer}),
+                    encoding="utf-8")
+    return path
+
+
+def test_manifest_layers_reads_source_layer_range(tmp_path) -> None:
+    """★ 段工件 manifest 的 `source_layer_range` 能读出来 ⇒ 工件**从此可自证**覆盖哪几层。"""
+    module = _load()
+    manifest = _manifest_file(tmp_path, "mid8-16.gguf.manifest.json", start=8, end=16)
+
+    assert module._manifest_layers(manifest) == (8, 16)
+
+
+def test_manifest_layers_is_none_on_missing_or_malformed(tmp_path) -> None:
+    """缺文件 / JSON 坏 / 区间倒置 / 空值 ⇒ 一律 `None`（**不猜**，交由调用方回落）。"""
+    module = _load()
+    bad = tmp_path / "bad.json"
+    bad.write_text("{ not json", encoding="utf-8")
+    inverted = _manifest_file(tmp_path, "inv.json", start=16, end=8)
+
+    assert module._manifest_layers(None) is None
+    assert module._manifest_layers(tmp_path / "nope.json") is None
+    assert module._manifest_layers(bad) is None
+    assert module._manifest_layers(inverted) is None
+
+
+def test_respect_manifests_fills_only_missing_layers(tmp_path) -> None:
+    """★ 只补空位：显式 `--*-layers` **绝不被** manifest 覆盖（显式参数永远优先）。"""
+    module = _load()
+    mid = _manifest_file(tmp_path, "mid.gguf.manifest.json", start=8, end=16)
+    tail = _manifest_file(tmp_path, "tail.gguf.manifest.json", start=16, end=24)
+
+    args = _coverage_args(mid_manifest=str(mid), tail_manifest=str(tail))
+    used = module._respect_manifests(args)
+
+    assert (args.mid_layers, args.tail_start) == ("8-16", 16)
+    assert set(used) == {"middle", "tail"}
+
+    # 显式值存在 ⇒ manifest 不参与、也不写进证据
+    args = _coverage_args(head_layers="8", mid_layers="4-16", tail_start=12,
+                          mid_manifest=str(mid), tail_manifest=str(tail))
+    assert module._respect_manifests(args) == {}
+    assert (args.head_layers, args.mid_layers, args.tail_start) == ("8", "4-16", 12)
+
+
+def test_respect_manifests_discovers_head_manifest_next_to_artifact(tmp_path) -> None:
+    """★ head 段支持**自动发现**：`--head-model X.gguf` ⇒ 试 `X.gguf.manifest.json`。"""
+    module = _load()
+    artifact = tmp_path / "qwen25-05b-f16-head8.gguf"
+    artifact.write_bytes(b"stub")
+    _manifest_file(tmp_path, "qwen25-05b-f16-head8.gguf.manifest.json", start=0, end=8)
+
+    args = _coverage_args(head_model=str(artifact))
+    used = module._respect_manifests(args)
+
+    assert args.head_layers == "8"
+    assert used["head"].endswith("qwen25-05b-f16-head8.gguf.manifest.json")
+
+    # 工件旁边**没有** manifest ⇒ 什么都不补（缺 manifest 是常态，不报错）
+    lonely = tmp_path / "head12.gguf"
+    lonely.write_bytes(b"stub")
+    args = _coverage_args(head_model=str(lonely))
+    assert module._respect_manifests(args) == {}
+    assert args.head_layers is None
+
+
+def test_manifest_derived_coverage_verifies_end_to_end(tmp_path) -> None:
+    """★ 端到端：三段层范围**全部**来自 manifest ⇒ `verified` 且能列出 segments。"""
+    module = _load()
+    head = tmp_path / "head8.gguf"
+    head.write_bytes(b"stub")
+    _manifest_file(tmp_path, "head8.gguf.manifest.json", start=0, end=8)
+    mid = _manifest_file(tmp_path, "mid.gguf.manifest.json", start=8, end=16)
+    tail = _manifest_file(tmp_path, "tail.gguf.manifest.json", start=16, end=24)
+
+    args = _coverage_args(head_model=str(head), mid_manifest=str(mid),
+                          tail_manifest=str(tail), total_layers=24,
+                          middle_endpoint="127.0.0.1:50161")
+    module._respect_manifests(args)
+    coverage = module._layer_coverage(args)
+
+    assert coverage["status"] == "verified"
+    assert coverage["segments"] == {"head": [0, 8], "middle": [8, 16], "tail": [16, 24]}

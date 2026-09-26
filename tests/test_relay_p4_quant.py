@@ -29,6 +29,67 @@ def rx():
     return module
 
 
+# ------------------------------------------------------------------ ★ R-R8（§5.1④）：传输-计算重叠
+
+
+def test_overlap_budget_reproduces_documented_under_one_percent_on_lan(rx) -> None:
+    """★ 对齐文档结论：**同机 / 千兆**下可重叠窗口 **< 1%** ⇒ 不值得做。
+
+    文档 §4④ 记「同机可重叠窗口 < 1%，与既有『通信/同步仅 0.34%』一致 ⇒ 不投同步微优化」。
+    这条把它钉住：LAN 千兆也应落在 1% 以内。
+    """
+    row = rx._overlap_budget(896, "none", bandwidth_mbps=1000.0,
+                             compute_ms_per_step=10.5, hops=2)
+    assert row is not None
+    assert row["overlap_ceiling_pct"] < 1.0, row
+
+
+def test_overlap_budget_is_none_when_unmetered(rx) -> None:
+    """不限速（同机 loopback）⇒ 无可谈论的重叠 ⇒ 返回 `None`，而不是编一个数出来。"""
+    assert rx._overlap_budget(896, "none", bandwidth_mbps=0.0,
+                              compute_ms_per_step=10.5) is None
+
+
+def test_weak_network_makes_overlap_worthwhile(rx) -> None:
+    """★ 把"弱网下才值得做"**量化**：y700 实测 11.2 Mbps ⇒ 上限 **> 20%**（不再是 <1%）。"""
+    weak = rx._overlap_budget(896, "none", bandwidth_mbps=11.2,
+                              compute_ms_per_step=10.5, hops=2)
+    assert weak is not None
+    assert weak["overlap_ceiling_pct"] > 20.0, weak
+    assert weak["overlap_ceiling_pct"] <= 100.0, weak        # 占比不可能超过 100%
+    assert weak["speedup_ceiling"] > 1.2, weak
+
+
+def test_compression_and_overlap_are_substitutes_not_multipliers(rx) -> None:
+    """★★ **压缩与重叠是替代关系**，不是可以相乘的两份收益。
+
+    压缩把每 token 的线上字节变小 ⇒ 通信时间变小 ⇒ **可重叠窗口也随之变小**
+    （11.2 Mbps 下 `none` > `f16` > `int8` > `int4`）。这条纠正"压缩 + 重叠可以叠加"的直觉。
+    """
+    ceilings = [rx._overlap_budget(896, mode, bandwidth_mbps=11.2,
+                                   compute_ms_per_step=10.5, hops=2)["overlap_ceiling_pct"]
+                for mode in ("none", "f16", "int8_block128", "int4_block128")]
+    assert ceilings == sorted(ceilings, reverse=True), ceilings
+    assert ceilings[0] > ceilings[-1] * 2, ceilings      # 差异显著，不是噪声
+
+
+def test_extra_latency_shrinks_the_overlap_window(rx) -> None:
+    """★ RTT **不可重叠**：额外单程延迟越大，可重叠窗口占比越小。"""
+    base = rx._overlap_budget(896, "none", bandwidth_mbps=5.0,
+                              compute_ms_per_step=10.5, latency_ms=0.0, hops=2)
+    slow = rx._overlap_budget(896, "none", bandwidth_mbps=5.0,
+                              compute_ms_per_step=10.5, latency_ms=50.0, hops=2)
+    assert slow["overlap_ceiling_pct"] < base["overlap_ceiling_pct"], (base, slow)
+
+
+def test_overlap_budget_rejects_bad_shape(rx) -> None:
+    """非法输入（宽度 0 / 未知档位 / hops<1）⇒ `None`，不得静默给个数字。"""
+    assert rx._overlap_budget(0, "none", bandwidth_mbps=10.0, compute_ms_per_step=1.0) is None
+    assert rx._overlap_budget(896, "bogus", bandwidth_mbps=10.0, compute_ms_per_step=1.0) is None
+    assert rx._overlap_budget(896, "none", bandwidth_mbps=10.0, compute_ms_per_step=1.0,
+                              hops=0) is None
+
+
 def test_hidden_bytes_int4_is_half_of_int8(rx) -> None:
     width = 896
     blocks = (width + 127) // 128

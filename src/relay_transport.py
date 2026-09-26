@@ -18,10 +18,32 @@ from dataclasses import asdict, dataclass
 from enum import IntEnum
 from typing import BinaryIO, Sequence
 
+try:  # 兼容两种入口：`import relay_transport`（src 在 sys.path）与 `from src.relay_transport import …`
+    from relay_hidden_quant import (
+        HIDDEN_QUANT_MODES,
+        decode_hidden,
+        encode_hidden,
+        expected_quantized_bytes,
+    )
+except ImportError:  # pragma: no cover - 包路径导入
+    from src.relay_hidden_quant import (
+        HIDDEN_QUANT_MODES,
+        decode_hidden,
+        encode_hidden,
+        expected_quantized_bytes,
+    )
+
 RELAY_WIRE_MAGIC = b"QLHR"
 RELAY_WIRE_VERSION = 1
 RELAY_DTYPE = "float32_le"
 RELAY_DTYPE_BYTES = 4
+#: ★ 2026-09-23（A5）：帧头 `flags` 的**低 3 位** = hidden 压缩档（0 = f32 无压缩）。
+#: 旧实现对任何非零 flags 直接判 `unsupported_flags` ⇒ 新档位对旧对端**天然 fail-closed**，
+#: 因此**不需要升 version**：v1 客户端发 `flags=0` 时与旧行为逐字节一致。
+RELAY_FLAG_QUANT_MASK = 0b111
+#: 档位 ↔ flags 低 3 位的映射（顺序即编码；见 `relay_hidden_quant.HIDDEN_QUANT_MODES`）。
+RELAY_QUANT_MODES = tuple(HIDDEN_QUANT_MODES)
+RELAY_QUANT_CODES = {mode: index for index, mode in enumerate(RELAY_QUANT_MODES)}
 RELAY_DEFAULT_MAX_TOKENS = 4096
 _UINT32_MAX = (1 << 32) - 1
 RELAY_DEFAULT_MAX_PAYLOAD = 256 * 1024 * 1024
@@ -80,6 +102,8 @@ _RELAY_ERROR_CODES = frozenset({
     "token_count_exceeds_limit",
     "unknown_frame_kind",
     "unsupported_flags",
+    #: ★ A5：hidden 压缩档不受支持（旧对端 / 未知档位）—— 跨信任边界的稳定错误码。
+    "unsupported_hidden_quant",
     "unsupported_version",
     RELAY_INTERNAL_ERROR,
     RELAY_PROTOCOL_ERROR,
@@ -112,6 +136,8 @@ class RelayFrame:
     sequence: int
     n_tokens: int = 0
     payload: bytes = b""
+    #: ★ 2026-09-23（A5）：payload 里 hidden 的压缩档（`none` = f32 原样；见 `RELAY_QUANT_CODES`）。
+    quant: str = "none"
 
 
 @dataclass(frozen=True)
@@ -136,12 +162,52 @@ def is_loopback_host(host: str) -> bool:
         return False
 
 
-def expected_hidden_bytes(n_tokens: int, n_embd: int) -> int:
+def expected_hidden_bytes(n_tokens: int, n_embd: int, quant: str = "none") -> int:
+    """该档位下 hidden 的字节数（`quant="none"` ⇒ f32，与旧行为一致）。
+
+    ★ 2026-09-23（A5）：压缩档会改变 payload 长度 ⇒ 长度校验必须**按档位换算**，否则压缩帧要么被
+    当成"尺寸不符"拒掉，要么（更糟）被当成合法的 f32 数据喂进 runner。
+    """
     tokens = int(n_tokens)
     width = int(n_embd)
     if tokens < 1 or width < 1:
         raise RelayProtocolError("invalid_hidden_shape")
-    return tokens * width * RELAY_DTYPE_BYTES
+    if quant in (None, "none"):
+        return tokens * width * RELAY_DTYPE_BYTES
+    if quant not in RELAY_QUANT_CODES:
+        raise RelayProtocolError("unsupported_hidden_quant")
+    return expected_quantized_bytes(quant, tokens, width)
+
+
+def quantize_upload(hidden: bytes, n_tokens: int, n_embd: int,
+                    quant: str = "none") -> bytes:
+    """★ A5：把**法线化后的 f32 hidden** 压成该档位的 wire payload。
+
+    调用方永远给 f32（`expected_hidden_bytes(count, n_embd)` 校验过的长度）⇒ 压缩只发生在 wire 上。
+    `none` 档原样返回（与旧行为逐字节一致）；未知档位 fail-loud（不静默退回未压缩）。
+    """
+    mode = quant or "none"
+    if mode == "none":
+        return bytes(hidden)
+    try:
+        return encode_hidden(hidden, mode, int(n_tokens), int(n_embd))
+    except ValueError as exc:
+        raise RelayProtocolError("unsupported_hidden_quant") from exc
+
+
+def frame_hidden_bytes(frame: RelayFrame, *, n_embd: int) -> bytes:
+    """★ A5：把帧里的 hidden 解回 **f32 bytes**（`none` 档原样返回）—— runner 只认 f32。
+
+    设计意图：**压缩只发生在 wire 上**，段实现（shim / pip 引擎 / Android JNI）完全无感；
+    所以旧对端收到 `flags=0` 的帧行为不变，而新对端可以选档位省带宽。
+    """
+    quant = getattr(frame, "quant", "none") or "none"
+    if quant == "none":
+        return bytes(frame.payload)
+    try:
+        return decode_hidden(frame.payload, quant, int(frame.n_tokens), int(n_embd))
+    except ValueError as exc:
+        raise RelayProtocolError("hidden_payload_size_mismatch") from exc
 
 
 def _validate_hidden_seq_meta(meta: object, n_tokens: int) -> None:
@@ -167,11 +233,14 @@ def _validate_hidden_seq_meta(meta: object, n_tokens: int) -> None:
             raise RelayProtocolError("hidden_seq_meta_shape_invalid")
 
 
-def encode_hidden_seq(hidden: bytes, *, n_tokens: int, meta: dict[str, object]) -> bytes:
+def encode_hidden_seq(hidden: bytes, *, n_tokens: int, meta: dict[str, object],
+                      quant: str = "none", n_embd: int | None = None) -> bytes:
     """★ P3：把 `hidden` + 元数据打包成 `HIDDEN_SEQ` 的 payload。
 
-    布局：`<n_tokens:u32><n_meta_bytes:u32><meta JSON><f32 hidden>`。
+    布局：`<n_tokens:u32><n_meta_bytes:u32><meta JSON><hidden（按 quant 档）>`。
     元数据只允许 `n_seq_id` / `seq_ids` / `positions`（其余键一律拒绝，避免协议被当通用通道）。
+
+    ★ A5：`quant != "none"` 时**必须**给 `n_embd`（压缩要按宽度分块）。
     """
     count = int(n_tokens)
     if isinstance(n_tokens, bool) or count < 1 or count > _UINT32_MAX:
@@ -183,11 +252,23 @@ def encode_hidden_seq(hidden: bytes, *, n_tokens: int, meta: dict[str, object]) 
         raise RelayProtocolError("hidden_seq_meta_invalid") from exc
     if len(meta_bytes) > RELAY_SEQ_META_LIMIT:
         raise RelayProtocolError("hidden_seq_meta_too_large")
-    return _SEQ_HEADER.pack(count, len(meta_bytes)) + meta_bytes + bytes(hidden)
+    mode = quant or "none"
+    if mode == "none":
+        body = bytes(hidden)
+    else:
+        width = int(n_embd or 0)
+        if width < 1:
+            raise RelayProtocolError("invalid_hidden_shape")
+        body = quantize_upload(hidden, count, width, mode)
+    return _SEQ_HEADER.pack(count, len(meta_bytes)) + meta_bytes + body
 
 
-def decode_hidden_seq(payload: bytes, *, n_embd: int) -> tuple[bytes, int, dict[str, object]]:
-    """★ P3：拆 `HIDDEN_SEQ` payload → `(hidden, n_tokens, meta)`，形状不符即拒。"""
+def decode_hidden_seq(payload: bytes, *, n_embd: int,
+                      quant: str = "none") -> tuple[bytes, int, dict[str, object]]:
+    """★ P3：拆 `HIDDEN_SEQ` payload → `(hidden(f32), n_tokens, meta)`，形状不符即拒。
+
+    ★ A5：`quant != "none"` 时按档位换算长度并**解回 f32**（对 runner 透明）。
+    """
     if len(payload) < _SEQ_HEADER.size:
         raise RelayProtocolError("hidden_seq_payload_too_small")
     n_tokens, meta_len = _SEQ_HEADER.unpack_from(payload, 0)
@@ -203,8 +284,14 @@ def decode_hidden_seq(payload: bytes, *, n_embd: int) -> tuple[bytes, int, dict[
         raise RelayProtocolError("hidden_seq_meta_invalid") from exc
     _validate_hidden_seq_meta(meta, int(n_tokens))
     hidden = payload[end:]
-    if len(hidden) != expected_hidden_bytes(int(n_tokens), int(n_embd)):
+    if len(hidden) != expected_hidden_bytes(int(n_tokens), int(n_embd), quant):
         raise RelayProtocolError("hidden_payload_size_mismatch")
+    mode = quant or "none"
+    if mode != "none":
+        try:
+            hidden = decode_hidden(hidden, mode, int(n_tokens), int(n_embd))
+        except ValueError as exc:
+            raise RelayProtocolError("hidden_payload_size_mismatch") from exc
     return hidden, int(n_tokens), meta
 
 
@@ -222,12 +309,16 @@ def _recv_exact(sock: socket.socket, size: int) -> bytes:
 
 def send_frame(sock: socket.socket, frame: RelayFrame) -> None:
     payload = bytes(frame.payload)
+    quant = getattr(frame, "quant", "none") or "none"
+    code = RELAY_QUANT_CODES.get(quant)
+    if code is None:
+        raise RelayProtocolError("unsupported_hidden_quant")
     try:
         header = _HEADER.pack(
             RELAY_WIRE_MAGIC,
             RELAY_WIRE_VERSION,
             int(frame.kind),
-            0,
+            code,
             int(frame.sequence),
             int(frame.n_tokens),
             len(payload),
@@ -246,8 +337,13 @@ def recv_frame(
         raise RelayProtocolError("invalid_magic")
     if version != RELAY_WIRE_VERSION:
         raise RelayProtocolError("unsupported_version")
-    if flags != 0:
+    # ★ A5：低 3 位是 hidden 压缩档；其余位仍然未定义 ⇒ 必须拒（未知 flags 不能当合法帧）。
+    if flags & ~RELAY_FLAG_QUANT_MASK:
         raise RelayProtocolError("unsupported_flags")
+    quant_code = flags & RELAY_FLAG_QUANT_MASK
+    if quant_code >= len(RELAY_QUANT_MODES):
+        raise RelayProtocolError("unsupported_hidden_quant")
+    quant = RELAY_QUANT_MODES[quant_code]
     try:
         kind = RelayFrameKind(kind_value)
     except ValueError as exc:
@@ -255,7 +351,8 @@ def recv_frame(
     if payload_size > int(max_payload_bytes):
         raise RelayProtocolError("payload_too_large")
     payload = _recv_exact(sock, payload_size) if payload_size else b""
-    return RelayFrame(kind=kind, sequence=sequence, n_tokens=n_tokens, payload=payload)
+    return RelayFrame(kind=kind, sequence=sequence, n_tokens=n_tokens, payload=payload,
+                      quant=quant)
 
 
 def encode_tokens(tokens: Sequence[int]) -> bytes:
@@ -277,19 +374,30 @@ def decode_tokens(payload: bytes, *, limit: int) -> list[int]:
     return [int(_TOKEN.unpack_from(payload, i * size)[0]) for i in range(count)]
 
 
+def _error_code_from_frame(frame: RelayFrame, expected_sequence: int) -> str:
+    """从 `ERROR` 帧解出**稳定码**（不合法一律回落 `remote_error`）。
+
+    ★ 2026-09-24：此前只有 token 返回路径（`_decode_token`）解 ERROR 帧；三条 **hidden 返回路径**
+    （`request_hidden` / `request_hidden_seq` / `request_hidden_from_tokens`）直接把它当成
+    "非 HIDDEN 帧" ⇒ 抛 `hidden_response_required`，于是服务端**明明发来**的 `runner_failed`
+    / `hidden_payload_size_mismatch` 等稳定码被丢掉（而 `hidden_response_required` 本身不在
+    白名单 ⇒ 调用方最终只看到笼统的 `relay_protocol_error`）。这直接破坏"具名回退"：
+    `_fallback_reason` 写不出真实原因，失败会退化成"与模型算错难以区分"。三条路径现在共用本函数。
+    """
+    if frame.sequence != expected_sequence:
+        raise RelayProtocolError("response_sequence_mismatch")
+    if len(frame.payload) > _RELAY_ERROR_PAYLOAD_LIMIT:
+        return RELAY_REMOTE_ERROR
+    try:
+        code = frame.payload.decode("ascii")
+    except UnicodeDecodeError:
+        return RELAY_REMOTE_ERROR
+    return code if code in _RELAY_ERROR_CODES else RELAY_REMOTE_ERROR
+
+
 def _decode_token(frame: RelayFrame, expected_sequence: int) -> int:
     if frame.kind == RelayFrameKind.ERROR:
-        if frame.sequence != expected_sequence:
-            raise RelayProtocolError("response_sequence_mismatch")
-        if len(frame.payload) > _RELAY_ERROR_PAYLOAD_LIMIT:
-            raise RelayProtocolError(RELAY_REMOTE_ERROR)
-        try:
-            code = frame.payload.decode("ascii")
-        except UnicodeDecodeError:
-            code = RELAY_REMOTE_ERROR
-        if code not in _RELAY_ERROR_CODES:
-            code = RELAY_REMOTE_ERROR
-        raise RelayProtocolError(code)
+        raise RelayProtocolError(_error_code_from_frame(frame, expected_sequence))
     if frame.sequence != expected_sequence:
         raise RelayProtocolError("response_sequence_mismatch")
     if frame.kind != RelayFrameKind.TOKEN or frame.n_tokens != 1 or len(frame.payload) != 4:
@@ -324,7 +432,7 @@ class RelayTcpClient:
         self._sequence = 0
         self._closed = False
 
-    def request_token(self, hidden: bytes, *, n_tokens: int) -> int:
+    def request_token(self, hidden: bytes, *, n_tokens: int, quant: str = "none") -> int:
         if self._closed:
             raise RelayProtocolError("client_closed")
         count = int(n_tokens)
@@ -332,10 +440,12 @@ class RelayTcpClient:
             raise RelayProtocolError("token_count_exceeds_limit")
         if len(hidden) != expected_hidden_bytes(count, self.n_embd):
             raise RelayProtocolError("hidden_payload_size_mismatch")
+        payload = quantize_upload(hidden, count, self.n_embd, quant)
         sequence = self._sequence
         send_frame(
             self._sock,
-            RelayFrame(RelayFrameKind.HIDDEN, sequence, n_tokens=count, payload=hidden),
+            RelayFrame(RelayFrameKind.HIDDEN, sequence, n_tokens=count, payload=payload,
+                       quant=quant or "none"),
         )
         response = recv_frame(self._sock, max_payload_bytes=self.max_payload_bytes)
         token = _decode_token(response, sequence)
@@ -366,18 +476,22 @@ class RelayTcpClient:
                        payload=encode_tokens(values)),
         )
         response = recv_frame(self._sock, max_payload_bytes=self.max_payload_bytes)
+        if response.kind == RelayFrameKind.ERROR:
+            # ★ 2026-09-24：ERROR 帧必须解出服务端的**稳定码**，不能笼统当成"非 HIDDEN"。
+            raise RelayProtocolError(_error_code_from_frame(response, sequence))
         if response.sequence != sequence:
             raise RelayProtocolError("response_sequence_mismatch")
         if response.kind != RelayFrameKind.HIDDEN:
             raise RelayProtocolError("hidden_response_required")
         if response.n_tokens != count:
             raise RelayProtocolError("hidden_token_count_mismatch")
-        if len(response.payload) != expected_hidden_bytes(count, self.n_embd):
+        if len(response.payload) != expected_hidden_bytes(count, self.n_embd, response.quant):
             raise RelayProtocolError("hidden_payload_size_mismatch")
         self._sequence += 1
-        return bytes(response.payload)
+        # ★ A5：下行档位由**服务端**决定 ⇒ 按帧里的档位解回 f32（对调用方永远是 f32）。
+        return frame_hidden_bytes(response, n_embd=self.n_embd)
 
-    def request_hidden(self, hidden: bytes, *, n_tokens: int) -> bytes:
+    def request_hidden(self, hidden: bytes, *, n_tokens: int, quant: str = "none") -> bytes:
         """★ 中间段往返：发 HIDDEN，收 HIDDEN（远端段交出它自己的 hidden）。
 
         与 `request_token`（末段，收 token）配对 —— 这正是「1 个 torch 上游 + n 个
@@ -385,6 +499,8 @@ class RelayTcpClient:
 
         远端实现的语义必须与本地 keep-head 一致（末层输出，`output_norm` 之前）；
         Android 侧由 `nativeLayerForwardHiddenKeepHead` 提供同一语义。
+
+        ★ A5：`quant` 只作用于**上行**（本函数发出的帧）；响应仍按 f32 校验（下行压缩本轮未启用）。
         """
         if self._closed:
             raise RelayProtocolError("client_closed")
@@ -393,25 +509,30 @@ class RelayTcpClient:
             raise RelayProtocolError("token_count_exceeds_limit")
         if len(hidden) != expected_hidden_bytes(count, self.n_embd):
             raise RelayProtocolError("hidden_payload_size_mismatch")
+        payload = quantize_upload(hidden, count, self.n_embd, quant)
         sequence = self._sequence
         send_frame(
             self._sock,
-            RelayFrame(RelayFrameKind.HIDDEN, sequence, n_tokens=count, payload=hidden),
+            RelayFrame(RelayFrameKind.HIDDEN, sequence, n_tokens=count, payload=payload,
+                       quant=quant or "none"),
         )
         response = recv_frame(self._sock, max_payload_bytes=self.max_payload_bytes)
+        if response.kind == RelayFrameKind.ERROR:
+            raise RelayProtocolError(_error_code_from_frame(response, sequence))
         if response.sequence != sequence:
             raise RelayProtocolError("response_sequence_mismatch")
         if response.kind != RelayFrameKind.HIDDEN:
             raise RelayProtocolError("hidden_response_required")
         if response.n_tokens != count:
             raise RelayProtocolError("hidden_token_count_mismatch")
-        if len(response.payload) != expected_hidden_bytes(count, self.n_embd):
+        if len(response.payload) != expected_hidden_bytes(count, self.n_embd, response.quant):
             raise RelayProtocolError("hidden_payload_size_mismatch")
         self._sequence += 1
-        return bytes(response.payload)
+        # ★ A5：下行档位由**服务端**决定 ⇒ 按帧里的档位解回 f32（对调用方永远是 f32）。
+        return frame_hidden_bytes(response, n_embd=self.n_embd)
 
     def request_hidden_seq(self, hidden: bytes, *, n_tokens: int,
-                           meta: dict[str, object]) -> bytes:
+                           meta: dict[str, object], quant: str = "none") -> bytes:
         """★ P3：**多序列**中间段往返 —— 请求帧带 `seq_ids` / `positions`（`HIDDEN_SEQ`）。
 
         响应仍是纯 `HIDDEN`（远端已按显式 seq/pos 算完）。元数据只允许
@@ -424,23 +545,28 @@ class RelayTcpClient:
             raise RelayProtocolError("token_count_exceeds_limit")
         if len(hidden) != expected_hidden_bytes(count, self.n_embd):
             raise RelayProtocolError("hidden_payload_size_mismatch")
-        payload = encode_hidden_seq(hidden, n_tokens=count, meta=meta)
+        payload = encode_hidden_seq(hidden, n_tokens=count, meta=meta, quant=quant,
+                                    n_embd=self.n_embd)
         sequence = self._sequence
         send_frame(
             self._sock,
-            RelayFrame(RelayFrameKind.HIDDEN_SEQ, sequence, n_tokens=count, payload=payload),
+            RelayFrame(RelayFrameKind.HIDDEN_SEQ, sequence, n_tokens=count, payload=payload,
+                       quant=quant or "none"),
         )
         response = recv_frame(self._sock, max_payload_bytes=self.max_payload_bytes)
+        if response.kind == RelayFrameKind.ERROR:
+            raise RelayProtocolError(_error_code_from_frame(response, sequence))
         if response.sequence != sequence:
             raise RelayProtocolError("response_sequence_mismatch")
         if response.kind != RelayFrameKind.HIDDEN:
             raise RelayProtocolError("hidden_response_required")
         if response.n_tokens != count:
             raise RelayProtocolError("hidden_token_count_mismatch")
-        if len(response.payload) != expected_hidden_bytes(count, self.n_embd):
+        if len(response.payload) != expected_hidden_bytes(count, self.n_embd, response.quant):
             raise RelayProtocolError("hidden_payload_size_mismatch")
         self._sequence += 1
-        return bytes(response.payload)
+        # ★ A5：下行档位由**服务端**决定 ⇒ 按帧里的档位解回 f32（对调用方永远是 f32）。
+        return frame_hidden_bytes(response, n_embd=self.n_embd)
 
     def close(self) -> None:
         if self._closed:
@@ -582,11 +708,13 @@ def serve_relay_connection(
                 raise RelayProtocolError("hidden_frame_required")
             if frame.n_tokens < 1 or frame.n_tokens > limit:
                 raise RelayProtocolError("token_count_exceeds_limit")
-            if len(frame.payload) != expected_hidden_bytes(frame.n_tokens, width):
+            if len(frame.payload) != expected_hidden_bytes(frame.n_tokens, width, frame.quant):
                 raise RelayProtocolError("hidden_payload_size_mismatch")
 
             try:
-                token = int(runner.request_token(frame.payload, n_tokens=frame.n_tokens))
+                # ★ A5：按帧里的档位**解回 f32** —— runner 只认 f32（压缩对段实现完全透明）。
+                token = int(runner.request_token(frame_hidden_bytes(frame, n_embd=width),
+                                                 n_tokens=frame.n_tokens))
             except RelayProtocolError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -647,6 +775,7 @@ def serve_relay_middle_connection(
     *,
     n_embd: int,
     max_tokens: int = RELAY_DEFAULT_MAX_TOKENS,
+    hidden_quant: str = "none",
 ) -> RelayBridgeResult:
     """★ 中间段服务：HIDDEN → `runner.request_hidden()` → HIDDEN（末位 argmax 不传）。
 
@@ -654,6 +783,12 @@ def serve_relay_middle_connection(
     `request_hidden(hidden_bytes, n_tokens=...) -> bytes` 与 `close()`；
     主仓的 `llama_keep_head.KeepHeadUpstream`（经 `forward_hidden_to_hidden`）与
     Android 的 `nativeLayerForwardHiddenKeepHead` 语义一致。
+
+    ★ A5 两个方向：
+    * **上行**（客户端 → 本服务）：档位写在请求帧的 `flags` 低 3 位（`frame.quant`）——
+      本函数按它解回 f32 再喂 runner；
+    * **下行**（本服务 → 客户端）：档位由 `hidden_quant` 单方面决定（客户端只跟随解压）。
+      两端可以选不同档位（例如上行 `f16`、下行 `int8_block128`）。
     """
 
     width = int(n_embd)
@@ -688,7 +823,9 @@ def serve_relay_middle_connection(
             if frame.kind == RelayFrameKind.HIDDEN_SEQ:
                 # ★ P3 多序列：payload 自带 seq/pos；远端 runner 必须支持显式绑定，
                 # 否则 fail-loud（绝不退回"远端按隐式位置猜"——那会静默算错）。
-                hidden, n_tokens, meta = decode_hidden_seq(frame.payload, n_embd=width)
+                # ★ A5：按帧里的档位解回 f32（`HIDDEN_SEQ` 的 hidden 段可能被压缩）。
+                hidden, n_tokens, meta = decode_hidden_seq(frame.payload, n_embd=width,
+                                                           quant=frame.quant)
                 if n_tokens != frame.n_tokens:
                     raise RelayProtocolError("hidden_seq_token_count_mismatch")
                 if n_tokens < 1 or n_tokens > limit:
@@ -709,7 +846,8 @@ def serve_relay_middle_connection(
                 send_frame(
                     sock,
                     RelayFrame(RelayFrameKind.HIDDEN, sequence, n_tokens=n_tokens,
-                               payload=produced),
+                               payload=quantize_upload(produced, n_tokens, width, hidden_quant),
+                               quant=hidden_quant or "none"),
                 )
                 frames += 1
                 tokens += n_tokens
@@ -737,7 +875,9 @@ def serve_relay_middle_connection(
                 send_frame(
                     sock,
                     RelayFrame(RelayFrameKind.HIDDEN, sequence, n_tokens=len(incoming),
-                               payload=produced),
+                               payload=quantize_upload(produced, len(incoming), width,
+                                                       hidden_quant),
+                               quant=hidden_quant or "none"),
                 )
                 frames += 1
                 tokens += len(incoming)
@@ -748,11 +888,13 @@ def serve_relay_middle_connection(
                 raise RelayProtocolError("hidden_frame_required")
             if frame.n_tokens < 1 or frame.n_tokens > limit:
                 raise RelayProtocolError("token_count_exceeds_limit")
-            if len(frame.payload) != expected_hidden_bytes(frame.n_tokens, width):
+            if len(frame.payload) != expected_hidden_bytes(frame.n_tokens, width, frame.quant):
                 raise RelayProtocolError("hidden_payload_size_mismatch")
 
             try:
-                produced = bytes(runner.request_hidden(frame.payload, n_tokens=frame.n_tokens))
+                # ★ A5：按档位解回 f32 再喂 runner（压缩对段实现透明）。
+                produced = bytes(runner.request_hidden(frame_hidden_bytes(frame, n_embd=width),
+                                                       n_tokens=frame.n_tokens))
             except RelayProtocolError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -763,7 +905,9 @@ def serve_relay_middle_connection(
             send_frame(
                 sock,
                 RelayFrame(RelayFrameKind.HIDDEN, sequence, n_tokens=frame.n_tokens,
-                           payload=produced),
+                           payload=quantize_upload(produced, frame.n_tokens, width,
+                                                   hidden_quant),
+                           quant=hidden_quant or "none"),
             )
             frames += 1
             tokens += frame.n_tokens

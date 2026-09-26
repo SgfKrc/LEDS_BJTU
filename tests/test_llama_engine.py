@@ -5,6 +5,7 @@ import ctypes
 import types
 import hashlib
 import json
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -328,6 +329,58 @@ def test_chat_image_runs_native_pipeline_and_frees_resources(monkeypatch, tmp_pa
     assert mtmd.calls["free_batch"] == 1
     assert FakeNativeBatch.closed == 1
     assert FakeNativeSampler.closed == 1
+
+
+def test_model_name_reports_actual_gguf_not_static_default(tmp_path):
+    """★ 2026-09-24 回归（B2）：`LlamaCppEngine.model_name` 必须反映**实际加载物**。
+
+    缺陷史：`get_model_info()` 原先**不报** `model_name` ⇒ 消费方（`/status`、`/models/current`）
+    各自兜底到静态 `config.MODEL_NAME`（= 默认 0.6B）⇒ 实测加载 2B（`qwen35-2b-Q4_K_M.gguf`）
+    却对外报 `Qwen/Qwen3-0.6B`（见 `docs/未完成工作备忘-2026-09-23.md` §4.8 B2）。
+
+    「该红必须红」：若有人把 `model_name` 改回"取不到就返回 `MODEL_NAME`"，本用例立刻红。
+    """
+    engine = LlamaCppEngine()
+
+    # ① 未加载 ⇒ 空串；**不得**是任何静态默认模型名
+    assert engine.model_name == "", "未加载时不应报出模型名，更不能是静态默认值"
+
+    # ② 有路径但读不到 metadata ⇒ 回退到 GGUF **文件名**（去扩展名）
+    gguf = tmp_path / "qwen35-2b-Q4_K_M.gguf"
+    gguf.write_bytes(b"")          # 刻意不真加载：只验证取值链
+    engine._model_path = str(gguf)
+    assert engine.model_name == "qwen35-2b-Q4_K_M"
+
+    # ③ 真加载时 llama_cpp 提供 metadata ⇒ 优先取 GGUF 自带的 general.name
+    class _ModelWithMetadata:
+        metadata = {"general.name": "Qwen3 5 2b"}
+
+    engine._model = _ModelWithMetadata()
+    assert engine.model_name == "Qwen3 5 2b"
+
+    # ④ `get_model_info()` 必须带上该键（消费方正是从这里取）
+    info = engine.get_model_info()
+    assert info["model_name"] == "Qwen3 5 2b"
+    assert info["engine"] == "llama.cpp"
+
+
+def test_reporting_paths_do_not_fall_back_to_static_model_name():
+    """★ 2026-09-24 回归（B2）：`/status` 与 `/models/current` 的 `model_name` 兜底**不得**
+    再用静态 `config.MODEL_NAME`（那会张冠李戴）。
+
+    这是**源码级守卫**：兜底位置在 API 层、端到端验证要起真后端 + 真模型，
+    所以这里直接锁住"不该出现的写法" —— 任何人改回去立刻红。
+    """
+    root = Path(__file__).resolve().parents[1]
+    for relative in ("src/api/routes_health.py", "src/api/routes_models.py"):
+        text = (root / relative).read_text(encoding="utf-8")
+        offenders = [
+            line.strip() for line in text.splitlines()
+            if "model_name" in line and "MODEL_NAME" in line
+        ]
+        assert not offenders, (
+            f"{relative} 的 model_name 兜底又用回了静态 MODEL_NAME: {offenders}"
+        )
 
 
 def test_chat_image_requires_registered_vision(tmp_path):

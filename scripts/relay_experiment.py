@@ -49,7 +49,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
-for _path in (str(ROOT), str(SRC)):
+SCRIPTS = ROOT / "scripts"   # ★ R-R9：本目录的 relay_health 要被 import（接力前置探活）
+for _path in (str(ROOT), str(SRC), str(SCRIPTS)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
@@ -453,6 +454,35 @@ def _load_upstream(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+#: ★ R-R9：本进程内已探活成功的远端端点 —— 同一端点只探一次，避免多段重复握手。
+_RELAY_PROBED: set[str] = set()
+
+
+def _require_relay_alive(endpoint: str) -> None:
+    """★ R-R9：接力**开始前**对远端段做一次**协议级**探活，不通就 fail-loud。
+
+    为什么不能只 `connect`：远端段跑在 ssh 会话里时，一次网络抖动会把会话带走、**服务随之退出**，
+    而隧道端口**仍在本机监听**、新连接被接受后立刻 reset ⇒ 那种失败看起来像"模型算错"，
+    会毁掉整轮实验的**可归因性**（`docs/跨框架接力-当前有效基线与后续优化计划-2026-09-21.md` §8.6）。
+    宁可开始前就报错，也不要跑出一个无法归因的结果。
+
+    `scripts/relay_health.py` 的 `probe_relay` 会真发一个 `CLOSE` 帧并等 `TOKEN(-1)` 应答
+    （不经 runner、不加载模型）。探活成功的端点会被记住，同一进程内不再重复。
+    """
+    if endpoint in _RELAY_PROBED:
+        return
+    from relay_health import probe_relay  # noqa: PLC0415 - 同目录工具脚本
+
+    result = probe_relay(endpoint, timeout=10.0)
+    if result.get("ok") is not True:
+        raise SystemExit(
+            f"FAIL: 远端段未通过协议级探活 {endpoint}：{result.get('reason')}"
+            f"（{result.get('detail')}）\n"
+            f"  hint: {result.get('hint') or '确认该段服务是否还在（例如随 ssh 会话被网络抖动静默带走）'}"
+        )
+    _RELAY_PROBED.add(endpoint)
+
+
 class _RemoteMiddleSegment:
     """跨机中间段代理：接口与 `KeepHeadUpstream.forward_hidden_to_hidden` 一致。
 
@@ -478,6 +508,8 @@ class _RemoteMiddleSegment:
         self.hidden_quant = str(hidden_quant or "none")
         self.uplink_bytes = 0        # Actual bytes passed to the Relay wire.
         self.downlink_bytes = 0
+        # ★ R-R9：连上之前先做一次**协议级**探活（fail-loud）—— 见 `_require_relay_alive` 的说明。
+        _require_relay_alive(self.endpoint)
         self._client = RelayTcpClient(host, int(port), n_embd=self.n_embd, timeout=timeout)
 
     def _simulate_link(self, n_bytes: int) -> None:
@@ -596,6 +628,58 @@ def _wire_hidden_bytes(n_embd: int | None) -> int | None:
 
     width = int(n_embd or 0)
     return width * 4 if width > 0 else None
+
+
+def _overlap_budget(
+    n_embd: int | None,
+    hidden_quant: str,
+    *,
+    bandwidth_mbps: float,
+    compute_ms_per_step: float,
+    latency_ms: float = 0.0,
+    hops: int = 1,
+) -> dict[str, float] | None:
+    """★ R-R8（§5.1④）：**传输-计算重叠**的可重叠窗口与理论上限（纯计算，不跑模型）。
+
+    背景（`docs/跨框架接力…` §4④ / §5.1④）：同机 loopback 下可重叠窗口 **< 1%** ⇒ 不值得做；
+    文档明确「**弱网下才值得做**预取/压缩-计算重叠，届时**先测网络与解码计算的实际重叠窗口**」。
+    本函数就是那个"先测"的**纯计算**部分：把已实测的 `compute_ms_per_step` 与按带宽算出的
+    通信时间放在一起给出上限。
+
+    模型（保守、按"每跳各传一次"记账）：
+
+    * `wire_bytes = 每 token 线上字节 × hops` —— 走 `_hidden_bytes`，**已含** int8/int4 的 scale 开销；
+    * `comm_ms = wire_bytes × 8 / (bandwidth × 1e6) × 1000 + latency_ms`（串行化 + 单程额外延迟）；
+    * `serial_ms = compute + comm`，完全重叠时最多省 `min(comm, compute)`。
+
+    ⚠️ **这是可达性上界，不是实测**：它假设"通信与计算能完全交叠且互不干扰"，真实流水线还要受
+    batch、依赖关系与内核争用限制 ⇒ 报告里必须写明是**上界**。
+    `bandwidth_mbps <= 0`（不限速 ⇒ 同机）或宽度非法时返回 `None`：那种场景无可谈论的重叠。
+    """
+    width = int(n_embd or 0)
+    step_count = int(hops)
+    if width <= 0 or step_count < 1 or float(bandwidth_mbps) <= 0:
+        return None
+    wire_bytes = _hidden_bytes(width, hidden_quant)
+    if wire_bytes is None:
+        return None
+
+    total_bytes = int(wire_bytes) * step_count
+    compute_ms = max(0.0, float(compute_ms_per_step))
+    comm_ms = (total_bytes * 8.0 / (float(bandwidth_mbps) * 1e6) * 1000.0
+               + max(0.0, float(latency_ms)))
+    serial_ms = compute_ms + comm_ms
+    overlap_ms = min(comm_ms, compute_ms)
+    return {
+        "wire_bytes_per_token_per_hop": float(wire_bytes),
+        "total_wire_bytes": float(total_bytes),
+        "comm_ms": comm_ms,
+        "compute_ms": compute_ms,
+        "serial_ms": serial_ms,
+        "overlap_gain_ms": overlap_ms,
+        "overlap_ceiling_pct": (100.0 * overlap_ms / serial_ms) if serial_ms > 0 else 0.0,
+        "speedup_ceiling": (serial_ms / (serial_ms - overlap_ms)) if serial_ms > overlap_ms else 1.0,
+    }
 
 
 class _QuantErrorTracker:
@@ -719,6 +803,18 @@ def _load_keep_head_segment(args: argparse.Namespace, model_path: str, *,
                                 # 直接拒绝该批次）。
                                 n_batch=max(512, int(args.batch) * max(1, int(args.prefill))),
                                 extra_dll_dirs=extra)
+    # ★ 2026-09-24：**前置**校验 ctx 预算（fail-closed）—— llama.cpp 把 `n_ctx` 按 `n_seq_max`
+    #   **均分**（见 `KeepHeadUpstream.ctx_per_seq`）。若 `batch × prefill + gen` 超过每序列可用
+    #   ctx，长 decode 会在**中途**报 `llama_decode rc=1`（"failed to find a memory slot for
+    #   batch"），表面表现为 `runner_failed`，极易被误读成"数值不一致"。这里直接拒绝启动。
+    _need = (max(1, int(args.batch)) * max(1, int(args.prefill))
+             + max(0, int(args.gen)) + 256)
+    if int(upstream.ctx_per_seq) < _need:
+        upstream.close()
+        raise SystemExit(
+            f"FAIL: 每序列 ctx 不足：n_ctx={args.n_ctx} / n_seq_max={upstream.n_seq_max} = "
+            f"{upstream.ctx_per_seq} < 需要 {_need}（batch×prefill + gen + 256 余量）；"
+            f"请提高 --n-ctx 到 ≥ {_need * upstream.n_seq_max}，或把 --batch 降到 1")
     return {
         "keep_head": upstream,
         "load_s": round(time.perf_counter() - started, 2),
@@ -832,6 +928,11 @@ def _run_relay(args: argparse.Namespace, prompt: list[int], upstream: dict[str, 
     mid_decode: list[float] = []
     margins: list[float] = []      # ★ P4：每步（每序列）的 top1-top2 边距
     failure: str | None = None
+    # ★ 2026-09-24：`middle` 只在**三段**分支（`else:`）里赋值，但函数尾部的 `mid_uplink_bytes` /
+    #   `mid_downlink_bytes`（以及 `close()`）会无条件引用它 ⇒ 走 2 段链路（`PATH_L2L` /
+    #   `PATH_L2L_KEEP_HEAD`）时必然 `UnboundLocalError: cannot access local variable 'middle'`。
+    #   既有 bug（与本轮余量改动无关，是在验证 l2l_keep_head 时撞上的），这里补默认值。
+    middle = None
     pos = 0
 
     if args.path in (PATH_L2L, PATH_L2L_KEEP_HEAD):
@@ -1384,6 +1485,15 @@ def _dry_run_record(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # ★ R-R8 顺手修：Windows 控制台默认 GBK，报告里的 `⇒` 等符号会让 `print` 抛
+    #   `UnicodeEncodeError` ⇒ **整个报告打不出来**（`relay_health.py` / `tui_e2e_flow.py`
+    #   都踩过同一个坑）。这里统一降级为 replace，保证报告永远打得出来。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 - 老环境没有 reconfigure 就照旧
+            pass
+
     args = _parse(argv)
     record = _dry_run_record(args) if args.dry_run else _run(args)
 

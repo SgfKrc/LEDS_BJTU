@@ -32,7 +32,13 @@ def test_bridge_preset_examples_use_current_v41_api_ref():
 
 @_bridge_present
 def test_main_docs_distinguish_current_ref_from_legacy_aliases():
-    cache_plan = (ROOT / "docs" / "\u7f13\u5b58\u673a\u5236\u4e13\u9879\u8ba1\u5212-2026-09-13.md").read_text(encoding="utf-8")
+    cache_plan = (
+        ROOT
+        / "docs"
+        / "archive"
+        / "runtime"
+        / "\u7f13\u5b58\u673a\u5236\u4e13\u9879\u8ba1\u5212-2026-09-13.md"
+    ).read_text(encoding="utf-8")
     bridge_config = (BRIDGE_DIR / "config.example.toml").read_text(encoding="utf-8")
 
     assert "deepseek-flash" in cache_plan

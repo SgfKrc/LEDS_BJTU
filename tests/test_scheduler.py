@@ -2013,6 +2013,122 @@ class TestPipelineMessageDispatch:
             "runtime_quant_type": "fp16",
         }
 
+    def test_relay_middle_assignment_does_not_load_scheduler_host(
+            self, sched, monkeypatch):
+        """relay_middle uses the supervised endpoint, not a local full/layer model."""
+        import scheduler_pipeline as pipeline_module
+
+        relay_spec = {
+            "role": "middle",
+            "host": "127.0.0.1",
+            "port": 50183,
+            "n_embd": 896,
+            "timeout": 5.0,
+        }
+        load_calls = []
+        fake_host = type("RelayHost", (), {
+            "is_loaded": False,
+            "model_loaded": False,
+            "layer_range": None,
+            "load_layer_range": lambda self, *args, **kwargs: load_calls.append(
+                (args, kwargs)
+            ),
+        })()
+        sent = []
+        sched._host = fake_host
+        sched._tcp_client = type("Client", (), {
+            "send_data": lambda self, payload, msg_type: sent.append((payload, msg_type)),
+        })()
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: "worker")
+        monkeypatch.setattr(pipeline_module, "PIPELINE_RELAY_ENABLED", True)
+
+        sched._handle_layer_config("master", {
+            "node_id": "worker",
+            "config_id": "cfg-relay",
+            "start_layer": 8,
+            "end_layer": 16,
+            "model_id": "qwen-test",
+            "model_sha256": "sha-relay",
+            "model_type": "qwen2",
+            "total_layers": 24,
+            "engine": "relay_middle",
+            "relay_segment": relay_spec,
+        })
+
+        assert load_calls == []
+        assert fake_host.model_loaded is False
+        assert sent[-1][0]["status"] == "ready"
+        assert sched._active_layer_config["engine"] == "relay_middle"
+        assert sched._active_layer_config["relay_segment"] == relay_spec
+
+    def test_relay_middle_prepare_does_not_require_local_capacity(
+            self, sched, monkeypatch):
+        import scheduler_pipeline as pipeline_module
+
+        relay_spec = {
+            "role": "middle", "host": "127.0.0.1", "port": 50183,
+            "n_embd": 896, "timeout": 5.0,
+        }
+        sent = []
+        sched._host = type("RelayHost", (), {
+            "is_loaded": False, "model_loaded": False, "layer_range": None,
+        })()
+        sched._tcp_client = type("Client", (), {
+            "send_data": lambda self, payload, msg_type: sent.append(payload),
+        })()
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: "worker")
+        monkeypatch.setattr(pipeline_module, "PIPELINE_RELAY_ENABLED", True)
+
+        sched._handle_layer_config("master", {
+            "node_id": "worker", "config_id": "cfg-relay-prepare",
+            "phase": "prepare", "plan_id": "plan-relay",
+            "start_layer": 8, "end_layer": 16,
+            "model_id": "qwen-test", "model_sha256": "sha-relay",
+            "model_type": "qwen2", "total_layers": 24,
+            "engine": "relay_middle", "relay_segment": relay_spec,
+        })
+
+        assert sent[-1]["status"] == "prepared"
+        assert sent[-1]["engine"] == "relay_middle"
+        assert sched._prepared_layer_configs["cfg-relay-prepare"]["plan_id"] == "plan-relay"
+
+    def test_relay_middle_forward_bypasses_local_model_check(
+            self, sched, monkeypatch):
+        """A confirmed relay assignment can forward with an unloaded host."""
+        import scheduler_pipeline as pipeline_module
+
+        relay_spec = {
+            "role": "middle", "host": "127.0.0.1", "port": 50183,
+            "n_embd": 4, "timeout": 5.0,
+        }
+        sched._host = type("RelayHost", (), {
+            "is_loaded": False, "model_loaded": False, "layer_range": None,
+        })()
+        sched._active_layer_config = {
+            "config_id": "cfg-relay", "model_id": "qwen-test",
+            "model_sha256": "sha-relay", "model_type": "qwen2",
+            "layer_range": [8, 16], "engine": "relay_middle",
+            "relay_segment": relay_spec,
+        }
+        sched._tcp_client = type("Client", (), {"_running": True})()
+        monkeypatch.setattr(pipeline_module, "PIPELINE_RELAY_ENABLED", True)
+        forwarded = []
+        monkeypatch.setattr(
+            sched, "_handle_layer_forward_via_relay",
+            lambda spec, **kwargs: forwarded.append((spec, kwargs)),
+        )
+
+        hidden = (b"\x00" * (4 * 4))
+        sched._handle_layer_forward_locked("master", {"data": {
+            "task_id": "relay-task", "step": 0, "use_kv_cache": False,
+            "config_id": "cfg-relay", "model_sha256": "sha-relay",
+            "model_type": "qwen2", "hidden_states": hidden,
+            "hidden_shape": [4, 4], "relay_segment": relay_spec,
+        }})
+
+        assert len(forwarded) == 1
+        assert forwarded[0][0] == relay_spec
+
     def test_capacity_prepare_validates_without_loading_range(
             self, sched, monkeypatch, tmp_path):
         from model_host import model_host as _host
@@ -5755,6 +5871,11 @@ class TestLocalMasterIdentity:
         monkeypatch.setenv("QLH_SQLITE_PATH", str(sqlite_path))
         monkeypatch.setattr(local_store, "_initialized_paths", set())
 
+        # ★ R-R4（用户裁定 A，`dec-e31b944dfde347ef`）：`reset_master_identity()` 以**物理 MAC** 为准
+        #   ⇒ 这里把物理探测固定成可预测值，使「重置绑定物理值」这一契约可以被断言。
+        monkeypatch.setattr("transport_port.get_mac_addresses",
+                            lambda: ["AA-BB-CC-DD-EE-FF"], raising=False)
+
         sched = Scheduler()
         sched._role_override = "master"
         sched._mac_addresses = ["AA-BB-CC-DD-EE-FF"]
@@ -5781,8 +5902,10 @@ class TestLocalMasterIdentity:
         result = sched.reset_master_identity()
         assert result["status"] == "ok"
         assert sched.get_invite_info()["identity_reason"] == "reset"
+        # ★ 重置绑的是**物理** MAC，而**不是**上面被改成 `11:22:33:44:55:66` 的内存缓存 ——
+        #   用户裁定 A：重置 = 强制回到物理真相，缓存陈旧/被污染时不得被固化。
         assert local_store.get_local_master_identity()["mac_addresses"] == [
-            "11:22:33:44:55:66",
+            "aa-bb-cc-dd-ee-ff",
         ]
 
     def test_invite_reports_tailnet_address_source(self):
@@ -5790,6 +5913,50 @@ class TestLocalMasterIdentity:
         sched._lan_ip = "100.88.9.10"
 
         assert sched.get_invite_info()["master_host_source"] == "tailnet"
+
+
+class TestMasterIdentityAdvertiseAndReset:
+    """★ R-R4（B5 / #8）实机复验补的回归：重置必须绑**物理** MAC；host_source 要区分 tailnet/LAN。"""
+
+    def test_reset_binds_physical_mac_not_stale_cache(self, monkeypatch, tmp_path):
+        """★ 重置的语义 = 「强制回到物理真相」⇒ **不得**沿用内存里可能陈旧/被污染的缓存。
+
+        实机复验发现：`reset_master_identity()` 原先**优先**用 `self._mac_addresses`；把该缓存污染成
+        `de-ad-be-ef-00-01` 后重置，会把**错值固化**进 SQLite —— 而它的 docstring 明说
+        「立即把当前**物理** MAC 绑定到主节点 SQLite」。
+        """
+        import local_store
+        from scheduler import Scheduler
+
+        monkeypatch.setenv("QLH_SQLITE_PATH", str(tmp_path / "qlh-control.sqlite3"))
+        monkeypatch.setattr(local_store, "_initialized_paths", set())
+        monkeypatch.setattr(
+            "transport_port.get_mac_addresses",
+            lambda: ["AA-BB-CC-DD-EE-FF", "11-22-33-44-55-66"],
+            raising=False,
+        )
+
+        sched = Scheduler()
+        sched._role_override = "master"
+        sched._mac_addresses = ["de-ad-be-ef-00-01"]          # 陈旧 / 被污染的缓存
+
+        result = sched.reset_master_identity()
+
+        assert result["status"] == "ok"
+        stored = local_store.get_local_master_identity()["mac_addresses"]
+        assert stored == ["11-22-33-44-55-66", "aa-bb-cc-dd-ee-ff"]     # 物理值（已排序）
+        assert "de-ad-be-ef-00-01" not in stored
+
+    def test_invite_reports_lan_source_when_not_on_tailnet(self):
+        """③ 的另一半：不在 Tailnet 上时 `master_host_source` 必须是 `lan`（B5 的「LAN 回退」）。"""
+        from scheduler import Scheduler
+
+        sched = Scheduler()
+        sched._lan_ip = "192.168.1.61"
+
+        invite = sched.get_invite_info()
+        assert invite["master_host_source"] == "lan"
+        assert invite["master_host"] == "192.168.1.61"
 
 
 class TestSchedulerHighAvailabilitySQLite:

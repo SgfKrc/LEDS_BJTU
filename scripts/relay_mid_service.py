@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -118,14 +119,33 @@ class KeepHeadMiddleRunner:
 
 
 class TailRunner:
-    """末段：吃 hidden → 吐 token（主仓 llama_engine）。"""
+    """末段：吃 hidden → 吐 token（主仓 llama_engine）。
 
-    def __init__(self, *, model: str, n_ctx: int, n_threads: int) -> None:
+    ★ 2026-09-23：pip 绑定的 `Llama.__init__` 会**无条件**把 `flash_attn_type` 写成
+    `DISABLED`、把 `n_threads_batch` 写成 `multiprocessing.cpu_count()`；而自建 shim 那份
+    llama.cpp 是 `flash_attn = auto → enabled`、`n_threads_batch = n_threads`。这两项在
+    32-token prefill（`ubatch.n_tokens > 1`）上都会改变浮点结果 ⇒ 与 shim 段**混用**时可能把
+    近并列的 top-1 翻转（实测：同一 head 段下 9B 两段 pip tail 1/32、shim tail 32/32）。
+    这里把两者暴露为可显式对齐的参数；不传则保持 pip 默认（便于复现差异本身）。
+    """
+
+    def __init__(self, *, model: str, n_ctx: int, n_threads: int,
+                 flash_attn: bool = True, n_threads_batch: int | None = None) -> None:
         from llama_engine import LlamaCppEngine  # noqa: PLC0415
 
+        # 默认与自建 shim 取齐（`flash_attn=True`、`n_threads_batch=n_threads`）：
+        #   - flash attention 是**判据关键**：pip 绑定默认 DISABLED 时 9B 两段 1/32，
+        #     打开后 32/32（单变量实测：只对齐 batch 线程仍 1/32）；
+        #   - batch 线程数不是判据关键，但取齐可避免无谓的浮点差异。
+        load_kwargs: dict[str, object] = {
+            "flash_attn": bool(flash_attn),
+            "n_threads_batch": (int(n_threads_batch)
+                                if (n_threads_batch is not None and int(n_threads_batch) > 0)
+                                else int(n_threads)),
+        }
         self._engine = LlamaCppEngine()
         self._engine.load_model(model_path=str(model), n_ctx=n_ctx, n_threads=n_threads,
-                               n_seq_max=1)
+                               n_seq_max=1, **load_kwargs)
         if not self._engine.is_loaded:
             raise RuntimeError(f"下游模型加载失败：{model}")
         import llama_cpp.llama_cpp as M  # noqa: PLC0415
@@ -134,8 +154,14 @@ class TailRunner:
         self.n_embd = int(M.llama_model_n_embd_inp(native))
         self.n_layer = int(M.llama_model_n_layer(native))
         self._pos = 0
+        # ★ 逐段引擎/参数标识（§10.2 待办的一部分）：写清实际生效的构建与开关
         print(json.dumps({"role": "tail", "n_embd": self.n_embd, "n_layer": self.n_layer,
-                          "channel": "llama_engine.forward_layers_from_hidden"}), flush=True)
+                          "channel": "llama_engine.forward_layers_from_hidden",
+                          "flash_attn": bool(flash_attn),
+                          "n_threads_batch": (int(n_threads_batch)
+                                              if n_threads_batch is not None else None),
+                          "llama_cpp_version": getattr(
+                              __import__("llama_cpp"), "__version__", "?")}), flush=True)
 
     def reset(self) -> None:
         self._pos = 0
@@ -287,7 +313,7 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--n-embd", type=int, default=None, help="可选：与本地期望宽度核对")
     ap.add_argument("--n-ctx", type=int, default=4096)
     ap.add_argument("--threads", type=int, default=8)
-    ap.add_argument("--n-seq-max", type=int, default=8,
+    ap.add_argument("--n-seq-max", type=int, default=1,
                     help="★ P3：允许的并行序列上限（跨机多序列要求 ≥ 调用方 batch）")
     ap.add_argument("--n-batch", type=int, default=1024,
                     help="★ P3：batch 容量下限（≥ 调用方 batch × prefill 长度）")
@@ -297,14 +323,39 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
                          "会跑满全部层，只适合验证或没有裁层工件时）")
     ap.add_argument("--cut-layer", type=int, default=None,
                     help="--mode layer_inp 必需：切点 K（取第 K 层输入 = 前 K 层输出）")
+    ap.add_argument("--tail-no-flash-attn", action="store_true",
+                    help="★ 仅 --role tail（pip llama_engine）：**关闭** flash attention。"
+                         "默认打开（与自建 shim 的 AUTO→enabled 取齐）—— pip 绑定默认写成 "
+                         "DISABLED，那是 9B 两段 1/32 的根因（单变量实测：只对齐 batch 线程"
+                         "仍 1/32，只打开 FA 即 32/32）。此开关只用于复现差异")
+    ap.add_argument("--tail-threads-batch", type=int, default=None,
+                    help="★ 仅 --role tail（pip llama_engine）：批处理线程数；缺省取 --threads "
+                         "（与 shim 一致。pip 绑定默认 cpu_count()）")
     ap.add_argument("--max-tokens", type=int, default=RELAY_DEFAULT_MAX_TOKENS)
+    ap.add_argument("--hidden-quant", default="none",
+                    choices=("none", "f16", "int8_block128", "int4_block128"),
+                    help="★ A5：**下行**（本服务 → 客户端）的 hidden 压缩档。只有 --role head/middle "
+                         "会回 HIDDEN（tail 回 TOKEN，不受影响）；客户端按帧里的档位解压。"
+                         "实测判据见 docs/跨框架接力 §5.1③（f16 / int8 32/32 PASS，int4 FAIL）")
     ap.add_argument("--dll-dir", action="append", default=[])
-    ap.add_argument("--ready-file", default=None, help="写就绪标记（含实际端点），供驱动等待")
+    ap.add_argument("--ready-file", default=None,
+                    help="写就绪标记（含实际端点与**构建标识**），供驱动等待与逐段对账")
+    ap.add_argument("--digest-artifacts", action="store_true",
+                    help="★ ready 文件里对**段工件**也算 sha256（GB 级会明显变慢；默认只记大小/名字）")
     ap.add_argument("--max-connections", type=int, default=0, help="0 = 不限制")
     ap.add_argument("--heartbeat-interval", type=float, default=5.0,
                     help="★ P4.5 健康检查：定期刷新 ready 文件的时间戳（秒；0 = 关闭）。"
                          "外部据此判断服务是否还活着 —— 服务跑在 ssh 会话里时会被网络抖动静默带走，"
                          "没有心跳就分不清'服务已退出'与'模型算错'")
+    ap.add_argument("--detach", action="store_true",
+                    help="★ R-R9：**脱离发起会话**运行（重起为无终端子进程后父进程退出）—— "
+                         "§8.6 的实测教训：ssh 起的段会被网络抖动带走，而隧道端口仍在监听、"
+                         "新连接被接受后立刻 reset，与'模型层错误'难以区分。需配合 --log-file")
+    ap.add_argument("--log-file", default=None,
+                    help="★ R-R9：--detach 时 stdout/stderr 的落点（detach 后没有终端可写）")
+    ap.add_argument("--pid-file", default=None,
+                    help="★ R-R9：写入服务 PID，便于停止与对账（服务本身不删该文件："
+                         "判断活性请用 scripts/relay_health.py --probe）")
     return ap.parse_args(argv)
 
 
@@ -315,8 +366,96 @@ def _split_endpoint(endpoint: str) -> tuple[str, int]:
     return host, int(port)
 
 
+def _runner_build(runner: Any, *, digest_artifacts: bool = False) -> dict[str, Any]:
+    """收集**本段**构建标识，写进 ready 文件（供探针逐段对账；§10.2 待办）。
+
+    shim 路径的 runner（`KeepHeadMiddleRunner` / `HeadRunner` / `ShimTailRunner`）都持有 `_upstream`，
+    于是能记下 shim 与同目录 `libllama`/`ggml*` 的摘要；pip 的 `TailRunner` 没有 shim，
+    就记 `llama_cpp` 版本与它自带的 `lib/llama.dll` 摘要 —— 这正是 §10.7 里 1/32 vs 32/32 的分界。
+    """
+    from relay_segment_info import collect_local_build  # noqa: PLC0415
+
+    upstream = getattr(runner, "_upstream", None)
+    shim = getattr(upstream, "shim_path", None)
+    model = getattr(upstream, "model_path", None)
+    module = None
+    if upstream is None:  # pip 绑定路径：没有 shim
+        try:
+            import llama_cpp as module  # noqa: PLC0415
+        except Exception:  # noqa: BLE001 - 未安装不影响服务本身
+            module = None
+    return collect_local_build(shim=shim, model=model, llama_cpp_module=module,
+                               digest_artifacts=digest_artifacts)
+
+
+def _detach_self(args: argparse.Namespace) -> int:
+    """★ R-R9：把本服务**重起为脱离会话的进程**，父进程随即退出。
+
+    ## 为什么需要（§8.6 的实测教训）
+
+    用 `ssh ... python3 relay_mid_service.py` 起的段，**网络抖动会把 ssh 会话带走、服务随之退出**；
+    此后隧道端口**仍在本机监听**，新连接被"接受"后立刻 reset（`ConnectionResetError`）——
+    现象与"模型层错误"**难以区分**。生产形态要求服务**不依赖发起会话**。
+
+    ## 做法（零依赖，不引入 `systemd` / `pywin32`）
+
+    - `subprocess.Popen` **重起自己**，并用 `QLH_RELAY_DETACHED=1` 防止无限递归；
+    - Windows：`CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS`；POSIX：`start_new_session=True`
+      （等效 `setsid`，Termux 无 `setsid` 也可用）；
+    - stdout/stderr 重定向到 `--log-file`（detach 后没有终端可写）；
+    - 打印子进程 PID（并按需写 `--pid-file`）后**父进程退出** —— 调用方会话断了也不影响服务。
+
+    ## 怎么停
+
+    先用 `scripts/relay_health.py --probe <name>=tcp:<host>:<port>` 确认该段是否真在服务
+    （**协议级**握手，能识别"端口在监听但对端已死"），再按 `--pid-file` 或 PID 停：
+    Windows `taskkill /PID <pid> /T /F`；POSIX `kill <pid>`。
+    """
+    if not args.log_file:
+        print("FAIL: --detach 需要 --log-file（detach 后没有终端可接管输出）", file=sys.stderr)
+        return 2
+
+    env = dict(os.environ, QLH_RELAY_DETACHED="1")
+    command = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
+    log_path = Path(args.log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as log:
+        if os.name == "nt":
+            flags = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                     | getattr(subprocess, "DETACHED_PROCESS", 0))
+            child = subprocess.Popen(command, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                                     env=env, creationflags=flags, close_fds=True)
+        else:
+            child = subprocess.Popen(command, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                                     env=env, start_new_session=True, close_fds=True)
+    print(f"[detached] pid={child.pid} log={log_path}")
+    if args.pid_file:
+        Path(args.pid_file).write_text(str(child.pid), encoding="utf-8")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    # ★ R-R8 顺手修：服务端日志里含 `⇒` 等符号时，Windows GBK 控制台会让写日志抛
+    #   `UnicodeEncodeError`（同 `relay_health.py` 踩过的坑）。统一降级为 replace。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
+
     args = _parse(argv)
+
+    # ★ R-R9：先处理"脱离会话"，再进入真正的服务流程。
+    if args.detach and os.environ.get("QLH_RELAY_DETACHED") != "1":
+        return _detach_self(args)
+
+    if args.pid_file:
+        try:
+            Path(args.pid_file).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.pid_file).write_text(str(os.getpid()), encoding="utf-8")
+        except OSError:
+            pass        # 写不了 pid 文件不该让服务起不来；判断活性请用 relay_health --probe
+
     host, port = _split_endpoint(args.listen)
 
     if args.role == "middle":
@@ -350,7 +489,9 @@ def main(argv: list[str] | None = None) -> int:
                                     extra_dll_dirs=list(args.dll_dir),
                                     n_seq_max=args.n_seq_max, n_batch=args.n_batch)
         else:
-            runner = TailRunner(model=args.model, n_ctx=args.n_ctx, n_threads=args.threads)
+            runner = TailRunner(model=args.model, n_ctx=args.n_ctx, n_threads=args.threads,
+                                flash_attn=not bool(args.tail_no_flash_attn),
+                                n_threads_batch=args.tail_threads_batch)
         serve = serve_relay_connection
 
     if args.n_embd is not None and int(args.n_embd) != int(runner.n_embd):
@@ -359,7 +500,15 @@ def main(argv: list[str] | None = None) -> int:
     listener = open_loopback_listener(host, port)
     utc_now = lambda: datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     ready = {"role": args.role, "host": host, "port": port, "n_embd": runner.n_embd,
-             "ready_at": utc_now()}
+             "ready_at": utc_now(),
+             # ★ 2026-09-23（A5）：本服务**下行**（→ 客户端）的 hidden 压缩档。
+             #   tail 角色回 TOKEN、不回 HIDDEN ⇒ 记 `None`，避免记录里出现误导性档位。
+             "hidden_quant_downlink": (args.hidden_quant
+                                       if serve is serve_relay_middle_connection else None),
+             # ★ 2026-09-23（§10.2）：把**本段构建标识**写进 ready 文件 —— 探针据此在记录里
+             #   逐段写出 runner/构建，避免「记录里看不出用的是 pip 绑定还是自建 shim」。
+             "build": _runner_build(runner,
+                                    digest_artifacts=bool(args.digest_artifacts))}
     if args.ready_file:
         target = Path(args.ready_file)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -385,19 +534,59 @@ def main(argv: list[str] | None = None) -> int:
                         pass
 
             threading.Thread(target=_beat, daemon=True).start()
+    # ★ 2026-09-24：把**每序列可用 ctx** 讲清楚 —— llama.cpp 会把 `n_ctx` 按 `n_seq_max`
+    #   **均分**；单序列长 decode 一旦超过 `n_ctx / n_seq_max` 就会在中途报 llama.cpp 的
+    #   "failed to find a memory slot for batch"（`llama_decode rc=1`）。
+    #   实测（tail 段）：`n_ctx=2048, n_seq_max=8` ⇒ 单序列仅 256 槽位，decode 到第 256 步即失败；
+    #   `4096/8=512` ⇒ ~481 步失败；`8192/8=1024` ⇒ ~1000 步失败（三者完全吻合）。
+    #   ⇒ 单序列用法请显式 `--n-seq-max 1`，或把 `--n-ctx` 放大到 `n_seq_max` 倍。
+    _per_seq = int(args.n_ctx) // max(1, int(args.n_seq_max))
+    if int(args.n_seq_max) > 1:
+        print(f"[warn] n_seq_max={args.n_seq_max} ⇒ 每序列 ctx ≈ {_per_seq}（单序列长 decode "
+              f"超过它会在中途 rc=1 失败）；单序列请用 --n-seq-max 1 或放大 --n-ctx", flush=True)
     print(f"[ready] role={args.role} listening {host}:{port} n_embd={runner.n_embd} "
-          f"(heartbeat={args.heartbeat_interval}s)", flush=True)
+          f"ctx_per_seq={_per_seq} (heartbeat={args.heartbeat_interval}s)", flush=True)
 
     served = 0
+    degraded: str | None = None
     try:
         while True:
             if args.max_connections and served >= int(args.max_connections):
                 break
             sock, _addr = listener.accept()
+            # ★ 2026-09-24：**fail-closed 但不退出** —— runner 一旦不可用（例如长 decode 触发
+            #   `llama_decode rc=1` 找不到 KV 槽位），后续会话必须**明确拒绝**，而不是让异常冒到
+            #   顶层把服务进程带走（那样现象与"模型算错"难以区分，实测踩到）。保持进程存活，
+            #   心跳与日志才继续可见。
+            if degraded is not None:
+                print(f"[reject] runner unavailable: {degraded}", flush=True)
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                served += 1
+                continue
             try:
-                runner.reset()
-                result = serve(sock, runner, n_embd=int(runner.n_embd),
-                               max_tokens=int(args.max_tokens))
+                try:
+                    runner.reset()
+                except Exception as exc:  # noqa: BLE001 - 引擎已不可用
+                    degraded = f"{type(exc).__name__}: {exc}"
+                    print(f"[degraded] runner reset failed -> marking unavailable: {degraded}",
+                          flush=True)
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    served += 1
+                    continue
+                # ★ A5：只有 head/middle 角色会回 HIDDEN ⇒ 下行压缩档仅对它们有意义。
+                if serve is serve_relay_middle_connection:
+                    result = serve(sock, runner, n_embd=int(runner.n_embd),
+                                   max_tokens=int(args.max_tokens),
+                                   hidden_quant=args.hidden_quant)
+                else:
+                    result = serve(sock, runner, n_embd=int(runner.n_embd),
+                                   max_tokens=int(args.max_tokens))
                 print(f"[session] frames={result.frames} tokens={result.tokens} "
                       f"closed_cleanly={result.closed_cleanly} error={result.error or '-'}",
                       flush=True)

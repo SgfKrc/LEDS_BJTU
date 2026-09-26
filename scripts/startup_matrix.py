@@ -35,6 +35,8 @@ NO_TORCH_TESTS = (
 TUI_TESTS = (
     "tests/test_tui_backend.py",
     "tests/test_tui_textual.py",
+    "tests/test_tui_e2e_flow.py",
+    "tests/test_tui_e2e_flow_distributed.py",
 )
 
 

@@ -70,6 +70,7 @@ from config import (
     COMPILE_RECOMPILE_LIMIT,
 COMPILE_MIN_PARAMS,
     QUANT_TYPE, USE_COMPILE, USE_MONOLITHIC_FORWARD,
+    USE_FUSED_RMSNORM,
     DEVICE, TRUST_REMOTE_CODE,
     INFERENCE_ENGINE,
     TOTAL_MODEL_LAYERS, DEFAULT_LAYER_CONFIG,
@@ -374,6 +375,40 @@ class _LayerLoop(torch.nn.Module):
             hidden_states = layer_output[0] if isinstance(layer_output, tuple) else layer_output
         return hidden_states
 _IMPORTED_INFERENCE_ENGINE = INFERENCE_ENGINE
+
+
+def _apply_fused_rmsnorm(model: torch.nn.Module) -> int:
+    """★ R-R7 rank3：把模型里的 `RMSNorm` 模块换成 `F.rms_norm` 融合实现。返回替换个数。
+
+    **只按实例替换**（把 `module.forward` 设成闭包），**不 patch transformers 的类** —— 后者会连
+    同进程里其他模型与其他用途一起改，范围失控。用闭包而非 `types.MethodType`：`nn.Module.__call__`
+    取的是 `self.forward` 属性，实例属性为普通函数时不会自动传 `self`，闭包直接捕获模块更稳。
+
+    语义与 `transformers` 的 `Qwen2RMSNorm.forward` 一致：`weight * x * rsqrt(mean(x²) + eps)`；
+    差别只在**算子数**（6 → 1）与不再走 `.to(float32)` 往返（实测那 2 次 `.to` 占全部 `.to` 的 90%）。
+    torch < 2.4 没有 `F.rms_norm` ⇒ 返回 0，行为不变。
+    """
+    if not hasattr(torch.nn.functional, "rms_norm"):
+        return 0
+
+    replaced = 0
+    for module in model.modules():
+        if "RMSNorm" not in type(module).__name__:
+            continue
+        weight = getattr(module, "weight", None)
+        eps = getattr(module, "variance_epsilon", None)
+        if eps is None:
+            eps = getattr(module, "eps", None)
+        if weight is None or eps is None:
+            continue
+
+        def forward(hidden_states, _module=module, _eps=eps):  # noqa: ANN001
+            return torch.nn.functional.rms_norm(
+                hidden_states, (_module.weight.shape[0],), _module.weight, _eps)
+
+        module.forward = forward
+        replaced += 1
+    return replaced
 
 
 def _select_layer_runtime() -> Tuple[str, torch.dtype]:
@@ -1886,6 +1921,9 @@ class ModelManager:
         # 注意：forward_layers() 是**手动逐层**前向，吃不到整段 compile；
         # 此处注册的编译版本供 self.model(...) / 内部 transformer(...) 的整段调用使用。
         self._maybe_apply_compile()
+        # ★ R-R7 rank3：层分段路径（load_layer_range）同样应用融合 RMSNorm —— 与本方法并列，
+        #   因为该路径的层循环同样吃不到整段 compile，但能吃到 RMSNorm 的算子合并。
+        self._maybe_apply_fused_rmsnorm()
 
     def _load_qwen2_layer_range(
         self,
@@ -2787,6 +2825,10 @@ class ModelManager:
             else:
                 self._apply_compile()
 
+        # ★ R-R7 rank3：融合 RMSNorm —— 与 compile 无关的**独立开关**（见 config.USE_FUSED_RMSNORM）。
+        #   不放在 `if USE_COMPILE` 内：它不需要 CUDA、也没有规模门，收益来自消掉每步的 `.to` 往返。
+        self._maybe_apply_fused_rmsnorm()
+
     def _count_transformer_layers(self) -> int:
         """统计模型的 Transformer 层数（A3：改用统一的包装器探测）。"""
         if self.model is None:
@@ -2941,6 +2983,26 @@ class ModelManager:
             return float(layers) * (4.0 * h * h + 3.0 * h * i)
         except Exception:  # noqa: BLE001
             return None
+
+    def _maybe_apply_fused_rmsnorm(self) -> None:
+        """★ R-R7 rank3：按 `USE_FUSED_RMSNORM` 决定是否把本模型的 RMSNorm 换成 `F.rms_norm`。
+
+        与 `_maybe_apply_compile` 不同，这里**不设规模门**：实测收益来自「消掉每步 2×层数的 `.to`
+        往返」，而该路径是 CPU/launch-bound，占比**在小模型上更高**，与参数量无关；也不需要 CUDA
+        （`F.rms_norm` 在 CPU 上同样可用）。
+        默认关闭 ⇒ 与旧版行为完全一致（见 `config.USE_FUSED_RMSNORM` 的实测依据与判据）。
+        """
+        if not USE_FUSED_RMSNORM:
+            return
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+        replaced = _apply_fused_rmsnorm(model)
+        if replaced:
+            logger.info("✅ 已启用融合 RMSNorm（F.rms_norm）：替换 %d 个模块", replaced)
+        else:
+            logger.warning(
+                "⚠️ USE_FUSED_RMSNORM=1 但未找到可替换的 RMSNorm 模块（保持原实现、行为不变）")
 
     def _maybe_apply_compile(self) -> None:
         """按与 ``_load_pytorch`` 相同的条件决定是否启用算子融合。

@@ -1,0 +1,42 @@
+{
+  "schema_version": "qlh.torch_hetero_plan_stability_matrix.v1",
+  "ticket": "TORCH-HETERO-PLAN-01",
+  "created_at": "2026-09-26",
+  "model": "qwen2.5-0.5b-instruct",
+  "runtime": {
+    "torch": "2.13.0+cu126",
+    "precision": "fp32",
+    "prompt_tokens": 64,
+    "warmup": 3,
+    "repeats": 7,
+    "inner_loops": 8,
+    "cpu_threads": 6,
+    "cpu_interop_threads": 1,
+    "cpu_affinity": [0, 2, 4, 6, 8, 10],
+    "layer_range": [0, 24],
+    "stability_gate": "cv <= 0.10 and warmup_consistent=true"
+  },
+  "identity": {
+    "model_fingerprint_match": true,
+    "workload_fingerprint_match": true,
+    "prefill_shape_match": true,
+    "decode_shape_match": true,
+    "model_fingerprint": "model:sha256:fdf756fa7fcbe7404d5c60e26bff1a0c8b8aa1f72ced49e7dd0210fe288fb7fe",
+    "workload_fingerprint": "workload:sha256:7ca39b149995c240a37e49605cac5f838d673ffd7b111c9caa8e3cf94a54126f"
+  },
+  "coverage": {
+    "cpu": {"prefill_layers": 24, "prefill_stable": 22, "decode_layers": 24, "decode_stable": 12},
+    "cuda": {"prefill_layers": 24, "prefill_stable": 10, "decode_layers": 24, "decode_stable": 9},
+    "both_devices_stable": {"prefill_layers": 10, "decode_layers": 2}
+  },
+  "sources": {
+    "cpu": "local_docs/evidence/torch-hetero-plan/cpu-layer-profile-fp32-full-loop8-20260926.json",
+    "cuda": "local_docs/evidence/torch-hetero-plan/cuda-layer-profile-fp32-full-loop8-20260926.json"
+  },
+  "decision": {
+    "measurement_protocol_improved": true,
+    "full_layer_plan_admitted": false,
+    "runtime_connected": false,
+    "reason": "long-tail costs remain unstable; no rows were synthesized, repaired, or substituted"
+  }
+}

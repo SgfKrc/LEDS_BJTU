@@ -1,0 +1,146 @@
+{
+  "schema": "qlh.tui.e2e.flow.v1",
+  "title": "QLH TUI 端到端 flow（F1 档：假后端、零模型）",
+  "plan": "docs/TUI端到端flow测试与答辩演示复用计划-2026-09-24.md",
+  "ticket": "CORE-TUI-E2E-01",
+  "tier": "F1",
+  "topology": "single_host_loopback",
+  "physical_dual_host": false,
+  "real_model_loaded": false,
+  "topology_note": "只做流程级断言：不打起真后端、不加载模型、不做跨机；不得据此宣称双机物理分布式或真模型已加载（计划 §6.1 风险 6）",
+  "exit_codes": {
+    "assert": {"0": "全通过", "1": "有断言失败", "2": "环境缺失（等价 skip，不判失败）"},
+    "demo": {"0": "全 PASS", "1": "有 FAIL", "2": "环境缺失", "3": "有 DEGRADED"}
+  },
+  "nav_ids": [
+    "nav-chat", "nav-status", "nav-models", "nav-cluster", "nav-nodes",
+    "nav-queue", "nav-logs", "nav-device", "nav-settings", "nav-api"
+  ],
+  "steps": [
+    {
+      "id": "boot_to_main",
+      "caption": "启动外壳 → 主界面（十项侧栏就绪）",
+      "actions": [
+        {"kind": "new_app", "api": "fake"},
+        {"kind": "enter_main"}
+      ],
+      "expect": [
+        {"kind": "screen_is_main"},
+        {"kind": "nav_count", "value": 10},
+        {"kind": "page", "value": "page-chat"},
+        {"kind": "nav_index", "value": 0}
+      ]
+    },
+    {
+      "id": "nav_sweep_all_pages",
+      "caption": "鼠标点击侧栏，逐屏走完九个后续页面",
+      "actions": [
+        {"kind": "click_nav", "page": "status"},
+        {"kind": "click_nav", "page": "models"},
+        {"kind": "click_nav", "page": "cluster"},
+        {"kind": "click_nav", "page": "nodes"},
+        {"kind": "click_nav", "page": "queue"},
+        {"kind": "click_nav", "page": "logs"},
+        {"kind": "click_nav", "page": "device"},
+        {"kind": "click_nav", "page": "settings"},
+        {"kind": "click_nav", "page": "api"}
+      ],
+      "expect": [
+        {"kind": "page", "value": "page-api"},
+        {"kind": "nav_index", "value": 9}
+      ]
+    },
+    {
+      "id": "nav_back_to_chat",
+      "caption": "点回首屏（确认导航不是单向的）",
+      "actions": [
+        {"kind": "click_nav", "page": "chat"}
+      ],
+      "expect": [
+        {"kind": "page", "value": "page-chat"},
+        {"kind": "nav_index", "value": 0}
+      ]
+    },
+    {
+      "id": "distributed_toggle_requested",
+      "caption": "分布式屏：T 键 → 确认框 y → PUT /cluster/config/distributed-inference",
+      "actions": [
+        {"kind": "click_nav", "page": "cluster"},
+        {"kind": "set_cluster_aux", "data": {"distributed": {"enabled": false}}},
+        {"kind": "cluster_toggle"},
+        {"kind": "confirm", "key": "y"}
+      ],
+      "expect": [
+        {
+          "kind": "api_called",
+          "method": "PUT",
+          "path": "/cluster/config/distributed-inference",
+          "body": {"enabled": true}
+        }
+      ]
+    },
+    {
+      "id": "route_preference_local",
+      "caption": "聊天屏 /route local → routing_preference=local_only",
+      "actions": [
+        {"kind": "click_nav", "page": "chat"},
+        {"kind": "chat_command", "text": "/route local"}
+      ],
+      "expect": [
+        {"kind": "app_attr", "name": "routing_preference", "value": "local_only"}
+      ]
+    },
+    {
+      "id": "route_preference_required",
+      "caption": "聊天屏 /route required → routing_preference=distributed_required",
+      "actions": [
+        {"kind": "chat_command", "text": "/route required"}
+      ],
+      "expect": [
+        {"kind": "app_attr", "name": "routing_preference", "value": "distributed_required"}
+      ]
+    },
+    {
+      "id": "route_preference_auto_restore",
+      "caption": "还原为 auto（不把偏好留给后续步骤）",
+      "actions": [
+        {"kind": "chat_command", "text": "/route auto"}
+      ],
+      "expect": [
+        {"kind": "app_attr", "name": "routing_preference", "value": "auto"}
+      ]
+    },
+    {
+      "id": "backend_absent_still_usable",
+      "caption": "后端不可达：状态屏给出错误文本，外壳照常可用（降级不崩）",
+      "actions": [
+        {"kind": "new_app", "api": "unreachable"},
+        {"kind": "enter_main"}
+      ],
+      "expect": [
+        {"kind": "screen_is_main"},
+        {"kind": "status_pane_contains_any", "values": ["后端不可达", "无法连接"]}
+      ]
+    },
+    {
+      "id": "unknown_selector_fails_loud",
+      "caption": "负向：点不存在的 selector 必须抛 NoMatches（不静默当成功）",
+      "actions": [
+        {"kind": "click_nav_unknown", "page": "does-not-exist"}
+      ],
+      "expect": [
+        {"kind": "raised", "exception": "no_matches"}
+      ]
+    },
+    {
+      "id": "quit_clean",
+      "caption": "q 键干净退出",
+      "actions": [
+        {"kind": "press", "key": "q"}
+      ],
+      "expect": [
+        {"kind": "app_exited"}
+      ]
+    }
+  ]
+}
