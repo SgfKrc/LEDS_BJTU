@@ -1295,24 +1295,6 @@ class SchedulerPipelineMixin:
                 aborted_config_id = str(data.get("aborted_config_id", "") or "")
                 if aborted_config_id:
                     self._prepared_layer_configs.pop(aborted_config_id, None)
-            # 退出分层角色时本机可能仍驻留"某个层段"的模型。若不清掉，worker
-            # 上报的 capabilities 会与真实状态不符：残留 layer_range 让实时
-            # models 为空（远端 Stage 被误拒），或在 layer_range 被清但模型仍是
-            # 层段时误报为完整模型（已知问题 #28）。层段模型本身无独立用处，
-            # 因此这里显式卸载；卸载失败则保持原状态，不制造假一致。
-            if getattr(self._host, "layer_range", None) is not None:
-                unload_model = getattr(self._host, "unload_model", None)
-                if callable(unload_model):
-                    try:
-                        unload_model()
-                        logger.info(
-                            "已卸载层段模型并退出分层 worker: node=%s", node_id,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "退出分层 worker 时卸载层段模型失败，保留原状态",
-                            exc_info=True,
-                        )
             if data.get("abort"):
                 abort_materialization = getattr(
                     self._host, "abort_pipeline_materialization", None
