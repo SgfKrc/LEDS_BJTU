@@ -435,3 +435,134 @@ def test_connect_with_retry_reaps_last_worker_when_all_attempts_fail():
 
     assert reaped == [0, 1]                       # 前两次被回收
     assert excinfo.value.process is started[-1]   # 最后一次挂到异常上（供诊断）
+
+
+class TestExplicitSshPort:
+    """★ 审计（GPT 报告）：y700 Termux 的 SSH 端口此前**无法显式指定**。
+
+    报告三点与对应修复：
+    - "相关 SSH 路径未统一使用显式端口" ⇒ `_ssh_process` / `_ssh_worker` / `_ssh_works` /
+      `_termux_ssh_works` / `_run_y700_ssh` 全部接受 `port` 并传 `-p`；
+    - "动态端口会走默认 22 或超时" ⇒ weaknet 代理目标端口不再硬编码 `:22`；
+    - "测试覆盖的是动态 ADB 端口而非 Termux SSH" ⇒ 本类补 SSH 侧覆盖。
+
+    纪律：**不给端口时 argv 与旧版逐字一致**（默认行为不变）。
+    """
+
+    @staticmethod
+    def _stub_popen(monkeypatch, seen):
+        class _FakePopen:
+            def __init__(self, argv, **kwargs):
+                seen.append(argv)
+                self.stdin = SimpleNamespace(
+                    write=lambda _b: None, flush=lambda: None, close=lambda: None)
+
+        monkeypatch.setattr(smoke.subprocess, "Popen", _FakePopen)
+
+    def test_ssh_process_without_port_keeps_legacy_argv(self, monkeypatch):
+        seen = []
+        self._stub_popen(monkeypatch, seen)
+
+        smoke._ssh_process("surface@host", "C:/root", 43001, 1234)
+
+        argv = seen[0]
+        assert "-p" not in argv                 # 不给端口 ⇒ 完全不传 -p
+        assert "-R" in argv                     # 反向通道仍在
+        assert argv[-1].startswith("cd /d ")
+
+    def test_ssh_process_passes_explicit_port(self, monkeypatch):
+        seen = []
+        self._stub_popen(monkeypatch, seen)
+
+        smoke._ssh_process("surface@host", "C:/root", 43001, 1234, port=8022)
+
+        argv = seen[0]
+        assert argv[argv.index("-p") + 1] == "8022"
+        assert "-R" in argv
+
+    def test_ssh_worker_passes_explicit_port_and_legacy_default(self, monkeypatch):
+        seen = []
+        self._stub_popen(monkeypatch, seen)
+
+        smoke._ssh_worker("t", "r", 1, 2, "src")
+        smoke._ssh_worker("t", "r", 1, 2, "src", port=2202)
+
+        assert "-p" not in seen[0]
+        assert seen[1][seen[1].index("-p") + 1] == "2202"
+
+    def test_ssh_works_passes_port_and_keeps_legacy_shape(self):
+        seen = []
+
+        def _runner(argv, **kwargs):
+            seen.append(argv)
+            return SimpleNamespace(returncode=0)
+
+        assert smoke._ssh_works("t", runner=_runner, attempts=1) is True
+        assert "-p" not in seen[0]
+
+        seen.clear()
+        assert smoke._ssh_works("t", runner=_runner, attempts=1, port=8022) is True
+        assert seen[0][seen[0].index("-p") + 1] == "8022"
+
+    def test_termux_ssh_works_is_wired_and_takes_port(self):
+        """`_termux_ssh_works` 此前是**未接线的死代码**（`return False` 之后残留函数体）。"""
+        seen = []
+
+        def _runner(argv, **kwargs):
+            seen.append(argv)
+            return SimpleNamespace(returncode=0)
+
+        assert smoke._termux_ssh_works("y700-lan", runner=_runner) is True
+        assert "-p" not in seen[0]
+
+        seen.clear()
+        assert smoke._termux_ssh_works("y700-lan", port=8022, runner=_runner) is True
+        assert seen[0][seen[0].index("-p") + 1] == "8022"
+
+    def test_run_y700_ssh_records_port_and_passes_it(self, monkeypatch):
+        seen = []
+
+        def _runner(argv, **kwargs):
+            seen.append(argv)
+            return SimpleNamespace(returncode=0, stdout="abi=arm64-v8a\n", stderr="")
+
+        monkeypatch.setattr(smoke.subprocess, "run", _runner)
+        result = smoke._run_y700_ssh("y700-ip", port=8022)
+
+        assert seen[0][seen[0].index("-p") + 1] == "8022"
+        assert result["transport"] == "termux_ssh"
+
+    def test_run_y700_ssh_failure_hint_mentions_the_explicit_port(self, monkeypatch):
+        def _boom(*args, **kwargs):
+            raise OSError("no route")
+
+        monkeypatch.setattr(smoke.subprocess, "run", _boom)
+        result = smoke._run_y700_ssh("y700-ip", port=8022)
+
+        assert result["status"] == "failed"
+        assert result["ssh_port"] == 8022
+        assert "8022" in result["hint"]
+        assert "--y700-ssh-port" in result["hint"]      # 指路到新参数
+
+    def test_y700_probe_passes_ssh_port_through_to_probe(self, monkeypatch):
+        calls = []
+
+        def _fake_probe(target, port=None):
+            calls.append((target, port))
+            return {"status": "passed", "transport": "termux_ssh"}
+
+        monkeypatch.setattr(smoke, "_run_y700_ssh", _fake_probe)
+        monkeypatch.setattr(smoke, "_termux_ssh_works", lambda t, port=None: True)
+
+        result = smoke._run_y700_probe(None, None, ssh_port=8022)
+
+        assert result["status"] == "passed"
+        assert calls and calls[0][1] == 8022
+
+    def test_weaknet_proxy_target_uses_configurable_surface_port(self):
+        """weaknet 代理目标端口此前**硬编码 `:22`** ⇒ 非 22 端口时代理连错目标。"""
+        import inspect
+
+        source = inspect.getsource(smoke.main)
+        assert "{surface_host}:22" not in source            # 不得再有硬编码
+        assert "{surface_host}:{surface_port}" in source

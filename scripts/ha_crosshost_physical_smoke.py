@@ -378,7 +378,8 @@ def _expect_ok(sock: socket.socket, value: dict[str, Any]) -> dict[str, Any]:
 
 
 def _ssh_process(target: str, remote_root: str, remote_port: int, local_port: int,
-                 proxy_command: str | None = None) -> subprocess.Popen[bytes]:
+                 proxy_command: str | None = None,
+                 port: int | None = None) -> subprocess.Popen[bytes]:
     command = f'cd /d "{remote_root}" && python - --root "{remote_root}" --port {remote_port}'
     options = ["BatchMode=yes", "ConnectTimeout=8", "ExitOnForwardFailure=yes"]
     if proxy_command:
@@ -388,6 +389,10 @@ def _ssh_process(target: str, remote_root: str, remote_port: int, local_port: in
         [
             "ssh",
             *[arg for option in options for arg in ("-o", option)],
+            # ★ 显式 SSH 端口：`None` 时**完全不传 `-p`**，端口仍由 `~/.ssh/config`
+            # 别名解析（旧行为逐字不变）；只在显式给出时才覆盖。这样既支持非 22 /
+            # 非 8022 端口（含动态分配的端口），也不改变既有默认路径。
+            *(["-p", str(port)] if port else []),
             "-R",
             f"127.0.0.1:{remote_port}:127.0.0.1:{local_port}",
             target,
@@ -404,7 +409,8 @@ def _ssh_process(target: str, remote_root: str, remote_port: int, local_port: in
 
 
 def _ssh_worker(target: str, remote_root: str, remote_port: int, local_port: int,
-                source: str, extra_args: str = "") -> subprocess.Popen[bytes]:
+                source: str, extra_args: str = "",
+                port: int | None = None) -> subprocess.Popen[bytes]:
     """与 `_ssh_process` 同机制（源码经 stdin 流式传入、控制帧走 SSH 反向 TCP），
     但可注入**任意 worker 源码**与附加参数 —— 供跨机 quorum voter 使用。"""
     command = (f'cd /d "{remote_root}" && python - {extra_args} '
@@ -415,6 +421,7 @@ def _ssh_worker(target: str, remote_root: str, remote_port: int, local_port: int
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=8",
             "-o", "ExitOnForwardFailure=yes",
+            *(["-p", str(port)] if port else []),
             "-R", f"127.0.0.1:{remote_port}:127.0.0.1:{local_port}",
             target,
             command,
@@ -499,7 +506,8 @@ class _RemoteVoter:
 
 
 def _run_quorum_exchange(target: str, remote_root: str, *,
-                         remote_state: str) -> dict[str, Any]:
+                         remote_state: str,
+                         port: int | None = None) -> dict[str, Any]:
     """★ HA-CROSSHOST-01 的 open 项「quorum certificate exchange」的**跨机实测**。
 
     配 3 个 voter（`QuorumPolicy.election_allowed` 要求 ≥3 ⇒ 两节点场景必须配 3 个），
@@ -547,7 +555,8 @@ def _run_quorum_exchange(target: str, remote_root: str, *,
             # ★ R-R2：起 voter 同样走「重起 + 重等」（`accept()` 超时是这里最常见的失败点）
             worker, connection = _connect_with_retry(
                 listener,
-                lambda: _ssh_worker(target, remote_root, remote_port, local_port, source))
+                lambda: _ssh_worker(target, remote_root, remote_port, local_port, source,
+                                    port=port))
         except (OSError, PhysicalSmokeError) as exc:
             # 远端 voter 没连上来 ⇒ 附上它的 stderr 便于诊断
             worker = getattr(exc, "process", None)
@@ -620,7 +629,8 @@ def _run_quorum_exchange(target: str, remote_root: str, *,
 
 
 def _run_surface(target: str, remote_root: str, *, long_steps: int = 1,
-                 proxy_command: str | None = None) -> dict[str, Any]:
+                 proxy_command: str | None = None,
+                 port: int | None = None) -> dict[str, Any]:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", 0))
@@ -638,7 +648,7 @@ def _run_surface(target: str, remote_root: str, *, long_steps: int = 1,
         first_process, connection = _connect_with_retry(
             listener,
             lambda: _ssh_process(target, remote_root, remote_port, local_port,
-                                 proxy_command=proxy_command))
+                                 proxy_command=proxy_command, port=port))
         connection.settimeout(_control_timeout_from_env())
         with connection:
             ready = _recv_line(connection)
@@ -702,7 +712,7 @@ def _run_surface(target: str, remote_root: str, *, long_steps: int = 1,
             second_process, connection = _connect_with_retry(
                 listener,
                 lambda: _ssh_process(target, remote_root, remote_port, local_port,
-                                     proxy_command=proxy_command))
+                                     proxy_command=proxy_command, port=port))
             connection.settimeout(_control_timeout_from_env())
             with connection:
                 ready = _recv_line(connection)
@@ -802,10 +812,13 @@ def _discover_y700_serial(adb: str, host: str) -> str | None:
 
 def _ssh_works(target: str, *, timeout: int = 6, attempts: int = SSH_RETRY_ATTEMPTS,
                runner: Callable[..., Any] | None = None,
-               sleeper: Callable[[float], None] | None = None) -> bool:
+               sleeper: Callable[[float], None] | None = None,
+               port: int | None = None) -> bool:
     """探测目标是否可用 SSH 登录 —— **带重试与指数退避**（★ R-R2，§26 丢包硬边界）。
 
     `runner` / `sleeper` 可注入（单测用）；默认走真 `subprocess.run` + `time.sleep`。
+    `port` 给出时**显式传 `-p`**（支持非 22 / 非 8022 / 动态端口）；`None` 时仍由
+    `~/.ssh/config` 别名解析，旧行为不变。
     """
     runner = runner or subprocess.run
     sleeper = sleeper or time.sleep
@@ -815,7 +828,8 @@ def _ssh_works(target: str, *, timeout: int = 6, attempts: int = SSH_RETRY_ATTEM
         try:
             completed = runner(
                 ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}",
-                 "-o", "StrictHostKeyChecking=accept-new", target, "true"],
+                 "-o", "StrictHostKeyChecking=accept-new",
+                 *(["-p", str(port)] if port else []), target, "true"],
                 capture_output=True,
                 text=True,
                 timeout=timeout + 5,
@@ -828,16 +842,23 @@ def _ssh_works(target: str, *, timeout: int = 6, attempts: int = SSH_RETRY_ATTEM
         if index < len(delays):
             sleeper(delays[index])
     return False
-    """探测 Termux sshd 是否可达。
+
+
+def _termux_ssh_works(target: str, *, port: int | None = None, timeout: int = 6,
+                      runner: Callable[..., Any] | None = None) -> bool:
+    """探测 **Termux sshd** 是否可达（y700 专用）。
 
     为什么优先它：Android 无线调试的端口**每次都会变**（设备 `ro.debuggable=0`
-    且 `persist.adb.tcp.port` 为空 ⇒ 无法在设备侧固定），而 Termux 的 sshd 端口是
-    **固定 8022**（实测可用）。所以「能用 SSH 就用 SSH」才能真正摆脱动态端口。
+    且 `persist.adb.tcp.port` 为空 ⇒ 无法在设备侧固定），而 Termux 的 sshd 端口
+    通常是固定的（8022 为 Termux 默认）。所以「能用 SSH 就用 SSH」才能真正摆脱
+    动态 ADB 端口。`port=None` 时端口交由 `~/.ssh/config` 别名解析。
     """
+    runner = runner or subprocess.run
     try:
-        completed = subprocess.run(
+        completed = runner(
             ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}",
-             "-o", "StrictHostKeyChecking=accept-new", target, "true"],
+             "-o", "StrictHostKeyChecking=accept-new",
+             *(["-p", str(port)] if port else []), target, "true"],
             capture_output=True,
             text=True,
             timeout=timeout + 5,
@@ -899,28 +920,36 @@ def _y700_report(
     }
 
 
-def _run_y700_ssh(target: str) -> dict[str, Any]:
-    """走 Termux sshd 的 y700 探针（端口固定 8022，推荐路径）。"""
+def _run_y700_ssh(target: str, *, port: int | None = None) -> dict[str, Any]:
+    """走 Termux sshd 的 y700 探针（推荐路径）。
+
+    `port` 给出时**显式传 `-p`**（支持非 8022 的 / 动态分配的端口）；`None` 时端口
+    由 `~/.ssh/config` 别名解析（Termux 默认 8022）。
+    """
     try:
         completed = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
-             "-o", "StrictHostKeyChecking=accept-new", target, Y700_PROBE_COMMAND],
+             "-o", "StrictHostKeyChecking=accept-new",
+             *(["-p", str(port)] if port else []), target, Y700_PROBE_COMMAND],
             capture_output=True,
             text=True,
             timeout=30,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, subprocess.TimeoutExpired):
+        port_hint = f"端口 {port}" if port else "该别名对应的端口"
         return {
             "status": "failed",
             "target": "y700",
             "physical_nodes": True,
             "transport": "termux_ssh",
             "serial": target,
+            "ssh_port": port,
             "error_code": "termux_ssh_unreachable",
             "model_gate": "blocked_no_gguf",
-            "hint": ("Termux sshd 不可达：端口 8022 无监听通常意味着 Termux 进程被系统回收，"
-                     "在设备上重新执行 `sshd` 即可（装 Termux:Boot 可开机自启）"),
+            "hint": (f"Termux sshd 不可达：{port_hint} 无监听通常意味着 Termux 进程被系统回收，"
+                     "在设备上重新执行 `sshd` 即可（装 Termux:Boot 可开机自启）；"
+                     "若端口已被改为动态分配，用 `--y700-ssh-port` 显式指定"),
         }
     return _y700_report(transport="termux_ssh", serial=target, completed=completed,
                         failure_code="ssh_probe_failed")
@@ -932,22 +961,26 @@ def _run_y700_probe(
     *,
     adb: str | None = None,
     host: str = "100.99.211.13",
+    ssh_port: int | None = None,
 ) -> dict[str, Any]:
-    """y700 探针选路：**能用 Termux SSH 就用 SSH**（端口固定 8022），否则退回 ADB。
+    """y700 探针选路：**能用 Termux SSH 就用 SSH**，否则退回 ADB。
 
-    `--y700-ssh` 显式指定时只用它；否则依次探测 `y700`、`y700-ip` 两个 ssh 别名
-    （局域网别名优先，已在 `~/.ssh/config` 里），都不可达才走 ADB 无线调试。
+    `--y700-ssh` 显式指定时只用它；否则依次探测 `y700-lan` → `y700-ip` → `y700`
+    三个 ssh 别名（局域网别名优先，见 `~/.ssh/config`），都不可达才走 ADB 无线调试。
     这样"动态 ADB 端口"只在 SSH 不可用时才需要面对。
+
+    `ssh_port` 给出时，SSH 探测用**显式端口**（`-p`）而不依赖别名里的 `Port`；
+    `None` 时保持旧行为。
     """
     if ssh_target:
-        return _run_y700_ssh(ssh_target)
+        return _run_y700_ssh(ssh_target, port=ssh_port)
     if not serial:
         # 顺序很关键：**局域网别名排最前**。设备刚重启时 Tailscale 往往还在重建打洞
         # （实测 `tailscale status` 会短暂显示 `relay`），此时 Tailscale IP 超时、
         # 而局域网 IP 仍然通。所以按 lan -> ip -> ts.net 逐个探测。
         for candidate in ("y700-lan", "y700-ip", "y700"):
-            if _ssh_works(candidate):
-                return _run_y700_ssh(candidate)
+            if _termux_ssh_works(candidate, port=ssh_port):
+                return _run_y700_ssh(candidate, port=ssh_port)
     return _run_y700(serial, adb=adb, host=host)
 
 
@@ -1087,11 +1120,17 @@ def main() -> int:
             pass
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--surface-target", default="surface@100.100.52.106")
+    parser.add_argument("--surface-port", type=int, default=None,
+                        help="Surface 的 SSH 端口。不给则交由 ~/.ssh/config 别名解析（旧行为）；"
+                             "weaknet 代理目标端口也用它（此前该处硬编码 :22）")
     parser.add_argument("--surface-root", default=r"C:\Users\surface\Documents\LEDS_BJTU")
     parser.add_argument("--y700-serial", help="adb wireless serial, for example IP:<dynamic_port>")
     parser.add_argument("--y700-ssh", default=None,
-                        help="Termux sshd target (fixed port 8022). Default: auto-detect the "
-                             "`y700` / `y700-ip` ssh aliases; falls back to adb when unreachable")
+                        help="Termux sshd target. Default: auto-detect the `y700-lan` / `y700-ip` / "
+                             "`y700` ssh aliases; falls back to adb when unreachable")
+    parser.add_argument("--y700-ssh-port", type=int, default=None,
+                        help="y700 Termux sshd 端口（Termux 默认 8022）。不给则交由 ~/.ssh/config "
+                             "别名解析；端口被改为动态分配时用它显式指定")
     parser.add_argument("--y700-host", default="100.99.211.13")
     parser.add_argument("--adb", help="path to adb; defaults to PATH or the local Android SDK")
     parser.add_argument("--long-steps", type=int, default=1,
@@ -1121,25 +1160,29 @@ def main() -> int:
     if network_delay_ms or network_loss_pct:
         # ★ 真实弱网（网络层）：SSH 经本脚本的 `--weaknet-bridge` 代理（延迟 + 丢包注入）
         surface_host = args.surface_target.rpartition("@")[2] or args.surface_target
+        # 代理的**目标端口必须与真实 SSH 端口一致** —— 此前这里把 :22 写死，导致
+        # 非 22 端口（含动态分配）时代理连错目标（「动态 SSH 端口未完整支持」）。
+        surface_port = int(args.surface_port) if args.surface_port else 22
         proxy_command = (
             f'"{sys.executable}" "{Path(__file__).resolve()}" --weaknet-bridge '
-            f"{surface_host}:22 --delay-ms {network_delay_ms} "
+            f"{surface_host}:{surface_port} --delay-ms {network_delay_ms} "
             f"--loss-pct {network_loss_pct}")
     try:
         surface = _run_surface(args.surface_target, args.surface_root, long_steps=long_steps,
-                               proxy_command=proxy_command)
+                               proxy_command=proxy_command, port=args.surface_port)
     except Exception as exc:
         surface = _failed_result("surface", exc)
     try:
         y700 = _run_y700_probe(args.y700_ssh, args.y700_serial, adb=args.adb,
-                               host=args.y700_host)
+                               host=args.y700_host, ssh_port=args.y700_ssh_port)
     except Exception as exc:
         y700 = _failed_result("y700", exc)
     quorum: dict[str, Any] | None = None
     if args.quorum_exchange:
         try:
             quorum = _run_quorum_exchange(args.surface_target, args.surface_root,
-                                          remote_state=args.quorum_remote_state)
+                                          remote_state=args.quorum_remote_state,
+                                          port=args.surface_port)
         except Exception as exc:
             quorum = _failed_result("quorum", exc)
     report = {
