@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import struct
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,8 @@ __all__ = [
     "RELAY_SEGMENT_INFO_SCHEMA",
     "collect_local_build",
     "load_ready_build",
+    "read_artifact_manifest",
+    "read_gguf_layer_info",
     "unknown_remote_build",
 ]
 
@@ -53,6 +56,138 @@ def _utc_now() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+# ── 零依赖读 GGUF 头（★ A15b / #30）──────────────────────────────────────────
+# ⚠️ **刻意不 import `gguf` / `llama_cpp`** —— 与下面 `collect_local_build` 不做隐式 import 同因：
+#    `llama_cpp` 一旦进 `sys.modules` 就会改变 keep-head 的隔离判据（实测踩到）。
+#    这里只用标准库 `struct` 解 GGUF 的 KV 区，读 `block_count` / `nextn_predict_layers`，
+#    用来回答「**这一段覆盖多少层**」—— 工件此前完全无法自证这一点（见 `已知问题记录.md` #30）。
+
+_GGUF_MAGIC = b"GGUF"
+
+#: GGUF KV 值类型 → (struct 格式, 字节数)。只列**定长标量**；STRING / ARRAY 单独处理。
+_GGUF_SCALAR_TYPES: dict[int, tuple[str, int]] = {
+    0: ("<B", 1), 1: ("<b", 1), 2: ("<H", 2), 3: ("<h", 2),
+    4: ("<I", 4), 5: ("<i", 4), 6: ("<f", 4), 7: ("<?", 1),
+    10: ("<Q", 8), 11: ("<q", 8), 12: ("<d", 8),
+}
+_GGUF_TYPE_STRING = 8
+_GGUF_TYPE_ARRAY = 9
+
+
+def _gguf_read_string(handle) -> str:
+    (length,) = struct.unpack("<Q", handle.read(8))
+    return handle.read(int(length)).decode("utf-8", errors="replace")
+
+
+def _gguf_read_scalar(handle, value_type: int) -> Any:
+    entry = _GGUF_SCALAR_TYPES.get(value_type)
+    if entry is None:
+        return None
+    fmt, size = entry
+    return struct.unpack(fmt, handle.read(size))[0]
+
+
+def _gguf_skip_value(handle, value_type: int) -> None:
+    """结构化跳过一个 KV 值（数组递归）。未知类型 ⇒ `ValueError`（由调用方兜成 `None`）。"""
+    if value_type == _GGUF_TYPE_STRING:
+        _gguf_read_string(handle)
+        return
+    if value_type == _GGUF_TYPE_ARRAY:
+        (element_type,) = struct.unpack("<I", handle.read(4))
+        (count,) = struct.unpack("<Q", handle.read(8))
+        for _ in range(int(count)):
+            _gguf_skip_value(handle, element_type)
+        return
+    if value_type not in _GGUF_SCALAR_TYPES:
+        raise ValueError(f"未知的 GGUF KV 类型: {value_type}")
+    handle.read(_GGUF_SCALAR_TYPES[value_type][1])
+
+
+def read_gguf_layer_info(path: str | Path) -> dict[str, Any] | None:
+    """**零依赖**读 GGUF 头 ⇒ `{"architecture","block_count","nextn_predict_layers","n_layer"}`。
+
+    只解到需要的几个 KV，其余按类型**结构化跳过**；KV 顺序不做假设（先把标量都收集起来，
+    最后再按 `<arch>.block_count` 挑）。读不到 / 非 GGUF / 格式非法一律返回 `None`
+    （**不猜、不抛** —— 调用方据此如实记 `null`，而不是编一个层数出来）。
+
+    `n_layer = block_count - nextn_predict_layers`（MTP 层不计入），与
+    `scripts/cut_layers.py:82` 同口径。
+    """
+    target = Path(path)
+    if not target.is_file():
+        return None
+    try:
+        with target.open("rb") as handle:
+            if handle.read(4) != _GGUF_MAGIC:
+                return None
+            (version,) = struct.unpack("<I", handle.read(4))
+            if version < 2:
+                return None
+            handle.read(8)  # n_tensors（本函数不需要）
+            (n_kv,) = struct.unpack("<Q", handle.read(8))
+            arch: str | None = None
+            scalars: dict[str, Any] = {}
+            for _ in range(int(n_kv)):
+                key = _gguf_read_string(handle)
+                (value_type,) = struct.unpack("<I", handle.read(4))
+                if key == "general.architecture" and value_type == _GGUF_TYPE_STRING:
+                    arch = _gguf_read_string(handle)
+                    continue
+                # 只留**整数**标量：真正的层数 KV 都是整数，浮点/字符串没有用还占地方。
+                if (key.endswith(".block_count") or key.endswith(".nextn_predict_layers")):
+                    value = _gguf_read_scalar(handle, value_type)
+                    if isinstance(value, int):
+                        scalars[key] = value
+                    continue
+                _gguf_skip_value(handle, value_type)
+    except (OSError, ValueError, struct.error, UnicodeDecodeError):
+        return None
+
+    if not arch:
+        return None
+    block_count = scalars.get(f"{arch}.block_count")
+    if not isinstance(block_count, int) or block_count <= 0:
+        return None
+    nextn = scalars.get(f"{arch}.nextn_predict_layers") or 0
+    return {
+        "architecture": arch,
+        "block_count": block_count,
+        "nextn_predict_layers": int(nextn),
+        "n_layer": max(0, block_count - int(nextn)),
+    }
+
+
+def read_artifact_manifest(path: str | Path) -> dict[str, Any] | None:
+    """读**段工件旁的 manifest**（`<artifact>.gguf.manifest.json` 或显式路径）里的层范围。
+
+    返回 `{"source_layer_range": [start, end], "n_layer": N}`（能读到哪个给哪个）；
+    读不到 ⇒ `None`。用于回答「这一段**来自源模型的哪几层**」—— 工件头部**没有**这个信息
+    （裁层生成器只改 `block_count`、不记录来源层号），只能靠 manifest 自证（#30）。
+    """
+    target = Path(path)
+    if not target.is_file():
+        return None
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    info: dict[str, Any] = {}
+    span = payload.get("source_layer_range")
+    if isinstance(span, (list, tuple)) and len(span) == 2:
+        try:
+            start, end = int(span[0]), int(span[1])
+        except (TypeError, ValueError):
+            start = end = -1
+        if 0 <= start < end:
+            info["source_layer_range"] = [start, end]
+    total = payload.get("n_layer")
+    if isinstance(total, int) and total > 0:
+        info["n_layer"] = total
+    return info or None
 
 
 def _file_info(path: Path, *, digest: bool) -> dict[str, Any]:
@@ -121,7 +256,20 @@ def collect_local_build(
                 build["llama_cpp_libs"] = libs
 
     if model is not None:
-        build["model"] = _file_info(Path(model), digest=bool(digest_artifacts))
+        model_path = Path(model)
+        build["model"] = _file_info(model_path, digest=bool(digest_artifacts))
+        # ★ A15b / #30：让**工件自己**回答「我覆盖多少层」（此前无法自证 ⇒ 已误判过一次）。
+        #   ① 层数：零依赖读 GGUF 头（**不 import** `llama_cpp` / `gguf`，见上面的隔离约束）；
+        #   ② 来源层号：读工件旁的 manifest —— 工件头部**没有**这个信息（裁层只改 `block_count`）。
+        layer_info = read_gguf_layer_info(model_path)
+        if layer_info:
+            build["model"]["layer_info"] = layer_info
+        manifest_info = read_artifact_manifest(Path(str(model_path) + ".manifest.json"))
+        if manifest_info:
+            build["model"]["manifest"] = {
+                "path": str(model_path) + ".manifest.json",
+                **manifest_info,
+            }
     return build
 
 
