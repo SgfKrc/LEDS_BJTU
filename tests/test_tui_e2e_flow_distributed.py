@@ -42,6 +42,10 @@ for _candidate in (str(ROOT), str(ROOT / "src"), str(ROOT / "tests")):
 
 from tui_e2e_flow import wait_for  # noqa: E402
 
+# F3 uses a real backend/model and a physical peer.  Keep it out of the
+# always-on unit channel; the smoke channel is already serial and opt-in.
+pytestmark = [pytest.mark.real_model, pytest.mark.slow]
+
 MODEL_ID = (os.environ.get("QLH_TUI_E2E_MODEL") or "qwen2.5-0.5b").strip()
 ENGINE = (os.environ.get("QLH_TUI_E2E_ENGINE") or "pytorch").strip()
 HOST = "127.0.0.1"
