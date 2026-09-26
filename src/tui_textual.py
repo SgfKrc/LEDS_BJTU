@@ -479,8 +479,16 @@ class ChatPane(Vertical):
         self.chat_buffer = ""
         self.render_chat()
 
+    def on_mount(self) -> None:
+        # ★ 挂载完成前到达的流式片段可能没渲染成（compose 尚未 yield 出 #chat-log，
+        # 例如真后端的首包比首帧快）⇒ 这里补画一次，保证早期内容不丢。
+        self.render_chat()
+
     def render_chat(self) -> None:
-        self.query_one("#chat-log", Static).update(self.chat_buffer)
+        try:
+            self.query_one("#chat-log", Static).update(self.chat_buffer)
+        except Exception:  # noqa: BLE001 - compose 尚未 yield 出 #chat-log（同 #chat-scroll 的道理）
+            return
         try:
             self.query_one("#chat-scroll", VerticalScroll).scroll_end(animate=False)
         except Exception:  # noqa: BLE001 - 挂载早期可能尚无滚动容器
