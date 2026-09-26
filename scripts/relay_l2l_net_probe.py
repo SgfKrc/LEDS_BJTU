@@ -172,6 +172,70 @@ def _parse_mid_layers(raw: str | None) -> tuple[int, int] | None:
     return (start, end) if 0 <= start < end else None
 
 
+def _manifest_layers(path) -> tuple[int, int] | None:
+    """★ #30：从段工件的 manifest 读 `source_layer_range`（区间 `[start,end)`）。
+
+    manifest 由 `scripts/cut_layers.py`（生成时自带）或 `scripts/relay_artifact_manifest.py`
+    （对早期工件**事后补录**）产出 ⇒ 工件**从此可自证**自己覆盖哪几层。
+    读不到 / 格式非法一律返回 `None`（调用方据此回落到显式参数或 `unverified`，**不猜**）。
+    """
+    if not path:
+        return None
+    try:
+        payload = json.loads(Path(str(path)).read_text(encoding="utf-8"))
+        span = payload.get("source_layer_range")
+        start, end = int(span[0]), int(span[1])
+    except (OSError, ValueError, TypeError, KeyError, IndexError):
+        return None
+    return (start, end) if 0 <= start < end else None
+
+
+def _discover_manifest(path) -> str | None:
+    """★ #30：`<artifact>.gguf` ⇒ 试 `<artifact>.gguf.manifest.json`（`relay_artifact_manifest.py` 的默认落点）。
+
+    找不到就返回 `None`（**不报错** —— 缺 manifest 是常态，只意味着退回到"人填层范围"）。
+    """
+    if not path:
+        return None
+    candidate = Path(str(path) + ".manifest.json")
+    return str(candidate) if candidate.is_file() else None
+
+
+def _respect_manifests(args) -> dict[str, str]:
+    """★ #30：用 manifest 补齐**未显式给出**的层覆盖参数（显式参数永远优先）。
+
+    优先级：显式 `--*-layers` > 显式 `--*-manifest` > 自动发现（`<head-model>.manifest.json`）。
+    只补空位，**绝不覆盖**已经由人显式给出的值。返回实际用到的 manifest 路径（写进证据）。
+    """
+    used: dict[str, str] = {}
+
+    # head：[0, K) —— 显式 `--head-manifest` 优先；否则自动试 `<head-model>.manifest.json`
+    head_manifest = getattr(args, "head_manifest", None)
+    if not head_manifest and getattr(args, "head_model", None):
+        head_manifest = _discover_manifest(args.head_model)
+    if head_manifest and not getattr(args, "head_layers", None):
+        span = _manifest_layers(head_manifest)
+        if span:
+            args.head_layers = str(span[1])
+            used["head"] = str(head_manifest)
+
+    # middle：[K1, K2)
+    if getattr(args, "mid_manifest", None) and not getattr(args, "mid_layers", None):
+        span = _manifest_layers(args.mid_manifest)
+        if span:
+            args.mid_layers = f"{span[0]}-{span[1]}"
+            used["middle"] = str(args.mid_manifest)
+
+    # tail：[K2, N)
+    if getattr(args, "tail_manifest", None) and getattr(args, "tail_start", None) is None:
+        span = _manifest_layers(args.tail_manifest)
+        if span:
+            args.tail_start = span[0]
+            used["tail"] = str(args.tail_manifest)
+
+    return used
+
+
 def _layer_coverage(args) -> dict[str, object]:
     """★ #30：校验各段层覆盖**恰好铺满 `[0,total)` 且不重叠**，并给出可落进证据的结论。
 
@@ -286,6 +350,13 @@ def main() -> int:
     #   而 L→L 路径此前**完全不做**覆盖校验 ⇒ 缺层 / 重复层会静默通过、只表现为数值不一致
     #   （与"代码算错"同型，实测已误判过一次）。这里要求显式给出每段层区间，校验
     #   **恰好铺满 `[0, total)` 且不重叠**；参数不全时不拦、只标 `unverified`（加 `--strict-coverage` 才失败）。
+    ap.add_argument("--head-manifest", default=None,
+                    help="★ #30：head 段工件的 manifest（据 `source_layer_range` 自动填 `--head-layers`）；"
+                         "缺省时自动试 `<--head-model>.manifest.json`")
+    ap.add_argument("--mid-manifest", default=None,
+                    help="★ #30：middle 段工件的 manifest（自动填 `--mid-layers`）")
+    ap.add_argument("--tail-manifest", default=None,
+                    help="★ #30：tail 段工件的 manifest（自动填 `--tail-start`）")
     ap.add_argument("--head-layers", default=None,
                     help="★ #30：上游 head 段覆盖层数 K（区间 `[0,K)`）；不给则记 unverified")
     ap.add_argument("--mid-layers", default=None,
@@ -298,7 +369,14 @@ def main() -> int:
                     help="★ #30：层覆盖参数不全或校验不通过时**直接失败**（默认只 WARN + 记 unverified）")
     args = ap.parse_args()
 
+    # ★ #30：先用 manifest 补齐**未显式给出**的层覆盖参数（显式参数永远优先），再做校验。
+    used_manifests = _respect_manifests(args)
+    if used_manifests:
+        print(f"[coverage] 从 manifest 自动读入层范围：{used_manifests}", file=sys.stderr)
+
     coverage = _layer_coverage(args)
+    # ★ #30：证据里留痕 —— 这些层范围是**从哪个 manifest 读来的**（便于事后自证）。
+    coverage["manifests"] = used_manifests
     if coverage["status"] == "invalid":
         detail = f"层覆盖校验不通过：{coverage['detail']}"
         if args.strict_coverage:
