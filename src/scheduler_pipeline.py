@@ -22,6 +22,51 @@ logger = logging.getLogger("scheduler")
 RELAY_HIDDEN_WIRE_FORMAT = "qlh.relay_hidden.f32.v1"
 
 
+def _kv_state_seq_len(past, model_type: str) -> tuple[int, int]:
+    """从 KV 状态里取 `(槽位数, 已缓存序列长度)` —— **同时支持 tuple 与 Cache 对象**。
+
+    ⚠️ 为什么需要它（`已知问题记录.md` #31 M4）：hybrid（`qwen3_5`）在层流水线上，
+    `forward_layers` 返回的 `past_key_values` **tuple 是"有损兼容通道"** ——
+    `linear_attention` 层的 recurrent state 在 tuple 里是 `None` 占位
+    （实测：12 层里 **9 层是 `None`，且第 0 层就是**）⇒ 旧代码 `past_kv[0][0].shape`
+    会 `None[0]` 直接 `TypeError` 硬崩。
+    完整的 recurrent state 只在 `result["cache"]` 里（`cache.layers[i].recurrent_states`），
+    所以这里**优先吃 cache 对象**，并**跳过 `None` 槽位**。
+
+    序列长度取**第一个非空槽位**的对应维度（`qwen` 系是 `[1]`，其余是 `[2]`，与既有口径一致）；
+    一个可读的槽位都没有时 `seq_len=0`（recurrent 槽位没有 `keys`，不参与 seq_len 判定）。
+    """
+    layers = getattr(past, "layers", None)      # Cache 对象（DynamicCache 等）
+    entries = list(layers) if layers is not None else list(past or ())
+    for entry in entries:
+        if entry is None:
+            continue
+        keys = getattr(entry, "keys", None)     # Cache 的 KV 层
+        if keys is not None and hasattr(keys, "shape"):
+            shape = keys.shape
+        elif hasattr(entry, "shape"):
+            shape = entry.shape                 # tuple 的 (k, v) ⇒ 取 k
+        elif isinstance(entry, (list, tuple)) and entry and hasattr(entry[0], "shape"):
+            shape = entry[0].shape
+        else:
+            continue                            # recurrent 槽位：没有 keys，不提供 seq_len
+        if len(shape) >= 3:
+            return len(entries), int(shape[1] if model_type == "qwen" else shape[2])
+    return len(entries), 0
+
+
+def _prefer_cache_state(result) -> object:
+    """★ #31 M4：优先取**完整**的 `cache` 对象，回落到 `past_key_values`（tuple）。
+
+    与 `scripts/relay_experiment.py:1008-1010` 同一模式 —— hybrid 下 tuple 会丢 recurrent
+    state（`linear_attention` 层是 `None` 占位）。
+    """
+    cache = result.get("cache") if hasattr(result, "get") else None
+    if cache is not None:
+        return cache
+    return result["past_key_values"]
+
+
 def _encode_relay_hidden(tensor) -> tuple[str, list[int]]:
     """Encode relay input as the explicit raw-f32 wire contract."""
     torch = require_torch()
@@ -2303,14 +2348,14 @@ class SchedulerPipelineMixin:
                     raise RuntimeError(
                         f"decode step {step} 缺少本地 KV cache: task={task_id}"
                     )
-                if past_kv:
-                    cached_shape = past_kv[0][0].shape
-                    cached_seq_len = (
-                        cached_shape[1] if model_type == "qwen" else cached_shape[2]
-                    )
+                if past_kv is not None:
+                    # ★ #31 M4：`past_kv` 现在可能是 **Cache 对象**（hybrid 必须），也可能是旧 tuple
+                    #   ⇒ 统一走 helper 取形状，并**跳过 hybrid 的 `None` 槽位**
+                    #   （旧写法 `past_kv[0][0].shape` 在第 0 层是 None 时直接 TypeError）。
+                    cached_layers, cached_seq_len = _kv_state_seq_len(past_kv, model_type)
                     logger.debug(
                         f"📦 KV cache 命中: task={task_id}, "
-                        f"layers={len(past_kv)}, "
+                        f"layers={cached_layers}, "
                         f"seq_len={cached_seq_len}"
                     )
 
@@ -2337,14 +2382,17 @@ class SchedulerPipelineMixin:
                 return
             elapsed_ms = (time.time() - t_start) * 1000
             # ---- KV Cache: 存储更新后的 past_key_values ----
-            if result.get("past_key_values"):
+            # ★ #31 M4：**优先持有 `result["cache"]`** —— hybrid 的 tuple 会丢 recurrent state
+            #   （`linear_attention` 层在 tuple 里是 `None` 占位）。旧代码只搬 tuple ⇒
+            #   ① 后续 decode 的状态是错的，② 取形状时 `[0][0]` 直接 TypeError 硬崩。
+            if result.get("cache") is not None or result.get("past_key_values"):
+                state = _prefer_cache_state(result)
                 with self._kv_cache_lock:
-                    self._kv_cache[task_id] = result["past_key_values"]
-                kv_shape = result["past_key_values"][0][0].shape
-                kv_seq_len = kv_shape[1] if model_type == "qwen" else kv_shape[2]
+                    self._kv_cache[task_id] = state
+                kv_layers, kv_seq_len = _kv_state_seq_len(state, model_type)
                 logger.debug(
                     f"💾 KV cache 已更新: task={task_id}, "
-                    f"seq_len={kv_seq_len}"
+                    f"layers={kv_layers}, seq_len={kv_seq_len}"
                 )
             else:
                 raise RuntimeError("分层前向未返回 KV cache")
@@ -4219,9 +4267,12 @@ class SchedulerPipelineMixin:
                         apply_lm_head=False,
                     )
                     master_elapsed_ms = (time.time() - t_master) * 1000
-                    if local_result.get("past_key_values"):
+                    # ★ #31 M4：同上 —— master 首段也要**优先持有 cache 对象**
+                    #   （hybrid 的 tuple 会丢 recurrent state）。
+                    if (local_result.get("cache") is not None
+                            or local_result.get("past_key_values")):
                         with self._kv_cache_lock:
-                            self._kv_cache[task_id] = local_result["past_key_values"]
+                            self._kv_cache[task_id] = _prefer_cache_state(local_result)
                     if "hidden_states" not in local_result:
                         raise RuntimeError("主节点首段未返回 hidden_states")
                     hs_cpu = local_result["hidden_states"].detach().cpu()

@@ -439,9 +439,16 @@ class PeerClient:
                 return
             elapsed_ms = (time.time() - t_start) * 1000
 
-            if result.get("past_key_values"):
+            # ★ #31 M4：**优先持有 `result["cache"]`** —— hybrid 的 tuple 会丢 recurrent state
+            #   （`linear_attention` 层在 tuple 里是 `None` 占位）。
+            #   本文件是「复制自 `scheduler.py` 的 client 角色分支」的既有模式 ⇒ 同样内联，
+            #   与 `src/scheduler_pipeline.py` 的 `_prefer_cache_state` **同源（改一处要同步另一处）**。
+            if result.get("cache") is not None or result.get("past_key_values"):
                 with self._kv_cache_lock:
-                    self._kv_cache[task_id] = result["past_key_values"]
+                    self._kv_cache[task_id] = (
+                        result["cache"] if result.get("cache") is not None
+                        else result["past_key_values"]
+                    )
             else:
                 raise RuntimeError("分层前向未返回 KV cache")
             with self._layer_config_lock:
