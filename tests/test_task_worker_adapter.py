@@ -1377,7 +1377,7 @@ def test_scheduler_rejects_android_client_full_worker_claim(monkeypatch):
 
 
 def test_scheduler_does_not_advertise_a_layer_partition_as_full_model(
-    monkeypatch,
+        monkeypatch,
 ):
     from scheduler import Scheduler
 
@@ -1396,6 +1396,29 @@ def test_scheduler_does_not_advertise_a_layer_partition_as_full_model(
 
     assert capabilities["models"] == []
     assert capabilities["stage_types"] == ["full_inference", "aggregate"]
+
+
+def test_scheduler_advertises_endpoint_relay_as_layer_worker_without_local_model(
+        monkeypatch):
+    from scheduler import Scheduler
+
+    scheduler = Scheduler()
+    monkeypatch.setattr(
+        scheduler, "_host", SimpleNamespace(
+            model_loaded=False, is_loaded=False, layer_range=None,
+        ),
+    )
+    scheduler._active_layer_config = {
+        "engine": "relay_middle",
+        "config_id": "cfg-relay",
+        "layer_range": [8, 16],
+    }
+
+    capabilities = scheduler._task_worker_capabilities()
+
+    assert capabilities["models"] == []
+    assert capabilities["layer_worker"] is True
+    assert capabilities["relay_middle"] is True
 
 
 def test_scheduler_advertises_modelhost_loaded_model_without_legacy_is_loaded(

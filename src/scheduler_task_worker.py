@@ -116,11 +116,25 @@ class SchedulerTaskWorkerMixin:
                 "构建 PC Full Worker 模型能力快照失败，暂不上报模型",
                 exc_info=True,
             )
+        active_layer_config = getattr(self, "_active_layer_config", None) or {}
+        layer_worker = bool(
+            active_layer_config or getattr(self._host, "layer_range", None)
+        )
         return {
             "stage_types": ["full_inference", "aggregate"],
             "engines": engines,
             "models": models,
             "max_concurrency": 1,
+            # A distributed-only layer/relay worker is intentionally not a
+            # Full Worker.  Its segment capability is negotiated by the
+            # layer-config contract, so advertising no full-model identity
+            # must not cause the coordinator to opt it out of layer work.
+            "layer_worker": layer_worker,
+            "relay_middle": bool(
+                active_layer_config
+                and str(active_layer_config.get("engine", ""))
+                == "relay_middle"
+            ),
         }
 
 
@@ -741,7 +755,12 @@ class SchedulerTaskWorkerMixin:
                             if isinstance(message.payload, dict)
                             else []
                         )
-                        if advertised_models:
+                        # Layer/relay workers deliberately advertise no full
+                        # model identity.  Do not turn their hello into an
+                        # opt-out: the layer-config handshake is their role.
+                        if advertised_models and not bool(
+                            message.payload.get("capabilities", {}).get("layer_worker", False)
+                        ):
                             self._handle_layer_worker_opt_out(
                                 client_id,
                                 {"data": {"node_id": client_id}},

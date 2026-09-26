@@ -1405,7 +1405,7 @@ class SchedulerPipelineMixin:
                 raise ValueError(f"不支持的流水线模型架构: {expected_model_type or 'unknown'}")
             if expected_engine not in {"pytorch", "relay_middle"}:
                 raise ValueError(
-                    f"分层配置引擎必须为 pytorch，实际为 {expected_engine}"
+                    f"分层配置引擎必须为 pytorch 或 relay_middle，实际为 {expected_engine}"
                 )
             missing_contract = [
                 name for name, value in (
@@ -1422,28 +1422,51 @@ class SchedulerPipelineMixin:
                 )
             if phase not in {"prepare", "commit"}:
                 raise ValueError(f"不支持的分层加载阶段: {phase}")
-            if phase == "prepare" and (not plan_id or required_bytes <= 0):
-                raise ValueError("prepare 阶段缺少 plan_id 或 required_bytes")
+            if phase == "prepare" and not plan_id:
+                raise ValueError("prepare 阶段缺少 plan_id")
+            if phase == "prepare" and expected_engine != "relay_middle" and required_bytes <= 0:
+                raise ValueError("prepare 阶段缺少 required_bytes")
             if expected_engine == "relay_middle":
                 relay_spec = self._normalize_relay_segment(cfg.get("relay_segment"))
                 if not PIPELINE_RELAY_ENABLED or relay_spec is None:
                     raise ValueError("relay_middle requires an enabled valid relay_segment")
-                mgr = self._host
-                if not mgr or not mgr.is_loaded:
-                    raise RuntimeError("relay worker local model is not loaded")
-                actual_engine = backend_id_for(mgr, default="pytorch") or "pytorch"
-                if actual_engine == "pytorch":
-                    raise RuntimeError("relay_middle requires a non-PyTorch worker backend")
-                loaded_config = getattr(getattr(mgr, "model", None), "config", None)
-                actual_model_type = str(getattr(loaded_config, "model_type", "") or "").lower()
-                if actual_model_type != expected_model_type:
-                    raise RuntimeError(
-                        f"worker model type changed: actual={actual_model_type}, expected={expected_model_type}"
-                    )
+                # relay_middle is endpoint-backed.  The independently
+                # supervised relay_mid_service owns its segment artifact;
+                # this scheduler worker must not load a full model or a
+                # PyTorch layer range just to accept the logical assignment.
                 active_config = {
                     "node_id": node_id, "config_id": config_id,
                     "model_id": model_id, "model_sha256": expected_sha256,
-                    "model_type": actual_model_type, "layer_range": [start, end],
+                    "model_type": expected_model_type, "layer_range": [start, end],
+                    "engine": expected_engine, "relay_segment": relay_spec,
+                }
+                if phase == "prepare":
+                    with self._layer_config_lock:
+                        self._prepared_layer_configs[config_id] = {
+                            **active_config, "plan_id": plan_id,
+                        }
+                    self._send_layer_config_ack({
+                        "node_id": node_id, "config_id": config_id,
+                        "generation": ack_generation, "status": "prepared", "phase": phase,
+                        "plan_id": plan_id, "layer_range": [start, end],
+                        "model_sha256": expected_sha256, "model_type": expected_model_type,
+                        "engine": expected_engine, "relay_segment": relay_spec,
+                        "timestamp": time.time(),
+                    })
+                    return
+                if plan_id:
+                    with self._layer_config_lock:
+                        prepared = dict(self._prepared_layer_configs.get(config_id, {}))
+                    if (
+                        prepared.get("plan_id") != plan_id
+                        or prepared.get("layer_range") != [start, end]
+                        or prepared.get("model_sha256") != expected_sha256
+                    ):
+                        raise RuntimeError("commit 未命中同代际 relay prepared 记录")
+                active_config = {
+                    "node_id": node_id, "config_id": config_id,
+                    "model_id": model_id, "model_sha256": expected_sha256,
+                    "model_type": expected_model_type, "layer_range": [start, end],
                     "engine": expected_engine, "relay_segment": relay_spec,
                 }
                 with self._layer_config_lock:
@@ -1451,14 +1474,12 @@ class SchedulerPipelineMixin:
                     self._active_layer_config = dict(active_config)
                     self._local_pipeline_steps.clear()
                     self._prepared_layer_configs.pop(config_id, None)
-                self._host.model_loaded = True
-                self._host.current_quant = getattr(mgr, "quant_type", None) or "runtime"
                 self._send_layer_config_ack({
                     "node_id": node_id, "config_id": config_id,
                     "generation": ack_generation, "status": "ready", "phase": phase,
                     "plan_id": plan_id, "layer_range": [start, end],
                     "has_embedding": has_embed, "has_lm_head": has_lm,
-                    "model_sha256": expected_sha256, "model_type": actual_model_type,
+                    "model_sha256": expected_sha256, "model_type": expected_model_type,
                     "engine": expected_engine, "relay_segment": relay_spec,
                     "timestamp": time.time(),
                 })
@@ -2180,6 +2201,22 @@ class SchedulerPipelineMixin:
                         f"流水线 step 越序: task={task_id}, step={step}, "
                         f"last_step={last_step}"
                     )
+            if str(active_config.get("engine", "pytorch") or "pytorch").lower() == "relay_middle":
+                # relay_middle is endpoint-backed. The separately supervised
+                # relay_mid_service owns the segment artifact; this scheduler
+                # host does not need a local ModelHost/model loaded.
+                relay_spec = self._normalize_relay_segment(data.get("relay_segment"))
+                if not PIPELINE_RELAY_ENABLED or relay_spec is None:
+                    layer_config_invalid = True
+                    raise RuntimeError("relay_middle requires an enabled valid relay_segment")
+                if relay_spec != active_config.get("relay_segment"):
+                    layer_config_invalid = True
+                    raise RuntimeError("relay segment does not match active layer config")
+                return self._handle_layer_forward_via_relay(
+                    relay_spec, data=data, task_id=task_id, step=step,
+                    config_id=config_id, model_sha256=model_sha256,
+                    model_type=model_type, received_chain_path=received_chain_path,
+                )
             mgr = self._host
             if not mgr or not mgr.is_loaded:
                 layer_config_invalid = True

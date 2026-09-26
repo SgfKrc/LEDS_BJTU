@@ -2013,6 +2013,122 @@ class TestPipelineMessageDispatch:
             "runtime_quant_type": "fp16",
         }
 
+    def test_relay_middle_assignment_does_not_load_scheduler_host(
+            self, sched, monkeypatch):
+        """relay_middle uses the supervised endpoint, not a local full/layer model."""
+        import scheduler_pipeline as pipeline_module
+
+        relay_spec = {
+            "role": "middle",
+            "host": "127.0.0.1",
+            "port": 50183,
+            "n_embd": 896,
+            "timeout": 5.0,
+        }
+        load_calls = []
+        fake_host = type("RelayHost", (), {
+            "is_loaded": False,
+            "model_loaded": False,
+            "layer_range": None,
+            "load_layer_range": lambda self, *args, **kwargs: load_calls.append(
+                (args, kwargs)
+            ),
+        })()
+        sent = []
+        sched._host = fake_host
+        sched._tcp_client = type("Client", (), {
+            "send_data": lambda self, payload, msg_type: sent.append((payload, msg_type)),
+        })()
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: "worker")
+        monkeypatch.setattr(pipeline_module, "PIPELINE_RELAY_ENABLED", True)
+
+        sched._handle_layer_config("master", {
+            "node_id": "worker",
+            "config_id": "cfg-relay",
+            "start_layer": 8,
+            "end_layer": 16,
+            "model_id": "qwen-test",
+            "model_sha256": "sha-relay",
+            "model_type": "qwen2",
+            "total_layers": 24,
+            "engine": "relay_middle",
+            "relay_segment": relay_spec,
+        })
+
+        assert load_calls == []
+        assert fake_host.model_loaded is False
+        assert sent[-1][0]["status"] == "ready"
+        assert sched._active_layer_config["engine"] == "relay_middle"
+        assert sched._active_layer_config["relay_segment"] == relay_spec
+
+    def test_relay_middle_prepare_does_not_require_local_capacity(
+            self, sched, monkeypatch):
+        import scheduler_pipeline as pipeline_module
+
+        relay_spec = {
+            "role": "middle", "host": "127.0.0.1", "port": 50183,
+            "n_embd": 896, "timeout": 5.0,
+        }
+        sent = []
+        sched._host = type("RelayHost", (), {
+            "is_loaded": False, "model_loaded": False, "layer_range": None,
+        })()
+        sched._tcp_client = type("Client", (), {
+            "send_data": lambda self, payload, msg_type: sent.append(payload),
+        })()
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: "worker")
+        monkeypatch.setattr(pipeline_module, "PIPELINE_RELAY_ENABLED", True)
+
+        sched._handle_layer_config("master", {
+            "node_id": "worker", "config_id": "cfg-relay-prepare",
+            "phase": "prepare", "plan_id": "plan-relay",
+            "start_layer": 8, "end_layer": 16,
+            "model_id": "qwen-test", "model_sha256": "sha-relay",
+            "model_type": "qwen2", "total_layers": 24,
+            "engine": "relay_middle", "relay_segment": relay_spec,
+        })
+
+        assert sent[-1]["status"] == "prepared"
+        assert sent[-1]["engine"] == "relay_middle"
+        assert sched._prepared_layer_configs["cfg-relay-prepare"]["plan_id"] == "plan-relay"
+
+    def test_relay_middle_forward_bypasses_local_model_check(
+            self, sched, monkeypatch):
+        """A confirmed relay assignment can forward with an unloaded host."""
+        import scheduler_pipeline as pipeline_module
+
+        relay_spec = {
+            "role": "middle", "host": "127.0.0.1", "port": 50183,
+            "n_embd": 4, "timeout": 5.0,
+        }
+        sched._host = type("RelayHost", (), {
+            "is_loaded": False, "model_loaded": False, "layer_range": None,
+        })()
+        sched._active_layer_config = {
+            "config_id": "cfg-relay", "model_id": "qwen-test",
+            "model_sha256": "sha-relay", "model_type": "qwen2",
+            "layer_range": [8, 16], "engine": "relay_middle",
+            "relay_segment": relay_spec,
+        }
+        sched._tcp_client = type("Client", (), {"_running": True})()
+        monkeypatch.setattr(pipeline_module, "PIPELINE_RELAY_ENABLED", True)
+        forwarded = []
+        monkeypatch.setattr(
+            sched, "_handle_layer_forward_via_relay",
+            lambda spec, **kwargs: forwarded.append((spec, kwargs)),
+        )
+
+        hidden = (b"\x00" * (4 * 4))
+        sched._handle_layer_forward_locked("master", {"data": {
+            "task_id": "relay-task", "step": 0, "use_kv_cache": False,
+            "config_id": "cfg-relay", "model_sha256": "sha-relay",
+            "model_type": "qwen2", "hidden_states": hidden,
+            "hidden_shape": [4, 4], "relay_segment": relay_spec,
+        }})
+
+        assert len(forwarded) == 1
+        assert forwarded[0][0] == relay_spec
+
     def test_capacity_prepare_validates_without_loading_range(
             self, sched, monkeypatch, tmp_path):
         from model_host import model_host as _host
