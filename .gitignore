@@ -228,6 +228,7 @@ scripts/*
 !scripts/relay_cut_model_analysis.py
 !scripts/relay_l2l_net_probe.py
 !scripts/relay_artifact_manifest.py
+!scripts/relay_ssh_tunnel.py
 !scripts/relay_sync_device.ps1
 !scripts/relay_health.py
 !scripts/run_doc_checks.py
