@@ -109,37 +109,62 @@ def open_tunnel(target: str, remote_port: int, local_port: int, *,
         argv += ["-p", str(ssh_port)]
     argv.append(target)
 
-    # Windows 上 ssh 是控制台程序：用 DETACHED_PROCESS 让它活过本 shell（与 relay_mid_service 同法）。
-    creationflags = 0
+    # ★ 2026-09-28（三机验收实测）：Windows 上 `DETACHED_PROCESS` **留不住** ssh —— 隧道进程
+    #   仍随本 shell 结束被回收（实测：起完立刻探活 healthy=True，几分钟后端口已释放）。
+    #   ⇒ Windows 走 **schtasks**（与 Surface 上起长服务的做法一致）：写一个 `.bat` 再注册计划任务，
+    #   由任务计划程序托管 ⇒ 真正脱离本 shell。
+    #   POSIX 侧保留原逻辑（`start_new_session=True` 足够）。
+    task_name = f"qlh-relay-tunnel-{local_port}"
+    process = None
     if os.name == "nt":  # pragma: no cover - 平台相关
-        creationflags = getattr(subprocess, "DETACHED_PROCESS", 0)
-    log_handle = log_path.open("wb")
-    process = subprocess.Popen(argv, stdout=log_handle, stderr=log_handle,
-                               stdin=subprocess.DEVNULL, creationflags=creationflags)
-    _pid_path(local_port).write_text(str(process.pid), encoding="utf-8")
+        bat_path = PID_DIR / f"tunnel-{local_port}.bat"
+        quoted = " ".join(f'"{part}"' if " " in part else part for part in argv)
+        bat_path.write_text(
+            "@echo off\r\n" + quoted + f" > \"{log_path}\" 2>&1\r\n", encoding="ascii"
+        )
+        subprocess.run(["schtasks", "/create", "/tn", task_name, "/tr", str(bat_path),
+                        "/sc", "once", "/st", "23:59", "/f"],
+                       capture_output=True, check=False)
+        subprocess.run(["schtasks", "/run", "/tn", task_name],
+                       capture_output=True, check=False)
+    else:
+        log_handle = log_path.open("wb")
+        process = subprocess.Popen(argv, stdout=log_handle, stderr=log_handle,
+                                   stdin=subprocess.DEVNULL, start_new_session=True)
+    _pid_path(local_port).write_text(
+        str(process.pid) if process is not None else task_name, encoding="utf-8"
+    )
 
     alive = _wait_port(local_port, wait)
     result = {
         "action": "open", "target": target, "local_port": local_port,
-        "remote_port": remote_port, "pid": process.pid,
+        "remote_port": remote_port,
+        "pid": process.pid if process is not None else None,
+        "task": task_name if process is None else None,
         "listening": alive, "log": str(log_path),
         "argv": argv,
     }
     if not alive:
-        # 别把死隧道留在后台：pid 文件可能指向一个已经退出的进程
+        # 别把死隧道留在后台（pid 文件/计划任务都可能指向已退出的东西）
         detail = ""
         try:
             detail = log_path.read_text(encoding="utf-8", errors="replace")[-800:]
         except OSError:
             pass
         print(f"FAIL: 隧道未在 {wait}s 内监听 127.0.0.1:{local_port}\n{detail}", file=sys.stderr)
-        try:
-            process.kill()
-        except OSError:
-            pass
+        if process is not None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        else:  # pragma: no cover - 平台相关
+            subprocess.run(["schtasks", "/end", "/tn", task_name], capture_output=True, check=False)
+            subprocess.run(["schtasks", "/delete", "/tn", task_name, "/f"],
+                           capture_output=True, check=False)
         result["listening"] = False
     else:
-        print(f"[tunnel] pid={process.pid} 127.0.0.1:{local_port} -> {target}:{remote_port}")
+        where = f"pid={process.pid}" if process is not None else f"task={task_name}"
+        print(f"[tunnel] {where} 127.0.0.1:{local_port} -> {target}:{remote_port}")
     return result
 
 
@@ -173,28 +198,44 @@ def check_tunnel(local_port: int, *, timeout: float = 8.0) -> dict:
 
 
 def close_tunnel(local_port: int) -> dict:
-    """按 pid 文件停掉隧道（**先列出将停的 pid**，与本仓"删除前 dry-run"的规矩一致）。"""
+    """停掉隧道（**先列出将停的对象**，与本仓"删除前 dry-run"的规矩一致）。
+
+    ⚠️ pid 文件里存的可能是 **pid**（POSIX）或**计划任务名**（Windows，见 `open_tunnel`）
+    —— 两种都要能停。
+    """
     path = _pid_path(local_port)
     if not path.is_file():
         print(f"[close] 没有 pid 文件（{path}）⇒ 无事可做")
         return {"action": "close", "local_port": local_port, "pid": None, "stopped": False}
     try:
-        pid = int(path.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        raw = ""
+    if not raw:
         path.unlink(missing_ok=True)
         return {"action": "close", "local_port": local_port, "pid": None, "stopped": False}
 
-    print(f"[close] 将停 pid={pid}（127.0.0.1:{local_port} 的隧道）")
     stopped = False
-    try:
-        if os.name == "nt":  # pragma: no cover - 平台相关
-            subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                           capture_output=True, check=False)
-        else:  # pragma: no cover - 平台相关
-            os.kill(pid, 15)
+    if raw.lstrip("-").isdigit():
+        pid = int(raw)
+        print(f"[close] 将停 pid={pid}（127.0.0.1:{local_port} 的隧道）")
+        try:
+            if os.name == "nt":  # pragma: no cover - 平台相关
+                subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                               capture_output=True, check=False)
+            else:  # pragma: no cover - 平台相关
+                os.kill(pid, 15)
+            stopped = True
+        except OSError as exc:
+            print(f"[close] 停 pid={pid} 失败：{exc}", file=sys.stderr)
+    else:
+        task_name = raw
+        print(f"[close] 将停计划任务 {task_name}（127.0.0.1:{local_port} 的隧道）")
+        subprocess.run(["schtasks", "/end", "/tn", task_name], capture_output=True, check=False)
+        subprocess.run(["schtasks", "/delete", "/tn", task_name, "/f"],
+                       capture_output=True, check=False)
         stopped = True
-    except OSError as exc:
-        print(f"[close] 停 pid={pid} 失败：{exc}", file=sys.stderr)
+        pid = None
     path.unlink(missing_ok=True)
     if stopped and _port_open("127.0.0.1", local_port):
         print(f"[close] ⚠️ pid 已停但 127.0.0.1:{local_port} 仍在监听（可能是别的进程）",
