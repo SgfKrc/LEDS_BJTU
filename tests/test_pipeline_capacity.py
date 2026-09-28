@@ -58,6 +58,69 @@ def test_aggregate_capacity_admits_when_no_single_node_fits():
     assert "master" in plan["control_only_nodes"]
 
 
+# ── ★ #31 M3：被运行时忽略的分量可以不计入容量账（只有**显式声明**的架构才行）──────
+
+
+def test_hybrid_visual_and_mtp_no_longer_block_capacity() -> None:
+    """★ M3 的核心：`qwen3_5` 声明了 visual / mtp 不参与层执行 ⇒ 容量账**放行**。
+
+    修复前这里必然 `PipelineCapacityError`（"separately placeable components without a
+    runtime plan"）⇒ hybrid 在层流水线上完全不可用。
+    """
+    model = descriptor()
+    model["model_type"] = "qwen3_5"
+    model["component_weight_bytes"]["visual"] = 600 * MIB
+    model["component_weight_bytes"]["mtp"] = 100 * MIB
+    model["runtime_ignored_components"] = ["visual", "mtp"]
+    model["runtime_ignored_component_bytes"] = {"visual": 600 * MIB, "mtp": 100 * MIB}
+
+    plan = solve_pipeline_capacity(
+        model,
+        [node("master", 300, role="master", score=100), node("worker", 300)],
+        safety_margin=1.0,
+    )
+
+    assert plan["admitted"] is True
+
+
+def test_unignored_component_still_blocks_capacity() -> None:
+    """★ 闸门**没被削弱**：只声明了 visual / mtp，但 `multimodal` 也非零 ⇒ 仍必须拒绝。"""
+    model = descriptor()
+    model["component_weight_bytes"]["visual"] = 600 * MIB
+    model["component_weight_bytes"]["multimodal"] = 1 * MIB
+    model["runtime_ignored_components"] = ["visual", "mtp"]
+
+    with pytest.raises(PipelineCapacityError, match="without a runtime plan"):
+        solve_pipeline_capacity(
+            model, [node("master", 300, role="master", score=100)], safety_margin=1.0
+        )
+
+
+def test_unknown_ignored_component_is_rejected() -> None:
+    """★ 标记里写错名字必须报错 —— 否则一个笔误就等于**悄悄放行**了一个分量。"""
+    model = descriptor()
+    model["runtime_ignored_components"] = ["visualx"]
+
+    with pytest.raises(PipelineCapacityError, match="unknown entries"):
+        solve_pipeline_capacity(
+            model, [node("master", 300, role="master", score=100)], safety_margin=1.0
+        )
+
+
+def test_descriptor_without_the_marker_behaves_as_before() -> None:
+    """★ 兼容性：**没有**这个字段的 descriptor（老工件 / 其它架构）行为与修复前一致。"""
+    model = descriptor()          # 不带 runtime_ignored_components
+    assert "runtime_ignored_components" not in model
+
+    plan = solve_pipeline_capacity(
+        model,
+        [node("master", 300, role="master", score=100), node("worker", 300)],
+        safety_margin=1.0,
+    )
+
+    assert plan["admitted"] is True
+
+
 def test_required_distributed_rejects_single_node_shortcut():
     plan = solve_pipeline_capacity(
         descriptor(),
