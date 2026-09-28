@@ -19,7 +19,13 @@ DESCRIPTOR_SCHEMA_VERSION = 1
 # These model types have an in-process loader and forward executor.  Architectures
 # may still have a metadata/assignment layout below while remaining fail-closed
 # here when they require an isolated runtime.
-PIPELINE_RUNTIME_MODEL_TYPES = frozenset({"qwen", "qwen2"})
+#
+# ★ #31 M1（2026-09-26）：加入 hybrid。**两个名字都要** —— `qwen3-5-2b` 的外层 config 是
+#   `model_type=qwen3_5`（多模态包装 `Qwen3_5ForConditionalGeneration`），而**文本子 config**
+#   是 `qwen3_5_text`；主仓的层加载路径与 `forward_lm_head` 报出来的正是 **`qwen3_5_text`**
+#   （实测 `RuntimeError: 模型架构 qwen3_5_text 缺少最终 Norm`）。两者共用
+#   `model.language_model.*` 前缀（实测真工件 318 个层 key 全部匹配）。
+PIPELINE_RUNTIME_MODEL_TYPES = frozenset({"qwen", "qwen2", "qwen3_5", "qwen3_5_text"})
 _MAX_JSON_BYTES = 64 * 1024 * 1024
 _DTYPE_BYTES = {
     "BOOL": 1,
@@ -94,6 +100,29 @@ _ARCHITECTURE_LAYOUTS = {
         "visual_prefixes": ("model.visual.", "visual."),
         "mtp_prefixes": ("mtp.",),
         "multimodal_prefixes": (),
+        # ★ #31 M3（2026-09-26）：这些分量**参与了权重索引、但不参与层执行** ⇒ 可归零。
+        #   依据（均为实测，见 #31 §31.6.1）：`Qwen3_5ForCausalLM` 顶层子模块只有
+        #   `['model','lm_head']`（**无 mtp**）、`model` 子模块只有
+        #   `['embed_tokens','layers','norm','rotary_emb']`（**无 visual**），且
+        #   `_keys_to_ignore_on_load_unexpected = ['^mtp.*','^model.visual.*']`。
+        #   ⇒ `pipeline_capacity` 不再为这两类分量要求"运行时计划"（其余仍 fail-closed）。
+        "runtime_ignored_components": ("visual", "mtp"),
+    },
+    # ★ #31 M1：`qwen3-5-2b` 的**文本子 config** 用的就是这个 model_type
+    #   （主仓层加载路径与 `forward_lm_head` 报出来的都是它）⇒ 必须单独登记，
+    #   否则"只加白名单不生效"（`_ARCHITECTURE_LAYOUTS.get(model_type)` 返回 None）。
+    #   前缀与 `qwen3_5` **共用** —— 真工件 318 个层 key 全在 `model.language_model.*` 下（实测）；
+    #   作为**纯文本**架构，visual / mtp 前缀为空（那些分量的 key 只在外层多模态口径里）。
+    "qwen3_5_text": {
+        "layer_pattern": re.compile(
+            r"^model\.language_model\.layers\.(\d+)\."
+        ),
+        "layer_prefix": "model.language_model.layers.",
+        "embedding_prefixes": ("model.language_model.embed_tokens.",),
+        "final_norm_prefixes": ("model.language_model.norm.",),
+        "lm_head_prefixes": ("lm_head.",),
+        "visual_prefixes": (),
+        "mtp_prefixes": (),
     },
     "gemma4_unified": {
         "layer_pattern": re.compile(
@@ -114,6 +143,20 @@ _ARCHITECTURE_LAYOUTS = {
 
 for _layout in _ARCHITECTURE_LAYOUTS.values():
     _layout.setdefault("multimodal_prefixes", ())
+    # ★ #31 M3：默认"没有被运行时忽略的分量" —— 只有**显式声明**的架构（hybrid）才允许归零。
+    _layout.setdefault("runtime_ignored_components", ())
+
+# ★ #31 M3：标记只能取已知的分量名 —— 写错一个字母就等于悄悄放行一个分量，
+#   那是这条闸门最不该出的错（顺带校验：被忽略的分量必须**真的**有前缀声明）。
+for _name, _layout in _ARCHITECTURE_LAYOUTS.items():
+    for _component in _layout["runtime_ignored_components"]:
+        if _component not in ("visual", "mtp", "multimodal"):
+            raise ValueError(f"{_name}: 未知的 runtime_ignored_components 项 {_component!r}")
+        if not _layout.get(f"{_component}_prefixes"):
+            raise ValueError(
+                f"{_name}: runtime_ignored_components 声明了 {_component!r}，"
+                f"但布局里没有 {_component}_prefixes"
+            )
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -332,6 +375,13 @@ def inspect_pipeline_model(
         "weight_file_count": len(keys_by_shard),
         "layer_weight_bytes": layer_bytes,
         "component_weight_bytes": component_bytes,
+        # ★ #31 M3：如实记录"这些分量在索引里、但**不参与层执行**" ⇒ 容量账可据此归零。
+        #   不静默丢弃：字节数一并给出，便于事后核对（`pipeline_capacity` 只对这两类放行）。
+        "runtime_ignored_components": list(layout["runtime_ignored_components"]),
+        "runtime_ignored_component_bytes": {
+            name: int(component_bytes.get(name, 0))
+            for name in layout["runtime_ignored_components"]
+        },
         "tie_word_embeddings": bool(decoder_config.get("tie_word_embeddings", False)),
         "pipeline_runtime_supported": runtime_supported,
         "runtime_block_reason": (

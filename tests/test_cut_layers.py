@@ -20,8 +20,14 @@ ARCH = "qwen2"
 N_LAYERS = 4
 
 
-def _make_gguf(path: Path, n_layers: int = N_LAYERS, interval: int | None = None) -> None:
-    """合成一个结构上合法（但不含真实权重语义）的迷你 GGUF。"""
+def _make_gguf(path: Path, n_layers: int = N_LAYERS, interval: int | None = None,
+               nextn: int = 0) -> None:
+    """合成一个结构上合法（但不含真实权重语义）的迷你 GGUF。
+
+    `nextn > 0` 时额外写 MTP 层 —— **挂在 `blk.(n_layers-1)` 上**并置
+    `<arch>.nextn_predict_layers`，复刻 `qwen35-*` 的真实形态（实测 `qwen35-2b` 的
+    MTP tensor 名是 `blk.24.nextn.*`，而 `block_count=25`）。
+    """
     import numpy as np
     import torch
 
@@ -31,11 +37,18 @@ def _make_gguf(path: Path, n_layers: int = N_LAYERS, interval: int | None = None
     if interval is not None:
         writer.add_key_value(f"{ARCH}.full_attention_interval", interval,
                              gguf.GGUFValueType.INT32)
+    if nextn:
+        writer.add_key_value(f"{ARCH}.nextn_predict_layers", nextn,
+                             gguf.GGUFValueType.UINT32)
     for layer in range(n_layers):
         writer.add_tensor(f"blk.{layer}.attn_norm.weight",
                           np.ones(8, dtype=np.float32))
         writer.add_tensor(f"blk.{layer}.ffn_norm.weight",
                           np.ones(8, dtype=np.float32))
+    if nextn:
+        for suffix in ("eh_proj", "enorm", "hnorm"):
+            writer.add_tensor(f"blk.{n_layers - 1}.nextn.{suffix}.weight",
+                              np.ones(8, dtype=np.float32))
     writer.add_tensor("token_embd.weight", np.ones((8, 8), dtype=np.float32))
     writer.add_tensor("output_norm.weight", np.ones(8, dtype=np.float32))
     writer.write_header_to_file()
@@ -215,3 +228,46 @@ class TestHeadAndMiddleModes:
 
         ok = _run("--src", str(src), "--k", "2", "--end", "4", "--dry-run")      # 对齐 ⇒ 通过
         assert ok.returncode == 0, ok.stdout
+
+
+class TestNextnMtpHandling:
+    """★ 2026-09-27：MTP（nextn）层被裁掉时**必须同时把 `nextn_predict_layers` 归 0**。
+
+    实测踩到：`cut_layers.py --keep-head 12` 对一个 `qwen35` 整模只改了 `block_count`，
+    而 `nextn_predict_layers` 留成 1 ⇒ llama.cpp 把**最后一个普通层**当成 MTP 层、
+    要求它带 `nextn.*` tensor ⇒ 报 `missing tensor 'blk.11.nextn.eh_proj.weight'`
+    ⇒ **整模加载失败**。这条是补 hybrid **端到端**验证时才暴露的 ——
+    单机/协议级测试测不出来（它们不会真的让 llama.cpp 去加载那个工件）。
+    """
+
+    def test_keep_head_drops_mtp_and_zeroes_the_kv(self, tmp_path: Path) -> None:
+        src = tmp_path / "with_mtp.gguf"
+        _make_gguf(src, n_layers=4, nextn=1)
+        dst = tmp_path / "head2.gguf"
+
+        r = _run("--src", str(src), "--dst", str(dst), "--keep-head", "2")
+
+        assert r.returncode == 0, r.stderr
+        assert "nextn_predict_layers: 1 -> 0" in r.stdout
+        reader = gguf.GGUFReader(str(dst))
+        assert int(reader.fields[f"{ARCH}.nextn_predict_layers"].contents()) == 0
+        assert not any(t.name.endswith(".nextn.eh_proj.weight") for t in reader.tensors)
+
+    def test_tail_keeps_mtp_when_the_range_includes_it(self, tmp_path: Path) -> None:
+        """保留区间**含** MTP 时不得归零（`--k` 只丢前面的层）—— 防止矫枉过正。"""
+        src = tmp_path / "with_mtp.gguf"
+        _make_gguf(src, n_layers=4, nextn=1)
+        dst = tmp_path / "tail.gguf"
+
+        r = _run("--src", str(src), "--dst", str(dst), "--k", "1")
+
+        assert r.returncode == 0, r.stderr
+        reader = gguf.GGUFReader(str(dst))
+        assert int(reader.fields[f"{ARCH}.nextn_predict_layers"].contents()) == 1
+
+    def test_source_without_mtp_is_untouched(self, src_gguf: Path, tmp_path: Path) -> None:
+        """没有 MTP 的源（既有形态）⇒ 不写这个 KV、也不打印那句话（**零行为变化**）。"""
+        r = _run("--src", str(src_gguf), "--dst", str(tmp_path / "out.gguf"), "--k", "1")
+
+        assert r.returncode == 0, r.stderr
+        assert "nextn_predict_layers" not in r.stdout

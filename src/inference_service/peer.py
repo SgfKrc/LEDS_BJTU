@@ -25,6 +25,9 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
+# ★ #31 M2：层流水线支持的架构走**单一事实来源**（此前硬编码 `{"qwen","qwen2"}`）
+from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
+
 logger = logging.getLogger("inference_service.peer")
 
 
@@ -252,7 +255,8 @@ class PeerClient:
         try:
             if target_node_id != node_id:
                 raise ValueError(f"层配置目标节点 {target_node_id} 与本节点 {node_id} 不一致")
-            if expected_model_type not in {"qwen", "qwen2"}:
+            # ★ #31 M2：同上，走单一事实来源
+            if expected_model_type not in PIPELINE_RUNTIME_MODEL_TYPES:
                 raise ValueError(f"不支持的流水线模型架构: {expected_model_type or 'unknown'}")
             missing_contract = [
                 name for name, value in (
@@ -439,9 +443,16 @@ class PeerClient:
                 return
             elapsed_ms = (time.time() - t_start) * 1000
 
-            if result.get("past_key_values"):
+            # ★ #31 M4：**优先持有 `result["cache"]`** —— hybrid 的 tuple 会丢 recurrent state
+            #   （`linear_attention` 层在 tuple 里是 `None` 占位）。
+            #   本文件是「复制自 `scheduler.py` 的 client 角色分支」的既有模式 ⇒ 同样内联，
+            #   与 `src/scheduler_pipeline.py` 的 `_prefer_cache_state` **同源（改一处要同步另一处）**。
+            if result.get("cache") is not None or result.get("past_key_values"):
                 with self._kv_cache_lock:
-                    self._kv_cache[task_id] = result["past_key_values"]
+                    self._kv_cache[task_id] = (
+                        result["cache"] if result.get("cache") is not None
+                        else result["past_key_values"]
+                    )
             else:
                 raise RuntimeError("分层前向未返回 KV cache")
             with self._layer_config_lock:

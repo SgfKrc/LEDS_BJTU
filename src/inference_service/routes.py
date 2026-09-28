@@ -478,6 +478,23 @@ async def layers_unload(req: LayerUnloadRequest, request: Request):
 @router.post("/layers/forward")
 async def layers_forward(req: LayerForwardRequest, request: Request):
     host = _engine_host(request)
+    # ★ #31 M6：hybrid（如 `qwen3_5`）的 recurrent state **不在** KV 分页里 ⇒ `KVHost` 的
+    #   `PagedKVCache` 对它是**错误的载体**：拿它当 `past_key_values` 同一轮不报错、数值却错
+    #   （静默丢状态，事后极难归因）。而且本端点的响应**只回张量、不回 cache**
+    #   ⇒ prefill 产出的 recurrent state 也传不出去、下一轮 decode 必失败。
+    #   所以这里**一律明确 fail-closed**（501），而不是"看起来能跑"。
+    #   真支持它需要把载体换成 transformers `Cache`（连带 `KVHost` 的分页/cold-tier 设计），
+    #   属独立工程 —— 见 `已知问题记录.md` #31 §31.5 M6。
+    kind = getattr(host, "kv_state_kind", None)
+    if callable(kind) and kind() == "hybrid":
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "该模型是混合层型架构（含 linear_attention 层，recurrent state 不在 KV 分页中）："
+                "/layers/forward 的 PagedKVCache 载体不适用（且本端点不回传 cache）"
+                "⇒ 请改用进程内层流水线（scheduler_pipeline）路径"
+            ),
+        )
     hidden = _decode_tensor(req.tensor_ref)
     past_key_values = None
     if req.past_key_values_ref:

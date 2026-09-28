@@ -305,6 +305,36 @@ def test_respect_manifests_discovers_head_manifest_next_to_artifact(tmp_path) ->
     assert args.head_layers is None
 
 
+def test_discover_manifest_accepts_both_naming_conventions(tmp_path) -> None:
+    """★ 两种 manifest 命名都要认 —— **两个生成器的约定不同**（补验证时实测踩到）。
+
+    * `scripts/relay_artifact_manifest.py`（对早期工件事后补录）
+      ⇒ `<artifact>.gguf.manifest.json`
+    * `scripts/cut_layers.py --manifest X`（生成时自带）
+      ⇒ 路径由调用方给，本仓惯用 `<artifact 去掉 .gguf>.manifest.json`
+
+    只认第一种时，`cut_layers.py` 裁出的 head 工件读不到 manifest ⇒ 覆盖校验退回
+    `unverified`（hybrid 端到端验证时实测：tail 读到了、head 没有）。
+    """
+    module = _load()
+
+    a = tmp_path / "a.gguf"
+    a.write_bytes(b"stub")
+    _manifest_file(tmp_path, "a.gguf.manifest.json", start=0, end=4)
+    assert module._discover_manifest(a).endswith("a.gguf.manifest.json")
+
+    b = tmp_path / "b.gguf"
+    b.write_bytes(b"stub")
+    _manifest_file(tmp_path, "b.manifest.json", start=4, end=8)
+    assert module._discover_manifest(b).endswith("b.manifest.json")
+
+    # 两种都不存在 / 空路径 ⇒ None（**不报错**）
+    c = tmp_path / "c.gguf"
+    c.write_bytes(b"stub")
+    assert module._discover_manifest(c) is None
+    assert module._discover_manifest(None) is None
+
+
 def test_manifest_derived_coverage_verifies_end_to_end(tmp_path) -> None:
     """★ 端到端：三段层范围**全部**来自 manifest ⇒ `verified` 且能列出 segments。"""
     module = _load()

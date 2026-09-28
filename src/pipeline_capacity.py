@@ -82,7 +82,23 @@ def _descriptor_costs(
         )
         for name in ("visual", "mtp", "multimodal")
     }
-    active_unsupported = [name for name, size in unsupported.items() if size > 0]
+    # ★ #31 M3：架构可以**显式声明**某些分量"进了权重索引、但**不参与层执行**"
+    #   （hybrid 的 visual / mtp —— 依据是运行时结构里根本没有这两类子模块，见
+    #   `已知问题记录.md` #31 §31.6.1 的实测）。这类分量**不计入容量账**（没有任何节点会加载它们）；
+    #   **其余分量一律照旧 fail-closed**，且标记里的未知名字本身也要报错（防手抖）。
+    ignored = descriptor.get("runtime_ignored_components") or []
+    if not isinstance(ignored, (list, tuple)):
+        raise PipelineCapacityError("descriptor runtime_ignored_components must be a list")
+    unknown = [str(name) for name in ignored if name not in unsupported]
+    if unknown:
+        raise PipelineCapacityError(
+            "descriptor runtime_ignored_components has unknown entries: " + ", ".join(unknown)
+        )
+    ignored = set(ignored)
+    active_unsupported = [
+        name for name, size in unsupported.items()
+        if size > 0 and name not in ignored
+    ]
     if active_unsupported:
         raise PipelineCapacityError(
             "descriptor has separately placeable components without a runtime plan: "

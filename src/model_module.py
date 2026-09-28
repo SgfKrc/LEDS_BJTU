@@ -3631,6 +3631,20 @@ class ModelManager:
             norm = getattr(self.model.transformer, "ln_f", None)
         else:
             norm = None
+        # ★ #31 M5（2026-09-26）：再加一层**按架构属性**的兜底定位，而不是只认两个硬编码的
+        #   `model_type`。hybrid（`qwen3_5_text`）此前在这里直接抛
+        #   「模型架构 qwen3_5_text 缺少最终 Norm」⇒「master 保留 LM Head、层在 worker」
+        #   那条路径对它完全不可用。
+        #   与 `forward_layers` 的 Step 7（`transformer.norm(hidden_states)`，约 :4076）**同源**
+        #   —— 用的是同一个 `_locate_text_transformer`，所以两条路径不会各自漂移。
+        #   既有 `qwen2` / `qwen` 分支**保持不变**（先命中就先返回 ⇒ 行为零变化）。
+        if norm is None:
+            try:
+                transformer, _layers_attr, _embed_attr = _locate_text_transformer(self.model)
+            except RuntimeError:
+                transformer = None
+            if transformer is not None:
+                norm = getattr(transformer, "norm", None)
         if norm is None:
             raise RuntimeError(f"模型架构 {model_type or 'unknown'} 缺少最终 Norm")
         device = self.get_device()

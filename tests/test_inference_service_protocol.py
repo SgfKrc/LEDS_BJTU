@@ -607,6 +607,84 @@ def test_layers_forward_unknown_kv_ref(client):
 
 
 # ----------------------------------------------------------------------
+# ★ #31 M6：hybrid 在 /v1/layers/forward 上**明确 fail-closed**
+# ----------------------------------------------------------------------
+class _ConfigStub:
+    def __init__(self, layer_types):
+        self.layer_types = layer_types
+
+
+class _ModelStub:
+    def __init__(self, layer_types):
+        self.config = _ConfigStub(layer_types)
+
+
+def _app_with_layer_types(layer_types):
+    """造 app 并把 engine_host 底下的 `_host.model` 换成带 `layer_types` 的桩。"""
+    app = make_app()
+    app.state.engine_host._host.model = (
+        None if layer_types is None else _ModelStub(layer_types)
+    )
+    return app
+
+
+def test_layers_forward_rejects_hybrid_with_explicit_fail_closed():
+    """★ M6：hybrid 的 recurrent state **不在** KV 分页里 ⇒ 必须**明确拒绝**（501）。
+
+    否则会拿 `PagedKVCache` 当载体"看起来能跑" —— 那正是最坏的一种：同一轮不报错、
+    数值却错（静默丢状态），事后极难归因。
+    """
+    client = TestClient(_app_with_layer_types(["linear_attention", "full_attention"]))
+    hidden = torch.randn(2, 2048, dtype=torch.float16)
+    tensor_ref = base64.b64encode(serialize_tensor(hidden)).decode("ascii")
+
+    resp = client.post(
+        "/v1/layers/forward",
+        json={"layer_range": "0-12", "tensor_ref": tensor_ref},
+    )
+
+    assert resp.status_code == 501
+    detail = resp.json()["detail"]
+    assert "混合层型" in detail or "recurrent" in detail
+
+
+def test_layers_forward_pure_full_attention_is_not_gated():
+    """★ 回归：纯 `full_attention`（含 transformers 5.x 给 Qwen2 也加 `layer_types` 的形态）
+    **不受**这条闸门影响 —— 必须能透过闸门（FakeModel 无 `forward_layers`，故只断言非 501）。"""
+    for layer_types in (["full_attention"] * 4, None):
+        client = TestClient(_app_with_layer_types(layer_types))
+        hidden = torch.randn(2, 2048, dtype=torch.float16)
+        tensor_ref = base64.b64encode(serialize_tensor(hidden)).decode("ascii")
+
+        resp = client.post(
+            "/v1/layers/forward",
+            json={"layer_range": "0-12", "tensor_ref": tensor_ref},
+        )
+
+        assert resp.status_code != 501, layer_types
+
+
+def test_kv_state_kind_uses_layer_types_not_model_type_allowlist():
+    """★ 判据是**层类型**：含 `linear_attention` 才算 hybrid；无 `layer_types` ⇒ 老架构。"""
+    host = EngineHost.__new__(EngineHost)      # 不跑 __init__（避免拉起真实 ModelHost）
+
+    class _Holder:
+        model = None
+
+    host._host = _Holder()
+    assert host.kv_state_kind() == "unknown"   # 没模型 ⇒ unknown（**不**误判成 hybrid/tuple）
+
+    host._host.model = _ModelStub(["linear_attention", "full_attention"])
+    assert host.kv_state_kind() == "hybrid"
+
+    host._host.model = _ModelStub(["full_attention"] * 24)
+    assert host.kv_state_kind() == "tuple"
+
+    host._host.model = _ModelStub(None)
+    assert host.kv_state_kind() == "tuple"
+
+
+# ----------------------------------------------------------------------
 # 7. 实验端点门控
 # ----------------------------------------------------------------------
 def test_speculative_run_gated_off(client):
