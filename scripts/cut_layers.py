@@ -380,7 +380,33 @@ def main() -> int:
     dst = Path(args.dst)
     writer = gguf.GGUFWriter(str(dst), identity["architecture"])
     bc_name = f"{identity['architecture']}.block_count"
-    n_kv = _copy_kv(gguf, reader, writer, {bc_name: kept_block_count})
+    overrides = {bc_name: kept_block_count}
+    # ★ 2026-09-27：MTP（nextn）层是**原模型的最后一层**（实测 `qwen35-2b` 的 MTP tensor
+    #   名为 `blk.24.nextn.*`，而 `block_count=25`）⇒ **只要它被裁掉/被截断，
+    #   `nextn_predict_layers` 就必须归 0**。否则 llama.cpp 会把**最后一个普通层**当成 MTP 层、
+    #   要求它带 `nextn.*` tensor ⇒ 报 `missing tensor 'blk.11.nextn.eh_proj.weight'`
+    #   而**整个模型加载失败**（补 hybrid 端到端验证时实测踩到；单机/协议级测试测不出来）。
+    nextn = int(identity["nextn_predict_layers"])
+    if nextn:
+        mtp_index = int(identity["block_count"]) - 1        # MTP 所在层号
+        kept_last_index = kept_block_count - 1
+        # `keep_head`/`tail`/`middle` 三种模式共享同一判据：MTP 层是否还在保留区间里
+        mtp_kept = (
+            (args.keep_head is not None and mtp_index < int(args.keep_head))
+            or (args.keep_head is None and args.end is not None
+                and int(args.k) <= mtp_index < int(args.end))
+            or (args.keep_head is None and args.end is None and mtp_index >= int(args.k))
+        )
+        if not mtp_kept:
+            nextn_name = f"{identity['architecture']}.nextn_predict_layers"
+            overrides[nextn_name] = 0
+            print(f"[kv] ★ MTP 层（blk.{mtp_index}）已不在保留区间 ⇒ "
+                  f"{nextn_name}: {nextn} -> 0")
+        elif kept_last_index != mtp_index:
+            # 保留区间含 MTP 但**层号变了**（tail/middle 会重编号）⇒ 记录，便于事后核对
+            print(f"[kv] MTP 层保留，重编号后位于 blk.{kept_last_index}"
+                  f"（tensor 名随 `_plan_tensors` 一起重写）")
+    n_kv = _copy_kv(gguf, reader, writer, overrides)
     print(f"[kv] 复制 {n_kv} 字段，{bc_name}: {identity['block_count']} -> {kept_block_count}")
     for tensor, new_name in keep:
         writer.add_tensor(new_name, tensor.data, raw_dtype=tensor.tensor_type)

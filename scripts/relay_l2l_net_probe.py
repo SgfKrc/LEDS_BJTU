@@ -197,8 +197,19 @@ def _discover_manifest(path) -> str | None:
     """
     if not path:
         return None
-    candidate = Path(str(path) + ".manifest.json")
-    return str(candidate) if candidate.is_file() else None
+    text = str(path)
+    # ⚠️ 两种命名都真实存在 —— **两个生成器的约定不同**（实测踩到：只试第一种时
+    #    `cut_layers.py` 裁出的 head 工件读不到 manifest，覆盖校验因此退回 unverified）：
+    #   * `scripts/relay_artifact_manifest.py`（对早期工件事后补录）⇒ `<artifact>.gguf.manifest.json`
+    #   * `scripts/cut_layers.py --manifest X`（生成时自带）⇒ 路径由调用方给，
+    #     本仓惯用 `<artifact 去掉 .gguf>.manifest.json`
+    candidates = [text + ".manifest.json"]
+    if text.endswith(".gguf"):
+        candidates.append(text[: -len(".gguf")] + ".manifest.json")
+    for candidate in candidates:
+        if Path(candidate).is_file():
+            return candidate
+    return None
 
 
 def _respect_manifests(args) -> dict[str, str]:
