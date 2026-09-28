@@ -195,18 +195,33 @@ def _run_edge_profile(edge_python: Path, *, timeout_s: float) -> dict[str, Any]:
         result["profile"] = "edge"
         return result
 
-    try:
-        preflight = json.loads(result.get("stdout", ""))
-    except json.JSONDecodeError as exc:
+    raw_stdout = result.get("stdout", "")
+    if len(raw_stdout) >= OUTPUT_TAIL:
+        # 与审计那一步同因：`_run_subprocess` 只保留**尾部** OUTPUT_TAIL 字符 ⇒
+        # 明确区分"被截断"与"JSON 非法"，别让截断伪装成非法 JSON。
         result.update(
             {
                 "ok": False,
-                "error": f"edge_preflight did not emit JSON: {exc}",
+                "error": f"edge_preflight stdout truncated at OUTPUT_TAIL={OUTPUT_TAIL}",
             }
         )
     else:
-        result["ok"] = result["ok"] and preflight.get("ok") is True
-        result["preflight"] = preflight
+        try:
+            preflight = json.loads(raw_stdout)
+        except json.JSONDecodeError as exc:
+            result.update(
+                {
+                    "ok": False,
+                    "error": f"edge_preflight did not emit JSON: {exc}",
+                }
+            )
+        else:
+            result["ok"] = result["ok"] and preflight.get("ok") is True
+            result["preflight"] = preflight
+            # ★ 把运行半边的 SLIM 结论透出，便于直接从矩阵报告读出真实载荷的状态。
+            checks = preflight.get("checks") or {}
+            result["slim_entry_present"] = preflight.get("slim_entry_present")
+            result["slim_entry_import_ok"] = checks.get("slim_entry_import")
 
     # ★ 静态半边：无论 preflight 的 JSON 是否可解析都要跑（它是独立的判据，
     #   不能被前一步的失败"顺带跳过"而假装通过）。
