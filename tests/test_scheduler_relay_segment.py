@@ -468,3 +468,55 @@ def test_guard_branch_requires_both_switch_and_spec(monkeypatch: pytest.MonkeyPa
     assert _would_delegate(None, True) is False         # 无规格 ⇒ 不委托
     assert _would_delegate({"role": "tail", "host": "127.0.0.1", "port": 1,
                             "n_embd": 4}, True) is False
+
+
+# ---- 「该红必须红」：请求级路由偏好必须能挡住 relay 委派 -------------------
+
+
+def _enable_relay_with_one_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """打开开关 + 给一个 worker 配好 middle 段（两处都走 monkeypatch，不碰环境变量）。"""
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_ENABLED", True)
+    monkeypatch.setattr(
+        scheduler_pipeline, "PIPELINE_RELAY_SEGMENTS",
+        "worker-2=middle@127.0.0.1:50183#896",
+    )
+
+
+def test_guard_local_only_never_delegates_to_a_relay_segment(monkeypatch: pytest.MonkeyPatch):
+    """★「该红必须红」：`routing_preference == "local_only"` ⇒ **绝不**委派给远端 relay 段。
+
+    这是 §4.7「X 档包含」第 3 项的**请求级那一半**。把 `_relay_segment_for_worker` 里
+    `local_only ⇒ None` 那个闸门去掉，本用例立刻红 —— 届时带「只要本地算」语义的请求仍会被
+    派给远端段。API 层虽然已经在 `local_only` 时跳过整条流水线路径（`api_server.py`），
+    但这里守的是**流水线内部**那条边界：换任何入口进来都不该被绕过。
+    """
+    _enable_relay_with_one_worker(monkeypatch)
+    harness = _Harness()
+
+    # 先证明这条链路本身是通的 —— 否则下面的 None 可能只是"什么都没配上"的假通过。
+    assert harness.obj._relay_segment_for_worker("worker-2") is not None
+    assert harness.obj._relay_segment_for_worker("worker-2", "auto") is not None
+
+    # ⇒ `local_only` 必须挡住。
+    assert harness.obj._relay_segment_for_worker("worker-2", "local_only") is None
+
+
+def test_default_routing_preference_is_equivalent_to_auto(monkeypatch: pytest.MonkeyPatch):
+    """不传 `routing_preference` 必须与显式 `"auto"` **等价** ⇒ 旧调用方零影响。"""
+    _enable_relay_with_one_worker(monkeypatch)
+    harness = _Harness()
+
+    default = harness.obj._relay_segment_for_worker("worker-2")
+    explicit = harness.obj._relay_segment_for_worker("worker-2", "auto")
+
+    assert default == explicit
+    assert default is not None
+
+
+def test_only_local_only_blocks_delegation(monkeypatch: pytest.MonkeyPatch):
+    """闸门**只**认 `local_only` —— `auto` / `distributed_required` / 空串 / 未来新值都不挡。"""
+    _enable_relay_with_one_worker(monkeypatch)
+    harness = _Harness()
+
+    for preference in ("auto", "distributed_required", "", "some-future-value"):
+        assert harness.obj._relay_segment_for_worker("worker-2", preference) is not None, preference

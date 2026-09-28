@@ -3607,6 +3607,10 @@ def _execute_chat_full(
                 messages=list(history) + [{"role": "user", "content": req.message}],
                 show_thinking=req.show_thinking,
                 enable_thinking=req.enable_thinking,
+                # ★ A1 / X 档：请求级路由偏好要贯通到流水线内部（`local_only` ⇒ 本段不委派给
+                #   远端 relay 段）。此前只在流水线**入口**用它做"是否走分布式路径"的判断，
+                #   没往 `_run_pipeline` 里传，于是 relay 委派完全不区分请求。
+                routing_preference=req.routing_preference,
                 _require_distributed=(req.routing_preference == "distributed_required"),
                 _force_distributed_assignment=True,
                 _cancel_event=cancel_event,

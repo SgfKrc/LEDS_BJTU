@@ -12,8 +12,9 @@ A1 的实质不是"没有 Relay 传输层"，而是**传输层、合同层、生
   Relay wire"）。未在白名单 ⇒ 回落 `relay_protocol_error`，**不会**把原始字符串带上 wire。
 * **默认不压缩**：`quant="none"`。X 档**不含**任何量化档（`f16`/`int8_block128`/`int4_block128`
   留给 Y 档；`int4` 已有 23/32 FAIL 证据，永不作为可选档）。
-* **不自带开关**：是否启用由**调度层**按 `QLH_RELAY_ENABLED` 与请求级 `routing_preference`
-  决定；本模块不读环境变量（一个事实一个来源，避免"两处开关互相打架"）。
+* **不自带开关**：是否启用由**调度层**按三者共同决定 —— `QLH_RELAY_ENABLED`（默认关）、
+  请求级 `routing_preference`（`local_only` ⇒ 不委派）以及该 worker 在 `QLH_RELAY_SEGMENTS`
+  里的映射；本模块不读环境变量（一个事实一个来源，避免"两处开关互相打架"）。
 * **不 import torch / llama_cpp**：只碰 `bytes` 与 `relay_transport` ⇒ 无 torch 的环境
   （`.venv-edge`）也能导入，与 §4.7 的"本机可闭环、不需要模型"一致。
 

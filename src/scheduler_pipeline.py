@@ -3528,13 +3528,28 @@ class SchedulerPipelineMixin:
                 result[name.strip()] = spec
         return result
 
-    def _relay_segment_for_worker(self, worker_id: str) -> Optional[dict]:
+    def _relay_segment_for_worker(self, worker_id: str,
+                                  routing_preference: str = "auto") -> Optional[dict]:
         """★ A1 / X 档：该 worker 是否由远端 relay 段代跑本段（主节点侧配置，解析一次后缓存）。
 
-        开关关闭 ⇒ 直接 `None`（对既有路径零影响）。缓存用 `getattr` 惰性挂在实例上，
-        **不**改 `__init__`（本方法是 mixin 方法，实例可能来自多种构造路径）。
+        **三重闸门**，任一不成立即 `None`（对既有路径零影响）：
+
+        1. **全局开关** `QLH_RELAY_ENABLED`（默认关）；
+        2. **请求级** `routing_preference == "local_only"` ⇒ 不委派（语义一致：「只要本地算」）。
+           注：API 层在 `local_only` 时**本就不会进流水线路径**（`api_server.py` 的
+           `req.routing_preference != "local_only"` 判断），这里是**防御性**的第二道边界 ——
+           即使将来有别的入口把 `local_only` 请求送进流水线，也不会被派给远端段；
+        3. 该 worker 在 `QLH_RELAY_SEGMENTS` 映射里。
+
+        更细的「请求级 relay 取舍」（例如按请求挑不同段）**不在 X 档**：`routing_preference`
+        现有取值集不含这个维度，扩它等于改 API 契约 ⇒ 归 Y 档。
+
+        缓存用 `getattr` 惰性挂在实例上，**不**改 `__init__`（本方法是 mixin 方法，
+        实例可能来自多种构造路径）。
         """
         if not PIPELINE_RELAY_ENABLED:
+            return None
+        if str(routing_preference or "auto") == "local_only":
             return None
         cache = getattr(self, "_relay_segment_map_cache", None)
         if cache is None:
@@ -3880,6 +3895,9 @@ class SchedulerPipelineMixin:
                      session_id: str = None,
                      messages: list = None,
                      show_thinking: bool = False,
+                     # ★ A1 / X 档：请求级路由偏好（`local_only` ⇒ 本段不委派给远端 relay 段）。
+                     #   默认 "auto" ⇒ 旧调用方**逐比特不变**。
+                     routing_preference: str = "auto",
                      _stream_callback=None,
                      _cancel_event: threading.Event = None) -> dict:
         """
@@ -4284,7 +4302,7 @@ class SchedulerPipelineMixin:
                     hs_cpu = local_result["hidden_states"].detach().cpu()
                     import base64 as _b64
                     relay_segment = (
-                        self._relay_segment_for_worker(first_node_id)
+                        self._relay_segment_for_worker(first_node_id, routing_preference)
                         if master_participates else None
                     )
                     if relay_segment is not None:
@@ -4332,10 +4350,16 @@ class SchedulerPipelineMixin:
             #   随 LAYER_FORWARD 下发规格；worker 侧仅在开关打开时才会认它（默认关 ⇒ 零影响）。
             relay_segment = (
                 relay_segment if "relay_segment" in locals()
-                else self._relay_segment_for_worker(first_node_id)
+                else self._relay_segment_for_worker(first_node_id, routing_preference)
             )
             if relay_segment is not None:
                 forward_data["relay_segment"] = relay_segment
+
+            # ★ A1 / X 档：把请求级路由偏好一并下发。此前 worker 侧
+            #   `data.get("routing_preference", "auto")` 因主节点**从不下发**该字段而永远读到
+            #   默认值（死读）；补上这一行后才真正贯通（worker 侧 `_handle_layer_forward`
+            #   已用它决定 `_require_distributed` / `_force_distributed_assignment`）。
+            forward_data["routing_preference"] = routing_preference
 
             # ---- 发送给首个 worker ----
             try:
