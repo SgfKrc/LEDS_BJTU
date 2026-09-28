@@ -994,6 +994,33 @@ class EngineHost:
             "layers": list(self._layers),
         }
 
+    def kv_state_kind(self) -> str:
+        """★ #31 M6：本进程 KV 状态的**载体类型** —— `"tuple"` / `"hybrid"` / `"unknown"`。
+
+        为什么要有它：`/layers/forward` 的 `past_key_values_ref` 走 `KVHost` 的
+        **`PagedKVCache`（纯 KV 分页）**，而 hybrid（如 `qwen3_5`）的 `linear_attention` 层
+        用的是 **recurrent state**（**不在** KV 分页里）⇒ 分页载体对它**根本不成立**：
+        拿它当 `past_key_values` 会**静默丢状态**（同一轮不报错、数值却错，事后极难归因）。
+        所以这里如实报出载体类型，让端点**明确 fail-closed**，而不是"看起来能跑"。
+
+        判据用**层类型**（`model_module._is_hybrid_layer_types`），**不**按 `model_type`
+        白名单 —— 后者会随新架构漂移，而"存在 linear_attention 层"才是"存在 recurrent state"
+        的本质（同一个判定也被 `forward_layers` 用来决定 mask/cache 形态，口径一致）。
+        """
+        try:
+            from model_module import _is_hybrid_layer_types
+        except ImportError:  # pragma: no cover - 环境相关
+            return "unknown"
+        model = getattr(self._host, "model", None)
+        config = getattr(model, "config", None)
+        if config is None:
+            return "unknown"
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types is None:
+            # 没有 `layer_types` ⇒ 纯 full-attention（老架构）⇒ 沿用既有 KV 契约
+            return "tuple"
+        return "hybrid" if _is_hybrid_layer_types(layer_types) else "tuple"
+
     def generation_status(self) -> Dict[str, Any]:
         """Return active generation IDs for cancellation and leak diagnostics."""
 
