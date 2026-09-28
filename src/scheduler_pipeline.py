@@ -2817,6 +2817,28 @@ class SchedulerPipelineMixin:
             return False
 
 
+    @staticmethod
+    def _extract_relay_metrics(metrics: object) -> dict:
+        """★ A1 / X 档：从末节点回传的 `metrics` 里取出 relay 五字段（没走 relay 时返回空 dict）。
+
+        只挑 `relay_segment` / `relay_frames` / `relay_tokens` / `relay_payload_bytes` /
+        `relay_error` 这五个键，且要求 `relay_segment` 非空 —— worker 侧只有**真走了 relay 分支**
+        才会写它们（`_handle_layer_forward_via_relay` 里的 `**outcome.to_metrics()`）⇒
+        "键存在且非空"就等价于"这一步确实委托出去了"，普通 pytorch 路径不会被误标成 relay。
+        """
+
+        if not isinstance(metrics, dict):
+            return {}
+        if not metrics.get("relay_segment"):
+            return {}
+        return {
+            "relay_segment": metrics.get("relay_segment"),
+            "relay_frames": metrics.get("relay_frames"),
+            "relay_tokens": metrics.get("relay_tokens"),
+            "relay_payload_bytes": metrics.get("relay_payload_bytes"),
+            "relay_error": metrics.get("relay_error"),
+        }
+
     def _handle_layer_result(self, client_id: str, msg: dict) -> None:
         """
         主节点：收到从节点的 LAYER_RESULT → 存储到流水线结果字典，
@@ -2972,9 +2994,23 @@ class SchedulerPipelineMixin:
             else:
                 decoded[k] = v
 
+        # ★ A1 / X 档（Y 档第一条）：把末节点回传的 relay 指标读出来存到主节点，供
+        #   `_get_pipeline_status()` 展示。X 档只支持 **2 段**，relay 段执行完**直接**
+        #   `_send_layer_result("master", ...)`（`_handle_layer_forward_via_relay` 明确拒绝
+        #   `chain_next`）⇒ 指标本来就在这一帧的 `metrics` 里，**不需要**跨节点聚合。
+        #   （真跨节点聚合要等 >2 段拓扑，那属 Y 档的另一条。）
+        relay_metrics = self._extract_relay_metrics(decoded.get("metrics"))
+
         key = f"{task_id}:{node_id}"
         with self._pipeline_lock:
             self._pipeline_results[key] = decoded
+            if relay_metrics:
+                self._last_relay_metrics = {
+                    "node_id": node_id,
+                    "task_id": task_id,
+                    "step": decoded.get("step"),
+                    **relay_metrics,
+                }
             if key in self._pipeline_events:
                 self._pipeline_events[key].set()
 
@@ -5415,4 +5451,8 @@ class SchedulerPipelineMixin:
             "readiness_reason_code": reason_code,
             "readiness_reason": reason,
             "workers": worker_status,
+            # ★ A1 / X 档（Y 档第一条）：最近一次 relay 段委托的真实指标（没走过则为空 dict）。
+            #   取自末节点 `LAYER_RESULT.metrics` —— worker 侧只在**真走 relay 分支**时才写这五个键，
+            #   所以空 dict 就等价于"本次没走 relay"，不会误报。
+            "relay": dict(getattr(self, "_last_relay_metrics", None) or {}),
         }

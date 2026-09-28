@@ -520,3 +520,93 @@ def test_only_local_only_blocks_delegation(monkeypatch: pytest.MonkeyPatch):
 
     for preference in ("auto", "distributed_required", "", "some-future-value"):
         assert harness.obj._relay_segment_for_worker("worker-2", preference) is not None, preference
+
+
+# ---- Y 档第一条：主节点展示 relay 指标 -------------------------------------
+
+
+def test_extract_relay_metrics_picks_only_the_five_keys():
+    """只取五个 relay 键（其余 metrics 字段不外带），供主节点 status 展示。"""
+    metrics = {
+        "time_ms": 12.5, "kv_cache": False, "relay_executed": True,
+        "relay_segment": "middle@127.0.0.1:50183",
+        "relay_frames": 4, "relay_tokens": 4,
+        "relay_payload_bytes": 4096, "relay_error": None,
+        "fallback_reason": "",           # 不该被带出来
+    }
+
+    picked = SchedulerPipelineMixin._extract_relay_metrics(metrics)
+
+    assert picked == {
+        "relay_segment": "middle@127.0.0.1:50183",
+        "relay_frames": 4,
+        "relay_tokens": 4,
+        "relay_payload_bytes": 4096,
+        "relay_error": None,
+    }
+
+
+def test_guard_extract_relay_metrics_does_not_misfire_on_plain_path():
+    """★「该红必须红」：**普通 pytorch 路径**的 metrics 必须取不出 relay 字段。
+
+    守卫的是"误报"：把 `_extract_relay_metrics` 里 `relay_segment` 非空那个判断去掉，
+    任何 metrics 都会被当成 relay 结果，主节点 status 就**凭空显示** relay 指标 ——
+    那是最难查的一类假证据。去掉该判断，本用例立刻红。
+    """
+    plain = {"time_ms": 8.0, "kv_cache": True, "distributed_used": True}
+
+    assert SchedulerPipelineMixin._extract_relay_metrics(plain) == {}
+    # 半残 metrics（只有 relay_* 键、没有 relay_segment）同样不算 relay 结果。
+    assert SchedulerPipelineMixin._extract_relay_metrics({"relay_frames": 3}) == {}
+    # 非 dict 输入不得抛。
+    assert SchedulerPipelineMixin._extract_relay_metrics(None) == {}
+    assert SchedulerPipelineMixin._extract_relay_metrics("relay_segment") == {}
+
+
+def test_pipeline_status_relay_is_empty_before_any_relay_run():
+    """没走过 relay 时 status 的 `relay` 必须是**空 dict**（不是 None、也不能缺键）。"""
+    harness = _status_harness()
+
+    status = harness.obj._get_pipeline_status()
+
+    assert status["relay"] == {}
+
+
+def test_pipeline_status_surfaces_the_last_relay_metrics():
+    """收到过 relay 结果后，status 必须把它读出来（这是 Y 档第一条的可见产物）。"""
+    harness = _status_harness()
+    harness.obj._last_relay_metrics = {
+        "node_id": "worker-2", "task_id": "t1", "step": 0,
+        "relay_segment": "middle@127.0.0.1:50183",
+        "relay_frames": 4, "relay_tokens": 4,
+        "relay_payload_bytes": 4096, "relay_error": None,
+    }
+
+    status = harness.obj._get_pipeline_status()
+
+    assert status["relay"]["relay_segment"] == "middle@127.0.0.1:50183"
+    assert status["relay"]["relay_tokens"] == 4
+    assert status["relay"]["node_id"] == "worker-2"
+    # 必须是副本，调用方改它不该污染调度器内部状态。
+    status["relay"]["relay_tokens"] = 999
+    assert harness.obj._last_relay_metrics["relay_tokens"] == 4
+
+
+def _status_harness() -> _Harness:
+    """`_get_pipeline_status()` 需要的最小实例。
+
+    该方法的依赖比 relay 分支宽（`_nodes_lock` / `_inference_lock` / `nodes` 等），
+    这里一并补齐 —— 免得 `AttributeError` 抢在断言的语义之前把用例变成"假红"。
+    """
+    harness = _Harness()
+    harness.obj._host = None
+    harness.obj.nodes = {}
+    harness.obj._nodes_lock = threading.RLock()
+    harness.obj._inference_lock = threading.RLock()
+    harness.obj.get_layer_assignments = lambda: {"assignments": []}
+    harness.obj.get_distributed_inference_enabled = lambda: False
+    harness.obj._effective_role = lambda: "master"
+    harness.obj._get_pipeline_readiness = lambda: {
+        "ready": False, "reason_code": "no_workers", "reason": "无", "workers": [],
+    }
+    return harness
