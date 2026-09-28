@@ -230,6 +230,7 @@ scripts/*
 !scripts/relay_artifact_manifest.py
 !scripts/relay_ssh_tunnel.py
 !scripts/relay_y700_build.sh
+!scripts/edge_import_audit.py
 !scripts/relay_sync_device.ps1
 !scripts/relay_health.py
 !scripts/run_doc_checks.py
