@@ -5,7 +5,7 @@ __pycache__/
 .venv/
 .venv-test/
 .venv-edge/
-# RPC 鐗?llama-cpp-python 瀹為獙鐜锛圙GML_RPC=ON锛岃 local_docs/CORE-LLAMA-PC-RPC-01-*.md锛?
+# RPC 版 llama-cpp-python 实验环境（GGML_RPC=ON，见 local_docs/CORE-LLAMA-PC-RPC-01-*.md）
 .venv-llama-rpc/
 venv/
 env/
@@ -45,7 +45,7 @@ Thumbs.db
 logs/*.log
 logs/*.err
 logs/*.out
-# logs/ 涓嬬殑涓€娆℃€ц皟璇曡剼鏈笌涓存椂浜х墿锛堜繚鐣?.gitkeep 涓庤繍琛屾棩蹇楁湰韬級
+# logs/ 下的一次性调试脚本与临时产物（保留 .gitkeep 与运行日志本身）
 logs/*.py
 logs/*.json
 logs/sd15/
@@ -60,9 +60,9 @@ chat_history/
 /package-lock.json
 
 # Environment
-# 鈿狅笍 `.env.bak*` 蹇呴』蹇界暐 鈥斺€?澶囦唤**鍚湡瀹炲瘑閽?*锛圦LH_DB_PASSWORD / QLH_CLUSTER_SECRET /
-#    QLH_SMTP_PASSWORD锛夈€?026-09-20 瀹炴祴锛歚.env.bak-20260920` 鏇句互 `??` 鍑虹幇鍦?
-#    `git status` 涓紝涓€娆?`git add -A` 灏变細鎶婂瘑閽ユ彁浜ゅ苟鎺ㄩ€佸嚭鍘汇€?
+# ⚠️ `.env.bak*` 必须忽略 —— 备份**含真实密钥**（QLH_DB_PASSWORD / QLH_CLUSTER_SECRET /
+#    QLH_SMTP_PASSWORD）。2026-09-20 实测：`.env.bak-20260920` 曾以 `??` 出现在
+#    `git status` 中，一次 `git add -A` 就会把密钥提交并推送出去。
 .env
 .env.local
 .env.docagent
@@ -100,7 +100,7 @@ packaging/dist/
 packaging/build/
 packaging/linux/*.deb
 packaging/__pycache__/
-# 鍙戝竷绛惧悕绉侀挜锛圲P-N2 鍙俊鍙戝竷锛夛細鍙瓨鍦ㄤ簬鍙戝竷鑰呮湰鏈猴紝缁濅笉杩涘叆浠撳簱鎴栨瀯寤轰骇鐗?
+# 发布签名私钥（UP-N2 可信发布）：只存在于发布者本机，绝不进入仓库或构建产物
 packaging/.signing-keys/
 
 # Packaging virtual environments (CPU + CUDA, must remain separate)
@@ -144,7 +144,7 @@ models/gemma4-native/*.gguf
 /runtime-*.stdout.log
 /runtime-*.stderr.log
 /surface-ssh*.log
-# Harness 瀹為獙妯″瀷涓庝笅杞戒腑闂翠骇鐗╋紙妯″瀷鏂囦欢涓嶈繘 git锛?
+# Harness 实验模型与下载中间产物（模型文件不进 git）
 models/qwen2.5-0.5b-instruct/
 models/minicpm4-0.5b/
 models/distilqwen25-ds3-0324-7b/
@@ -153,31 +153,31 @@ models/.*.qlh-import-*/
 # frontend_cybergothic: abandoned (kept locally, no longer maintained)
 frontend_cybergothic/
 
-# 鈽?2026-09-20锛氫袱涓?*妗ユ帴鍣?*鏀逛负銆屽伐浣滃尯鐙珛鐩綍銆嶏紝涓嶅啀浣滀负涓讳粨瀛愭ā鍧椼€?
-# 鍚勮嚜鏄嫭绔?git 浠擄紙鏈湴 clone 鍚勮嚜缁存姢锛夛紱涓讳粨鍙繚鐣欐湰鍦扮洰褰曪紝涓嶅叆搴撱€?
-#   tools/reasonix-codex-bridge 鈥斺€?Reasonix/Codex 妗ワ紙MCP server + ACP transport锛?
-#   tools/dsh-codex-bridge 鈥斺€?瀛敓椤圭洰锛圖SH 渚э紝vendor 浜嗘ˉ鎺ュ櫒杩愯鏃朵笌娴嬭瘯锛?
+# ★ 2026-09-20：两个**桥接器**改为「工作区独立目录」，不再作为主仓子模块。
+# 各自是独立 git 仓（本地 clone 各自维护）；主仓只保留本地目录，不入库。
+#   tools/reasonix-codex-bridge —— Reasonix/Codex 桥（MCP server + ACP transport）
+#   tools/dsh-codex-bridge —— 孪生项目（DSH 侧，vendor 了桥接器运行时与测试）
 tools/reasonix-codex-bridge/
 tools/dsh-codex-bridge/
 
 # ============================================================================
-# 鈽?2026-09-20 涓讳粨鐦﹁韩锛堢敤鎴疯瀹氾級锛?*寮€鍙?瀹為獙宸ュ叿涓庤繍琛屾椂浜х墿涓嶅叆搴擄紝鍙暀鏈湴**
+# ★ 2026-09-20 主仓瘦身（用户裁定）：**开发/实验工具与运行时产物不入库，只留本地**
 # ============================================================================
-# 鏁寸洰褰曡鎺夛細
-#   tools/            鈥斺€?寮€鍙戝伐鍏凤紙docagent / toolbox / model_tools 琛ヤ竵 / modelscope 涓嬭浇绛夛級
-#                        鍏朵腑 tools/docagent銆乼ools/toolbox 鍘熶负瀛愭ā鍧楋紝鎸囬拡宸插墧闄?
-#   packages/         鈥斺€?spawnledger锛堝師瀛愭ā鍧楋紝鎸囬拡宸插墧闄わ級
-#   logs/             鈥斺€?杩愯鏃舵棩蹇椾骇鐗╋紙浠ｇ爜閲岀殑 /api/logs/* 璺敱涓嶅彈褰卞搷锛?
-#   docs/agent_tool/  鈥斺€?鏂囨。瀹¤宸ュ叿锛?*娉ㄦ剰**鍏?model-artifacts/remote-model-pins-*.json
-#                        鏄繍琛屾椂鏁版嵁锛屽凡闅忚縼鍒?fixtures/model-artifacts/锛堜粛鍏ュ簱锛?
+# 整目录裁掉：
+#   tools/            —— 开发工具（docagent / toolbox / model_tools 补丁 / modelscope 下载等）
+#                        其中 tools/docagent、tools/toolbox 原为子模块，指针已剔除
+#   packages/         —— spawnledger（原子模块，指针已剔除）
+#   logs/             —— 运行时日志产物（代码里的 /api/logs/* 路由不受影响）
+#   docs/agent_tool/  —— 文档审计工具；**注意**其 model-artifacts/remote-model-pins-*.json
+#                        是运行时数据，已随迁到 fixtures/model-artifacts/（仍入库）
 tools/
 packages/
 logs/
 docs/agent_tool/
 
-# scripts/ 鈥斺€?鍙銆屼竴娆℃€у疄楠?鍩哄噯銆嶏紝**淇濈暀**鍩虹璁炬柦涓庡父鐢ㄥ伐鍏枫€?
-# 绛栫暐锛氬厛鏁翠綋蹇界暐锛屽啀鐧藉悕鍗曟斁鍥炰笅鍒楀繀闇€椤癸紙琚?src/ import 鐨勩€佽娴嬭瘯 import 鐨勩€?
-# 浠ュ強涓婃墜/娴佹按绾胯鐢ㄥ埌鐨勫伐鍏凤級銆?
+# scripts/ —— 只裁「一次性实验/基准」，**保留**基础设施与常用工具。
+# 策略：先整体忽略，再白名单放回下列必需项（被 src/ import 的、被测试 import 的、
+# 以及上手/流水线要用到的工具）。
 scripts/*
 !scripts/model_tools/
 !scripts/model_tools.py
@@ -218,7 +218,7 @@ scripts/*
 !scripts/find_broken_links.py
 !scripts/fix_broken_links.py
 !scripts/check_readme_l10n.py
-# P1/P2 缁熶竴瀹為獙椹卞姩鏃忥紙2026-09-21锛夛細琚枃妗ｄ笌娴嬭瘯寮曠敤锛屽繀椤诲叆搴?
+# P1/P2 统一实验驱动族（2026-09-21）：被文档与测试引用，必须入库
 !scripts/relay_experiment.py
 !scripts/relay_diag_head_norm.py
 !scripts/relay_cut_plan.py
@@ -235,10 +235,10 @@ scripts/*
 !scripts/run_doc_checks.py
 !scripts/tui_e2e_flow.py
 
-# 鏍圭洰褰曪細杩囨椂鏃ュ織 / 澶囦唤锛?026-09-20 鍓旈櫎锛?
-# 鈿狅笍 `bjtu.bat` / `bjtu.sh` **淇濈暀** 鈥斺€?瀹冧滑浠嶆槸娲昏穬鍏ュ彛锛?
-#    `tests/test_qlh_cli.py` 涓?`tests/test_test_environment_scripts.py` 鐩存帴璇诲畠浠紝
-#    `docs/TUI浣跨敤鎸囧崡.md` 绛夊澶勫紩鐢ㄣ€傚師鍏堜互涓哄畠鏄€屾棫椤圭洰鍚嶉仐鐣欍€嶆槸**璇垽**銆?
+# 根目录：过时日志 / 备份（2026-09-20 剔除）
+# ⚠️ `bjtu.bat` / `bjtu.sh` **保留** —— 它们仍是活跃入口：
+#    `tests/test_qlh_cli.py` 与 `tests/test_test_environment_scripts.py` 直接读它们，
+#    `docs/TUI使用指南.md` 等多处引用。原先以为它是「旧项目名遗留」是**误判**。
 runtime-master*.log
 surface-ssh*.log
 .gitignore_bak
