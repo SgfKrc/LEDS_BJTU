@@ -1167,7 +1167,7 @@ class TestOriginalQwenLayerPipeline:
         assert last_decode["past_key_values"][0][0].shape[1] == 4
         assert last_decode["logits"].shape == (1, 1, 16)
 
-    def test_architecture_aware_lm_head_supports_qwen_and_qwen2(self):
+    def test_architecture_aware_lm_head_supports_qwen_qwen2_and_hybrid(self):
         full, _first, last = self._split_managers()
         states = torch.randn(1, 2, 8)
         expected_qwen = last.model.lm_head(last.model.transformer.ln_f(states))
@@ -1180,6 +1180,45 @@ class TestOriginalQwenLayerPipeline:
         qwen2_states = torch.randn(1, 2, 128)
         expected_qwen2 = qwen2.model.lm_head(qwen2.model.model.norm(qwen2_states))
         assert torch.allclose(qwen2.forward_lm_head(qwen2_states), expected_qwen2)
+
+        # ★ #31 M5：hybrid（`qwen3_5_text`）此前在这里直接抛
+        #   「模型架构 qwen3_5_text 缺少最终 Norm」⇒「master 保留 LM Head、层在 worker」
+        #   那条路径对它完全不可用。现在改为**按架构属性**兜底定位
+        #   （`_locate_text_transformer(...).norm`，与 `forward_layers` 的 Step 7 同源）。
+        #   这里搭一个**多模态外壳**形态：文本塔挂在 `model.model.language_model`，
+        #   norm 在它身上（**不是** `model.model.norm`）—— 正是真工件的形态。
+        hybrid = ModelManager()
+        hybrid.model = _make_tiny_model()
+        # ⚠️ `_make_tiny_model()` 建的是**共享**的 `TINY_CONFIG` ⇒ **不能**就地改 `model_type`
+        #    （实测会把后续用例带成 `forward_layers 不支持模型架构: some_unknown_arch`）。
+        #    测试里要改模块级对象，必须先拷一份。
+        hybrid.model.config = copy.deepcopy(hybrid.model.config)
+        hybrid.model.config.model_type = "qwen3_5_text"      # 触发新分支
+        text_tower = hybrid.model.model
+        shell = nn.Module()
+        shell.language_model = text_tower
+        hybrid.model.model = shell
+        hybrid._engine_type = "pytorch"
+        hybrid.layer_range = (0, 4)
+        hybrid_states = torch.randn(1, 2, 128)
+        expected_hybrid = hybrid.model.lm_head(text_tower.norm(hybrid_states))
+        assert torch.allclose(hybrid.forward_lm_head(hybrid_states), expected_hybrid)
+
+    def test_lm_head_still_fails_closed_when_no_final_norm_exists(self):
+        """★ 兜底**不等于**放行：连 `_locate_text_transformer` 都找不到主体时仍要抛。
+
+        没有这条，M5 会把"缺 Norm"从 fail-closed 变成"静默用错对象"。
+        """
+        orphan = ModelManager()
+        orphan.model = _make_tiny_model()
+        orphan.model.config = copy.deepcopy(orphan.model.config)   # 同上：勿改共享 config
+        orphan.model.config.model_type = "some_unknown_arch"
+        orphan.model.model = nn.Module()          # 既无 norm 也无 language_model
+        orphan._engine_type = "pytorch"
+        orphan.layer_range = (0, 4)
+
+        with pytest.raises(RuntimeError, match="缺少最终 Norm"):
+            orphan.forward_lm_head(torch.randn(1, 2, 128))
 
 
 # ================================================================
