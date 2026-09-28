@@ -6,6 +6,13 @@ from types import ModuleType
 
 from fastapi import APIRouter
 from api._routing import configure_route_module
+from journal_replication import JournalReplicationError
+from journal_replication_service import (
+    JournalReplicationDisabled,
+    JournalReplicationSettings,
+    JournalReplicationTransportError,
+    replicate_journal_once,
+)
 
 router = APIRouter()
 _api_module: ModuleType | None = None
@@ -15,7 +22,7 @@ def configure_api_module(module: ModuleType) -> None:
     configure_route_module(globals(), module, _RESOLUTION_NAMES)
 
 def exported_handlers() -> dict[str, object]:
-    return {name: globals()[name] for name in ['list_workflows', 'cleanup_task_journal', 'get_workflow', 'cancel_workflow']}
+    return {name: globals()[name] for name in ['list_workflows', 'cleanup_task_journal', 'replicate_journal', 'journal_replication_status', 'get_workflow', 'cancel_workflow']}
 
 async def list_workflows(limit: int = 20, session_id: str = "", summary: bool = False):
     if summary:
@@ -121,6 +128,50 @@ async def cleanup_task_journal(
         "result": result,
     }
 
+async def replicate_journal(workflow_id: str):
+    """把一个 workflow 的 journal checkpoint 推到对端副本服务（R-R11 的最小可用接线）。
+
+    三重 fail-closed，顺序刻意如此：非主节点 **403**、未开启 **409**、journal 不可用 **503**，
+    然后才是真正推送（对端拒绝 ⇒ **502**，参数/契约问题 ⇒ **400**）。
+    """
+
+    if _api_module.scheduler._effective_role() != "master":
+        raise _api_module.HTTPException(403, "只有主节点可以推送 journal 副本。")
+    settings = JournalReplicationSettings.from_env()
+    if not settings.enabled:
+        raise _api_module.HTTPException(
+            409, "journal 复制未启用（QLH_JOURNAL_REPLICATION_ENABLED）。"
+        )
+    journal = getattr(_api_module.task_graph_coordinator, "journal", None)
+    if journal is None:
+        raise _api_module.HTTPException(503, "任务图 journal 不可用，无法取快照。")
+    try:
+        return replicate_journal_once(journal, workflow_id=workflow_id, settings=settings)
+    except JournalReplicationDisabled as exc:
+        raise _api_module.HTTPException(409, str(exc)) from exc
+    except JournalReplicationTransportError as exc:
+        raise _api_module.HTTPException(502, str(exc)) from exc
+    except JournalReplicationError as exc:
+        raise _api_module.HTTPException(400, str(exc)) from exc
+
+
+async def journal_replication_status():
+    """复制链路的只读状态（**不回显 secret**）：运维据此确认「到底开没开、对端是谁」。"""
+
+    settings = JournalReplicationSettings.from_env()
+    journal = getattr(_api_module.task_graph_coordinator, "journal", None)
+    return {
+        "enabled": settings.enabled,
+        "settings": settings.public(),
+        "journal_available": journal is not None,
+        "role": _api_module.scheduler._effective_role(),
+        "note": (
+            "最小可用接线：不自动常驻、不随 NODE_ROLE 自动启停；"
+            "复制由 POST /api/workflows/journal/replicate 显式驱动。"
+        ),
+    }
+
+
 async def get_workflow(workflow_id: str):
     try:
         workflow = _api_module.task_graph_coordinator.get(workflow_id)
@@ -160,5 +211,8 @@ async def cancel_workflow(workflow_id: str):
 def register_routes() -> None:
     router.add_api_route('/api/workflows', list_workflows, methods=['GET'])
     router.add_api_route('/api/workflows/journal/cleanup', cleanup_task_journal, methods=['POST'])
+    # 复制端点刻意排在 `/api/workflows/{workflow_id}` **之前**（固定段先注册更稳妥）。
+    router.add_api_route('/api/workflows/journal/replicate', replicate_journal, methods=['POST'])
+    router.add_api_route('/api/workflows/journal/replication', journal_replication_status, methods=['GET'])
     router.add_api_route('/api/workflows/{workflow_id}', get_workflow, methods=['GET'])
     router.add_api_route('/api/workflows/{workflow_id}/cancel', cancel_workflow, methods=['POST'])

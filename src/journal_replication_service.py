@@ -1,0 +1,290 @@
+"""Minimal production wiring for durable journal replication (R-R11).
+
+**为什么只需要"接线"**：复制契约（`src/journal_replication.py`，`JournalCheckpoint` +
+`DurableJournalReplica`）、认证 TCP 帧（`src/journal_replication_transport.py`）与事件源
+（`src/task_journal.py` 的 `workflow_events`）**三者都已存在**，而且 `TaskJournal` 的
+`get_snapshot` / `list_events` **恰好就是** `ReplicationJournal` 契约要求的那两个方法 ——
+`build_checkpoint()` 可以直接吃 `SQLiteTaskJournal`，不需要适配器。缺的只是**生产侧消费者**
+（此前唯一消费者是 `tests/test_journal_replication.py`）。
+
+**本模块做的**：
+* 全局开关 `QLH_JOURNAL_REPLICATION_ENABLED`，**默认关**（关时任何调用都 fail-closed）；
+* leader 侧 ``replicate_journal_once()``：`build_checkpoint()` + `send_checkpoint()`；
+* follower 侧 ``JournalReplicaReceiver``：`DurableJournalReplica` + `JournalReplicationTcpServer`。
+
+**本模块刻意不做的**（留给后续，别把它当已完成）：
+* 不自动挂 `lifespan`、不随 `NODE_ROLE` 自动启停、不参与 leader 选举 —— 那些属 P4.5 的 HA
+  生产启用（`NODE_ROLE=auto` 至今默认关，`production_availability_claim` 仍为 `false`）；
+* 因此这里只提供**显式可调用**的入口，由 `src/api/routes_tasks.py` 的端点驱动。
+
+**安全**：HMAC 只做认证，**不加密**；默认 bind loopback。生产部署需要受保护的传输与密钥托管
+（见 `journal_replication_transport.py` 的模块 docstring）。
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from typing import Any, Mapping
+
+from journal_replication import (
+    DurableJournalReplica,
+    JournalCheckpoint,
+    JournalReplicationError,
+    build_checkpoint,
+)
+from journal_replication_transport import (
+    JournalReplicationTcpServer,
+    JournalReplicationTransportError,
+    send_checkpoint,
+)
+
+#: HMAC 密钥下限，与 `journal_replication_transport` 内部的判据一致。
+MIN_SECRET_BYTES = 32
+
+
+class JournalReplicationDisabled(RuntimeError):
+    """`QLH_JOURNAL_REPLICATION_ENABLED` 未开启时使用复制路径，一律 fail-closed。"""
+
+
+def _env_flag(env: Mapping[str, str], name: str, default: bool = False) -> bool:
+    raw = env.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_text(env: Mapping[str, str], *names: str, default: str = "") -> str:
+    for name in names:
+        value = env.get(name)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return default
+
+
+def _env_port(env: Mapping[str, str], name: str, default: int = 0) -> int:
+    raw = env.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    # 0 合法 —— 表示"由系统分配端口"（测试与 loopback 场景用）。
+    if not (0 <= value <= 65535):
+        return default
+    return value
+
+
+def _env_timeout(env: Mapping[str, str], name: str, default: float = 5.0) -> float:
+    raw = env.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if not (0.1 <= value <= 600.0):
+        return default
+    return value
+
+
+@dataclass(frozen=True)
+class JournalReplicationSettings:
+    """复制链路的运行参数。`enabled` 默认 **False** —— 不显式开启就什么都不做。"""
+
+    enabled: bool = False
+    source_node_id: str = ""
+    stream_id: str = "task-graph-journal"
+    replica_path: str = ""
+    bind_host: str = "127.0.0.1"
+    bind_port: int = 0
+    peer_host: str = ""
+    peer_port: int = 0
+    timeout_s: float = 5.0
+    secret: bytes = b""
+
+    @property
+    def secret_bytes(self) -> bytes:
+        return bytes(self.secret)
+
+    def validate(self) -> None:
+        """配置自检。**只在开启时才严格要求** —— 关着的时候允许缺项。"""
+
+        if not self.enabled:
+            return
+        if not self.source_node_id:
+            raise JournalReplicationError(
+                "QLH_JOURNAL_REPLICATION_SOURCE_NODE_ID (or QLH_NODE_ID) is required"
+            )
+        if not self.stream_id:
+            raise JournalReplicationError("QLH_JOURNAL_REPLICATION_STREAM_ID is required")
+        if not self.replica_path:
+            raise JournalReplicationError("QLH_JOURNAL_REPLICATION_REPLICA_PATH is required")
+        if len(self.secret_bytes) < MIN_SECRET_BYTES:
+            raise JournalReplicationError(
+                f"QLH_JOURNAL_REPLICATION_SECRET must be at least {MIN_SECRET_BYTES} bytes"
+            )
+
+    def require_enabled(self) -> None:
+        if not self.enabled:
+            raise JournalReplicationDisabled(
+                "journal replication is disabled; set QLH_JOURNAL_REPLICATION_ENABLED=1"
+            )
+        self.validate()
+
+    def require_peer(self) -> None:
+        """leader 侧推送需要显式对端。"""
+
+        self.require_enabled()
+        if not self.peer_host or self.peer_port <= 0:
+            raise JournalReplicationError(
+                "QLH_JOURNAL_REPLICATION_PEER_HOST / _PEER_PORT are required to push a checkpoint"
+            )
+
+    def public(self) -> dict[str, Any]:
+        """对外可见的状态 —— **绝不回显 secret**。"""
+
+        return {
+            "enabled": self.enabled,
+            "source_node_id": self.source_node_id,
+            "stream_id": self.stream_id,
+            "replica_path": self.replica_path,
+            "bind": {"host": self.bind_host, "port": self.bind_port},
+            "peer": {"host": self.peer_host, "port": self.peer_port},
+            "timeout_s": self.timeout_s,
+            "secret_present": len(self.secret_bytes) >= MIN_SECRET_BYTES,
+        }
+
+    @classmethod
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> "JournalReplicationSettings":
+        """从环境变量构造。
+
+        刻意**不经过 `src/config.py`**：config 的常量在 import 时求值，测试里改 env 不会生效。
+        本函数每次调用都读当前环境，既保持单一 env 命名空间，又可注入/可测。
+        """
+
+        env: Mapping[str, str] = os.environ if environ is None else environ
+        secret_text = _env_text(env, "QLH_JOURNAL_REPLICATION_SECRET")
+        return cls(
+            enabled=_env_flag(env, "QLH_JOURNAL_REPLICATION_ENABLED", False),
+            source_node_id=_env_text(
+                env, "QLH_JOURNAL_REPLICATION_SOURCE_NODE_ID", "QLH_NODE_ID"
+            ),
+            stream_id=_env_text(
+                env, "QLH_JOURNAL_REPLICATION_STREAM_ID", default="task-graph-journal"
+            ),
+            replica_path=_env_text(env, "QLH_JOURNAL_REPLICATION_REPLICA_PATH"),
+            bind_host=_env_text(
+                env, "QLH_JOURNAL_REPLICATION_BIND_HOST", default="127.0.0.1"
+            ),
+            bind_port=_env_port(env, "QLH_JOURNAL_REPLICATION_BIND_PORT", 0),
+            peer_host=_env_text(env, "QLH_JOURNAL_REPLICATION_PEER_HOST"),
+            peer_port=_env_port(env, "QLH_JOURNAL_REPLICATION_PEER_PORT", 0),
+            timeout_s=_env_timeout(env, "QLH_JOURNAL_REPLICATION_TIMEOUT_S", 5.0),
+            secret=secret_text.encode("utf-8"),
+        )
+
+
+def replicate_journal_once(
+    journal: Any,
+    *,
+    workflow_id: str,
+    settings: JournalReplicationSettings | None = None,
+) -> dict[str, Any]:
+    """leader 侧：把一个 workflow 的 checkpoint 推到对端 replica 服务。
+
+    ``journal`` 是鸭子类型 —— 只要有 ``get_snapshot()`` / ``list_events()`` 即可
+    （``SQLiteTaskJournal`` 本来就满足 ``ReplicationJournal`` 契约，无需适配器）。
+    失败一律抛出，由调用方决定 HTTP 语义；**不吞异常、不降级**。
+    """
+
+    resolved = settings or JournalReplicationSettings.from_env()
+    resolved.require_peer()
+    if not isinstance(workflow_id, str) or not workflow_id:
+        raise JournalReplicationError("workflow_id is required")
+
+    checkpoint: JournalCheckpoint = build_checkpoint(
+        journal,
+        source_node_id=resolved.source_node_id,
+        stream_id=resolved.stream_id,
+        workflow_id=workflow_id,
+    )
+    result = send_checkpoint(
+        resolved.peer_host,
+        resolved.peer_port,
+        checkpoint,
+        secret=resolved.secret_bytes,
+        timeout=resolved.timeout_s,
+    )
+    return {
+        "status": "replicated",
+        "workflow_id": workflow_id,
+        "source_node_id": resolved.source_node_id,
+        "stream_id": resolved.stream_id,
+        "durable_sequence": result.get("durable_sequence"),
+        "checkpoint_digest": result.get("checkpoint_digest"),
+        "event_count": len(checkpoint.records),
+    }
+
+
+class JournalReplicaReceiver:
+    """follower 侧接收端：``DurableJournalReplica`` + 认证 TCP 服务。
+
+    这是"能收"的那一半。**不自动常驻** —— 由调用方显式 ``start()`` / ``close()``。
+    """
+
+    def __init__(
+        self,
+        settings: JournalReplicationSettings | None = None,
+        *,
+        replica_path: str | None = None,
+    ) -> None:
+        resolved = settings or JournalReplicationSettings.from_env()
+        resolved.require_enabled()
+        path = replica_path or resolved.replica_path
+        if not path:
+            raise JournalReplicationError("a replica path is required")
+        self.settings = resolved
+        self.replica = DurableJournalReplica(
+            path,
+            source_node_id=resolved.source_node_id,
+            stream_id=resolved.stream_id,
+        )
+        self.server = JournalReplicationTcpServer(
+            self.replica,
+            bind_host=resolved.bind_host,
+            port=resolved.bind_port,
+            secret=resolved.secret_bytes,
+            timeout=resolved.timeout_s,
+        )
+        self.address: tuple[str, int] | None = None
+
+    def start(self) -> tuple[str, int]:
+        self.address = self.server.start()
+        return self.address
+
+    def close(self) -> None:
+        try:
+            self.server.close()
+        finally:
+            self.replica.close()
+
+    def status(self, workflow_id: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "address": list(self.address) if self.address else None,
+            "settings": self.settings.public(),
+        }
+        if workflow_id:
+            payload["recovery_status"] = self.replica.recovery_status(workflow_id)
+        return payload
+
+
+__all__ = [
+    "MIN_SECRET_BYTES",
+    "JournalReplicaReceiver",
+    "JournalReplicationDisabled",
+    "JournalReplicationSettings",
+    "JournalReplicationTransportError",
+    "replicate_journal_once",
+]

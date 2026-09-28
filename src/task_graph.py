@@ -1248,6 +1248,17 @@ class TaskGraphCoordinator:
             decorated["runtime_status"] = "terminal"
         return decorated
 
+    @property
+    def journal(self) -> Optional[TaskJournal]:
+        """本 coordinator 持有的持久化 journal。
+
+        复制路径（`src/journal_replication_service.py`）用它取快照与事件 —— 只读调用
+        ``get_snapshot()`` / ``list_events()``，不写回、不改状态。给它一个**公开**访问器是因为
+        `task_journal.py` 有单实例锁（`_acquire_instance_lock`），复制侧不能另开一个 journal。
+        """
+
+        return self._journal
+
     def journal_status(self) -> dict:
         if self._journal is None:
             return {

@@ -374,6 +374,36 @@ TASK_GRAPH_RETENTION_MAX_RECORDS = _env_int(
     "QLH_TASK_GRAPH_RETENTION_MAX_RECORDS", 1000, min_val=0, max_val=100000,
 )
 
+# ------------------------------------------------------- journal 复制（R-R11，默认全关）
+# `src/journal_replication_service.py` 是这套配置的**真实消费者**。注意该模块的
+# `from_env()` 刻意直接读**同一批 env**（config 常量在 import 时求值，测试里改 env 不会生效）；
+# 两处的 env 名**必须保持同名**，此处登记是为了让配置集中可见、并让配置清单类检查扫得到。
+JOURNAL_REPLICATION_ENABLED = _env_bool("QLH_JOURNAL_REPLICATION_ENABLED", False)
+JOURNAL_REPLICATION_SOURCE_NODE_ID = _env_first(
+    "QLH_JOURNAL_REPLICATION_SOURCE_NODE_ID", "QLH_NODE_ID", default="",
+)
+JOURNAL_REPLICATION_STREAM_ID = _env_first(
+    "QLH_JOURNAL_REPLICATION_STREAM_ID", default="task-graph-journal",
+)
+JOURNAL_REPLICATION_REPLICA_PATH = _env_first(
+    "QLH_JOURNAL_REPLICATION_REPLICA_PATH", default="",
+)
+JOURNAL_REPLICATION_BIND_HOST = _env_first(
+    "QLH_JOURNAL_REPLICATION_BIND_HOST", default="127.0.0.1",
+)
+JOURNAL_REPLICATION_BIND_PORT = _env_int(
+    "QLH_JOURNAL_REPLICATION_BIND_PORT", 0, min_val=0, max_val=65535,
+)
+JOURNAL_REPLICATION_PEER_HOST = _env_first(
+    "QLH_JOURNAL_REPLICATION_PEER_HOST", default="",
+)
+JOURNAL_REPLICATION_PEER_PORT = _env_int(
+    "QLH_JOURNAL_REPLICATION_PEER_PORT", 0, min_val=0, max_val=65535,
+)
+JOURNAL_REPLICATION_TIMEOUT_S = _env_float(
+    "QLH_JOURNAL_REPLICATION_TIMEOUT_S", 5.0, min_val=0.1, max_val=600.0,
+)
+
 # 回退分层配置（当没有从节点注册时使用）
 # 注意：分层现在由 compute_layer_assignment() 动态计算，此配置仅供文档参考。
 # 实际部署中不依赖硬编码的 client1/client2 槽位。
