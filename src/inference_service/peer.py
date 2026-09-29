@@ -202,10 +202,17 @@ class PeerClient:
                         )
                 except Exception:
                     logger.warning("清理已中止的 assignment 缓存失败", exc_info=True)
+            # ★ A1 / X 档（Y 档第二条缺口 2）：release ACK **必须**回 `release` 与 `generation`
+            #   两个字段 —— 主节点 `scheduler_pipeline.py:1930-1934` 的 `released` 判据是
+            #   `status == "released"` **且** `release is True` **且** `generation` 相等。
+            #   此前只回 status ⇒ 主节点恒判「从节点分层释放 ACK 未通过」⇒ 每 5 秒重发
+            #   （实测刷了 99 次 attempt），进而 `pipeline_distributed_workers_unavailable`。
             self._send_layer_config_ack({
                 "node_id": node_id,
                 "config_id": str(data.get("config_id", "")),
                 "status": "released",
+                "release": True,
+                "generation": int(data.get("generation", 0) or 0),
             })
             logger.info("分层配置已释放: config_id=%s", data.get("config_id", ""))
             return
