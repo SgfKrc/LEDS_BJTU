@@ -4214,6 +4214,13 @@ class SchedulerPipelineMixin:
         input_ids = inputs["input_ids"]  # (1, prompt_len)
         attention_mask = inputs.get("attention_mask")
         prompt_len = input_ids.shape[1]
+        # ★ 数值对照诊断：把**真正**的 token 数与 prompt 首尾打出来，便于与
+        #   `local_only`（`metrics.prompt_tokens`）逐字对齐 —— 跨机 relay 的对照里，
+        #   两条路若输入不同，任何"数值不一致"的判断都不成立。
+        logger.info(
+            "流水线 prompt: tokens=%d chars=%d head=%r tail=%r",
+            prompt_len, len(model_prompt), model_prompt[:70], model_prompt[-50:],
+        )
 
         # ---- Step 3: 自回归生成 ----
         task_id = uuid.uuid4().hex[:12]

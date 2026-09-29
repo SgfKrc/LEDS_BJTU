@@ -3831,6 +3831,13 @@ def _execute_chat_full(
             system_prompt=thinking_prompt,
             assistant_prefill=thinking_prefill,
         )
+        # ★ 数值对照诊断：与 `scheduler_pipeline._run_pipeline` 的同一行日志配对，
+        #   用于确认两条路喂给模型的 prompt 是否逐字一致 —— 这是跨机 relay
+        #   数值（per-token argmax）对照成立的前提。
+        logger.info(
+            "本地 prompt: chars=%d head=%r tail=%r",
+            len(prompt), prompt[:70], prompt[-50:],
+        )
         inputs = tokenizer(prompt, return_tensors="pt")
         input_ids = inputs["input_ids"].to(model_manager.get_device())
         attention_mask = inputs.get("attention_mask")
