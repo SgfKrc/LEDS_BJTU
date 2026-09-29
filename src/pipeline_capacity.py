@@ -161,6 +161,41 @@ def _required_bytes(raw_bytes: int, node: dict[str, Any], safety_margin: float) 
     )
 
 
+def _relay_zero_layer_assignments(
+    relay_nodes: list[dict[str, Any]], total_layers: int,
+) -> list[dict[str, Any]]:
+    """★ A1 / X 档（Y 档第二条缺口 6）：把 relay 段节点作为**零层**条目并入 assignments。
+
+    主节点据此给它下发 `engine="relay_middle"` 配置（`scheduler_pipeline.py:298-302` 按
+    `_relay_segment_for_worker()` 决定），worker 侧于是**不加载任何层**、只转发
+    （`peer.py` 的 relay 分支）。
+
+    `plan_identity` / `plan_id` **不含**它们（那里只用上面的 `assignments`）⇒
+    零层条目不改变 plan 的身份摘要。
+    """
+    return [
+        {
+            "node_id": node["node_id"],
+            "role": node["role"],
+            "start_layer": total_layers,
+            "end_layer": total_layers,
+            "layers_count": 0,
+            "has_embedding": False,
+            "has_lm_head": False,
+            "raw_weight_bytes": 0,
+            "required_bytes": 0,
+            "capacity_bytes": node["capacity_bytes"],
+            "headroom_bytes": node["capacity_bytes"],
+            "reserve_bytes": 0,
+            "runtime_multiplier": 1.0,
+            "execution_device": node["execution_device"],
+            "capacity_source": "relay_exempt",
+            "score": node["score"],
+        }
+        for node in relay_nodes
+    ]
+
+
 def solve_pipeline_capacity(
     descriptor: dict[str, Any],
     nodes: list[dict[str, Any]],
@@ -186,6 +221,14 @@ def solve_pipeline_capacity(
         descriptor
     )
     usable, excluded = _normalize_nodes(nodes)
+    # ★ A1 / X 档（Y 档第二条缺口 6）：relay 段节点**不占层、不计容量**，但**算参与节点**。
+    #   `scheduler.py` 的 `_get_pipeline_capacity_nodes` 给它打 `capacity_source="relay_exempt"`
+    #   （段工件在远端 relay_mid_service，本节点只转发 ⇒ 不需要本地容量预算）。
+    #   若把它留在 `usable`：求解器会要求它真装下若干层 ⇒ 必然失败（实测 plan 被拒）。
+    #   若整个剔除：`len(usable) < 2` 又会把"master + relay"这种**合法**拓扑拒掉。
+    #   ⇒ 单列：不参与分层搜索，但计入"分布式可用节点数"，并以**零层条目**进 assignments。
+    relay_only = [n for n in usable if n.get("capacity_source") == "relay_exempt"]
+    usable = [n for n in usable if n.get("capacity_source") != "relay_exempt"]
     total_layers = len(layer_bytes)
     raw_model_bytes = (
         sum(layer_bytes) + embedding_bytes + per_node_bytes + output_bytes
@@ -205,7 +248,7 @@ def solve_pipeline_capacity(
         "candidate_node_count": len(usable),
         "excluded_nodes": excluded,
     }
-    if not usable:
+    if not usable and not relay_only:
         return {
             **base,
             "status": "rejected",
@@ -218,7 +261,7 @@ def solve_pipeline_capacity(
             "assignments": [],
             "control_only_nodes": [],
         }
-    if require_distributed and len(usable) < 2:
+    if require_distributed and len(usable) + len(relay_only) < 2:
         return {
             **base,
             "status": "rejected",
@@ -357,7 +400,9 @@ def solve_pipeline_capacity(
         "admitted": True,
         "reason_code": "distributed_forced" if require_distributed else "",
         "plan_id": plan_id,
-        "assignments": assignments,
+        "assignments": assignments + _relay_zero_layer_assignments(
+            relay_only, total_layers
+        ),
         "control_only_nodes": [
             node["node_id"] for node in usable if node["node_id"] not in used_ids
         ],

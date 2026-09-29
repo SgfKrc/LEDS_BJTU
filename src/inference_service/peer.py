@@ -259,6 +259,43 @@ class PeerClient:
             f"embed={has_embed}, lm_head={has_lm}, config_id={config_id or 'legacy'}"
         )
 
+        # ★ A1 / X 档（Y 档第二条缺口 5）：`engine == "relay_middle"` ⇒ **不加载任何层**。
+        #   段工件由远端 relay_mid_service 持有（正是 `scheduler_pipeline.py:2255` 分支的语义：
+        #   "this scheduler host does not need a local ModelHost/model loaded"）。
+        #   此前这里无条件 `load_model` + `load_layer_range` ⇒ relay worker 白加载一遍 23-24 层
+        #   （实测日志反复出现 `✅ 层段加载完成: Layer 23-24`），既浪费又会让它按普通层节点
+        #   去响应 LAYER_FORWARD（`a bytes-like object is required, not 'str'`）。
+        #   ⇒ 直接回 ready；`layer_range` 用 **list**（与主节点 `expected_range` 同型）。
+        if str(cfg.get("engine", "pytorch") or "pytorch").lower() == "relay_middle":
+            with self._layer_config_lock:
+                self._active_layer_config = dict(cfg)
+            # ⚠️ 阶段判定：主节点下发时带了 `"phase": "prepare"`（`scheduler_pipeline.py:313-321`）
+            #   ⇒ ACK 必须走 **`prepared`** 判据（`:1954-1965`：`status=="prepared"` 且
+            #   `phase=="prepare"` 且 `plan_id`/`layer_range`/`model_sha256`/`model_type`/`engine`
+            #   全等，且 `available_bytes >= required_bytes`）。
+            #   relay 节点不落任何层 ⇒ `available_bytes` 给一个足够大的占位值，
+            #   `required_bytes` 本就是 0（`pipeline_capacity` 的零层条目）。
+            self._send_layer_config_ack({
+                "node_id": node_id,
+                "config_id": config_id,
+                "status": "prepared",
+                "phase": "prepare",
+                "plan_id": str(cfg.get("plan_id", "")),
+                "layer_range": [int(start), int(end)],
+                "model_sha256": expected_sha256,
+                "model_type": expected_model_type,
+                "engine": "relay_middle",
+                "has_embedding": bool(has_embed),
+                "has_lm_head": bool(has_lm),
+                "available_bytes": 1 << 40,
+            })
+            logger.info(
+                "relay_middle 段配置就绪（本节点不加载层，段由远端服务持有）: "
+                "Layer %s-%s, config_id=%s",
+                start, end, config_id,
+            )
+            return
+
         try:
             if target_node_id != node_id:
                 raise ValueError(f"层配置目标节点 {target_node_id} 与本节点 {node_id} 不一致")

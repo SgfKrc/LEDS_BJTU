@@ -309,6 +309,11 @@ class SchedulerPipelineMixin:
             relay_segment = self._relay_segment_for_worker(nid)
             if relay_segment is not None:
                 assignments[nid]["relay_segment"] = relay_segment
+                logger.info(
+                    "relay 段委派已下发: node=%s → %s@%s:%s（该节点不加载本地层）",
+                    nid, relay_segment.get("role"), relay_segment.get("host"),
+                    relay_segment.get("port"),
+                )
             if capacity_plan is not None:
                 assignments[nid].update({
                     "phase": "prepare",
@@ -3027,10 +3032,20 @@ class SchedulerPipelineMixin:
 
         assignments = self.get_layer_assignments()
         master_ids = {"master", self.get_effective_node_id()}
+        # ★ A1 / X 档（Y 档第二条缺口 3）：relay 段节点**也**是流水线成员，尽管它 `layers_count=0`
+        #   （缺口 1 把它摘成不占层）。只按"层数 > 0"过滤会把它排除 ⇒ 若它是唯一 worker，
+        #   `pipeline_nodes` 直接为空 ⇒ `no_pipeline_workers`（实测日志
+        #   `reason=未分配任何 PC 从节点参与模型层计算`）。
+        relay_for_worker = getattr(self, "_relay_segment_for_worker", None)
+
+        def _is_relay_member(node_id: str) -> bool:
+            """该 node_id 是否被配成「由远端 relay 段代跑本段」。"""
+            return callable(relay_for_worker) and relay_for_worker(node_id) is not None
+
         pipeline_nodes = [
             a for a in assignments.get("assignments", [])
             if a.get("node_id") not in master_ids
-            and a.get("layers_count", 1) > 0
+            and (a.get("layers_count", 1) > 0 or _is_relay_member(a.get("node_id", "")))
         ]
         if not pipeline_nodes:
             return {
@@ -3071,14 +3086,28 @@ class SchedulerPipelineMixin:
                 assignment.get("start_layer", 0),
                 assignment.get("end_layer", 0),
             ]
-            layer_ready = (
-                node_id in ready_nodes
-                and ack.get("config_id") == expected.get("config_id")
-                and ack.get("layer_range") == expected_range
-                and ack.get("model_sha256") == expected.get("model_sha256")
-                and ack.get("model_type") == expected.get("model_type")
-                and ack.get("engine") == expected.get("engine", "pytorch")
+            relay_for_assignment = getattr(self, "_relay_segment_for_worker", None)
+            is_relay_worker = (
+                callable(relay_for_assignment)
+                and relay_for_assignment(node_id) is not None
             )
+            if is_relay_worker:
+                # ★ A1 / X 档（Y 档第二条缺口 3）：relay 段节点**不需要**加载本地层
+                #   （`:2255` 分支明说段工件由外边监督的 relay_mid_service 持有 ——
+                #   "this scheduler host does not need a local ModelHost/model loaded"）
+                #   ⇒ 就绪判据退化为「在线 + TCP 连着」。段**不可达**会在**运行时**具名失败
+                #   （`relay_transport_error` ⇒ 具名回退 ⇒ `_fallback_reason` 带得出原因），
+                #   不靠这里探活 —— 主节点也没法直接探远端 loopback 上的段服务。
+                layer_ready = online and tcp_connected
+            else:
+                layer_ready = (
+                    node_id in ready_nodes
+                    and ack.get("config_id") == expected.get("config_id")
+                    and ack.get("layer_range") == expected_range
+                    and ack.get("model_sha256") == expected.get("model_sha256")
+                    and ack.get("model_type") == expected.get("model_type")
+                    and ack.get("engine") == expected.get("engine", "pytorch")
+                )
             layer_status = "ready" if layer_ready else (
                 "error" if ack.get("status") == "error" else
                 "loading" if expected else "not_configured"
@@ -3360,20 +3389,30 @@ class SchedulerPipelineMixin:
                     f"({heartbeat_age:.1f}s > 10s)"
                 )
 
-            with self._layer_config_lock:
-                expected = self._layer_config_expected.get(node_id, {})
-                ack = self._layer_config_acks.get(node_id, {})
-                expected_range = [node.get("start_layer"), node.get("end_layer")]
-                layer_ready = (
-                    node_id in self._layer_config_pushed
-                    and ack.get("config_id") == expected.get("config_id")
-                    and ack.get("layer_range") == expected_range
-                    and ack.get("model_sha256") == expected.get("model_sha256")
-                    and ack.get("model_type") == expected.get("model_type")
-                    and ack.get("engine") == expected.get("engine", "pytorch")
-                )
-            if not layer_ready:
-                return False, f"节点 {node_id} 尚未确认层配置加载成功"
+            # ★ A1 / X 档（Y 档第二条缺口 3 的**第二处**同型判据）：relay 段节点**不需要**
+            #   确认"层配置加载" —— 段工件由远端 relay_mid_service 持有，本节点不加载模型
+            #   （`scheduler_pipeline.py:2255` 注释即 "this scheduler host does not need a
+            #   local ModelHost/model loaded"）。上面已检查过在线 / TCP / 心跳，这里对
+            #   relay 节点直接放行；段**不可达**会在**运行时**具名失败。
+            relay_for_check = getattr(self, "_relay_segment_for_worker", None)
+            is_relay_worker = (
+                callable(relay_for_check) and relay_for_check(node_id) is not None
+            )
+            if not is_relay_worker:
+                with self._layer_config_lock:
+                    expected = self._layer_config_expected.get(node_id, {})
+                    ack = self._layer_config_acks.get(node_id, {})
+                    expected_range = [node.get("start_layer"), node.get("end_layer")]
+                    layer_ready = (
+                        node_id in self._layer_config_pushed
+                        and ack.get("config_id") == expected.get("config_id")
+                        and ack.get("layer_range") == expected_range
+                        and ack.get("model_sha256") == expected.get("model_sha256")
+                        and ack.get("model_type") == expected.get("model_type")
+                        and ack.get("engine") == expected.get("engine", "pytorch")
+                    )
+                if not layer_ready:
+                    return False, f"节点 {node_id} 尚未确认层配置加载成功"
 
         logger.info(
             f"✅ 二次就绪检查通过: "
@@ -3934,6 +3973,16 @@ class SchedulerPipelineMixin:
                      # ★ A1 / X 档：请求级路由偏好（`local_only` ⇒ 本段不委派给远端 relay 段）。
                      #   默认 "auto" ⇒ 旧调用方**逐比特不变**。
                      routing_preference: str = "auto",
+                     # ★ 既有缺陷修复（Y 档第二条跑通时暴露）：`api_server.py:3609` 一直传
+                     #   `enable_thinking`，而 `run_pipeline_safe`（`:5094`）pop 它之后透传
+                     #   `run_pipeline(**kwargs)` ⇒ 本方法收不了 ⇒
+                     #   `TypeError: _run_pipeline() got an unexpected keyword argument
+                     #   'enable_thinking'` ⇒ **任何**走分布式流水线的请求都 503。
+                     #   此前从未暴露，因为流水线路径一直没跑通过。
+                     #   语义与 `run_pipeline_safe` 一致：`None` ⇒ 不干预模型模板默认。
+                     #   流水线路径下它由 master 首段的 prompt 决定；这里接收是为**消除崩溃**，
+                     #   并让签名与"回退到全模型"那条路保持一致。
+                     enable_thinking: bool | None = None,
                      _stream_callback=None,
                      _cancel_event: threading.Event = None) -> dict:
         """

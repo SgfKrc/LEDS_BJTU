@@ -2399,17 +2399,61 @@ class Scheduler(
         records = []
         effective_id = self.get_effective_node_id()
         for node_id, node in snapshot:
-            if (
-                not _node_supports_forward_layers(node)
-                or (eligible_node_ids is not None and node_id not in eligible_node_ids)
-                or node_id in opted_out
-                or self._node_is_island_gateway(node.device_info)
-                or (
-                    node.role != NodeRole.MASTER
-                    and node_id != effective_id
-                    and not node.is_available()
-                )
+            # ★ 逐条件诊断：把「为什么某个在线 PC 没进容量候选」直接打出来。
+            #   此前是一个 5 条件的 `or` 短路，出问题时只能靠猜 —— 排查 relay 跨机拓扑时
+            #   正是卡在这里（`candidate_node_count: 1` 却看不出被哪条排除）。
+            skip_reason = ""
+            if not _node_supports_forward_layers(node):
+                skip_reason = "no_forward_layers"
+            elif eligible_node_ids is not None and node_id not in eligible_node_ids:
+                skip_reason = "not_eligible"
+            elif node_id in opted_out:
+                skip_reason = "opted_out"
+            elif self._node_is_island_gateway(node.device_info):
+                skip_reason = "island_gateway"
+            elif (
+                node.role != NodeRole.MASTER
+                and node_id != effective_id
+                and not node.is_available()
             ):
+                skip_reason = "not_available"
+            if skip_reason:
+                logger.info(
+                    "容量候选跳过 %s: reason=%s node_type=%s role=%s eligible=%s opted_out=%d",
+                    node_id, skip_reason, getattr(node, "node_type", "?"),
+                    node.role,
+                    (node_id in eligible_node_ids) if eligible_node_ids is not None else "n/a",
+                    len(opted_out),
+                )
+                continue
+            # ★ A1 / X 档（Y 档第二条缺口 4）：relay 段节点**不能**被剔除出候选集 ——
+            #   求解器的 `require_distributed and len(usable) < 2` 闸门（`pipeline_capacity.py:221`）
+            #   会因为"只剩 master 一个可用节点"而拒掉整个 plan
+            #   （实测 `reason=distributed placement requires at least two usable PC nodes`）。
+            #   它**也不需要**本地容量预算：段工件由**远端** relay_mid_service 持有，本节点只转发。
+            #   ⇒ 收录它，但容量取"占位值"（`relay_exempt`），**不参与真实的内存准入**。
+            #   它实际跑不跑层由下发 assignment 里的 `engine="relay_middle"` 决定
+            #   （见 `compute_layer_assignment` 的 `_append_relay_assignments`）。
+            relay_for_node = getattr(self, "_relay_segment_for_worker", None)
+            if callable(relay_for_node) and relay_for_node(node_id) is not None:
+                device_info = dict(node.device_info or {})
+                ram = device_info.get("ram", {})
+                total_gb = 0.0
+                if isinstance(ram, dict):
+                    try:
+                        total_gb = float(ram.get("total_gb", 0) or 0)
+                    except (TypeError, ValueError):
+                        total_gb = 0.0
+                records.append({
+                    "node_id": node_id,
+                    "role": node.role,
+                    "capacity_bytes": max(1024 ** 3, int(total_gb * 1024 ** 3)),
+                    "reserve_bytes": 0,
+                    "runtime_multiplier": 1.0,
+                    "execution_device": "cpu",
+                    "capacity_source": "relay_exempt",
+                    "score": 0.0,
+                })
                 continue
             device_info = dict(node.device_info or {})
             gpu = self._select_scoring_gpu(device_info)
@@ -2481,9 +2525,20 @@ class Scheduler(
         if not isinstance(plan, dict) or plan.get("admitted") is not True:
             return plan
         result = dict(plan)
+        # ★ A1 / X 档（Y 档第二条缺口 6）：`pipeline_layout_from_capacity_plan` 要求 assignments
+        #   **恰好连续覆盖全部层**，而 relay 段条目是**零层**（`layers_count == 0`）⇒ 会让它抛
+        #   `PipelineNodeContractError`（实测 `reason_code=pipeline_node_contract_invalid`，
+        #   而且异常消息为空，极难定位）。
+        #   ⇒ 只为 layout 计算**剔除**零层条目；下发给 worker 的 `assignments` 仍带它们
+        #   （主节点据此下发 `engine="relay_middle"`，worker 侧不加载层、只转发）。
+        layout_assignments = [
+            item for item in (result.get("assignments") or [])
+            if int(item.get("layers_count", 1) or 0) > 0
+        ]
         try:
             layout = pipeline_layout_from_capacity_plan(
-                result, node_metadata=self._pipeline_node_metadata(),
+                {**result, "assignments": layout_assignments},
+                node_metadata=self._pipeline_node_metadata(),
             )
         except PipelineNodeContractError as exc:
             result.update({
