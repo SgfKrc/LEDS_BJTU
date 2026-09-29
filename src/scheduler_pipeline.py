@@ -161,9 +161,19 @@ class SchedulerPipelineMixin:
         full_worker_release_ids = (
             releasable_legacy_ids & self._task_worker_full_model_ids()
         )
+        # A node explicitly assigned to an endpoint-backed relay segment is
+        # still a pipeline participant even if it also advertises a full model.
+        relay_worker_ids = {
+            node_id for node_id in releasable_legacy_ids
+            if self._relay_segment_for_worker(node_id) is not None
+        }
+        full_worker_release_ids.difference_update(relay_worker_ids)
         layer_releasable_worker_ids = releasable_legacy_ids - full_worker_release_ids
 
         with self._layer_config_lock:
+            # Clear stale opt-outs created before this node was assigned as a
+            # relay; compute_layer_assignment filters opted-out nodes first.
+            self._pipeline_worker_opt_out.difference_update(relay_worker_ids)
             if full_worker_release_ids:
                 self._pipeline_worker_opt_out.update(full_worker_release_ids)
             authoritative_sync = bool(
@@ -2130,6 +2140,14 @@ class SchedulerPipelineMixin:
                 node_id,
             )
             return
+        if self._relay_segment_for_worker(client_id) is not None:
+            with self._layer_config_lock:
+                self._pipeline_worker_opt_out.discard(client_id)
+            logger.info(
+                "忽略 relay 节点的本地分层退出通知: node=%s", client_id,
+            )
+            self.push_layer_config_to_clients()
+            return
         with self._layer_config_lock:
             self._pipeline_worker_opt_out.add(client_id)
         self._clear_layer_config_state(client_id)
@@ -2495,6 +2513,10 @@ class SchedulerPipelineMixin:
                     "model_type": model_type,
                     "chain_path": response["chain_path"],
                     "hidden_states": _b64.b64encode(_hs).decode("ascii") if _hs else None,
+                    # Preserve the explicit relay raw-f32 contract across a
+                    # CHAIN_FORWARD hop. Legacy tensor-fast frames leave this
+                    # unset and keep their existing decoder path.
+                    "hidden_wire_format": response.get("hidden_wire_format"),
                     "hidden_shape": response.get("hidden_shape"),
                     "chain_next": chain_remaining[0] if chain_remaining else None,
                     "chain_remaining": chain_remaining[1:] if len(chain_remaining) > 1 else [],
@@ -3328,9 +3350,15 @@ class SchedulerPipelineMixin:
             # 旧安装包不认识 authoritative_sync，会再次发送 opt-out。
             # 这是明确的不可恢复信号；不应让本次推理无谓等待完整同步
             # 超时，直接按既有安全路径回退到主节点。
+            relay_for_worker = getattr(self, "_relay_segment_for_worker", None)
             with self._layer_config_lock:
                 opted_out = sorted(
-                    set(worker_ids) & self._pipeline_worker_opt_out
+                    node_id for node_id in set(worker_ids)
+                    if node_id in self._pipeline_worker_opt_out
+                    and not (
+                        callable(relay_for_worker)
+                        and relay_for_worker(node_id) is not None
+                    )
                 )
             if opted_out:
                 logger.warning(

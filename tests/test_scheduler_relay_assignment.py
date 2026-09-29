@@ -70,6 +70,48 @@ def test_relay_worker_gets_no_layers_and_is_marked_relay_middle(monkeypatch):
     assert max(a["end_layer"] for a in learning) == 24
 
 
+def test_opted_out_relay_worker_is_restored_before_assignment(monkeypatch):
+    """An endpoint-backed relay must survive a stale Full Worker opt-out."""
+    sched = _scheduler(monkeypatch, {"client2"})
+    sched._pipeline_worker_opt_out.add("client2")
+
+    result = {a["node_id"]: a for a in sched.compute_layer_assignment()}
+
+    assert result["client2"]["engine"] == "relay_middle"
+    assert result["client2"]["layers_count"] == 0
+    assert sum(
+        item["layers_count"] for node_id, item in result.items()
+        if node_id != "client2"
+    ) == 24
+
+
+def test_opted_out_relay_worker_is_a_capacity_candidate(monkeypatch):
+    """Relay capacity is an endpoint placeholder, not local model capacity."""
+    sched = _scheduler(monkeypatch, {"client2"})
+    sched._pipeline_worker_opt_out.add("client2")
+
+    candidates = sched._get_pipeline_capacity_nodes()
+
+    relay = next(item for item in candidates if item["node_id"] == "client2")
+    assert relay["capacity_source"] == "relay_exempt"
+    assert relay["reserve_bytes"] == 0
+
+
+def test_opted_out_relay_worker_is_not_filtered_from_manual_assignments(monkeypatch):
+    sched = _scheduler(monkeypatch, {"client2"})
+    sched._pipeline_worker_opt_out.add("client2")
+    sched._runtime_layer_override = [{
+        "node_id": "client2",
+        "start_layer": 0,
+        "end_layer": 0,
+        "layers_count": 0,
+    }]
+
+    result = sched.get_layer_assignments()
+
+    assert any(item["node_id"] == "client2" for item in result["assignments"])
+
+
 def test_relay_worker_alone_still_appears_in_the_plan(monkeypatch):
     """只有 relay 节点参与时也必须出条目 —— 否则流水线直接空转（`return []`）。"""
     sched = _scheduler(monkeypatch, {"master", "client1", "client2"})

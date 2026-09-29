@@ -30,6 +30,9 @@ from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
 
 logger = logging.getLogger("inference_service.peer")
 
+# Keep this lightweight peer import independent from the full scheduler module.
+RELAY_HIDDEN_WIRE_FORMAT = "qlh.relay_hidden.f32.v1"
+
 
 class PeerClient:
     """从节点客户端：连接主节点 + 层段加载 + 层前向执行闭环。"""
@@ -394,11 +397,11 @@ class PeerClient:
 
         import numpy as np
         import torch
-        # ⚠️ 主节点发来的是 `serialize_tensor_fast` 的 base64（见 `scheduler_pipeline._run_pipeline`），
-        #   与下面的 `deserialize_tensor_fast` **对称** —— fast 走 `TNR0` magic（numpy frombuffer），
-        #   **不经过 `torch.load`**：torch ≥2.6 的 `weights_only=True` 默认会让普通 pickle 载入
-        #   失败（实测 `UnpicklingError: Unsupported operand 26`）。
-        from tcp_comm import deserialize_tensor_fast, serialize_tensor_fast
+        # Product relay frames are explicit raw-f32 plus shape metadata. The
+        # tensor-fast fallback below is retained only for older non-relay peers.
+        # Relay product frames use explicit raw-f32 metadata; the legacy
+        # tensor-fast decoder below remains for mixed-version non-relay frames.
+        from tcp_comm import deserialize_tensor_fast
 
         from relay_segment_client import RelaySegmentClient
 
@@ -424,12 +427,37 @@ class PeerClient:
             self._send_layer_result(task_id, {}, error="relay 段委托缺 hidden_states")
             return
 
+        wire_format = str(data.get("hidden_wire_format", "") or "")
+        hidden_shape = data.get("hidden_shape")
         try:
-            tensor = deserialize_tensor_fast(raw_bytes)
-            hidden_bytes = tensor.detach().cpu().float().contiguous().numpy().tobytes()
+            if wire_format == RELAY_HIDDEN_WIRE_FORMAT:
+                # Product relay handoff is raw contiguous f32. Preserve the
+                # original shape for the return trip to the master's LM head.
+                if not isinstance(hidden_shape, list) or not hidden_shape:
+                    raise ValueError("relay hidden_shape is required for raw f32 payload")
+                expected_items = 1
+                for size in hidden_shape:
+                    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                        raise ValueError("relay hidden_shape must contain positive integers")
+                    expected_items *= size
+                if hidden_shape[-1] != width:
+                    raise ValueError(
+                        f"relay hidden_shape last dimension {hidden_shape[-1]} != n_embd {width}"
+                    )
+                if len(raw_bytes) != expected_items * 4:
+                    raise ValueError(
+                        f"relay raw f32 length mismatch: bytes={len(raw_bytes)} "
+                        f"expected={expected_items * 4}"
+                    )
+                hidden_bytes = raw_bytes
+            else:
+                # Legacy mixed-version workers still use tensor-fast.
+                tensor = deserialize_tensor_fast(raw_bytes)
+                hidden_bytes = tensor.detach().cpu().float().contiguous().numpy().tobytes()
+                hidden_shape = list(tensor.shape)
         except Exception as exc:
-            logger.error("relay 段委托的 hidden 反序列化失败: %s", exc, exc_info=True)
-            self._send_layer_result(task_id, {}, error=f"relay hidden 反序列化失败: {exc}")
+            logger.error("relay hidden wire decode failed: %s", exc, exc_info=True)
+            self._send_layer_result(task_id, {}, error=f"relay hidden wire decode failed: {exc}")
             return
 
         if width <= 0 or len(hidden_bytes) % (width * 4):
@@ -462,9 +490,14 @@ class PeerClient:
             return
 
         try:
-            out_tensor = torch.from_numpy(
-                np.frombuffer(bytes(outcome.hidden), dtype=np.float32).reshape(n_tokens, width)
-            )
+            shape = tuple(int(size) for size in hidden_shape)
+            out_array = np.frombuffer(bytes(outcome.hidden), dtype=np.float32)
+            expected_items = int(np.prod(shape))
+            if out_array.size != expected_items:
+                raise ValueError(
+                    f"relay output length mismatch: items={out_array.size} expected={expected_items}"
+                )
+            out_tensor = torch.from_numpy(out_array.reshape(shape).copy())
         except Exception as exc:
             logger.error("relay 段返回的 hidden 无法还原: %s", exc, exc_info=True)
             self._send_layer_result(task_id, {}, error=f"relay hidden 还原失败: {exc}")
@@ -478,7 +511,10 @@ class PeerClient:
             "model_sha256": str(data.get("model_sha256", "")),
             "model_type": str(data.get("model_type", "")),
             "chain_path": [*[str(x) for x in (data.get("chain_path") or [])], self._node_id],
-            "hidden_states": serialize_tensor_fast(out_tensor),
+            # Keep the relay contract symmetric with scheduler_pipeline:
+            # raw f32 in both directions, with an explicit discriminator.
+            "hidden_states": out_tensor.detach().cpu().float().contiguous().numpy().tobytes(),
+            "hidden_wire_format": RELAY_HIDDEN_WIRE_FORMAT,
             "hidden_shape": list(out_tensor.shape),
             "metrics": {
                 "time_ms": round(elapsed_ms, 1),

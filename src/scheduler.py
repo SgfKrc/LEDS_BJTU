@@ -1693,7 +1693,12 @@ class Scheduler(
             for node_id, info in self.nodes.items():
                 if not _node_supports_forward_layers(info):
                     continue
-                if node_id in opted_out:
+                relay_for_worker = getattr(self, "_relay_segment_for_worker", None)
+                is_relay_worker = (
+                    callable(relay_for_worker)
+                    and relay_for_worker(node_id) is not None
+                )
+                if node_id in opted_out and not is_relay_worker:
                     continue
                 # 孤岛网关不参与层拆分，缓存键同步排除保持一致
                 if self._node_is_island_gateway(info.device_info):
@@ -1849,6 +1854,14 @@ class Scheduler(
         # 继续按旧行为排除，避免把 HTTP 客户端误当成层工作器。
         with self._layer_config_lock:
             opted_out = set(self._pipeline_worker_opt_out)
+        relay_for_worker = getattr(self, "_relay_segment_for_worker", None)
+
+        def _is_relay_worker(node_id: str) -> bool:
+            return (
+                callable(relay_for_worker)
+                and relay_for_worker(node_id) is not None
+            )
+
         if nodes is None:
             # Phase 2.1: 快照 self.nodes 后解锁迭代，防止 TCP 回调并发修改 dict
             with self._nodes_lock:
@@ -1859,7 +1872,7 @@ class Scheduler(
                  "device_info": info.device_info}
                 for nid, info in nodes_snapshot
                 if _node_supports_forward_layers(info)
-                and nid not in opted_out
+                and (nid not in opted_out or _is_relay_worker(nid))
                 and not self._node_is_island_gateway(info.device_info)
                 and (
                     info.role == NodeRole.MASTER
@@ -1871,7 +1884,10 @@ class Scheduler(
             node_list = [
                 n for n in nodes
                 if _node_supports_forward_layers(n)
-                and n.get("node_id") not in opted_out
+                and (
+                    n.get("node_id") not in opted_out
+                    or _is_relay_worker(str(n.get("node_id", "")))
+                )
                 and not self._node_is_island_gateway(n.get("device_info", {}))
             ]
 
@@ -2336,10 +2352,18 @@ class Scheduler(
             }
 
         if self._runtime_layer_override:
+            relay_for_worker = getattr(self, "_relay_segment_for_worker", None)
             overrides = self._normalize_manual_assignments(
                 [
                     item for item in self._runtime_layer_override
-                    if item.get("node_id") not in opted_out
+                    if (
+                        item.get("node_id") not in opted_out
+                        or (
+                            callable(relay_for_worker)
+                            and relay_for_worker(str(item.get("node_id", "")))
+                            is not None
+                        )
+                    )
                 ]
             )
             if (
@@ -2403,11 +2427,16 @@ class Scheduler(
             #   此前是一个 5 条件的 `or` 短路，出问题时只能靠猜 —— 排查 relay 跨机拓扑时
             #   正是卡在这里（`candidate_node_count: 1` 却看不出被哪条排除）。
             skip_reason = ""
+            relay_for_node = getattr(self, "_relay_segment_for_worker", None)
+            is_relay_worker = (
+                callable(relay_for_node)
+                and relay_for_node(node_id) is not None
+            )
             if not _node_supports_forward_layers(node):
                 skip_reason = "no_forward_layers"
             elif eligible_node_ids is not None and node_id not in eligible_node_ids:
                 skip_reason = "not_eligible"
-            elif node_id in opted_out:
+            elif node_id in opted_out and not is_relay_worker:
                 skip_reason = "opted_out"
             elif self._node_is_island_gateway(node.device_info):
                 skip_reason = "island_gateway"
@@ -2434,8 +2463,7 @@ class Scheduler(
             #   ⇒ 收录它，但容量取"占位值"（`relay_exempt`），**不参与真实的内存准入**。
             #   它实际跑不跑层由下发 assignment 里的 `engine="relay_middle"` 决定
             #   （见 `compute_layer_assignment` 的 `_append_relay_assignments`）。
-            relay_for_node = getattr(self, "_relay_segment_for_worker", None)
-            if callable(relay_for_node) and relay_for_node(node_id) is not None:
+            if is_relay_worker:
                 device_info = dict(node.device_info or {})
                 ram = device_info.get("ram", {})
                 total_gb = 0.0
