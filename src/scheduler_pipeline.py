@@ -13,7 +13,11 @@ from config import (PIPELINE_MODEL_SYNC_TIMEOUT, PIPELINE_RELAY_ENABLED,
                     PIPELINE_RELAY_SEGMENTS)
 # ★ #31 M2：层流水线支持的架构**单一事实来源**（此前在 4 处各写了一份 `{"qwen","qwen2"}`）
 from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
-from relay_segment_client import RelaySegmentClient, RelaySegmentError
+from relay_segment_client import (
+    SEGMENT_ROLES,
+    RelaySegmentClient,
+    RelaySegmentError,
+)
 from relay_transport import is_loopback_host
 from scheduler_types import PreemptState
 from torch_runtime import require_torch
@@ -2619,9 +2623,12 @@ class SchedulerPipelineMixin:
         返回 `None` 表示"不适用"（缺失 / 非法 / 超出 X 档范围）—— 调用方据此走**既有**拒绝路径。
         严格到"多一个未知键就整条不认"，避免"半懂"的规格被误用。
 
-        **X 档只支持 `middle`**（hidden → hidden，与本节点"中间节点返回 hidden_states"的既有契约
-        完全对齐）；`head`（吃 token 列表）与 `tail`（吐 token）需要主节点侧接受 token 语义，
-        属 Y 档 ⇒ 这里**显式不认**（返回 `None` ⇒ 走原有拒绝，不会静默降级）。
+        **角色（Y-(b) 放开）**：`head` / `middle` / `tail` 三选一，判据与
+        `relay_segment_client.SEGMENT_ROLES` **同源**（段侧三者均已实现：`middle` =
+        hidden → hidden，与本节点"中间节点返回 hidden_states"的既有契约对齐；`head` =
+        token → hidden；`tail` = hidden → token，末段返回 logits）。
+        角色的**区间语义**（head 须从 0 起、tail 须到 total_layers 止）在**切分校验**处检查 ——
+        这里只保证"角色合法 + 层区间存在且非空"。
         **★ Y 档第二条：层区间必填**。relay 段必须声明它**认领**的层区间
         `[layer_start, layer_end)` —— 这是修复「relay 段的层范围从未进入调度 ⇒ 主节点跑满
         全部层、该段在"已过全部层"的 hidden 上重算」这一根因的**契约前提**：没有区间就无从
@@ -2633,8 +2640,9 @@ class SchedulerPipelineMixin:
         if set(raw) - {"role", "host", "port", "n_embd", "timeout",
                        "layer_start", "layer_end"}:
             return None
-        if str(raw.get("role", "")).strip().lower() != "middle":
-            return None
+        role = str(raw.get("role", "")).strip().lower()
+        if role not in SEGMENT_ROLES:
+            return None     # head / middle / tail 三选一（段侧均已支持）
         host = str(raw.get("host", "")).strip()
         if not is_loopback_host(host):
             return None     # 跨机必须走本地 SSH 隧道端点（Relay 传输层自身也强制 loopback）
@@ -2650,7 +2658,7 @@ class SchedulerPipelineMixin:
             return None
         if layer_start < 0 or layer_end <= layer_start:
             return None     # 层区间必填且非空
-        return {"role": "middle", "host": host, "port": port, "n_embd": n_embd,
+        return {"role": role, "host": host, "port": port, "n_embd": n_embd,
                 "timeout": timeout, "layer_start": layer_start, "layer_end": layer_end}
 
     def _handle_layer_forward_via_relay(self, spec: dict[str, object], *, data: dict,

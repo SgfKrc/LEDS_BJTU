@@ -135,10 +135,8 @@ def test_relay_wire_format_rejects_shape_mismatch():
         ("middle", "不是 dict"),
         ({"role": "middle", "host": "127.0.0.1", "port": 1, "n_embd": 4,
           "layer_start": 0, "layer_end": 1, "extra": 1}, "未知键"),
-        ({"role": "head", "host": "127.0.0.1", "port": 1, "n_embd": 4,
-          "layer_start": 0, "layer_end": 1}, "head 属 Y 档"),
-        ({"role": "tail", "host": "127.0.0.1", "port": 1, "n_embd": 4,
-          "layer_start": 0, "layer_end": 1}, "tail 属 Y 档"),
+        ({"role": "router", "host": "127.0.0.1", "port": 1, "n_embd": 4,
+          "layer_start": 0, "layer_end": 1}, "未知角色"),
         ({"role": "middle", "host": "10.1.2.3", "port": 1, "n_embd": 4,
           "layer_start": 0, "layer_end": 1}, "非 loopback"),
         ({"role": "middle", "host": "127.0.0.1", "port": 0, "n_embd": 4,
@@ -183,6 +181,22 @@ def test_normalize_defaults_timeout():
         {"role": "middle", "host": "127.0.0.1", "port": 50183, "n_embd": 896,
          "layer_start": 8, "layer_end": 16})
     assert spec is not None and spec["timeout"] == 60.0
+
+
+@pytest.mark.parametrize(
+    ("role", "start", "end"),
+    [("head", 0, 8), ("middle", 8, 16), ("tail", 16, 24)],
+)
+def test_normalize_accepts_all_three_roles(role: str, start: int, end: int):
+    """★ Y-(b)：三角色（head / middle / tail）均被接受，且**原样**回带角色与层区间。
+
+    判据与 `relay_segment_client.SEGMENT_ROLES` 同源（段侧三者均已实现）。
+    """
+    spec = SchedulerPipelineMixin._normalize_relay_segment(
+        {"role": role, "host": "127.0.0.1", "port": 50183, "n_embd": 896,
+         "layer_start": start, "layer_end": end})
+    assert spec == {"role": role, "host": "127.0.0.1", "port": 50183, "n_embd": 896,
+                    "timeout": 60.0, "layer_start": start, "layer_end": end}
 
 
 # ---- _handle_layer_forward_via_relay：成功路径 ----------------------------
@@ -350,7 +364,8 @@ def test_via_relay_rejects_missing_hidden():
 def test_parse_relay_segment_map_accepts_valid_and_drops_invalid():
     """配置解析：只认范围内、且**声明了层区间**的条目，其余**整条丢弃**（绝不下发"半懂"规格）。"""
     raw = ("worker-2=middle@127.0.0.1:50183#896#8-16;"           # 合法
-           "worker-3=head@127.0.0.1:50184#896#8-16;"            # head ⇒ Y 档，丢
+           "worker-3=router@127.0.0.1:50184#896#8-16;"          # ★ 未知角色，丢
+           "worker-10=tail@127.0.0.1:50190#896#16-24;"          # ★ Y-(b)：tail 合法
            "worker-4=middle@10.0.0.5:50185#896#8-16;"           # 非 loopback，丢
            "broken;worker-5=middle@127.0.0.1:notaport#896#8-16;"  # 非法，丢
            "worker-7=middle@127.0.0.1:50187#896;"               # ★ 缺层区间，丢
@@ -359,7 +374,7 @@ def test_parse_relay_segment_map_accepts_valid_and_drops_invalid():
            "worker-6=middle@127.0.0.1:50186#896#16-24")         # 合法
     parsed = SchedulerPipelineMixin._parse_relay_segment_map(raw)
 
-    assert set(parsed) == {"worker-2", "worker-6"}
+    assert set(parsed) == {"worker-2", "worker-6", "worker-10"}
     assert parsed["worker-2"] == {"role": "middle", "host": "127.0.0.1", "port": 50183,
                                   "n_embd": 896, "timeout": 60.0,
                                   "layer_start": 8, "layer_end": 16}
@@ -498,8 +513,11 @@ def test_guard_branch_requires_both_switch_and_spec(monkeypatch: pytest.MonkeyPa
     assert _would_delegate(good, True) is True
     assert _would_delegate(good, False) is False        # 开关关 ⇒ 不委托
     assert _would_delegate(None, True) is False         # 无规格 ⇒ 不委托
-    assert _would_delegate({"role": "tail", "host": "127.0.0.1", "port": 1,
+    assert _would_delegate({"role": "router", "host": "127.0.0.1", "port": 1,
                             "n_embd": 4, "layer_start": 0, "layer_end": 1}, True) is False
+    # ★ Y-(b)：`tail` 角色合法（其区间语义由切分校验把关）⇒ **可以**委托
+    assert _would_delegate({"role": "tail", "host": "127.0.0.1", "port": 1,
+                            "n_embd": 4, "layer_start": 16, "layer_end": 24}, True) is True
     # ★ Y 档第二条：缺层区间 ⇒ 半懂规格不得生效，同样不委托
     assert _would_delegate({"role": "middle", "host": "127.0.0.1", "port": 1,
                             "n_embd": 4}, True) is False
