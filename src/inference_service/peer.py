@@ -417,6 +417,15 @@ class PeerClient:
             self._send_layer_result(task_id, {}, error="relay_middle 缺少 relay_segment 规格")
             return
         width = int(spec.get("n_embd", 0) or 0)
+        # ★ Y-(b)：按**角色**分流。`middle` = hidden → hidden（把 hidden 转给远端段，再把
+        #   hidden 回给主节点）；`tail` = hidden → token（远端段跑完本段并回 **argmax**，
+        #   本节点把 token 回给主节点）。`head` 在**从节点这一侧**不支持 —— head 段要拿
+        #   token 序列，而从节点从主节点收到的是 hidden，语义不成立 ⇒ 明确拒绝，
+        #   绝不"当成 middle 硬算"（那会静默产出错误数值）。
+        role = str(spec.get("role", "middle") or "middle").strip().lower()
+        if role not in {"middle", "tail"}:
+            self._send_layer_result(task_id, {}, error=f"relay_role_unsupported:{role}")
+            return
 
         raw = data.get("hidden_states")
         if isinstance(raw, str):
@@ -471,10 +480,13 @@ class PeerClient:
         try:
             with RelaySegmentClient(
                 str(spec.get("host", "")), int(spec.get("port", 0)),
-                n_embd=width, role=str(spec.get("role", "middle")),
+                n_embd=width, role=role,
                 timeout=float(spec.get("timeout", 60.0) or 60.0),
             ) as client:
-                outcome = client.forward_hidden(hidden_bytes, n_tokens=n_tokens)
+                if role == "tail":
+                    outcome = client.forward_hidden_to_token(hidden_bytes, n_tokens=n_tokens)
+                else:
+                    outcome = client.forward_hidden(hidden_bytes, n_tokens=n_tokens)
         except Exception as exc:
             logger.error("relay 段委托失败: %s", exc, exc_info=True)
             self._send_layer_result(task_id, {}, error=f"relay_segment_failed:{exc}")
@@ -489,21 +501,7 @@ class PeerClient:
             self._send_layer_result(task_id, {}, error=f"relay_segment_failed:{code}")
             return
 
-        try:
-            shape = tuple(int(size) for size in hidden_shape)
-            out_array = np.frombuffer(bytes(outcome.hidden), dtype=np.float32)
-            expected_items = int(np.prod(shape))
-            if out_array.size != expected_items:
-                raise ValueError(
-                    f"relay output length mismatch: items={out_array.size} expected={expected_items}"
-                )
-            out_tensor = torch.from_numpy(out_array.reshape(shape).copy())
-        except Exception as exc:
-            logger.error("relay 段返回的 hidden 无法还原: %s", exc, exc_info=True)
-            self._send_layer_result(task_id, {}, error=f"relay hidden 还原失败: {exc}")
-            return
-
-        response = {
+        common_response = {
             "task_id": task_id,
             "node_id": self._node_id,
             "step": step,
@@ -511,11 +509,6 @@ class PeerClient:
             "model_sha256": str(data.get("model_sha256", "")),
             "model_type": str(data.get("model_type", "")),
             "chain_path": [*[str(x) for x in (data.get("chain_path") or [])], self._node_id],
-            # Keep the relay contract symmetric with scheduler_pipeline:
-            # raw f32 in both directions, with an explicit discriminator.
-            "hidden_states": out_tensor.detach().cpu().float().contiguous().numpy().tobytes(),
-            "hidden_wire_format": RELAY_HIDDEN_WIRE_FORMAT,
-            "hidden_shape": list(out_tensor.shape),
             "metrics": {
                 "time_ms": round(elapsed_ms, 1),
                 "kv_cache": False,
@@ -524,6 +517,37 @@ class PeerClient:
                 **outcome.to_metrics(),
             },
         }
+
+        if role == "tail":
+            # ★ Y-(b)：末段回 **token**（远端已跑完本段并做完 argmax）。
+            token = getattr(outcome, "token", None)
+            if token is None:
+                self._send_layer_result(task_id, {}, error="relay tail 段未返回 token")
+                return
+            response = {**common_response, "token": int(token)}
+        else:
+            try:
+                shape = tuple(int(size) for size in hidden_shape)
+                out_array = np.frombuffer(bytes(outcome.hidden), dtype=np.float32)
+                expected_items = int(np.prod(shape))
+                if out_array.size != expected_items:
+                    raise ValueError(
+                        f"relay output length mismatch: items={out_array.size} "
+                        f"expected={expected_items}"
+                    )
+                out_tensor = torch.from_numpy(out_array.reshape(shape).copy())
+            except Exception as exc:
+                logger.error("relay 段返回的 hidden 无法还原: %s", exc, exc_info=True)
+                self._send_layer_result(task_id, {}, error=f"relay hidden 还原失败: {exc}")
+                return
+            # Keep the relay contract symmetric with scheduler_pipeline:
+            # raw f32 in both directions, with an explicit discriminator.
+            response = {
+                **common_response,
+                "hidden_states": out_tensor.detach().cpu().float().contiguous().numpy().tobytes(),
+                "hidden_wire_format": RELAY_HIDDEN_WIRE_FORMAT,
+                "hidden_shape": list(out_tensor.shape),
+            }
         logger.info(
             "🔁 relay 段委托完成（从节点）: task=%s, step=%s, 段=%s@%s:%s, tokens=%s, time=%.0fms",
             task_id, step, spec.get("role"), spec.get("host"), spec.get("port"),

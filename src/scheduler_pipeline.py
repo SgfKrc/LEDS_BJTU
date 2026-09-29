@@ -4593,7 +4593,12 @@ class SchedulerPipelineMixin:
 
             # 提取末端输出。推荐拓扑由 worker 返回 hidden_states，主节点在
             # CUDA 上执行 Norm + LM Head；兼容旧配置直接返回 logits。
-            if "logits" in result and result["logits"] is not None:
+            # ★ Y-(b)：末节点是 relay **tail** 段时回的是 **token**（远端已做完 argmax），
+            #   既没有 logits 也没有 hidden —— 这种拓扑下 master 不需要跑 LM Head。
+            relay_token = result.get("token")
+            if relay_token is not None:
+                pass    # 由下方的 token 分支消费（不设 step_error）
+            elif "logits" in result and result["logits"] is not None:
                 logits_data = result["logits"]
                 if isinstance(logits_data, bytes):
                     logits = deserialize_tensor(logits_data).to(device=device)
@@ -4641,11 +4646,27 @@ class SchedulerPipelineMixin:
                 return {"response": "", "error": step_error}
 
             # ---- Step 4: 从 logits 选择下一个 token ----
-            # temperature=0 与单机路径一致采用贪心解码；正温度才执行
-            # FP32 top-p 采样并在进入 CUDA multinomial 前校验概率。
-            new_token_id = self._scheduler_facade_global('_sample_pipeline_token_id')(
-                logits, temperature=temperature, top_p=top_p,
-            )
+            # ★ Y-(b)：末节点为 relay **tail** 段时，远端已跑完本段并做完 argmax ⇒ 直接给
+            #   token，此时**没有 logits** 可用。该协议语义就是 argmax ⇒ 与**贪心**等价；
+            #   `temperature > 0` 的采样在远端无法执行 ⇒ 显式**具名拒绝**
+            #   （绝不把 token 当成"采样结果"，那会静默改变请求语义）。
+            if relay_token is not None:
+                if float(temperature or 0.0) > 0.0:
+                    step_error = (
+                        "relay tail 段只回 token（远端 argmax）⇒ 仅支持贪心解码，"
+                        f"但请求 temperature={temperature}"
+                    )
+                    logger.error(step_error)
+                    self._broadcast_pipeline_abort(pipeline_nodes, task_id, step_error)
+                    self._clear_pipeline_runtime_state(task_id)
+                    return {"response": "", "error": step_error}
+                new_token_id = int(relay_token)
+            else:
+                # temperature=0 与单机路径一致采用贪心解码；正温度才执行
+                # FP32 top-p 采样并在进入 CUDA multinomial 前校验概率。
+                new_token_id = self._scheduler_facade_global('_sample_pipeline_token_id')(
+                    logits, temperature=temperature, top_p=top_p,
+                )
 
             # 检查 EOS
             if new_token_id in eos_ids:
