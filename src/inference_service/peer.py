@@ -379,7 +379,134 @@ class PeerClient:
         with self._layer_execution_lock:
             self._handle_layer_forward_locked(data)
 
+    def _handle_layer_forward_via_relay(self, data: dict) -> None:
+        """★ A1 / X 档（Y 档第二条缺口 8）：委托远端 relay **middle** 段执行本步，再回主节点。
+
+        与 `scheduler_pipeline._handle_layer_forward_via_relay` **同语义**（吃 hidden、吐
+        hidden），但跑在**从节点进程**里。此前本文件只实现了「用本地模型跑层」⇒ relay worker
+        一收到 `LAYER_FORWARD` 就报「模型未加载」（实测 `层前向失败: step=0: 模型未加载`）。
+
+        ⚠️ 线上格式差异：主节点发来的 `hidden_states` 是 `serialize_tensor_fast` 的 base64
+        （它按**首个 worker** 决定格式，看不到末节点是不是 relay）⇒ 这里先反序列化成 tensor、
+        取 **raw f32** 交给 relay 段；回来时反向转回主节点期望的格式。
+        """
+        import base64 as _b64
+
+        import numpy as np
+        import torch
+        # ⚠️ 主节点发来的是 `serialize_tensor_fast` 的 base64（见 `scheduler_pipeline._run_pipeline`），
+        #   与下面的 `deserialize_tensor_fast` **对称** —— fast 走 `TNR0` magic（numpy frombuffer），
+        #   **不经过 `torch.load`**：torch ≥2.6 的 `weights_only=True` 默认会让普通 pickle 载入
+        #   失败（实测 `UnpicklingError: Unsupported operand 26`）。
+        from tcp_comm import deserialize_tensor_fast, serialize_tensor_fast
+
+        from relay_segment_client import RelaySegmentClient
+
+        task_id = str(data.get("task_id", "unknown") or "unknown")
+        try:
+            step = int(data.get("step", 0))
+        except (TypeError, ValueError):
+            step = -1
+
+        cfg = dict(self._active_layer_config or {})
+        spec = cfg.get("relay_segment") or {}
+        if not isinstance(spec, dict) or not spec:
+            self._send_layer_result(task_id, {}, error="relay_middle 缺少 relay_segment 规格")
+            return
+        width = int(spec.get("n_embd", 0) or 0)
+
+        raw = data.get("hidden_states")
+        if isinstance(raw, str):
+            raw_bytes = _b64.b64decode(raw)
+        elif isinstance(raw, (bytes, bytearray)):
+            raw_bytes = bytes(raw)
+        else:
+            self._send_layer_result(task_id, {}, error="relay 段委托缺 hidden_states")
+            return
+
+        try:
+            tensor = deserialize_tensor_fast(raw_bytes)
+            hidden_bytes = tensor.detach().cpu().float().contiguous().numpy().tobytes()
+        except Exception as exc:
+            logger.error("relay 段委托的 hidden 反序列化失败: %s", exc, exc_info=True)
+            self._send_layer_result(task_id, {}, error=f"relay hidden 反序列化失败: {exc}")
+            return
+
+        if width <= 0 or len(hidden_bytes) % (width * 4):
+            self._send_layer_result(
+                task_id, {}, error="relay 段委托的 hidden 长度与 n_embd 不匹配（需 f32 且整除）"
+            )
+            return
+        n_tokens = len(hidden_bytes) // (width * 4)
+
+        started = time.time()
+        try:
+            with RelaySegmentClient(
+                str(spec.get("host", "")), int(spec.get("port", 0)),
+                n_embd=width, role=str(spec.get("role", "middle")),
+                timeout=float(spec.get("timeout", 60.0) or 60.0),
+            ) as client:
+                outcome = client.forward_hidden(hidden_bytes, n_tokens=n_tokens)
+        except Exception as exc:
+            logger.error("relay 段委托失败: %s", exc, exc_info=True)
+            self._send_layer_result(task_id, {}, error=f"relay_segment_failed:{exc}")
+            return
+        elapsed_ms = (time.time() - started) * 1000
+
+        if not outcome.ok:
+            code = getattr(outcome, "error", "") or "relay_internal_error"
+            logger.warning(
+                "relay 段委托未成功: task=%s step=%s code=%s", task_id, step, code
+            )
+            self._send_layer_result(task_id, {}, error=f"relay_segment_failed:{code}")
+            return
+
+        try:
+            out_tensor = torch.from_numpy(
+                np.frombuffer(bytes(outcome.hidden), dtype=np.float32).reshape(n_tokens, width)
+            )
+        except Exception as exc:
+            logger.error("relay 段返回的 hidden 无法还原: %s", exc, exc_info=True)
+            self._send_layer_result(task_id, {}, error=f"relay hidden 还原失败: {exc}")
+            return
+
+        response = {
+            "task_id": task_id,
+            "node_id": self._node_id,
+            "step": step,
+            "config_id": str(data.get("config_id", "")),
+            "model_sha256": str(data.get("model_sha256", "")),
+            "model_type": str(data.get("model_type", "")),
+            "chain_path": [*[str(x) for x in (data.get("chain_path") or [])], self._node_id],
+            "hidden_states": serialize_tensor_fast(out_tensor),
+            "hidden_shape": list(out_tensor.shape),
+            "metrics": {
+                "time_ms": round(elapsed_ms, 1),
+                "kv_cache": False,
+                "kv_seq_len": 0,
+                "relay_executed": True,
+                **outcome.to_metrics(),
+            },
+        }
+        logger.info(
+            "🔁 relay 段委托完成（从节点）: task=%s, step=%s, 段=%s@%s:%s, tokens=%s, time=%.0fms",
+            task_id, step, spec.get("role"), spec.get("host"), spec.get("port"),
+            n_tokens, elapsed_ms,
+        )
+        self._send_layer_result(task_id, response)
+
     def _handle_layer_forward_locked(self, data: dict) -> None:
+        # ★ A1 / X 档（Y 档第二条缺口 8）：`engine == "relay_middle"` ⇒ 本节点**不跑层**，
+        #   把 hidden 委托给远端 relay 段（段工件由外边监督的 relay_mid_service 持有）。
+        #   此前本方法只会"用本地模型跑层" ⇒ relay worker 一收到 LAYER_FORWARD 就报
+        #   「模型未加载」（实测 `层前向失败: step=0: 模型未加载`）。
+        with self._layer_config_lock:
+            _active_engine = str(
+                (self._active_layer_config or {}).get("engine", "") or ""
+            ).lower()
+        if _active_engine == "relay_middle":
+            return self._handle_layer_forward_via_relay(data)
+
         import torch
         from tcp_comm import deserialize_tensor_fast, serialize_tensor_fast
 

@@ -2004,6 +2004,24 @@ class SchedulerPipelineMixin:
                     )
                 )
                 self._layer_config_acks[client_id] = dict(data)
+                if not (ready or prepared or prepared_late):
+                    # ★ 诊断：把 ACK 与期望的**逐字段差异**一次打全 ——
+                    #   排障跨机 relay 时，ACK 恒判失败却完全看不出是哪个字段不等
+                    #   （`expected` 来自 `_publish_layer_configs` 写入的原始 config，
+                    #    含 `phase="prepare"` ⇒ 正常应命中 `prepared` 判据）。
+                    logger.warning(
+                        "层配置 ACK 未通过 node=%s expected_phase=%s 差异=%s",
+                        client_id, expected_phase,
+                        {
+                            key: {"got": data.get(key), "want": expected.get(key)}
+                            for key in (
+                                "status", "phase", "plan_id", "layer_range",
+                                "model_sha256", "model_type", "engine",
+                                "required_bytes", "available_bytes",
+                            )
+                            if data.get(key) != expected.get(key)
+                        },
+                    )
                 if ready:
                     self._layer_config_pushed.add(client_id)
                     self._layer_config_retry_state.pop(client_id, None)
@@ -4022,6 +4040,11 @@ class SchedulerPipelineMixin:
         require_torch()
         import uuid
         from transport_port import MessageType, deserialize_tensor, serialize_tensor
+        # ★ 与 worker 的 `deserialize_tensor_fast` 对称：fast 走 `TNR0` magic（numpy
+        #   frombuffer），**不经过 `torch.load`** —— torch ≥2.6 的 `weights_only=True` 默认
+        #   会让普通 pickle 载入失败（实测 `UnpicklingError: Unsupported operand 26`，
+        #   在跨机 relay 上表现为"末节点响应超时"）。
+        from tcp_comm import serialize_tensor_fast
 
         mgr = self._host
         if not mgr:
@@ -4029,9 +4052,23 @@ class SchedulerPipelineMixin:
 
         # ---- Step 1: 获取分层配置 ----
         layer_info = self.get_layer_assignments()
+        # ★ A1 / X 档（Y 档第二条缺口 7）：**不能**只按 `layers_count > 0` 过滤 —— relay 段节点是
+        #   **零层**条目（不占层，段工件在远端 relay_mid_service），却必须留在流水线里，
+        #   否则 `pipeline_nodes` 为空 ⇒ 直接返回「没有可用的流水线从节点」
+        #   （实测 `503 没有可用的流水线从节点`）。
+        #   判据与 `_get_pipeline_readiness` 一致：用 `_relay_segment_for_worker()` 真判据放行。
+        relay_for_worker = getattr(self, "_relay_segment_for_worker", None)
+
+        def _participates(item: dict) -> bool:
+            if item.get("layers_count", 0) > 0:
+                return True
+            return (
+                callable(relay_for_worker)
+                and relay_for_worker(item.get("node_id", "")) is not None
+            )
+
         assignments = [
-            a for a in layer_info.get("assignments", [])
-            if a.get("layers_count", 0) > 0
+            a for a in layer_info.get("assignments", []) if _participates(a)
         ]
         assignments.sort(key=lambda a: a.get("start_layer", 0))
 
@@ -4397,7 +4434,7 @@ class SchedulerPipelineMixin:
                         forward_data["hidden_wire_format"] = RELAY_HIDDEN_WIRE_FORMAT
                     else:
                         forward_data["hidden_states"] = _b64.b64encode(
-                            serialize_tensor(hs_cpu)
+                            serialize_tensor_fast(hs_cpu)
                         ).decode("ascii")
                         forward_data["hidden_shape"] = list(hs_cpu.shape)
                     logger.debug(
