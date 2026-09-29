@@ -2622,10 +2622,16 @@ class SchedulerPipelineMixin:
         **X 档只支持 `middle`**（hidden → hidden，与本节点"中间节点返回 hidden_states"的既有契约
         完全对齐）；`head`（吃 token 列表）与 `tail`（吐 token）需要主节点侧接受 token 语义，
         属 Y 档 ⇒ 这里**显式不认**（返回 `None` ⇒ 走原有拒绝，不会静默降级）。
+        **★ Y 档第二条：层区间必填**。relay 段必须声明它**认领**的层区间
+        `[layer_start, layer_end)` —— 这是修复「relay 段的层范围从未进入调度 ⇒ 主节点跑满
+        全部层、该段在"已过全部层"的 hidden 上重算」这一根因的**契约前提**：没有区间就无从
+        把该段的层从主节点层范围里扣除，也无从校验切分是否恰好覆盖。缺区间 ⇒ 整条不认
+        （fail-closed，绝不静默降级成"只带 n_embd"的半懂规格）。
         """
         if not isinstance(raw, dict):
             return None
-        if set(raw) - {"role", "host", "port", "n_embd", "timeout"}:
+        if set(raw) - {"role", "host", "port", "n_embd", "timeout",
+                       "layer_start", "layer_end"}:
             return None
         if str(raw.get("role", "")).strip().lower() != "middle":
             return None
@@ -2636,12 +2642,16 @@ class SchedulerPipelineMixin:
             port = int(raw.get("port", 0))
             n_embd = int(raw.get("n_embd", 0))
             timeout = float(raw.get("timeout", 60.0))
+            layer_start = int(raw.get("layer_start", -1))
+            layer_end = int(raw.get("layer_end", -1))
         except (TypeError, ValueError):
             return None
         if not (0 < port <= 65535) or n_embd < 1 or not (0.0 < timeout <= 3600.0):
             return None
+        if layer_start < 0 or layer_end <= layer_start:
+            return None     # 层区间必填且非空
         return {"role": "middle", "host": host, "port": port, "n_embd": n_embd,
-                "timeout": timeout}
+                "timeout": timeout, "layer_start": layer_start, "layer_end": layer_end}
 
     def _handle_layer_forward_via_relay(self, spec: dict[str, object], *, data: dict,
                                         task_id: str, step: int, config_id: str,
@@ -3621,11 +3631,15 @@ class SchedulerPipelineMixin:
 
     @staticmethod
     def _parse_relay_segment_map(raw: str) -> dict[str, dict[str, object]]:
-        """★ A1 / X 档：解析 `QLH_RELAY_SEGMENTS`（`node=role@host:port#n_embd`，`;`/`,` 分隔）。
+        """★ A1 / X 档（Y 档第二条扩层区间）：解析 `QLH_RELAY_SEGMENTS`。
 
-        只接受 **X 档范围内**的规格（`middle`、loopback、合法端口/宽度）—— 校验**复用**
-        `_normalize_relay_segment`（单一真源，避免两套判据漂移）。任何不合法的条目**整条丢弃**
-        （宁可不下发，也不下发"半懂"的规格）；空配置 ⇒ `{}`（行为与接线前一致）。
+        条目格式：`node=role@host:port#n_embd#start-end`（`;`/`,` 分隔），
+        其中 **`start-end` 是该段认领的层区间 `[start, end)`，必填**。
+
+        校验**复用** `_normalize_relay_segment`（单一真源，避免两套判据漂移）。任何不合法、
+        或**未声明层区间**的条目**整条丢弃** —— 宁可不下发，也不下发"只带 n_embd"的半懂规格：
+        后者会让主节点无从扣除该段的层，退化成"段在已过全部层的 hidden 上重算"。
+        空配置 ⇒ `{}`（行为与接线前一致）。
         """
         result: dict[str, dict[str, object]] = {}
         for chunk in str(raw or "").replace(",", ";").split(";"):
@@ -3633,15 +3647,22 @@ class SchedulerPipelineMixin:
             if not chunk or "=" not in chunk or "@" not in chunk:
                 continue
             name, _, value = chunk.partition("=")
-            body, _, n_embd_text = value.partition("#")
+            body, _, fields_text = value.partition("#")
             role, _, host_port = body.partition("@")
             host, _, port_text = host_port.rpartition(":")
+            fields = fields_text.split("#")
+            if len(fields) != 2:
+                continue        # 缺层区间（或多余字段）⇒ 整条丢弃
+            n_embd_text, range_text = fields
+            range_start, _, range_end = range_text.partition("-")
             try:
                 spec = SchedulerPipelineMixin._normalize_relay_segment({
                     "role": role.strip(),
                     "host": host.strip(),
                     "port": int(port_text),
                     "n_embd": int(n_embd_text),
+                    "layer_start": int(range_start),
+                    "layer_end": int(range_end),
                 })
             except ValueError:
                 continue

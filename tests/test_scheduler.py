@@ -2024,6 +2024,8 @@ class TestPipelineMessageDispatch:
             "port": 50183,
             "n_embd": 896,
             "timeout": 5.0,
+            "layer_start": 8,
+            "layer_end": 16,
         }
         load_calls = []
         fake_host = type("RelayHost", (), {
@@ -2067,7 +2069,7 @@ class TestPipelineMessageDispatch:
 
         relay_spec = {
             "role": "middle", "host": "127.0.0.1", "port": 50183,
-            "n_embd": 896, "timeout": 5.0,
+            "n_embd": 896, "timeout": 5.0, "layer_start": 8, "layer_end": 16,
         }
         sent = []
         sched._host = type("RelayHost", (), {
@@ -2099,7 +2101,7 @@ class TestPipelineMessageDispatch:
 
         relay_spec = {
             "role": "middle", "host": "127.0.0.1", "port": 50183,
-            "n_embd": 4, "timeout": 5.0,
+            "n_embd": 4, "timeout": 5.0, "layer_start": 8, "layer_end": 16,
         }
         sched._host = type("RelayHost", (), {
             "is_loaded": False, "model_loaded": False, "layer_range": None,

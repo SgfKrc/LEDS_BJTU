@@ -24,7 +24,7 @@ from scheduler import NodeInfo, NodeState, Scheduler  # noqa: E402
 
 RELAY_SPEC = {
     "role": "middle", "host": "127.0.0.1", "port": 50283,
-    "n_embd": 896, "timeout": 60.0,
+    "n_embd": 896, "timeout": 60.0, "layer_start": 8, "layer_end": 16,
 }
 
 

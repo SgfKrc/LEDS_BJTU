@@ -1283,6 +1283,8 @@ def test_configured_relay_worker_precedes_full_task_worker_opt_out(
         "port": 50183,
         "n_embd": 896,
         "timeout": 5.0,
+        "layer_start": 8,
+        "layer_end": 16,
     }
     sent = []
     scheduler._tcp_server = type("Server", (), {
