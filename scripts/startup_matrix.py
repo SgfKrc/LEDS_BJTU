@@ -31,6 +31,11 @@ NO_TORCH_TESTS = (
     "tests/test_api_cold_start.py::test_l_tier_cold_start_gguf_inference_and_tui_without_torch",
     "tests/test_api_cold_start.py::test_paged_kv_cache_import_keeps_torch_out_of_default_gguf_process",
     "tests/test_api_cold_start.py::test_default_gguf_api_import_and_bootstrap_queries_do_not_load_torch",
+    # ★ P0-3：Edge 入口 import 闭包的**静态**半边（顶层闭包不得有无条件 torch 系 import）。
+    #   与上面三条**运行时**判据互补 —— 那三条证明「无 torch 环境下能正常起来」，
+    #   这条证明「依赖闭包里根本没有会把 torch 拽进来的无条件顶层 import」
+    #   （SLIM 用 `uvicorn src.api_server:app` 跑源码，排除 torch 后顶层命中即 ImportError）。
+    "tests/test_edge_import_audit.py",
 )
 TUI_TESTS = (
     "tests/test_tui_backend.py",
@@ -125,6 +130,58 @@ def _run_subprocess(
     }
 
 
+def _run_import_audit(edge_python: Path, *, timeout_s: float) -> dict[str, Any]:
+    """★ P0-3：**静态** import 闭包审计（纯标准库 + AST，不 import 本仓模块）。
+
+    与 `edge_preflight.py` 的**运行时**探针互补：
+    * 运行时探针证明「装出来的 Edge 环境能起来、`sys.modules` 里没有 torch」；
+    * 本步证明「依赖闭包的**顶层**没有会把 torch 系拽进来的 import」——
+      SLIM 跑的是**源码** `uvicorn src.api_server:app` 且 `qlh-slim.spec` 排除 torch 系
+      ⇒ 顶层命中即 **导入即 ImportError**，`excludes` 救不了。
+    """
+    command = [
+        str(edge_python),
+        str(ROOT / "scripts" / "edge_import_audit.py"),
+        "--json",
+        # ★ `--summary`：`_run_subprocess` 只保留 stdout 的**尾部** OUTPUT_TAIL 字符，
+        #   而完整 JSON 带着整个闭包的模块名列表（实测 86 个）⇒ 必然从中间被截断，
+        #   表现为"JSON 非法"的假象（实测踩到过）。摘要用模块数代替列表。
+        "--summary",
+    ]
+    result = _run_subprocess(command, timeout_s=timeout_s)
+
+    raw_stdout = result.get("stdout", "")
+    if len(raw_stdout) >= OUTPUT_TAIL:
+        # 明确区分"被截断"与"JSON 非法"——否则下次还会被同一个假象误导。
+        result.update(
+            {
+                "ok": False,
+                "error": f"edge_import_audit stdout truncated at OUTPUT_TAIL={OUTPUT_TAIL}",
+            }
+        )
+        return result
+
+    try:
+        payload = json.loads(raw_stdout)
+    except json.JSONDecodeError as exc:
+        result.update(
+            {
+                "ok": False,
+                "error": f"edge_import_audit did not emit JSON: {exc}",
+            }
+        )
+        return result
+
+    # `--summary` 用 `entries`；不带 `--summary` 时是 `reports` —— 两种都认，避免接线漂移。
+    reports = payload.get("entries") or payload.get("reports") or []
+    blocking = [hit for report in reports for hit in report.get("blocking", [])]
+    result["ok"] = bool(result.get("ok")) and not blocking
+    result["import_audit"] = payload
+    if blocking:
+        result["error"] = f"forbidden top-level imports in edge closure: {blocking}"
+    return result
+
+
 def _run_edge_profile(edge_python: Path, *, timeout_s: float) -> dict[str, Any]:
     command = [
         str(edge_python),
@@ -138,18 +195,44 @@ def _run_edge_profile(edge_python: Path, *, timeout_s: float) -> dict[str, Any]:
         result["profile"] = "edge"
         return result
 
-    try:
-        preflight = json.loads(result.get("stdout", ""))
-    except json.JSONDecodeError as exc:
+    raw_stdout = result.get("stdout", "")
+    if len(raw_stdout) >= OUTPUT_TAIL:
+        # 与审计那一步同因：`_run_subprocess` 只保留**尾部** OUTPUT_TAIL 字符 ⇒
+        # 明确区分"被截断"与"JSON 非法"，别让截断伪装成非法 JSON。
         result.update(
             {
                 "ok": False,
-                "error": f"edge_preflight did not emit JSON: {exc}",
+                "error": f"edge_preflight stdout truncated at OUTPUT_TAIL={OUTPUT_TAIL}",
             }
         )
     else:
-        result["ok"] = result["ok"] and preflight.get("ok") is True
-        result["preflight"] = preflight
+        try:
+            preflight = json.loads(raw_stdout)
+        except json.JSONDecodeError as exc:
+            result.update(
+                {
+                    "ok": False,
+                    "error": f"edge_preflight did not emit JSON: {exc}",
+                }
+            )
+        else:
+            result["ok"] = result["ok"] and preflight.get("ok") is True
+            result["preflight"] = preflight
+            # ★ 把运行半边的 SLIM 结论透出，便于直接从矩阵报告读出真实载荷的状态。
+            checks = preflight.get("checks") or {}
+            result["slim_entry_present"] = preflight.get("slim_entry_present")
+            result["slim_entry_import_ok"] = checks.get("slim_entry_import")
+
+    # ★ 静态半边：无论 preflight 的 JSON 是否可解析都要跑（它是独立的判据，
+    #   不能被前一步的失败"顺带跳过"而假装通过）。
+    audit = _run_import_audit(edge_python, timeout_s=timeout_s)
+    result["ok"] = result.get("ok") is True and audit.get("ok") is True
+    result["import_audit_ok"] = audit.get("ok") is True
+    if "import_audit" in audit:
+        result["import_audit"] = audit["import_audit"]
+    if audit.get("error"):
+        result["import_audit_error"] = audit["error"]
+
     result["profile"] = "edge"
     return result
 

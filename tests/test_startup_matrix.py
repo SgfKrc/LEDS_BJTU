@@ -39,6 +39,14 @@ def test_matrix_runs_selected_profiles_and_collects_failures(monkeypatch, tmp_pa
                 "stdout": '{"ok": true, "checks": {"cold_start": true}}',
                 "stderr": "",
             }
+        if any(str(item).endswith("edge_import_audit.py") for item in command):
+            return {
+                "ok": True,
+                "returncode": 0,
+                "stdout": '{"forbidden": ["torch"], "reports": ['
+                          '{"entry": "qlh_edge", "blocking": []}]}',
+                "stderr": "",
+            }
         return {"ok": False, "returncode": 1, "stdout": "pytest output", "stderr": "failure"}
 
     monkeypatch.setattr(startup_matrix, "_run_subprocess", fake_run)
@@ -56,8 +64,10 @@ def test_matrix_runs_selected_profiles_and_collects_failures(monkeypatch, tmp_pa
         "tui",
         "edge",
     ]
-    assert len(calls) == 4
+    # 4 个 profile：full/no-torch/tui 各 1 次，edge 里 **2 次**（运行时探针 + 静态 import 审计）。
+    assert len(calls) == 5
     assert report["results"][-1]["preflight"]["ok"] is True
+    assert report["results"][-1]["import_audit_ok"] is True
 
 
 def test_edge_profile_rejects_non_json_preflight(monkeypatch, tmp_path):
@@ -77,3 +87,36 @@ def test_edge_profile_rejects_non_json_preflight(monkeypatch, tmp_path):
     assert result["profile"] == "edge"
     assert result["ok"] is False
     assert "did not emit JSON" in result["error"]
+    # 两步是**独立判据**：preflight 的 JSON 解析失败不得让静态审计"顺带跳过"而假装通过。
+    assert result["import_audit_ok"] is False
+
+
+def test_edge_profile_fails_when_import_audit_reports_blocking(monkeypatch, tmp_path):
+    """★ P0-3 的**该红必须红**：静态审计报出顶层 forbidden import ⇒ edge profile 必须失败。
+
+    没有这条，`import_audit_ok` 就可能变成一个"永远 True 的装饰字段"。
+    """
+    def fake_run(command, **_kwargs):
+        if any(str(item).endswith("edge_preflight.py") for item in command):
+            return {
+                "ok": True,
+                "returncode": 0,
+                "stdout": '{"ok": true, "checks": {"cold_start": true}}',
+                "stderr": "",
+            }
+        return {
+            "ok": True,
+            "returncode": 0,
+            "stdout": '{"reports": [{"entry": "src.api_server", "blocking": '
+                      '[["model_module", "torch", 48, "must_load"]]}]}',
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(startup_matrix, "_run_subprocess", fake_run)
+
+    result = startup_matrix._run_edge_profile(tmp_path / "python", timeout_s=1)
+
+    assert result["preflight"]["ok"] is True      # 运行时探针本身是好的
+    assert result["import_audit_ok"] is False     # 静态判据单独把它拦下来
+    assert result["ok"] is False
+    assert "forbidden top-level imports" in result["import_audit_error"]

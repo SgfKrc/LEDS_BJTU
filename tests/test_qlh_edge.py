@@ -172,3 +172,113 @@ def test_development_edge_environment_passes_preflight():
     result = run_preflight(edge_python)
 
     assert result["ok"], result
+
+
+def _all_green_probe(entry, repository_root, **_kwargs):
+    """合成一个「qlh_edge 探针全绿」的返回，用于把判据隔离到 SLIM 入口上。"""
+    from scripts.edge_preflight import REQUIRED_ROUTES, ROUTES_CONTRACT_ENTRY
+
+    assert entry == ROUTES_CONTRACT_ENTRY, "absent 场景下不该去探 SLIM 入口"
+    return {
+        "entry": entry,
+        "ok": True,
+        "import_elapsed_s": 0.1,
+        "has_app": True,
+        "routes": list(REQUIRED_ROUTES),
+        "missing_required": [],
+        "forbidden_imported": [],
+        "forbidden_installed": [],
+        "probe_returncode": 0,
+    }
+
+
+def test_preflight_fails_when_slim_entry_cannot_import(monkeypatch, tmp_path):
+    """★ P0-3 的**该红必须红**：SLIM 真实载荷导入失败 ⇒ preflight 必须失败。
+
+    没有这条，`slim_entry_*` 三条 check 就可能退化成"永远 PASS 的装饰字段"。
+    这里让 qlh_edge 探针全绿、只让 `src.api_server` 的那次失败 ⇒ 唯一的红因就是它。
+    """
+    from scripts import edge_preflight
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "api_server.py").write_text("app = None\n", encoding="ascii")
+
+    def fake_run_probe(python_executable, repository_root, entry=edge_preflight.ROUTES_CONTRACT_ENTRY):
+        if entry == edge_preflight.SLIM_ENTRY:
+            return {"ok": False, "error": "slim boom", "probe_returncode": 1}
+        return _all_green_probe(entry, repository_root)
+
+    monkeypatch.setattr(edge_preflight, "_run_probe", fake_run_probe)
+
+    # `venv_size` 量的是**解释器所在 venv**（这里 = 跑测试的 `.venv-test`）⇒ 放宽，
+    # 免得这条因为与测试目标无关的体积判据假红。
+    result = edge_preflight.run_preflight(sys.executable, tmp_path, max_size_mb=10_000.0)
+
+    assert result["slim_entry_present"] is True
+    assert result["checks"]["slim_entry_import"] is False
+    assert result["checks"]["slim_entry_no_forbidden"] is True   # 只是导入失败，不代表拉进了 forbidden
+    assert result["checks"]["probe"] is True                     # 契约入口那一半是好的
+    assert result["ok"] is False                                 # ⇒ 唯一红因 = SLIM 入口
+
+
+def test_preflight_fails_when_slim_entry_pulls_forbidden_module(monkeypatch, tmp_path):
+    """反向：SLIM 载荷能导入、但把 forbidden 拽进了 `sys.modules` ⇒ 同样必须失败。"""
+    from scripts import edge_preflight
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "api_server.py").write_text("app = None\n", encoding="ascii")
+
+    def fake_run_probe(python_executable, repository_root, entry=edge_preflight.ROUTES_CONTRACT_ENTRY):
+        if entry == edge_preflight.SLIM_ENTRY:
+            return {
+                "entry": entry,
+                "ok": True,
+                "import_elapsed_s": 0.2,
+                "has_app": True,
+                "routes": [],
+                "missing_required": [],
+                "forbidden_imported": ["torch"],
+                "forbidden_installed": ["torch"],
+                "probe_returncode": 0,
+            }
+        return _all_green_probe(entry, repository_root)
+
+    monkeypatch.setattr(edge_preflight, "_run_probe", fake_run_probe)
+
+    result = edge_preflight.run_preflight(sys.executable, tmp_path, max_size_mb=10_000.0)
+
+    assert result["checks"]["slim_entry_import"] is True
+    assert result["checks"]["slim_entry_no_forbidden"] is False
+    assert result["ok"] is False
+
+
+def test_preflight_skips_slim_entry_when_package_omits_it(monkeypatch, tmp_path):
+    """Edge 安装包可以不含 `src/api_server.py` ⇒ 三条 slim check 不判失败，**也不去探它**。"""
+    from scripts import edge_preflight
+
+    def fake_run_probe(python_executable, repository_root, entry=edge_preflight.ROUTES_CONTRACT_ENTRY):
+        return _all_green_probe(entry, repository_root)   # 内部 assert 只允许契约入口
+
+    monkeypatch.setattr(edge_preflight, "_run_probe", fake_run_probe)
+
+    result = edge_preflight.run_preflight(sys.executable, tmp_path, max_size_mb=10_000.0)
+
+    assert result["slim_entry_present"] is False
+    assert result["checks"]["slim_entry_import"] is True
+    assert result["checks"]["slim_entry_no_forbidden"] is True
+    assert result["checks"]["slim_entry_required_modules"] is True
+    assert result["ok"] is True
+
+
+def test_probe_code_imports_the_requested_entry():
+    """防漂移：`_probe_code` 必须 import **传入的** entry，不能退回硬编码 `import qlh_edge`。"""
+    from scripts import edge_preflight
+
+    code = edge_preflight._probe_code(edge_preflight.SLIM_ENTRY)
+
+    assert "importlib.import_module" in code
+    assert edge_preflight.SLIM_ENTRY in code
+    assert edge_preflight.PROBE_ENTRIES == (
+        edge_preflight.ROUTES_CONTRACT_ENTRY,
+        edge_preflight.SLIM_ENTRY,
+    )

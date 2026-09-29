@@ -1264,6 +1264,85 @@ def test_full_task_worker_takes_precedence_over_automatic_layer_assignment(
     assert "worker_01" in scheduler._pipeline_worker_opt_out
 
 
+@pytest.mark.parametrize("previously_opted_out", [False, True])
+def test_configured_relay_worker_precedes_full_task_worker_opt_out(
+        monkeypatch, previously_opted_out):
+    from scheduler import NodeInfo, NodeRole, NodeState, Scheduler
+
+    scheduler = Scheduler()
+    scheduler._role_override = "master"
+    scheduler.nodes["worker_01"] = NodeInfo(
+        node_id="worker_01",
+        role=NodeRole.CLIENT,
+        node_type="pc",
+        state=NodeState.ONLINE,
+    )
+    relay_spec = {
+        "role": "middle",
+        "host": "127.0.0.1",
+        "port": 50183,
+        "n_embd": 896,
+        "timeout": 5.0,
+        "layer_start": 8,
+        "layer_end": 16,
+    }
+    sent = []
+    scheduler._tcp_server = type("Server", (), {
+        "_running": True,
+        "clients": {"worker_01": object()},
+        "get_client_ids": lambda self: ["worker_01"],
+        "send_layer_config": lambda self, node_id, payload: sent.append(
+            (node_id, payload)
+        ),
+    })()
+    monkeypatch.setattr(scheduler, "get_effective_node_id", lambda: "master")
+    monkeypatch.setattr(
+        scheduler,
+        "get_layer_assignments",
+        lambda: {"assignments": [
+            {"node_id": "master", "start_layer": 0, "end_layer": 21},
+            {"node_id": "worker_01", "start_layer": 21, "end_layer": 24},
+        ]},
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_get_active_pipeline_model_info",
+        lambda: {
+            "model_id": "qwen-1_8b",
+            "model_sha256": "1" * 64,
+            "model_type": "qwen",
+            "total_layers": 24,
+            "quant_type": "fp16",
+        },
+    )
+    monkeypatch.setattr(
+        scheduler, "_task_worker_full_model_ids", lambda: {"worker_01"},
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_relay_segment_for_worker",
+        lambda node_id, routing_preference="auto": (
+            relay_spec if node_id == "worker_01" else None
+        ),
+    )
+    monkeypatch.setattr(scheduler, "_start_layer_config_retry_monitor", lambda: None)
+    if previously_opted_out:
+        scheduler._pipeline_worker_opt_out.add("worker_01")
+
+    scheduler.push_layer_config_to_clients()
+    scheduler._handle_layer_worker_opt_out("worker_01", {"data": {
+        "node_id": "worker_01",
+    }})
+
+    assert "worker_01" not in scheduler._pipeline_worker_opt_out
+    assert len(sent) == 2
+    for node_id, config in sent:
+        assert node_id == "worker_01"
+        assert config.get("release") is not True
+        assert config["engine"] == "relay_middle"
+        assert config["relay_segment"] == relay_spec
+
+
 def test_scheduler_experimental_gate_reports_physical_validation_pending(
     monkeypatch,
 ):

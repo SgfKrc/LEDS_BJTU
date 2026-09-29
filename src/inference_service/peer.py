@@ -30,6 +30,9 @@ from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
 
 logger = logging.getLogger("inference_service.peer")
 
+# Keep this lightweight peer import independent from the full scheduler module.
+RELAY_HIDDEN_WIRE_FORMAT = "qlh.relay_hidden.f32.v1"
+
 
 class PeerClient:
     """从节点客户端：连接主节点 + 层段加载 + 层前向执行闭环。"""
@@ -75,6 +78,9 @@ class PeerClient:
         self._active_pipeline_task_ids: set = set()
         self._local_pipeline_cancelled: set = set()
         self._kv_cache: Dict[str, Any] = {}
+        # Relay sessions are task-scoped. Closing a client sends CLOSE and
+        # resets the remote runner's KV state, so it must not happen per step.
+        self._relay_sessions: Dict[str, Any] = {}
         self._pending_layer_config: Optional[tuple] = None
         self._running = False
         self._client: Optional[Any] = None  # tcp_comm.TCPClient
@@ -104,6 +110,8 @@ class PeerClient:
             self._report_device_profile()
 
         def _on_disconnect() -> None:
+            with self._layer_execution_lock:
+                self._close_all_relay_sessions()
             logger.warning("与主节点连接断开: %s:%s", self._master_host, self._master_port)
             with self._layer_config_lock:
                 self._active_layer_config = None
@@ -187,6 +195,7 @@ class PeerClient:
             if target_node_id != node_id:
                 logger.warning("忽略目标不匹配的分层释放: target=%s local=%s", target_node_id, node_id)
                 return
+            self._close_all_relay_sessions()
             with self._layer_config_lock:
                 self._active_layer_config = None
                 self._local_pipeline_steps.clear()
@@ -202,10 +211,17 @@ class PeerClient:
                         )
                 except Exception:
                     logger.warning("清理已中止的 assignment 缓存失败", exc_info=True)
+            # ★ A1 / X 档（Y 档第二条缺口 2）：release ACK **必须**回 `release` 与 `generation`
+            #   两个字段 —— 主节点 `scheduler_pipeline.py:1930-1934` 的 `released` 判据是
+            #   `status == "released"` **且** `release is True` **且** `generation` 相等。
+            #   此前只回 status ⇒ 主节点恒判「从节点分层释放 ACK 未通过」⇒ 每 5 秒重发
+            #   （实测刷了 99 次 attempt），进而 `pipeline_distributed_workers_unavailable`。
             self._send_layer_config_ack({
                 "node_id": node_id,
                 "config_id": str(data.get("config_id", "")),
                 "status": "released",
+                "release": True,
+                "generation": int(data.get("generation", 0) or 0),
             })
             logger.info("分层配置已释放: config_id=%s", data.get("config_id", ""))
             return
@@ -251,6 +267,43 @@ class PeerClient:
             f"🔧 收到分层配置: 节点={node_id}, Layer {start}-{end}, "
             f"embed={has_embed}, lm_head={has_lm}, config_id={config_id or 'legacy'}"
         )
+
+        # ★ A1 / X 档（Y 档第二条缺口 5）：`engine == "relay_middle"` ⇒ **不加载任何层**。
+        #   段工件由远端 relay_mid_service 持有（正是 `scheduler_pipeline.py:2255` 分支的语义：
+        #   "this scheduler host does not need a local ModelHost/model loaded"）。
+        #   此前这里无条件 `load_model` + `load_layer_range` ⇒ relay worker 白加载一遍 23-24 层
+        #   （实测日志反复出现 `✅ 层段加载完成: Layer 23-24`），既浪费又会让它按普通层节点
+        #   去响应 LAYER_FORWARD（`a bytes-like object is required, not 'str'`）。
+        #   ⇒ 直接回 ready；`layer_range` 用 **list**（与主节点 `expected_range` 同型）。
+        if str(cfg.get("engine", "pytorch") or "pytorch").lower() == "relay_middle":
+            with self._layer_config_lock:
+                self._active_layer_config = dict(cfg)
+            # ⚠️ 阶段判定：主节点下发时带了 `"phase": "prepare"`（`scheduler_pipeline.py:313-321`）
+            #   ⇒ ACK 必须走 **`prepared`** 判据（`:1954-1965`：`status=="prepared"` 且
+            #   `phase=="prepare"` 且 `plan_id`/`layer_range`/`model_sha256`/`model_type`/`engine`
+            #   全等，且 `available_bytes >= required_bytes`）。
+            #   relay 节点不落任何层 ⇒ `available_bytes` 给一个足够大的占位值，
+            #   `required_bytes` 本就是 0（`pipeline_capacity` 的零层条目）。
+            self._send_layer_config_ack({
+                "node_id": node_id,
+                "config_id": config_id,
+                "status": "prepared",
+                "phase": "prepare",
+                "plan_id": str(cfg.get("plan_id", "")),
+                "layer_range": [int(start), int(end)],
+                "model_sha256": expected_sha256,
+                "model_type": expected_model_type,
+                "engine": "relay_middle",
+                "has_embedding": bool(has_embed),
+                "has_lm_head": bool(has_lm),
+                "available_bytes": 1 << 40,
+            })
+            logger.info(
+                "relay_middle 段配置就绪（本节点不加载层，段由远端服务持有）: "
+                "Layer %s-%s, config_id=%s",
+                start, end, config_id,
+            )
+            return
 
         try:
             if target_node_id != node_id:
@@ -335,7 +388,270 @@ class PeerClient:
         with self._layer_execution_lock:
             self._handle_layer_forward_locked(data)
 
+    def _handle_layer_forward_via_relay(self, data: dict) -> None:
+        """★ A1 / X 档（Y 档第二条缺口 8）：委托远端 relay **middle** 段执行本步，再回主节点。
+
+        与 `scheduler_pipeline._handle_layer_forward_via_relay` **同语义**（吃 hidden、吐
+        hidden），但跑在**从节点进程**里。此前本文件只实现了「用本地模型跑层」⇒ relay worker
+        一收到 `LAYER_FORWARD` 就报「模型未加载」（实测 `层前向失败: step=0: 模型未加载`）。
+
+        ⚠️ 线上格式差异：主节点发来的 `hidden_states` 是 `serialize_tensor_fast` 的 base64
+        （它按**首个 worker** 决定格式，看不到末节点是不是 relay）⇒ 这里先反序列化成 tensor、
+        取 **raw f32** 交给 relay 段；回来时反向转回主节点期望的格式。
+        """
+        import base64 as _b64
+
+        import numpy as np
+        import torch
+        # Product relay frames are explicit raw-f32 plus shape metadata. The
+        # tensor-fast fallback below is retained only for older non-relay peers.
+        # Relay product frames use explicit raw-f32 metadata; the legacy
+        # tensor-fast decoder below remains for mixed-version non-relay frames.
+        from tcp_comm import deserialize_tensor_fast
+
+        from relay_segment_client import RelaySegmentClient
+
+        task_id = str(data.get("task_id", "unknown") or "unknown")
+        try:
+            step = int(data.get("step", 0))
+        except (TypeError, ValueError):
+            step = -1
+
+        cfg = dict(self._active_layer_config or {})
+        spec = cfg.get("relay_segment") or {}
+        if not isinstance(spec, dict) or not spec:
+            self._send_layer_result(task_id, {}, error="relay_middle 缺少 relay_segment 规格")
+            return
+        width = int(spec.get("n_embd", 0) or 0)
+        # ★ Y-(b)：按**角色**分流。`middle` = hidden → hidden（把 hidden 转给远端段，再把
+        #   hidden 回给主节点）；`tail` = hidden → token（远端段跑完本段并回 **argmax**，
+        #   本节点把 token 回给主节点）。`head` 在**从节点这一侧**不支持 —— head 段要拿
+        #   token 序列，而从节点从主节点收到的是 hidden，语义不成立 ⇒ 明确拒绝，
+        #   绝不"当成 middle 硬算"（那会静默产出错误数值）。
+        role = str(spec.get("role", "middle") or "middle").strip().lower()
+        if role not in {"middle", "tail"}:
+            self._send_layer_result(task_id, {}, error=f"relay_role_unsupported:{role}")
+            return
+
+        raw = data.get("hidden_states")
+        if isinstance(raw, str):
+            raw_bytes = _b64.b64decode(raw)
+        elif isinstance(raw, (bytes, bytearray)):
+            raw_bytes = bytes(raw)
+        else:
+            self._send_layer_result(task_id, {}, error="relay 段委托缺 hidden_states")
+            return
+
+        wire_format = str(data.get("hidden_wire_format", "") or "")
+        hidden_shape = data.get("hidden_shape")
+        try:
+            if wire_format == RELAY_HIDDEN_WIRE_FORMAT:
+                # Product relay handoff is raw contiguous f32. Preserve the
+                # original shape for the return trip to the master's LM head.
+                if not isinstance(hidden_shape, list) or not hidden_shape:
+                    raise ValueError("relay hidden_shape is required for raw f32 payload")
+                expected_items = 1
+                for size in hidden_shape:
+                    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                        raise ValueError("relay hidden_shape must contain positive integers")
+                    expected_items *= size
+                if hidden_shape[-1] != width:
+                    raise ValueError(
+                        f"relay hidden_shape last dimension {hidden_shape[-1]} != n_embd {width}"
+                    )
+                if len(raw_bytes) != expected_items * 4:
+                    raise ValueError(
+                        f"relay raw f32 length mismatch: bytes={len(raw_bytes)} "
+                        f"expected={expected_items * 4}"
+                    )
+                hidden_bytes = raw_bytes
+            else:
+                # Legacy mixed-version workers still use tensor-fast.
+                tensor = deserialize_tensor_fast(raw_bytes)
+                hidden_bytes = tensor.detach().cpu().float().contiguous().numpy().tobytes()
+                hidden_shape = list(tensor.shape)
+        except Exception as exc:
+            logger.error("relay hidden wire decode failed: %s", exc, exc_info=True)
+            self._send_layer_result(task_id, {}, error=f"relay hidden wire decode failed: {exc}")
+            return
+
+        if width <= 0 or len(hidden_bytes) % (width * 4):
+            self._send_layer_result(
+                task_id, {}, error="relay 段委托的 hidden 长度与 n_embd 不匹配（需 f32 且整除）"
+            )
+            return
+        n_tokens = len(hidden_bytes) // (width * 4)
+
+        seq_ids = data.get("seq_ids")
+        positions = data.get("positions")
+        seq_meta = None
+        if seq_ids is not None or positions is not None:
+            if not (isinstance(seq_ids, list) and isinstance(positions, list)
+                    and len(seq_ids) == n_tokens and len(positions) == n_tokens):
+                self._send_layer_result(
+                    task_id, {},
+                    error="relay seq_ids/positions must match hidden token count",
+                )
+                return
+            try:
+                seq_values = [int(value) for value in seq_ids]
+                pos_values = [int(value) for value in positions]
+                if any(value < 0 for value in seq_values + pos_values):
+                    raise ValueError
+                raw_n_seq_id = data.get("n_seq_id")
+                if raw_n_seq_id is None:
+                    n_seq_values = [1] * n_tokens
+                elif isinstance(raw_n_seq_id, list) and len(raw_n_seq_id) == n_tokens:
+                    n_seq_values = [int(value) for value in raw_n_seq_id]
+                else:
+                    raise ValueError
+                if any(value < 1 for value in n_seq_values):
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError):
+                self._send_layer_result(task_id, {}, error="relay seq_ids/positions are invalid")
+                return
+            seq_meta = {
+                "n_seq_id": n_seq_values,
+                "seq_ids": seq_values,
+                "positions": pos_values,
+            }
+
+        started = time.time()
+        try:
+            endpoint_key = (
+                str(spec.get("host", "")), int(spec.get("port", 0)), width, role,
+                float(spec.get("timeout", 60.0) or 60.0),
+            )
+            sessions = getattr(self, "_relay_sessions", None)
+            if sessions is None:
+                sessions = self._relay_sessions = {}
+            client = sessions.get(task_id)
+            if client is not None and getattr(client, "_relay_endpoint_key", None) != endpoint_key:
+                self._close_relay_session(task_id)
+                client = None
+            if client is None:
+                client = RelaySegmentClient(
+                    endpoint_key[0], endpoint_key[1], n_embd=width,
+                    role=role, timeout=endpoint_key[4],
+                )
+                client._relay_endpoint_key = endpoint_key
+                sessions[task_id] = client
+            if role == "tail":
+                if seq_meta is None:
+                    outcome = client.forward_hidden_to_token(hidden_bytes, n_tokens=n_tokens)
+                else:
+                    outcome = client.forward_hidden_to_token(
+                        hidden_bytes, n_tokens=n_tokens, seq_meta=seq_meta)
+            else:
+                if seq_meta is None:
+                    outcome = client.forward_hidden(hidden_bytes, n_tokens=n_tokens)
+                else:
+                    outcome = client.forward_hidden(
+                        hidden_bytes, n_tokens=n_tokens, seq_meta=seq_meta)
+        except Exception as exc:
+            logger.error("relay 段委托失败: %s", exc, exc_info=True)
+            self._close_relay_session(task_id)
+            self._send_layer_result(task_id, {}, error=f"relay_segment_failed:{exc}")
+            return
+        elapsed_ms = (time.time() - started) * 1000
+
+        if not outcome.ok:
+            code = getattr(outcome, "error", "") or "relay_internal_error"
+            logger.warning(
+                "relay 段委托未成功: task=%s step=%s code=%s", task_id, step, code
+            )
+            self._close_relay_session(task_id)
+            self._send_layer_result(task_id, {}, error=f"relay_segment_failed:{code}")
+            return
+
+        common_response = {
+            "task_id": task_id,
+            "node_id": self._node_id,
+            "step": step,
+            "config_id": str(data.get("config_id", "")),
+            "model_sha256": str(data.get("model_sha256", "")),
+            "model_type": str(data.get("model_type", "")),
+            "chain_path": [*[str(x) for x in (data.get("chain_path") or [])], self._node_id],
+            "metrics": {
+                "time_ms": round(elapsed_ms, 1),
+                "kv_cache": False,
+                "kv_seq_len": 0,
+                "relay_executed": True,
+                **outcome.to_metrics(),
+            },
+        }
+
+        if role == "tail":
+            # ★ Y-(b)：末段回 **token**（远端已跑完本段并做完 argmax）。
+            token = getattr(outcome, "token", None)
+            if token is None:
+                self._send_layer_result(task_id, {}, error="relay tail 段未返回 token")
+                self._close_relay_session(task_id)
+                return
+            response = {**common_response, "token": int(token)}
+        else:
+            try:
+                shape = tuple(int(size) for size in hidden_shape)
+                out_array = np.frombuffer(bytes(outcome.hidden), dtype=np.float32)
+                expected_items = int(np.prod(shape))
+                if out_array.size != expected_items:
+                    raise ValueError(
+                        f"relay output length mismatch: items={out_array.size} "
+                        f"expected={expected_items}"
+                    )
+                out_tensor = torch.from_numpy(out_array.reshape(shape).copy())
+            except Exception as exc:
+                logger.error("relay 段返回的 hidden 无法还原: %s", exc, exc_info=True)
+                self._send_layer_result(task_id, {}, error=f"relay hidden 还原失败: {exc}")
+                self._close_relay_session(task_id)
+                return
+            # Keep the relay contract symmetric with scheduler_pipeline:
+            # raw f32 in both directions, with an explicit discriminator.
+            response = {
+                **common_response,
+                "hidden_states": out_tensor.detach().cpu().float().contiguous().numpy().tobytes(),
+                "hidden_wire_format": RELAY_HIDDEN_WIRE_FORMAT,
+                "hidden_shape": list(out_tensor.shape),
+            }
+        logger.info(
+            "🔁 relay 段委托完成（从节点）: task=%s, step=%s, 段=%s@%s:%s, tokens=%s, time=%.0fms",
+            task_id, step, spec.get("role"), spec.get("host"), spec.get("port"),
+            n_tokens, elapsed_ms,
+        )
+        self._send_layer_result(task_id, response)
+
+    def _close_relay_session(self, task_id: str) -> None:
+        """Close one task-scoped relay connection and forget it."""
+        sessions = getattr(self, "_relay_sessions", None)
+        if not sessions:
+            return
+        client = sessions.pop(str(task_id), None)
+        if client is None:
+            return
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001 - cleanup must not mask pipeline state
+            logger.warning("relay session close failed: task=%s", task_id, exc_info=True)
+
+    def _close_all_relay_sessions(self) -> None:
+        sessions = getattr(self, "_relay_sessions", None)
+        if not sessions:
+            return
+        for task_id in list(sessions):
+            self._close_relay_session(task_id)
+
     def _handle_layer_forward_locked(self, data: dict) -> None:
+        # ★ A1 / X 档（Y 档第二条缺口 8）：`engine == "relay_middle"` ⇒ 本节点**不跑层**，
+        #   把 hidden 委托给远端 relay 段（段工件由外边监督的 relay_mid_service 持有）。
+        #   此前本方法只会"用本地模型跑层" ⇒ relay worker 一收到 LAYER_FORWARD 就报
+        #   「模型未加载」（实测 `层前向失败: step=0: 模型未加载`）。
+        with self._layer_config_lock:
+            _active_engine = str(
+                (self._active_layer_config or {}).get("engine", "") or ""
+            ).lower()
+        if _active_engine == "relay_middle":
+            return self._handle_layer_forward_via_relay(data)
+
         import torch
         from tcp_comm import deserialize_tensor_fast, serialize_tensor_fast
 
@@ -531,22 +847,26 @@ class PeerClient:
     def _handle_pipeline_done(self, data: dict) -> None:
         task_id = data.get("task_id", "")
         if task_id:
-            with self._layer_config_lock:
-                self._local_pipeline_cancelled.discard(task_id)
-                self._local_pipeline_steps.pop(task_id, None)
-            with self._kv_cache_lock:
-                self._kv_cache.pop(task_id, None)
-            logger.info(f"🧹 流水线任务 {task_id} KV 缓存已清理")
+            with self._layer_execution_lock:
+                self._close_relay_session(task_id)
+                with self._layer_config_lock:
+                    self._local_pipeline_cancelled.discard(task_id)
+                    self._local_pipeline_steps.pop(task_id, None)
+                with self._kv_cache_lock:
+                    self._kv_cache.pop(task_id, None)
+                logger.info(f"🧹 流水线任务 {task_id} KV 缓存已清理")
 
     def _handle_pipeline_abort(self, data: dict) -> None:
         task_id = data.get("task_id", "")
         if task_id:
-            with self._layer_config_lock:
-                self._local_pipeline_steps.pop(task_id, None)
-            self._local_pipeline_cancelled.add(task_id)
-            with self._kv_cache_lock:
-                self._kv_cache.pop(task_id, None)
-            logger.info(f"流水线任务取消: {task_id}")
+            with self._layer_execution_lock:
+                self._close_relay_session(task_id)
+                with self._layer_config_lock:
+                    self._local_pipeline_steps.pop(task_id, None)
+                    self._local_pipeline_cancelled.add(task_id)
+                with self._kv_cache_lock:
+                    self._kv_cache.pop(task_id, None)
+                logger.info(f"流水线任务取消: {task_id}")
 
     # ------------------------------------------------------------------
     # 设备画像上报（心跳时附带）

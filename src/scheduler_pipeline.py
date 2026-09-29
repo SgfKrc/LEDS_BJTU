@@ -13,7 +13,10 @@ from config import (PIPELINE_MODEL_SYNC_TIMEOUT, PIPELINE_RELAY_ENABLED,
                     PIPELINE_RELAY_SEGMENTS)
 # ★ #31 M2：层流水线支持的架构**单一事实来源**（此前在 4 处各写了一份 `{"qwen","qwen2"}`）
 from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
-from relay_segment_client import RelaySegmentClient, RelaySegmentError
+from relay_segment_client import (
+    RelaySegmentClient,
+    RelaySegmentError,
+)
 from relay_transport import is_loopback_host
 from scheduler_types import PreemptState
 from torch_runtime import require_torch
@@ -161,9 +164,19 @@ class SchedulerPipelineMixin:
         full_worker_release_ids = (
             releasable_legacy_ids & self._task_worker_full_model_ids()
         )
+        # A node explicitly assigned to an endpoint-backed relay segment is
+        # still a pipeline participant even if it also advertises a full model.
+        relay_worker_ids = {
+            node_id for node_id in releasable_legacy_ids
+            if self._relay_segment_for_worker(node_id) is not None
+        }
+        full_worker_release_ids.difference_update(relay_worker_ids)
         layer_releasable_worker_ids = releasable_legacy_ids - full_worker_release_ids
 
         with self._layer_config_lock:
+            # Clear stale opt-outs created before this node was assigned as a
+            # relay; compute_layer_assignment filters opted-out nodes first.
+            self._pipeline_worker_opt_out.difference_update(relay_worker_ids)
             if full_worker_release_ids:
                 self._pipeline_worker_opt_out.update(full_worker_release_ids)
             authoritative_sync = bool(
@@ -309,6 +322,11 @@ class SchedulerPipelineMixin:
             relay_segment = self._relay_segment_for_worker(nid)
             if relay_segment is not None:
                 assignments[nid]["relay_segment"] = relay_segment
+                logger.info(
+                    "relay 段委派已下发: node=%s → %s@%s:%s（该节点不加载本地层）",
+                    nid, relay_segment.get("role"), relay_segment.get("host"),
+                    relay_segment.get("port"),
+                )
             if capacity_plan is not None:
                 assignments[nid].update({
                     "phase": "prepare",
@@ -739,7 +757,7 @@ class SchedulerPipelineMixin:
             self._relay_segment_clients = cache
         key = (
             str(spec["host"]), int(spec["port"]), int(n_embd),
-            float(spec["timeout"]),
+            str(spec.get("role", "middle")), float(spec["timeout"]),
         )
         current = cache.get(task_id)
         if current is not None and current[0] == key:
@@ -751,7 +769,7 @@ class SchedulerPipelineMixin:
                 logger.debug("close stale relay session failed", exc_info=True)
         client = RelaySegmentClient(
             str(spec["host"]), int(spec["port"]), n_embd=int(n_embd),
-            role="middle", timeout=float(spec["timeout"]),
+            role=str(spec.get("role", "middle")), timeout=float(spec["timeout"]),
         )
         cache[task_id] = (key, client)
         return client
@@ -1999,6 +2017,24 @@ class SchedulerPipelineMixin:
                     )
                 )
                 self._layer_config_acks[client_id] = dict(data)
+                if not (ready or prepared or prepared_late):
+                    # ★ 诊断：把 ACK 与期望的**逐字段差异**一次打全 ——
+                    #   排障跨机 relay 时，ACK 恒判失败却完全看不出是哪个字段不等
+                    #   （`expected` 来自 `_publish_layer_configs` 写入的原始 config，
+                    #    含 `phase="prepare"` ⇒ 正常应命中 `prepared` 判据）。
+                    logger.warning(
+                        "层配置 ACK 未通过 node=%s expected_phase=%s 差异=%s",
+                        client_id, expected_phase,
+                        {
+                            key: {"got": data.get(key), "want": expected.get(key)}
+                            for key in (
+                                "status", "phase", "plan_id", "layer_range",
+                                "model_sha256", "model_type", "engine",
+                                "required_bytes", "available_bytes",
+                            )
+                            if data.get(key) != expected.get(key)
+                        },
+                    )
                 if ready:
                     self._layer_config_pushed.add(client_id)
                     self._layer_config_retry_state.pop(client_id, None)
@@ -2106,6 +2142,14 @@ class SchedulerPipelineMixin:
                 client_id,
                 node_id,
             )
+            return
+        if self._relay_segment_for_worker(client_id) is not None:
+            with self._layer_config_lock:
+                self._pipeline_worker_opt_out.discard(client_id)
+            logger.info(
+                "忽略 relay 节点的本地分层退出通知: node=%s", client_id,
+            )
+            self.push_layer_config_to_clients()
             return
         with self._layer_config_lock:
             self._pipeline_worker_opt_out.add(client_id)
@@ -2472,6 +2516,10 @@ class SchedulerPipelineMixin:
                     "model_type": model_type,
                     "chain_path": response["chain_path"],
                     "hidden_states": _b64.b64encode(_hs).decode("ascii") if _hs else None,
+                    # Preserve the explicit relay raw-f32 contract across a
+                    # CHAIN_FORWARD hop. Legacy tensor-fast frames leave this
+                    # unset and keep their existing decoder path.
+                    "hidden_wire_format": response.get("hidden_wire_format"),
                     "hidden_shape": response.get("hidden_shape"),
                     "chain_next": chain_remaining[0] if chain_remaining else None,
                     "chain_remaining": chain_remaining[1:] if len(chain_remaining) > 1 else [],
@@ -2574,16 +2622,27 @@ class SchedulerPipelineMixin:
         返回 `None` 表示"不适用"（缺失 / 非法 / 超出 X 档范围）—— 调用方据此走**既有**拒绝路径。
         严格到"多一个未知键就整条不认"，避免"半懂"的规格被误用。
 
-        **X 档只支持 `middle`**（hidden → hidden，与本节点"中间节点返回 hidden_states"的既有契约
-        完全对齐）；`head`（吃 token 列表）与 `tail`（吐 token）需要主节点侧接受 token 语义，
-        属 Y 档 ⇒ 这里**显式不认**（返回 `None` ⇒ 走原有拒绝，不会静默降级）。
+        **角色（当前 hidden 输入执行路径）**：`middle` / `tail` 二选一。`head` 需要
+        token → hidden 的独立上游协议，当前 scheduler/PeerClient 不接收该输入，因此在
+        配置解析层直接拒绝，避免 readiness 看似成功后首帧才失败。`middle` =
+        hidden → hidden，与本节点"中间节点返回 hidden_states"的既有契约对齐；`tail` =
+        hidden → token，末段返回 token。`head` 的 token → hidden 输入协议仍未接线。
+        角色的**区间语义**（tail 须到 total_layers 止）在**切分校验**处检查 ——
+        这里只保证"角色合法 + 层区间存在且非空"。
+        **★ Y 档第二条：层区间必填**。relay 段必须声明它**认领**的层区间
+        `[layer_start, layer_end)` —— 这是修复「relay 段的层范围从未进入调度 ⇒ 主节点跑满
+        全部层、该段在"已过全部层"的 hidden 上重算」这一根因的**契约前提**：没有区间就无从
+        把该段的层从主节点层范围里扣除，也无从校验切分是否恰好覆盖。缺区间 ⇒ 整条不认
+        （fail-closed，绝不静默降级成"只带 n_embd"的半懂规格）。
         """
         if not isinstance(raw, dict):
             return None
-        if set(raw) - {"role", "host", "port", "n_embd", "timeout"}:
+        if set(raw) - {"role", "host", "port", "n_embd", "timeout",
+                       "layer_start", "layer_end"}:
             return None
-        if str(raw.get("role", "")).strip().lower() != "middle":
-            return None
+        role = str(raw.get("role", "")).strip().lower()
+        if role not in {"middle", "tail"}:
+            return None     # head 需要 token→hidden，上游协议尚未接线
         host = str(raw.get("host", "")).strip()
         if not is_loopback_host(host):
             return None     # 跨机必须走本地 SSH 隧道端点（Relay 传输层自身也强制 loopback）
@@ -2591,12 +2650,16 @@ class SchedulerPipelineMixin:
             port = int(raw.get("port", 0))
             n_embd = int(raw.get("n_embd", 0))
             timeout = float(raw.get("timeout", 60.0))
+            layer_start = int(raw.get("layer_start", -1))
+            layer_end = int(raw.get("layer_end", -1))
         except (TypeError, ValueError):
             return None
         if not (0 < port <= 65535) or n_embd < 1 or not (0.0 < timeout <= 3600.0):
             return None
-        return {"role": "middle", "host": host, "port": port, "n_embd": n_embd,
-                "timeout": timeout}
+        if layer_start < 0 or layer_end <= layer_start:
+            return None     # 层区间必填且非空
+        return {"role": role, "host": host, "port": port, "n_embd": n_embd,
+                "timeout": timeout, "layer_start": layer_start, "layer_end": layer_end}
 
     def _handle_layer_forward_via_relay(self, spec: dict[str, object], *, data: dict,
                                         task_id: str, step: int, config_id: str,
@@ -2662,7 +2725,23 @@ class SchedulerPipelineMixin:
         started = time.time()
         client = self._relay_segment_client_for_task(task_id, spec, n_embd=width)
         try:
-            outcome = client.forward_hidden(hidden_bytes, n_tokens=n_tokens, seq_meta=seq_meta)
+            role = str(spec.get("role", "middle"))
+            if role == "tail":
+                if seq_meta is None:
+                    outcome = client.forward_hidden_to_token(
+                        hidden_bytes, n_tokens=n_tokens)
+                else:
+                    outcome = client.forward_hidden_to_token(
+                        hidden_bytes, n_tokens=n_tokens, seq_meta=seq_meta)
+            elif role == "middle":
+                if seq_meta is None:
+                    outcome = client.forward_hidden(hidden_bytes, n_tokens=n_tokens)
+                else:
+                    outcome = client.forward_hidden(
+                        hidden_bytes, n_tokens=n_tokens, seq_meta=seq_meta)
+            else:
+                raise RelaySegmentError("relay_role_unsupported", role=role,
+                                        detail="unsupported scheduler relay role")
         except Exception:
             self._close_relay_segment_client(task_id)
             raise
@@ -2673,7 +2752,7 @@ class SchedulerPipelineMixin:
             #   `_fallback_reason`（形如 `pipeline_error_result: ... relay_segment_failed:runner_failed#...`）。
             #   `detail` 只进可读消息；`RelaySegmentError.code` 仍是白名单码（可供线上/日志使用）。
             _code = outcome.error or "relay_internal_error"
-            raise RelaySegmentError(_code, role="middle", endpoint=outcome.endpoint,
+            raise RelaySegmentError(_code, role=str(spec.get("role", "middle")), endpoint=outcome.endpoint,
                                     detail=f"relay_segment_failed:{_code}")
 
         layer_lock = getattr(self, "_layer_config_lock", None)
@@ -2696,9 +2775,6 @@ class SchedulerPipelineMixin:
             "model_type": model_type,
             "chain_path": [*[str(item) for item in received_chain_path],
                            self.get_effective_node_id()],
-            "hidden_states": bytes(outcome.hidden),
-            "hidden_wire_format": RELAY_HIDDEN_WIRE_FORMAT,
-            "hidden_shape": hidden_shape,
             "metrics": {
                 "time_ms": round(elapsed_ms, 1),
                 "kv_cache": False,       # KV 在远端段，本节点没有本地 KV
@@ -2708,6 +2784,17 @@ class SchedulerPipelineMixin:
                 **outcome.to_metrics(),
             },
         }
+        if role == "tail":
+            if outcome.token is None:
+                raise RelaySegmentError("relay_internal_error", role=role,
+                                        detail="relay tail did not return token")
+            response["token"] = int(outcome.token)
+        else:
+            response.update({
+                "hidden_states": bytes(outcome.hidden),
+                "hidden_wire_format": RELAY_HIDDEN_WIRE_FORMAT,
+                "hidden_shape": hidden_shape,
+            })
         logger.info(
             f"🔁 relay 段委托完成: task={task_id}, step={step}, "
             f"段={outcome.role}@{spec['host']}:{spec['port']}, tokens={n_tokens}, "
@@ -2816,6 +2903,28 @@ class SchedulerPipelineMixin:
                 pass
             return False
 
+
+    @staticmethod
+    def _extract_relay_metrics(metrics: object) -> dict:
+        """★ A1 / X 档：从末节点回传的 `metrics` 里取出 relay 五字段（没走 relay 时返回空 dict）。
+
+        只挑 `relay_segment` / `relay_frames` / `relay_tokens` / `relay_payload_bytes` /
+        `relay_error` 这五个键，且要求 `relay_segment` 非空 —— worker 侧只有**真走了 relay 分支**
+        才会写它们（`_handle_layer_forward_via_relay` 里的 `**outcome.to_metrics()`）⇒
+        "键存在且非空"就等价于"这一步确实委托出去了"，普通 pytorch 路径不会被误标成 relay。
+        """
+
+        if not isinstance(metrics, dict):
+            return {}
+        if not metrics.get("relay_segment"):
+            return {}
+        return {
+            "relay_segment": metrics.get("relay_segment"),
+            "relay_frames": metrics.get("relay_frames"),
+            "relay_tokens": metrics.get("relay_tokens"),
+            "relay_payload_bytes": metrics.get("relay_payload_bytes"),
+            "relay_error": metrics.get("relay_error"),
+        }
 
     def _handle_layer_result(self, client_id: str, msg: dict) -> None:
         """
@@ -2972,9 +3081,23 @@ class SchedulerPipelineMixin:
             else:
                 decoded[k] = v
 
+        # ★ A1 / X 档（Y 档第一条）：把末节点回传的 relay 指标读出来存到主节点，供
+        #   `_get_pipeline_status()` 展示。X 档只支持 **2 段**，relay 段执行完**直接**
+        #   `_send_layer_result("master", ...)`（`_handle_layer_forward_via_relay` 明确拒绝
+        #   `chain_next`）⇒ 指标本来就在这一帧的 `metrics` 里，**不需要**跨节点聚合。
+        #   （真跨节点聚合要等 >2 段拓扑，那属 Y 档的另一条。）
+        relay_metrics = self._extract_relay_metrics(decoded.get("metrics"))
+
         key = f"{task_id}:{node_id}"
         with self._pipeline_lock:
             self._pipeline_results[key] = decoded
+            if relay_metrics:
+                self._last_relay_metrics = {
+                    "node_id": node_id,
+                    "task_id": task_id,
+                    "step": decoded.get("step"),
+                    **relay_metrics,
+                }
             if key in self._pipeline_events:
                 self._pipeline_events[key].set()
 
@@ -2991,10 +3114,20 @@ class SchedulerPipelineMixin:
 
         assignments = self.get_layer_assignments()
         master_ids = {"master", self.get_effective_node_id()}
+        # ★ A1 / X 档（Y 档第二条缺口 3）：relay 段节点**也**是流水线成员，尽管它 `layers_count=0`
+        #   （缺口 1 把它摘成不占层）。只按"层数 > 0"过滤会把它排除 ⇒ 若它是唯一 worker，
+        #   `pipeline_nodes` 直接为空 ⇒ `no_pipeline_workers`（实测日志
+        #   `reason=未分配任何 PC 从节点参与模型层计算`）。
+        relay_for_worker = getattr(self, "_relay_segment_for_worker", None)
+
+        def _is_relay_member(node_id: str) -> bool:
+            """该 node_id 是否被配成「由远端 relay 段代跑本段」。"""
+            return callable(relay_for_worker) and relay_for_worker(node_id) is not None
+
         pipeline_nodes = [
             a for a in assignments.get("assignments", [])
             if a.get("node_id") not in master_ids
-            and a.get("layers_count", 1) > 0
+            and (a.get("layers_count", 1) > 0 or _is_relay_member(a.get("node_id", "")))
         ]
         if not pipeline_nodes:
             return {
@@ -3035,14 +3168,28 @@ class SchedulerPipelineMixin:
                 assignment.get("start_layer", 0),
                 assignment.get("end_layer", 0),
             ]
-            layer_ready = (
-                node_id in ready_nodes
-                and ack.get("config_id") == expected.get("config_id")
-                and ack.get("layer_range") == expected_range
-                and ack.get("model_sha256") == expected.get("model_sha256")
-                and ack.get("model_type") == expected.get("model_type")
-                and ack.get("engine") == expected.get("engine", "pytorch")
+            relay_for_assignment = getattr(self, "_relay_segment_for_worker", None)
+            is_relay_worker = (
+                callable(relay_for_assignment)
+                and relay_for_assignment(node_id) is not None
             )
+            if is_relay_worker:
+                # ★ A1 / X 档（Y 档第二条缺口 3）：relay 段节点**不需要**加载本地层
+                #   （`:2255` 分支明说段工件由外边监督的 relay_mid_service 持有 ——
+                #   "this scheduler host does not need a local ModelHost/model loaded"）
+                #   ⇒ 就绪判据退化为「在线 + TCP 连着」。段**不可达**会在**运行时**具名失败
+                #   （`relay_transport_error` ⇒ 具名回退 ⇒ `_fallback_reason` 带得出原因），
+                #   不靠这里探活 —— 主节点也没法直接探远端 loopback 上的段服务。
+                layer_ready = online and tcp_connected
+            else:
+                layer_ready = (
+                    node_id in ready_nodes
+                    and ack.get("config_id") == expected.get("config_id")
+                    and ack.get("layer_range") == expected_range
+                    and ack.get("model_sha256") == expected.get("model_sha256")
+                    and ack.get("model_type") == expected.get("model_type")
+                    and ack.get("engine") == expected.get("engine", "pytorch")
+                )
             layer_status = "ready" if layer_ready else (
                 "error" if ack.get("status") == "error" else
                 "loading" if expected else "not_configured"
@@ -3245,9 +3392,15 @@ class SchedulerPipelineMixin:
             # 旧安装包不认识 authoritative_sync，会再次发送 opt-out。
             # 这是明确的不可恢复信号；不应让本次推理无谓等待完整同步
             # 超时，直接按既有安全路径回退到主节点。
+            relay_for_worker = getattr(self, "_relay_segment_for_worker", None)
             with self._layer_config_lock:
                 opted_out = sorted(
-                    set(worker_ids) & self._pipeline_worker_opt_out
+                    node_id for node_id in set(worker_ids)
+                    if node_id in self._pipeline_worker_opt_out
+                    and not (
+                        callable(relay_for_worker)
+                        and relay_for_worker(node_id) is not None
+                    )
                 )
             if opted_out:
                 logger.warning(
@@ -3324,20 +3477,30 @@ class SchedulerPipelineMixin:
                     f"({heartbeat_age:.1f}s > 10s)"
                 )
 
-            with self._layer_config_lock:
-                expected = self._layer_config_expected.get(node_id, {})
-                ack = self._layer_config_acks.get(node_id, {})
-                expected_range = [node.get("start_layer"), node.get("end_layer")]
-                layer_ready = (
-                    node_id in self._layer_config_pushed
-                    and ack.get("config_id") == expected.get("config_id")
-                    and ack.get("layer_range") == expected_range
-                    and ack.get("model_sha256") == expected.get("model_sha256")
-                    and ack.get("model_type") == expected.get("model_type")
-                    and ack.get("engine") == expected.get("engine", "pytorch")
-                )
-            if not layer_ready:
-                return False, f"节点 {node_id} 尚未确认层配置加载成功"
+            # ★ A1 / X 档（Y 档第二条缺口 3 的**第二处**同型判据）：relay 段节点**不需要**
+            #   确认"层配置加载" —— 段工件由远端 relay_mid_service 持有，本节点不加载模型
+            #   （`scheduler_pipeline.py:2255` 注释即 "this scheduler host does not need a
+            #   local ModelHost/model loaded"）。上面已检查过在线 / TCP / 心跳，这里对
+            #   relay 节点直接放行；段**不可达**会在**运行时**具名失败。
+            relay_for_check = getattr(self, "_relay_segment_for_worker", None)
+            is_relay_worker = (
+                callable(relay_for_check) and relay_for_check(node_id) is not None
+            )
+            if not is_relay_worker:
+                with self._layer_config_lock:
+                    expected = self._layer_config_expected.get(node_id, {})
+                    ack = self._layer_config_acks.get(node_id, {})
+                    expected_range = [node.get("start_layer"), node.get("end_layer")]
+                    layer_ready = (
+                        node_id in self._layer_config_pushed
+                        and ack.get("config_id") == expected.get("config_id")
+                        and ack.get("layer_range") == expected_range
+                        and ack.get("model_sha256") == expected.get("model_sha256")
+                        and ack.get("model_type") == expected.get("model_type")
+                        and ack.get("engine") == expected.get("engine", "pytorch")
+                    )
+                if not layer_ready:
+                    return False, f"节点 {node_id} 尚未确认层配置加载成功"
 
         logger.info(
             f"✅ 二次就绪检查通过: "
@@ -3500,11 +3663,15 @@ class SchedulerPipelineMixin:
 
     @staticmethod
     def _parse_relay_segment_map(raw: str) -> dict[str, dict[str, object]]:
-        """★ A1 / X 档：解析 `QLH_RELAY_SEGMENTS`（`node=role@host:port#n_embd`，`;`/`,` 分隔）。
+        """★ A1 / X 档（Y 档第二条扩层区间）：解析 `QLH_RELAY_SEGMENTS`。
 
-        只接受 **X 档范围内**的规格（`middle`、loopback、合法端口/宽度）—— 校验**复用**
-        `_normalize_relay_segment`（单一真源，避免两套判据漂移）。任何不合法的条目**整条丢弃**
-        （宁可不下发，也不下发"半懂"的规格）；空配置 ⇒ `{}`（行为与接线前一致）。
+        条目格式：`node=role@host:port#n_embd#start-end`（`;`/`,` 分隔），
+        其中 **`start-end` 是该段认领的层区间 `[start, end)`，必填**。
+
+        校验**复用** `_normalize_relay_segment`（单一真源，避免两套判据漂移）。任何不合法、
+        或**未声明层区间**的条目**整条丢弃** —— 宁可不下发，也不下发"只带 n_embd"的半懂规格：
+        后者会让主节点无从扣除该段的层，退化成"段在已过全部层的 hidden 上重算"。
+        空配置 ⇒ `{}`（行为与接线前一致）。
         """
         result: dict[str, dict[str, object]] = {}
         for chunk in str(raw or "").replace(",", ";").split(";"):
@@ -3512,15 +3679,22 @@ class SchedulerPipelineMixin:
             if not chunk or "=" not in chunk or "@" not in chunk:
                 continue
             name, _, value = chunk.partition("=")
-            body, _, n_embd_text = value.partition("#")
+            body, _, fields_text = value.partition("#")
             role, _, host_port = body.partition("@")
             host, _, port_text = host_port.rpartition(":")
+            fields = fields_text.split("#")
+            if len(fields) != 2:
+                continue        # 缺层区间（或多余字段）⇒ 整条丢弃
+            n_embd_text, range_text = fields
+            range_start, _, range_end = range_text.partition("-")
             try:
                 spec = SchedulerPipelineMixin._normalize_relay_segment({
                     "role": role.strip(),
                     "host": host.strip(),
                     "port": int(port_text),
                     "n_embd": int(n_embd_text),
+                    "layer_start": int(range_start),
+                    "layer_end": int(range_end),
                 })
             except ValueError:
                 continue
@@ -3528,13 +3702,28 @@ class SchedulerPipelineMixin:
                 result[name.strip()] = spec
         return result
 
-    def _relay_segment_for_worker(self, worker_id: str) -> Optional[dict]:
+    def _relay_segment_for_worker(self, worker_id: str,
+                                  routing_preference: str = "auto") -> Optional[dict]:
         """★ A1 / X 档：该 worker 是否由远端 relay 段代跑本段（主节点侧配置，解析一次后缓存）。
 
-        开关关闭 ⇒ 直接 `None`（对既有路径零影响）。缓存用 `getattr` 惰性挂在实例上，
-        **不**改 `__init__`（本方法是 mixin 方法，实例可能来自多种构造路径）。
+        **三重闸门**，任一不成立即 `None`（对既有路径零影响）：
+
+        1. **全局开关** `QLH_RELAY_ENABLED`（默认关）；
+        2. **请求级** `routing_preference == "local_only"` ⇒ 不委派（语义一致：「只要本地算」）。
+           注：API 层在 `local_only` 时**本就不会进流水线路径**（`api_server.py` 的
+           `req.routing_preference != "local_only"` 判断），这里是**防御性**的第二道边界 ——
+           即使将来有别的入口把 `local_only` 请求送进流水线，也不会被派给远端段；
+        3. 该 worker 在 `QLH_RELAY_SEGMENTS` 映射里。
+
+        更细的「请求级 relay 取舍」（例如按请求挑不同段）**不在 X 档**：`routing_preference`
+        现有取值集不含这个维度，扩它等于改 API 契约 ⇒ 归 Y 档。
+
+        缓存用 `getattr` 惰性挂在实例上，**不**改 `__init__`（本方法是 mixin 方法，
+        实例可能来自多种构造路径）。
         """
         if not PIPELINE_RELAY_ENABLED:
+            return None
+        if str(routing_preference or "auto") == "local_only":
             return None
         cache = getattr(self, "_relay_segment_map_cache", None)
         if cache is None:
@@ -3880,6 +4069,19 @@ class SchedulerPipelineMixin:
                      session_id: str = None,
                      messages: list = None,
                      show_thinking: bool = False,
+                     # ★ A1 / X 档：请求级路由偏好（`local_only` ⇒ 本段不委派给远端 relay 段）。
+                     #   默认 "auto" ⇒ 旧调用方**逐比特不变**。
+                     routing_preference: str = "auto",
+                     # ★ 既有缺陷修复（Y 档第二条跑通时暴露）：`api_server.py:3609` 一直传
+                     #   `enable_thinking`，而 `run_pipeline_safe`（`:5094`）pop 它之后透传
+                     #   `run_pipeline(**kwargs)` ⇒ 本方法收不了 ⇒
+                     #   `TypeError: _run_pipeline() got an unexpected keyword argument
+                     #   'enable_thinking'` ⇒ **任何**走分布式流水线的请求都 503。
+                     #   此前从未暴露，因为流水线路径一直没跑通过。
+                     #   语义与 `run_pipeline_safe` 一致：`None` ⇒ 不干预模型模板默认。
+                     #   流水线路径下它由 master 首段的 prompt 决定；这里接收是为**消除崩溃**，
+                     #   并让签名与"回退到全模型"那条路保持一致。
+                     enable_thinking: bool | None = None,
                      _stream_callback=None,
                      _cancel_event: threading.Event = None) -> dict:
         """
@@ -3919,6 +4121,11 @@ class SchedulerPipelineMixin:
         require_torch()
         import uuid
         from transport_port import MessageType, deserialize_tensor, serialize_tensor
+        # ★ 与 worker 的 `deserialize_tensor_fast` 对称：fast 走 `TNR0` magic（numpy
+        #   frombuffer），**不经过 `torch.load`** —— torch ≥2.6 的 `weights_only=True` 默认
+        #   会让普通 pickle 载入失败（实测 `UnpicklingError: Unsupported operand 26`，
+        #   在跨机 relay 上表现为"末节点响应超时"）。
+        from tcp_comm import serialize_tensor_fast
 
         mgr = self._host
         if not mgr:
@@ -3926,9 +4133,23 @@ class SchedulerPipelineMixin:
 
         # ---- Step 1: 获取分层配置 ----
         layer_info = self.get_layer_assignments()
+        # ★ A1 / X 档（Y 档第二条缺口 7）：**不能**只按 `layers_count > 0` 过滤 —— relay 段节点是
+        #   **零层**条目（不占层，段工件在远端 relay_mid_service），却必须留在流水线里，
+        #   否则 `pipeline_nodes` 为空 ⇒ 直接返回「没有可用的流水线从节点」
+        #   （实测 `503 没有可用的流水线从节点`）。
+        #   判据与 `_get_pipeline_readiness` 一致：用 `_relay_segment_for_worker()` 真判据放行。
+        relay_for_worker = getattr(self, "_relay_segment_for_worker", None)
+
+        def _participates(item: dict) -> bool:
+            if item.get("layers_count", 0) > 0:
+                return True
+            return (
+                callable(relay_for_worker)
+                and relay_for_worker(item.get("node_id", "")) is not None
+            )
+
         assignments = [
-            a for a in layer_info.get("assignments", [])
-            if a.get("layers_count", 0) > 0
+            a for a in layer_info.get("assignments", []) if _participates(a)
         ]
         assignments.sort(key=lambda a: a.get("start_layer", 0))
 
@@ -4046,6 +4267,13 @@ class SchedulerPipelineMixin:
         input_ids = inputs["input_ids"]  # (1, prompt_len)
         attention_mask = inputs.get("attention_mask")
         prompt_len = input_ids.shape[1]
+        # ★ 数值对照诊断：把**真正**的 token 数与 prompt 首尾打出来，便于与
+        #   `local_only`（`metrics.prompt_tokens`）逐字对齐 —— 跨机 relay 的对照里，
+        #   两条路若输入不同，任何"数值不一致"的判断都不成立。
+        logger.info(
+            "流水线 prompt: tokens=%d chars=%d head=%r tail=%r",
+            prompt_len, len(model_prompt), model_prompt[:70], model_prompt[-50:],
+        )
 
         # ---- Step 3: 自回归生成 ----
         task_id = uuid.uuid4().hex[:12]
@@ -4284,7 +4512,7 @@ class SchedulerPipelineMixin:
                     hs_cpu = local_result["hidden_states"].detach().cpu()
                     import base64 as _b64
                     relay_segment = (
-                        self._relay_segment_for_worker(first_node_id)
+                        self._relay_segment_for_worker(first_node_id, routing_preference)
                         if master_participates else None
                     )
                     if relay_segment is not None:
@@ -4292,9 +4520,27 @@ class SchedulerPipelineMixin:
                             _encode_relay_hidden(hs_cpu)
                         )
                         forward_data["hidden_wire_format"] = RELAY_HIDDEN_WIRE_FORMAT
+                        # Relay stages must see the same absolute RoPE/KV
+                        # positions as the local first stage.  A new TCP
+                        # session is no longer opened per step, but explicit
+                        # metadata also keeps tail/middle correct for callers
+                        # that use more than one sequence.
+                        if hs_cpu.ndim < 2:
+                            raise RuntimeError("relay hidden must have token and embedding dimensions")
+                        hidden_seq = int(hs_cpu.shape[-2])
+                        hidden_batch = int(hs_cpu.numel() // (hidden_seq * int(hs_cpu.shape[-1])))
+                        prompt_tokens = int(input_ids.shape[-1])
+                        if is_prefill:
+                            positions_per_seq = list(range(hidden_seq))
+                        else:
+                            positions_per_seq = [prompt_tokens + step - 1] * hidden_seq
+                        forward_data["seq_ids"] = [
+                            seq_id for seq_id in range(hidden_batch) for _ in range(hidden_seq)
+                        ]
+                        forward_data["positions"] = positions_per_seq * hidden_batch
                     else:
                         forward_data["hidden_states"] = _b64.b64encode(
-                            serialize_tensor(hs_cpu)
+                            serialize_tensor_fast(hs_cpu)
                         ).decode("ascii")
                         forward_data["hidden_shape"] = list(hs_cpu.shape)
                     logger.debug(
@@ -4332,10 +4578,16 @@ class SchedulerPipelineMixin:
             #   随 LAYER_FORWARD 下发规格；worker 侧仅在开关打开时才会认它（默认关 ⇒ 零影响）。
             relay_segment = (
                 relay_segment if "relay_segment" in locals()
-                else self._relay_segment_for_worker(first_node_id)
+                else self._relay_segment_for_worker(first_node_id, routing_preference)
             )
             if relay_segment is not None:
                 forward_data["relay_segment"] = relay_segment
+
+            # ★ A1 / X 档：把请求级路由偏好一并下发。此前 worker 侧
+            #   `data.get("routing_preference", "auto")` 因主节点**从不下发**该字段而永远读到
+            #   默认值（死读）；补上这一行后才真正贯通（worker 侧 `_handle_layer_forward`
+            #   已用它决定 `_require_distributed` / `_force_distributed_assignment`）。
+            forward_data["routing_preference"] = routing_preference
 
             # ---- 发送给首个 worker ----
             try:
@@ -4383,7 +4635,12 @@ class SchedulerPipelineMixin:
 
             # 提取末端输出。推荐拓扑由 worker 返回 hidden_states，主节点在
             # CUDA 上执行 Norm + LM Head；兼容旧配置直接返回 logits。
-            if "logits" in result and result["logits"] is not None:
+            # ★ Y-(b)：末节点是 relay **tail** 段时回的是 **token**（远端已做完 argmax），
+            #   既没有 logits 也没有 hidden —— 这种拓扑下 master 不需要跑 LM Head。
+            relay_token = result.get("token")
+            if relay_token is not None:
+                pass    # 由下方的 token 分支消费（不设 step_error）
+            elif "logits" in result and result["logits"] is not None:
                 logits_data = result["logits"]
                 if isinstance(logits_data, bytes):
                     logits = deserialize_tensor(logits_data).to(device=device)
@@ -4431,11 +4688,27 @@ class SchedulerPipelineMixin:
                 return {"response": "", "error": step_error}
 
             # ---- Step 4: 从 logits 选择下一个 token ----
-            # temperature=0 与单机路径一致采用贪心解码；正温度才执行
-            # FP32 top-p 采样并在进入 CUDA multinomial 前校验概率。
-            new_token_id = self._scheduler_facade_global('_sample_pipeline_token_id')(
-                logits, temperature=temperature, top_p=top_p,
-            )
+            # ★ Y-(b)：末节点为 relay **tail** 段时，远端已跑完本段并做完 argmax ⇒ 直接给
+            #   token，此时**没有 logits** 可用。该协议语义就是 argmax ⇒ 与**贪心**等价；
+            #   `temperature > 0` 的采样在远端无法执行 ⇒ 显式**具名拒绝**
+            #   （绝不把 token 当成"采样结果"，那会静默改变请求语义）。
+            if relay_token is not None:
+                if float(temperature or 0.0) > 0.0:
+                    step_error = (
+                        "relay tail 段只回 token（远端 argmax）⇒ 仅支持贪心解码，"
+                        f"但请求 temperature={temperature}"
+                    )
+                    logger.error(step_error)
+                    self._broadcast_pipeline_abort(pipeline_nodes, task_id, step_error)
+                    self._clear_pipeline_runtime_state(task_id)
+                    return {"response": "", "error": step_error}
+                new_token_id = int(relay_token)
+            else:
+                # temperature=0 与单机路径一致采用贪心解码；正温度才执行
+                # FP32 top-p 采样并在进入 CUDA multinomial 前校验概率。
+                new_token_id = self._scheduler_facade_global('_sample_pipeline_token_id')(
+                    logits, temperature=temperature, top_p=top_p,
+                )
 
             # 检查 EOS
             if new_token_id in eos_ids:
@@ -5391,4 +5664,8 @@ class SchedulerPipelineMixin:
             "readiness_reason_code": reason_code,
             "readiness_reason": reason,
             "workers": worker_status,
+            # ★ A1 / X 档（Y 档第一条）：最近一次 relay 段委托的真实指标（没走过则为空 dict）。
+            #   取自末节点 `LAYER_RESULT.metrics` —— worker 侧只在**真走 relay 分支**时才写这五个键，
+            #   所以空 dict 就等价于"本次没走 relay"，不会误报。
+            "relay": dict(getattr(self, "_last_relay_metrics", None) or {}),
         }

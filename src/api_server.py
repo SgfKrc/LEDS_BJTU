@@ -3607,6 +3607,10 @@ def _execute_chat_full(
                 messages=list(history) + [{"role": "user", "content": req.message}],
                 show_thinking=req.show_thinking,
                 enable_thinking=req.enable_thinking,
+                # ★ A1 / X 档：请求级路由偏好要贯通到流水线内部（`local_only` ⇒ 本段不委派给
+                #   远端 relay 段）。此前只在流水线**入口**用它做"是否走分布式路径"的判断，
+                #   没往 `_run_pipeline` 里传，于是 relay 委派完全不区分请求。
+                routing_preference=req.routing_preference,
                 _require_distributed=(req.routing_preference == "distributed_required"),
                 _force_distributed_assignment=True,
                 _cancel_event=cancel_event,
@@ -3826,6 +3830,13 @@ def _execute_chat_full(
             request_history,
             system_prompt=thinking_prompt,
             assistant_prefill=thinking_prefill,
+        )
+        # ★ 数值对照诊断：与 `scheduler_pipeline._run_pipeline` 的同一行日志配对，
+        #   用于确认两条路喂给模型的 prompt 是否逐字一致 —— 这是跨机 relay
+        #   数值（per-token argmax）对照成立的前提。
+        logger.info(
+            "本地 prompt: chars=%d head=%r tail=%r",
+            len(prompt), prompt[:70], prompt[-50:],
         )
         inputs = tokenizer(prompt, return_tensors="pt")
         input_ids = inputs["input_ids"].to(model_manager.get_device())

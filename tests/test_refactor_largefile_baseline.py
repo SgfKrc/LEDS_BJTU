@@ -353,7 +353,7 @@ def test_api_router_slice_preserves_facade_handlers_and_route_order() -> None:
         routes_models: 23,
         routes_auth: 12,
         routes_sessions: 10,
-        routes_tasks: 4,
+        routes_tasks: 6,
         routes_chat: 7,
         routes_system: 3,
         routes_logs: 12,
@@ -397,7 +397,7 @@ def test_api_routers_cover_every_openapi_operation() -> None:
         for path, operations in api_server.app.openapi()["paths"].items()
         for method in operations
     )
-    assert sum(routed.values()) == 144
+    assert sum(routed.values()) == 146
     assert routed == openapi
 
 

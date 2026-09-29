@@ -99,7 +99,7 @@ def _listen_middle(runner):
 
 def _spec(port: int, **overrides) -> dict[str, object]:
     spec = {"role": "middle", "host": "127.0.0.1", "port": port, "n_embd": N_EMBD,
-            "timeout": 5.0}
+            "timeout": 5.0, "layer_start": 8, "layer_end": 16}
     spec.update(overrides)
     return spec
 
@@ -133,15 +133,35 @@ def test_relay_wire_format_rejects_shape_mismatch():
     [
         (None, "缺失"),
         ("middle", "不是 dict"),
-        ({"role": "middle", "host": "127.0.0.1", "port": 1, "n_embd": 4, "extra": 1}, "未知键"),
-        ({"role": "head", "host": "127.0.0.1", "port": 1, "n_embd": 4}, "head 属 Y 档"),
-        ({"role": "tail", "host": "127.0.0.1", "port": 1, "n_embd": 4}, "tail 属 Y 档"),
-        ({"role": "middle", "host": "10.1.2.3", "port": 1, "n_embd": 4}, "非 loopback"),
-        ({"role": "middle", "host": "127.0.0.1", "port": 0, "n_embd": 4}, "端口越界"),
-        ({"role": "middle", "host": "127.0.0.1", "port": 70000, "n_embd": 4}, "端口越界"),
-        ({"role": "middle", "host": "127.0.0.1", "port": 1, "n_embd": 0}, "n_embd 非法"),
-        ({"role": "middle", "host": "127.0.0.1", "port": 1, "n_embd": 4, "timeout": 0}, "timeout 非法"),
-        ({"role": "middle", "host": "127.0.0.1", "port": "x", "n_embd": 4}, "端口不可解析"),
+        ({"role": "middle", "host": "127.0.0.1", "port": 1, "n_embd": 4,
+          "layer_start": 0, "layer_end": 1, "extra": 1}, "未知键"),
+        ({"role": "router", "host": "127.0.0.1", "port": 1, "n_embd": 4,
+          "layer_start": 0, "layer_end": 1}, "未知角色"),
+        ({"role": "middle", "host": "10.1.2.3", "port": 1, "n_embd": 4,
+          "layer_start": 0, "layer_end": 1}, "非 loopback"),
+        ({"role": "middle", "host": "127.0.0.1", "port": 0, "n_embd": 4,
+          "layer_start": 0, "layer_end": 1}, "端口越界"),
+        ({"role": "middle", "host": "127.0.0.1", "port": 70000, "n_embd": 4,
+          "layer_start": 0, "layer_end": 1}, "端口越界"),
+        ({"role": "middle", "host": "127.0.0.1", "port": 1, "n_embd": 0,
+          "layer_start": 0, "layer_end": 1}, "n_embd 非法"),
+        ({"role": "middle", "host": "127.0.0.1", "port": 1, "n_embd": 4,
+          "layer_start": 0, "layer_end": 1, "timeout": 0}, "timeout 非法"),
+        ({"role": "middle", "host": "127.0.0.1", "port": "x", "n_embd": 4,
+          "layer_start": 0, "layer_end": 1}, "端口不可解析"),
+        # ★ Y 档第二条：层区间**必填** —— 缺了就是"半懂规格"，必须整条不认（fail-closed），
+        #   否则主节点无从把该段的层从自己范围里扣除（那正是本线修的那个根因）。
+        ({"role": "middle", "host": "127.0.0.1", "port": 1, "n_embd": 4}, "缺层区间"),
+        ({"role": "middle", "host": "127.0.0.1", "port": 1, "n_embd": 4,
+          "layer_start": 8}, "只给起点"),
+        ({"role": "middle", "host": "127.0.0.1", "port": 1, "n_embd": 4,
+          "layer_end": 8}, "只给终点"),
+        ({"role": "middle", "host": "127.0.0.1", "port": 1, "n_embd": 4,
+          "layer_start": 8, "layer_end": 8}, "空区间"),
+        ({"role": "middle", "host": "127.0.0.1", "port": 1, "n_embd": 4,
+          "layer_start": -1, "layer_end": 8}, "负起点"),
+        ({"role": "middle", "host": "127.0.0.1", "port": 1, "n_embd": 4,
+          "layer_start": 16, "layer_end": 8}, "起点不早于终点"),
     ],
 )
 def test_normalize_rejects_out_of_scope(raw, why: str):
@@ -150,15 +170,37 @@ def test_normalize_rejects_out_of_scope(raw, why: str):
 
 def test_normalize_accepts_middle_loopback():
     spec = SchedulerPipelineMixin._normalize_relay_segment(
-        {"role": "MIDDLE", "host": "localhost", "port": 50183, "n_embd": 896, "timeout": 30})
+        {"role": "MIDDLE", "host": "localhost", "port": 50183, "n_embd": 896,
+         "layer_start": 8, "layer_end": 16, "timeout": 30})
     assert spec == {"role": "middle", "host": "localhost", "port": 50183, "n_embd": 896,
-                    "timeout": 30.0}
+                    "timeout": 30.0, "layer_start": 8, "layer_end": 16}
 
 
 def test_normalize_defaults_timeout():
     spec = SchedulerPipelineMixin._normalize_relay_segment(
-        {"role": "middle", "host": "127.0.0.1", "port": 50183, "n_embd": 896})
+        {"role": "middle", "host": "127.0.0.1", "port": 50183, "n_embd": 896,
+         "layer_start": 8, "layer_end": 16})
     assert spec is not None and spec["timeout"] == 60.0
+
+
+@pytest.mark.parametrize(
+    ("role", "start", "end"),
+    [("middle", 8, 16), ("tail", 16, 24)],
+)
+def test_normalize_accepts_hidden_input_roles(role: str, start: int, end: int):
+    """当前 scheduler relay 输入是 hidden，只接受 middle/tail。"""
+    spec = SchedulerPipelineMixin._normalize_relay_segment(
+        {"role": role, "host": "127.0.0.1", "port": 50183, "n_embd": 896,
+         "layer_start": start, "layer_end": end})
+    assert spec == {"role": role, "host": "127.0.0.1", "port": 50183, "n_embd": 896,
+                    "timeout": 60.0, "layer_start": start, "layer_end": end}
+
+
+def test_normalize_rejects_head_until_token_input_protocol_is_wired():
+    spec = SchedulerPipelineMixin._normalize_relay_segment(
+        {"role": "head", "host": "127.0.0.1", "port": 50183, "n_embd": 896,
+         "layer_start": 0, "layer_end": 8})
+    assert spec is None
 
 
 # ---- _handle_layer_forward_via_relay：成功路径 ----------------------------
@@ -324,17 +366,24 @@ def test_via_relay_rejects_missing_hidden():
 
 
 def test_parse_relay_segment_map_accepts_valid_and_drops_invalid():
-    """配置解析：只认 X 档范围内的条目，非法条目**整条丢弃**（绝不下发"半懂"规格）。"""
-    raw = ("worker-2=middle@127.0.0.1:50183#896;"           # 合法
-           "worker-3=head@127.0.0.1:50184#896;"            # head ⇒ Y 档，丢
-           "worker-4=middle@10.0.0.5:50185#896;"           # 非 loopback，丢
-           "broken;worker-5=middle@127.0.0.1:notaport#896;"  # 非法，丢
-           "worker-6=middle@127.0.0.1:50186#896")          # 合法
+    """配置解析：只认范围内、且**声明了层区间**的条目，其余**整条丢弃**（绝不下发"半懂"规格）。"""
+    raw = ("worker-2=middle@127.0.0.1:50183#896#8-16;"           # 合法
+           "worker-3=router@127.0.0.1:50184#896#8-16;"          # ★ 未知角色，丢
+           "worker-10=tail@127.0.0.1:50190#896#16-24;"          # ★ Y-(b)：tail 合法
+           "worker-4=middle@10.0.0.5:50185#896#8-16;"           # 非 loopback，丢
+           "broken;worker-5=middle@127.0.0.1:notaport#896#8-16;"  # 非法，丢
+           "worker-7=middle@127.0.0.1:50187#896;"               # ★ 缺层区间，丢
+           "worker-8=middle@127.0.0.1:50188#896#16-16;"         # ★ 空区间，丢
+           "worker-9=middle@127.0.0.1:50189#896#8-16#extra;"    # ★ 多余字段，丢
+           "worker-6=middle@127.0.0.1:50186#896#16-24")         # 合法
     parsed = SchedulerPipelineMixin._parse_relay_segment_map(raw)
 
-    assert set(parsed) == {"worker-2", "worker-6"}
+    assert set(parsed) == {"worker-2", "worker-6", "worker-10"}
     assert parsed["worker-2"] == {"role": "middle", "host": "127.0.0.1", "port": 50183,
-                                  "n_embd": 896, "timeout": 60.0}
+                                  "n_embd": 896, "timeout": 60.0,
+                                  "layer_start": 8, "layer_end": 16}
+    assert parsed["worker-6"]["layer_start"] == 16
+    assert parsed["worker-6"]["layer_end"] == 24
 
 
 def test_parse_relay_segment_map_empty_is_empty():
@@ -346,7 +395,7 @@ def test_relay_segment_for_worker_respects_switch(monkeypatch: pytest.MonkeyPatc
     """★ 开关关闭 ⇒ **永远不下发**（对既有路径零影响）。"""
     monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_ENABLED", False)
     monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_SEGMENTS",
-                        "worker-2=middle@127.0.0.1:50183#896")
+                        "worker-2=middle@127.0.0.1:50183#896#8-16")
     harness = _Harness()
 
     assert harness.obj._relay_segment_for_worker("worker-2") is None
@@ -355,16 +404,17 @@ def test_relay_segment_for_worker_respects_switch(monkeypatch: pytest.MonkeyPatc
 def test_relay_segment_for_worker_returns_spec_and_caches(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_ENABLED", True)
     monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_SEGMENTS",
-                        "worker-2=middle@127.0.0.1:50183#896")
+                        "worker-2=middle@127.0.0.1:50183#896#8-16")
     harness = _Harness()
 
     spec = harness.obj._relay_segment_for_worker("worker-2")
     assert spec is not None and spec["port"] == 50183
+    assert spec["layer_start"] == 8 and spec["layer_end"] == 16
     assert harness.obj._relay_segment_for_worker("worker-9") is None
 
     # 缓存：解析一次后进程内稳定（改配置不影响已解析结果）
     monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_SEGMENTS",
-                        "worker-9=middle@127.0.0.1:50199#896")
+                        "worker-9=middle@127.0.0.1:50199#896#8-16")
     assert harness.obj._relay_segment_for_worker("worker-9") is None
 
 
@@ -410,7 +460,7 @@ def test_end_to_end_config_to_worker_relay_roundtrip(monkeypatch: pytest.MonkeyP
     try:
         monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_ENABLED", True)
         monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_SEGMENTS",
-                            f"worker-1=middle@127.0.0.1:{port}#{N_EMBD}")
+                            f"worker-1=middle@127.0.0.1:{port}#{N_EMBD}#8-16")
 
         # ① 主节点侧：解析配置并取该 worker 的规格（= 会随 LAYER_FORWARD 下发的那个 dict）
         spec = harness.obj._relay_segment_for_worker("worker-1")
@@ -462,9 +512,158 @@ def test_guard_branch_requires_both_switch_and_spec(monkeypatch: pytest.MonkeyPa
         spec = SchedulerPipelineMixin._normalize_relay_segment(raw)
         return bool(enabled) and spec is not None
 
-    good = {"role": "middle", "host": "127.0.0.1", "port": 50183, "n_embd": 896}
+    good = {"role": "middle", "host": "127.0.0.1", "port": 50183, "n_embd": 896,
+            "layer_start": 8, "layer_end": 16}
     assert _would_delegate(good, True) is True
     assert _would_delegate(good, False) is False        # 开关关 ⇒ 不委托
     assert _would_delegate(None, True) is False         # 无规格 ⇒ 不委托
+    assert _would_delegate({"role": "router", "host": "127.0.0.1", "port": 1,
+                            "n_embd": 4, "layer_start": 0, "layer_end": 1}, True) is False
+    # ★ Y-(b)：`tail` 角色合法（其区间语义由切分校验把关）⇒ **可以**委托
     assert _would_delegate({"role": "tail", "host": "127.0.0.1", "port": 1,
+                            "n_embd": 4, "layer_start": 16, "layer_end": 24}, True) is True
+    # ★ Y 档第二条：缺层区间 ⇒ 半懂规格不得生效，同样不委托
+    assert _would_delegate({"role": "middle", "host": "127.0.0.1", "port": 1,
                             "n_embd": 4}, True) is False
+
+
+# ---- 「该红必须红」：请求级路由偏好必须能挡住 relay 委派 -------------------
+
+
+def _enable_relay_with_one_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """打开开关 + 给一个 worker 配好 middle 段（两处都走 monkeypatch，不碰环境变量）。"""
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_ENABLED", True)
+    monkeypatch.setattr(
+        scheduler_pipeline, "PIPELINE_RELAY_SEGMENTS",
+        "worker-2=middle@127.0.0.1:50183#896#8-16",
+    )
+
+
+def test_guard_local_only_never_delegates_to_a_relay_segment(monkeypatch: pytest.MonkeyPatch):
+    """★「该红必须红」：`routing_preference == "local_only"` ⇒ **绝不**委派给远端 relay 段。
+
+    这是 §4.7「X 档包含」第 3 项的**请求级那一半**。把 `_relay_segment_for_worker` 里
+    `local_only ⇒ None` 那个闸门去掉，本用例立刻红 —— 届时带「只要本地算」语义的请求仍会被
+    派给远端段。API 层虽然已经在 `local_only` 时跳过整条流水线路径（`api_server.py`），
+    但这里守的是**流水线内部**那条边界：换任何入口进来都不该被绕过。
+    """
+    _enable_relay_with_one_worker(monkeypatch)
+    harness = _Harness()
+
+    # 先证明这条链路本身是通的 —— 否则下面的 None 可能只是"什么都没配上"的假通过。
+    assert harness.obj._relay_segment_for_worker("worker-2") is not None
+    assert harness.obj._relay_segment_for_worker("worker-2", "auto") is not None
+
+    # ⇒ `local_only` 必须挡住。
+    assert harness.obj._relay_segment_for_worker("worker-2", "local_only") is None
+
+
+def test_default_routing_preference_is_equivalent_to_auto(monkeypatch: pytest.MonkeyPatch):
+    """不传 `routing_preference` 必须与显式 `"auto"` **等价** ⇒ 旧调用方零影响。"""
+    _enable_relay_with_one_worker(monkeypatch)
+    harness = _Harness()
+
+    default = harness.obj._relay_segment_for_worker("worker-2")
+    explicit = harness.obj._relay_segment_for_worker("worker-2", "auto")
+
+    assert default == explicit
+    assert default is not None
+
+
+def test_only_local_only_blocks_delegation(monkeypatch: pytest.MonkeyPatch):
+    """闸门**只**认 `local_only` —— `auto` / `distributed_required` / 空串 / 未来新值都不挡。"""
+    _enable_relay_with_one_worker(monkeypatch)
+    harness = _Harness()
+
+    for preference in ("auto", "distributed_required", "", "some-future-value"):
+        assert harness.obj._relay_segment_for_worker("worker-2", preference) is not None, preference
+
+
+# ---- Y 档第一条：主节点展示 relay 指标 -------------------------------------
+
+
+def test_extract_relay_metrics_picks_only_the_five_keys():
+    """只取五个 relay 键（其余 metrics 字段不外带），供主节点 status 展示。"""
+    metrics = {
+        "time_ms": 12.5, "kv_cache": False, "relay_executed": True,
+        "relay_segment": "middle@127.0.0.1:50183",
+        "relay_frames": 4, "relay_tokens": 4,
+        "relay_payload_bytes": 4096, "relay_error": None,
+        "fallback_reason": "",           # 不该被带出来
+    }
+
+    picked = SchedulerPipelineMixin._extract_relay_metrics(metrics)
+
+    assert picked == {
+        "relay_segment": "middle@127.0.0.1:50183",
+        "relay_frames": 4,
+        "relay_tokens": 4,
+        "relay_payload_bytes": 4096,
+        "relay_error": None,
+    }
+
+
+def test_guard_extract_relay_metrics_does_not_misfire_on_plain_path():
+    """★「该红必须红」：**普通 pytorch 路径**的 metrics 必须取不出 relay 字段。
+
+    守卫的是"误报"：把 `_extract_relay_metrics` 里 `relay_segment` 非空那个判断去掉，
+    任何 metrics 都会被当成 relay 结果，主节点 status 就**凭空显示** relay 指标 ——
+    那是最难查的一类假证据。去掉该判断，本用例立刻红。
+    """
+    plain = {"time_ms": 8.0, "kv_cache": True, "distributed_used": True}
+
+    assert SchedulerPipelineMixin._extract_relay_metrics(plain) == {}
+    # 半残 metrics（只有 relay_* 键、没有 relay_segment）同样不算 relay 结果。
+    assert SchedulerPipelineMixin._extract_relay_metrics({"relay_frames": 3}) == {}
+    # 非 dict 输入不得抛。
+    assert SchedulerPipelineMixin._extract_relay_metrics(None) == {}
+    assert SchedulerPipelineMixin._extract_relay_metrics("relay_segment") == {}
+
+
+def test_pipeline_status_relay_is_empty_before_any_relay_run():
+    """没走过 relay 时 status 的 `relay` 必须是**空 dict**（不是 None、也不能缺键）。"""
+    harness = _status_harness()
+
+    status = harness.obj._get_pipeline_status()
+
+    assert status["relay"] == {}
+
+
+def test_pipeline_status_surfaces_the_last_relay_metrics():
+    """收到过 relay 结果后，status 必须把它读出来（这是 Y 档第一条的可见产物）。"""
+    harness = _status_harness()
+    harness.obj._last_relay_metrics = {
+        "node_id": "worker-2", "task_id": "t1", "step": 0,
+        "relay_segment": "middle@127.0.0.1:50183",
+        "relay_frames": 4, "relay_tokens": 4,
+        "relay_payload_bytes": 4096, "relay_error": None,
+    }
+
+    status = harness.obj._get_pipeline_status()
+
+    assert status["relay"]["relay_segment"] == "middle@127.0.0.1:50183"
+    assert status["relay"]["relay_tokens"] == 4
+    assert status["relay"]["node_id"] == "worker-2"
+    # 必须是副本，调用方改它不该污染调度器内部状态。
+    status["relay"]["relay_tokens"] = 999
+    assert harness.obj._last_relay_metrics["relay_tokens"] == 4
+
+
+def _status_harness() -> _Harness:
+    """`_get_pipeline_status()` 需要的最小实例。
+
+    该方法的依赖比 relay 分支宽（`_nodes_lock` / `_inference_lock` / `nodes` 等），
+    这里一并补齐 —— 免得 `AttributeError` 抢在断言的语义之前把用例变成"假红"。
+    """
+    harness = _Harness()
+    harness.obj._host = None
+    harness.obj.nodes = {}
+    harness.obj._nodes_lock = threading.RLock()
+    harness.obj._inference_lock = threading.RLock()
+    harness.obj.get_layer_assignments = lambda: {"assignments": []}
+    harness.obj.get_distributed_inference_enabled = lambda: False
+    harness.obj._effective_role = lambda: "master"
+    harness.obj._get_pipeline_readiness = lambda: {
+        "ready": False, "reason_code": "no_workers", "reason": "无", "workers": [],
+    }
+    return harness

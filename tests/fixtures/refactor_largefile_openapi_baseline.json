@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "captured_from": "api_server.app.openapi()",
-  "path_count": 123,
-  "operation_count": 144,
-  "canonical_path_method_sha256": "3d23913eba2b4f74249082cfee6e5c758080b5a17e9b9c0f70d5c217337b3963",
+  "path_count": 125,
+  "operation_count": 146,
+  "canonical_path_method_sha256": "0433607312cca306c89cf75d697f35e3222a91e11b17dc9e5e4ac6c050e5fa50",
   "canonicalization": "json.dumps({path: sorted(methods) for path, methods in sorted(paths.items())}, separators=(',', ':'), ensure_ascii=True)",
   "route_order_invariant": {
     "before": "/api/logs/recent",

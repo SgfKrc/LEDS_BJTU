@@ -875,7 +875,11 @@ def deserialize_tensor_fast(data: bytes) -> torch.Tensor:
     if magic == b'TNR1':
         # 小张量路径
         buf = io.BytesIO(data[4:])
-        return _require_torch().load(buf)
+        # ★ torch ≥2.6 的 `torch.load` 默认 `weights_only=True` ⇒ 本路径（`TNR1` 小张量）
+        #   会拒绝**我们自己**的序列化帧（实测 `UnpicklingError: Unsupported operand 26`，
+        #   在跨机 relay 上表现为"末节点响应超时"，极难与"模型算错"区分）。
+        #   这里承载的是**集群内部**的帧、走 HMAC 认证的 TCP 通道 ⇒ 恢复历史载入语义。
+        return _require_torch().load(buf, weights_only=False)
     elif magic == b'TNR0':
         # 大张量路径
         import numpy as np

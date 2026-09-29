@@ -29,6 +29,17 @@ REQUIRED_MODULES = {
 REQUIRED_ROUTES = ("/health", "/status", "/generate", "/capabilities", "/rpc/status")
 PROBE_MARKER = "QLH_EDGE_PREFLIGHT="
 
+#: `REQUIRED_ROUTES` 描述的是**这个入口**的契约（裸 `/health` 等）。
+ROUTES_CONTRACT_ENTRY = "qlh_edge"
+#: ★ P0-3：「干净 venv 运行扫描」的第二个入口 —— **SLIM 的真实载荷**。
+#: `packaging/packaging/qlh_launcher.py` 用 `uvicorn src.api_server:app` 启动它，
+#: 而它的路由带 `/api/` 前缀 ⇒ **不能**拿 `REQUIRED_ROUTES` 去判它；只判
+#: 「**导入成功**且没把 forbidden 模块拽进 `sys.modules`」。
+SLIM_ENTRY = "src.api_server"
+#: 要做运行扫描的入口。两者各跑**独立子进程** —— 同一进程里先 import 谁会把
+#: `sys.modules` 污染给后一个，那样第二个入口的判据就不可信了。
+PROBE_ENTRIES = (ROUTES_CONTRACT_ENTRY, SLIM_ENTRY)
+
 
 def _venv_root(python_executable: Path) -> Path:
     # Prefer the on-disk layout: a venv keeps its interpreter under ``bin/`` (POSIX)
@@ -54,10 +65,11 @@ def _directory_size_mb(root: Path) -> float:
     return round(total / 2**20, 2)
 
 
-def _probe_code() -> str:
+def _probe_code(entry: str) -> str:
     forbidden = repr(list(FORBIDDEN_MODULES))
     required = repr(list(REQUIRED_MODULES))
     return f"""
+import importlib
 import importlib.util
 import json
 import sys
@@ -66,10 +78,18 @@ import time
 started = time.perf_counter()
 payload = {{}}
 try:
-    import qlh_edge
+    module = importlib.import_module({entry!r})
 
+    payload["entry"] = {entry!r}
     payload["import_elapsed_s"] = round(time.perf_counter() - started, 4)
-    payload["routes"] = sorted({{route.path for route in qlh_edge.app.routes}})
+    app = getattr(module, "app", None)
+    payload["has_app"] = app is not None
+    # 不是每条 route 都有 `.path`（FastAPI 的惰性 ``_IncludedRouter`` 就没有）⇒ 只取真有的。
+    payload["routes"] = sorted(
+        path
+        for path in (getattr(route, "path", None) for route in getattr(app, "routes", []))
+        if path
+    )
     payload["forbidden_imported"] = [name for name in {forbidden} if name in sys.modules]
     payload["forbidden_installed"] = []
     for name in {forbidden}:
@@ -93,7 +113,11 @@ print({PROBE_MARKER!r} + json.dumps(payload, sort_keys=True))
 """
 
 
-def _run_probe(python_executable: Path, repository_root: Path) -> dict[str, Any]:
+def _run_probe(
+    python_executable: Path,
+    repository_root: Path,
+    entry: str = ROUTES_CONTRACT_ENTRY,
+) -> dict[str, Any]:
     environment = os.environ.copy()
     python_path = [str(repository_root), str(repository_root / "src")]
     existing_python_path = environment.get("PYTHONPATH")
@@ -103,7 +127,7 @@ def _run_probe(python_executable: Path, repository_root: Path) -> dict[str, Any]
 
     try:
         completed = subprocess.run(
-            [str(python_executable), "-c", _probe_code()],
+            [str(python_executable), "-c", _probe_code(entry)],
             cwd=repository_root,
             env=environment,
             capture_output=True,
@@ -142,9 +166,18 @@ def run_preflight(
     python_path = Path(python_executable)
     venv_root = _venv_root(python_path)
     size_mb = _directory_size_mb(venv_root)
-    probe = _run_probe(python_path, root)
+    probe = _run_probe(python_path, root, ROUTES_CONTRACT_ENTRY)
     routes = set(probe.get("routes", []))
     import_elapsed_s = probe.get("import_elapsed_s")
+
+    # ★ P0-3 运行半边的第二个入口（SLIM 真实载荷）。**独立子进程** —— 同进程里先 import
+    #   谁都会把 `sys.modules` 污染给后一个。仅当该入口在本仓存在时才判：Edge 安装包
+    #   可以不含 `src/api_server.py`，那时这条不适用（SLIM 包的验收由 spec 决定），
+    #   **不得**因此判成失败。
+    slim_present = (root / "src" / "api_server.py").is_file()
+    slim_probe: dict[str, Any] = {}
+    if slim_present:
+        slim_probe = _run_probe(python_path, root, SLIM_ENTRY)
 
     checks = {
         "python_exists": python_path.is_file(),
@@ -155,6 +188,13 @@ def run_preflight(
         "no_forbidden_install": not probe.get("forbidden_installed"),
         "required_routes": set(REQUIRED_ROUTES).issubset(routes),
         "probe": probe.get("ok") is True and probe.get("probe_returncode") == 0,
+        # ★ P0-3：SLIM 真实载荷同样要能**导入成功**、**不把 forbidden 拽进 sys.modules**、
+        #   且必需依赖齐全。注意**不查路由** —— `src.api_server` 的路径带 `/api/` 前缀，
+        #   `REQUIRED_ROUTES` 是 `qlh_edge` 的契约，混用会误判。
+        "slim_entry_import": (not slim_present)
+        or (slim_probe.get("ok") is True and slim_probe.get("probe_returncode") == 0),
+        "slim_entry_no_forbidden": (not slim_present) or not slim_probe.get("forbidden_imported"),
+        "slim_entry_required_modules": (not slim_present) or not slim_probe.get("missing_required"),
     }
     return {
         "ok": all(checks.values()),
@@ -165,6 +205,9 @@ def run_preflight(
         "max_startup_s": max_startup_s,
         "checks": checks,
         "probe": probe,
+        "slim_entry": SLIM_ENTRY,
+        "slim_entry_present": slim_present,
+        "slim_probe": slim_probe,
     }
 
 
@@ -187,6 +230,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"edge python: {result['python']}")
         print(f"venv size: {result['venv_size_mb']} MB / {result['max_size_mb']} MB")
         print(f"cold start: {result['probe'].get('import_elapsed_s', 'n/a')} s / {result['max_startup_s']} s")
+        if result.get("slim_entry_present"):
+            slim = result.get("slim_probe", {})
+            print(
+                f"SLIM entry ({result['slim_entry']}): "
+                f"{'import OK' if slim.get('ok') else 'IMPORT FAILED'} "
+                f"in {slim.get('import_elapsed_s', 'n/a')} s"
+            )
+            if slim.get("error"):
+                print(f"  {slim['error']}", file=sys.stderr)
         for name, passed in result["checks"].items():
             print(f"{'PASS' if passed else 'FAIL'} {name}")
         if result["probe"].get("error"):
