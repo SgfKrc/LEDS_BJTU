@@ -165,7 +165,7 @@ def _claims(sched: Scheduler, claims: dict) -> None:
 # ---- ★ Y 档第二条：层区间认领的校验（fail-closed）-------------------------
 
 
-def test_claimed_prefix_accepts_middle_plus_tail(monkeypatch):
+def test_claimed_prefix_rejects_middle_plus_tail_until_chain_is_wired(monkeypatch):
     """合法形态：本机跑 head `[0,8)`，middle 段 `[8,16)`，tail 段 `[16,24)` ⇒ k = 8。
 
     这正是产品形态（master 做 head，Surface 上的 middle + tail 段覆盖其余）。
@@ -173,7 +173,8 @@ def test_claimed_prefix_accepts_middle_plus_tail(monkeypatch):
     sched = _scheduler(monkeypatch, set())
     _claims(sched, {"mid": _claim("middle", 8, 16), "tail": _claim("tail", 16, 24)})
 
-    assert sched._relay_claimed_layer_prefix(24) == 8
+    with pytest.raises(ValueError, match="单段 relay"):
+        sched._relay_claimed_layer_prefix(24)
 
 
 def test_claimed_prefix_accepts_middle_covering_to_top(monkeypatch):
@@ -189,12 +190,13 @@ def test_claimed_prefix_accepts_middle_covering_to_top(monkeypatch):
     assert sched._relay_claimed_layer_prefix(24) == 8
 
 
-def test_claimed_prefix_accepts_relay_only_topology(monkeypatch):
+def test_claimed_prefix_rejects_relay_only_multi_segment_topology(monkeypatch):
     """极端但合法：`head` 段从 0 起 + `tail` 段到顶 ⇒ 本机无层（k = 0）。"""
     sched = _scheduler(monkeypatch, set())
     _claims(sched, {"head": _claim("head", 0, 8), "tail": _claim("tail", 8, 24)})
 
-    assert sched._relay_claimed_layer_prefix(24) == 0
+    with pytest.raises(ValueError, match="relay head segment"):
+        sched._relay_claimed_layer_prefix(24)
 
 
 def test_claimed_prefix_without_claims_returns_total(monkeypatch):
@@ -236,7 +238,7 @@ def test_assignment_deducts_claimed_layers_from_local_nodes(monkeypatch):
     输出语义崩坏）。改造后：本机节点合计只分到 8 层，且上界 `<= 8`。
     """
     sched = _scheduler(monkeypatch, set())
-    _claims(sched, {"mid": _claim("middle", 8, 16), "tail": _claim("tail", 16, 24)})
+    _claims(sched, {"mid": _claim("middle", 8, 24)})
 
     result = sched.compute_layer_assignment()
 
@@ -249,6 +251,6 @@ def test_assignment_deducts_claimed_layers_from_local_nodes(monkeypatch):
 def test_assignment_with_all_layers_claimed_yields_no_local_layers(monkeypatch):
     """全部层都被认领 ⇒ 本机**无层条目**产出（`layer_budget == 0` 的早返回）。"""
     sched = _scheduler(monkeypatch, set())
-    _claims(sched, {"head": _claim("head", 0, 8), "tail": _claim("tail", 8, 24)})
+    _claims(sched, {"tail": _claim("tail", 0, 24)})
 
     assert sched.compute_layer_assignment() == []

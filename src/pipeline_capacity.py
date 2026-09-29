@@ -122,14 +122,18 @@ def _normalize_nodes(nodes: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
         seen.add(node_id)
         capacity_bytes = _non_negative_int(raw.get("capacity_bytes", 0), "capacity_bytes")
         reserve_bytes = _non_negative_int(raw.get("reserve_bytes", 0), "reserve_bytes")
-        if capacity_bytes <= reserve_bytes:
+        capacity_source = str(raw.get("capacity_source", "explicit") or "explicit")
+        # Relay-exempt nodes are transport participants, not local model
+        # placement candidates. Keep them normalized so their zero-layer
+        # assignment is counted even without a model-memory budget.
+        if capacity_bytes <= reserve_bytes and capacity_source != "relay_exempt":
             excluded.append({
                 "node_id": node_id,
                 "role": str(raw.get("role", "client") or "client"),
                 "reason_code": "node_capacity_unavailable",
                 "capacity_bytes": capacity_bytes,
                 "reserve_bytes": reserve_bytes,
-                "capacity_source": str(raw.get("capacity_source", "") or ""),
+                "capacity_source": capacity_source,
             })
             continue
         usable.append({
@@ -141,7 +145,7 @@ def _normalize_nodes(nodes: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
                 raw.get("runtime_multiplier", 1.0), "runtime_multiplier"
             ),
             "score": float(raw.get("score", 0.0) or 0.0),
-            "capacity_source": str(raw.get("capacity_source", "explicit") or "explicit"),
+            "capacity_source": capacity_source,
             "execution_device": str(raw.get("execution_device", "unknown") or "unknown"),
         })
     usable.sort(
@@ -419,6 +423,7 @@ def solve_pipeline_capacity(
         if required <= node["capacity_bytes"]:
             full_model_fits.append(node["node_id"])
 
+    participating_count = len(assignments) + len(relay_only)
     return {
         **base,
         "status": "admitted",
@@ -431,8 +436,8 @@ def solve_pipeline_capacity(
         "control_only_nodes": [
             node["node_id"] for node in usable if node["node_id"] not in used_ids
         ],
-        "participating_node_count": len(assignments),
+        "participating_node_count": participating_count,
         "single_node_full_model_candidates": full_model_fits,
-        "aggregate_only": len(assignments) > 1,
+        "aggregate_only": participating_count > 1,
         "require_distributed": bool(require_distributed),
     }

@@ -2180,8 +2180,8 @@ class Scheduler(
         校验（任一不成立即 **fail-closed**，抛 `ValueError`，绝不静默放过）：
 
         1. 各段认领区间**互不重叠**；
-        2. **段角色与位置匹配**：`head` ⇒ `start == 0`；`tail` ⇒ `end == total_layers`；
-           `middle` ⇒ `start > 0` 且 `end < total_layers`；
+        2. **段角色与位置匹配**：当前 hidden 输入路径拒绝 `head`；`tail` ⇒
+           `end == total_layers`；`middle` ⇒ `start > 0`（允许贴顶并返回 hidden）；
         3. 认领区间**连续覆盖**到 `total_layers`（中间不留空洞）—— 留空洞意味着那段层
            无人执行，而那正是本线要修的根因形态（主节点"顺手"把别人的层也跑了）。
         """
@@ -2210,9 +2210,10 @@ class Scheduler(
             return total_layers
 
         for start, end, role, node_id in claims:
-            # `head` 段吃 **token 序列** ⇒ 必须从 0 起（否则没有 embedding 输入）。
-            if role == "head" and start != 0:
-                raise ValueError(f"head 段 {node_id} 必须从 0 起，实际 [{start}, {end})")
+            if role == "head":
+                raise ValueError(
+                    f"relay head segment is unsupported for hidden input: {node_id} [{start}, {end})"
+                )
             # `tail` 段自己吐 **token**（远端做完 argmax）⇒ 必须覆盖到顶，否则它拿不到末层。
             if role == "tail" and end != total_layers:
                 raise ValueError(
@@ -2223,10 +2224,19 @@ class Scheduler(
             #   ⇒ `master[0,8) + middle[8,24)` 是**完全合法**的产品形态，不得误判为 tail。
             if role == "middle" and start == 0:
                 raise ValueError(
-                    f"middle 段 {node_id} 不能从 0 起（它吃 hidden；0 处应为本机节点或 head 段），"
+                    f"middle 段 {node_id} 不能从 0 起（它吃 hidden；0 处应为本机节点），"
                     f"实际 [{start}, {end})")
 
         ordered = sorted(claims, key=lambda item: item[0])
+        # The current production execution path has one relay worker per
+        # pipeline (master -> relay).  A second relay claim is not executable
+        # yet: relay workers reject chain_next and PeerClient does not forward
+        # relay output to another relay.  Reject it at admission instead of
+        # reporting an admitted plan that will fail on the first token.
+        if len(ordered) > 1:
+            raise ValueError(
+                "当前 relay 执行路径只支持单段 relay；多段 relay chain 尚未接线"
+            )
         for left, right in zip(ordered, ordered[1:]):
             if right[0] < left[1]:
                 raise ValueError(

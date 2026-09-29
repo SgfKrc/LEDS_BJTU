@@ -141,6 +141,23 @@ def test_required_distributed_rejects_single_node_shortcut():
     }
 
 
+def test_relay_exempt_assignment_counts_as_participating_node():
+    relay = node("relay", 1)
+    relay["capacity_source"] = "relay_exempt"
+    plan = solve_pipeline_capacity(
+        descriptor(),
+        [node("master", 600, role="master", score=100), relay],
+        safety_margin=1.0,
+        require_distributed=True,
+        local_layer_budget=4,
+        relay_claims={"relay": (4, 4)},
+    )
+
+    assert plan["admitted"] is True
+    assert plan["participating_node_count"] == 2
+    assert plan["aggregate_only"] is True
+
+
 def test_capacity_failure_returns_no_partial_assignment():
     plan = solve_pipeline_capacity(
         descriptor(),
