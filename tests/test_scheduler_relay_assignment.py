@@ -176,6 +176,19 @@ def test_claimed_prefix_accepts_middle_plus_tail(monkeypatch):
     assert sched._relay_claimed_layer_prefix(24) == 8
 
 
+def test_claimed_prefix_accepts_middle_covering_to_top(monkeypatch):
+    """★★ **当前产品形态**：本机跑 `[0,8)`，**单段 `middle[8,24)`** 覆盖到顶 ⇒ k = 8。
+
+    `middle` 贴顶是合法的 —— 它只输出 hidden，`lm_head` 由主节点在收到末节点回的 hidden
+    后自己跑（`scheduler_pipeline.py:4594-4595` 的推荐拓扑）。此前把它误判为"应 tail"
+    导致真实配置被拒（实测 `reason_code=relay_layer_claim_invalid`），本用例锁住该回归。
+    """
+    sched = _scheduler(monkeypatch, set())
+    _claims(sched, {"mid": _claim("middle", 8, 24)})
+
+    assert sched._relay_claimed_layer_prefix(24) == 8
+
+
 def test_claimed_prefix_accepts_relay_only_topology(monkeypatch):
     """极端但合法：`head` 段从 0 起 + `tail` 段到顶 ⇒ 本机无层（k = 0）。"""
     sched = _scheduler(monkeypatch, set())
@@ -196,8 +209,7 @@ def test_claimed_prefix_without_claims_returns_total(monkeypatch):
     ("claims", "why"),
     [
         ({"a": _claim("middle", 8, 16), "b": _claim("middle", 12, 20)}, "两段重叠"),
-        ({"a": _claim("middle", 8, 24)}, "middle 贴顶（应为 tail）"),
-        ({"a": _claim("middle", 0, 8), "b": _claim("tail", 8, 24)}, "middle 贴底（应为 head）"),
+        ({"a": _claim("middle", 0, 8), "b": _claim("middle", 8, 24)}, "middle 从 0 起（吃不到 hidden）"),
         ({"a": _claim("head", 4, 8), "b": _claim("tail", 8, 24)}, "head 未从 0 起"),
         ({"a": _claim("middle", 8, 16), "b": _claim("tail", 16, 20)}, "tail 未覆盖到顶"),
         ({"a": _claim("middle", 8, 16)}, "中间空洞（8-16 之外无人认领）"),
