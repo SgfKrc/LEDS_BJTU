@@ -205,10 +205,14 @@ class RelaySegmentClient:
 
         return self._run(_call, n_tokens=int(n_tokens), want="hidden")
 
-    def forward_hidden_to_token(self, hidden: bytes, *, n_tokens: int) -> RelaySegmentOutcome:
+    def forward_hidden_to_token(
+        self, hidden: bytes, *, n_tokens: int,
+        seq_meta: dict[str, object] | None = None,
+    ) -> RelaySegmentOutcome:
         """末段往返：hidden → token（远端自己跑完本段并回 argmax）。"""
         def _call(client: RelayTcpClient) -> int:
-            return client.request_token(hidden, n_tokens=int(n_tokens), quant=self.quant)
+            return client.request_token(hidden, n_tokens=int(n_tokens), quant=self.quant,
+                                        seq_meta=seq_meta)
 
         return self._run(_call, n_tokens=int(n_tokens), want="token")
 

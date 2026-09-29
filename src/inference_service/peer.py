@@ -78,6 +78,9 @@ class PeerClient:
         self._active_pipeline_task_ids: set = set()
         self._local_pipeline_cancelled: set = set()
         self._kv_cache: Dict[str, Any] = {}
+        # Relay sessions are task-scoped. Closing a client sends CLOSE and
+        # resets the remote runner's KV state, so it must not happen per step.
+        self._relay_sessions: Dict[str, Any] = {}
         self._pending_layer_config: Optional[tuple] = None
         self._running = False
         self._client: Optional[Any] = None  # tcp_comm.TCPClient
@@ -107,6 +110,8 @@ class PeerClient:
             self._report_device_profile()
 
         def _on_disconnect() -> None:
+            with self._layer_execution_lock:
+                self._close_all_relay_sessions()
             logger.warning("与主节点连接断开: %s:%s", self._master_host, self._master_port)
             with self._layer_config_lock:
                 self._active_layer_config = None
@@ -190,6 +195,7 @@ class PeerClient:
             if target_node_id != node_id:
                 logger.warning("忽略目标不匹配的分层释放: target=%s local=%s", target_node_id, node_id)
                 return
+            self._close_all_relay_sessions()
             with self._layer_config_lock:
                 self._active_layer_config = None
                 self._local_pipeline_steps.clear()
@@ -476,19 +482,75 @@ class PeerClient:
             return
         n_tokens = len(hidden_bytes) // (width * 4)
 
+        seq_ids = data.get("seq_ids")
+        positions = data.get("positions")
+        seq_meta = None
+        if seq_ids is not None or positions is not None:
+            if not (isinstance(seq_ids, list) and isinstance(positions, list)
+                    and len(seq_ids) == n_tokens and len(positions) == n_tokens):
+                self._send_layer_result(
+                    task_id, {},
+                    error="relay seq_ids/positions must match hidden token count",
+                )
+                return
+            try:
+                seq_values = [int(value) for value in seq_ids]
+                pos_values = [int(value) for value in positions]
+                if any(value < 0 for value in seq_values + pos_values):
+                    raise ValueError
+                raw_n_seq_id = data.get("n_seq_id")
+                if raw_n_seq_id is None:
+                    n_seq_values = [1] * n_tokens
+                elif isinstance(raw_n_seq_id, list) and len(raw_n_seq_id) == n_tokens:
+                    n_seq_values = [int(value) for value in raw_n_seq_id]
+                else:
+                    raise ValueError
+                if any(value < 1 for value in n_seq_values):
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError):
+                self._send_layer_result(task_id, {}, error="relay seq_ids/positions are invalid")
+                return
+            seq_meta = {
+                "n_seq_id": n_seq_values,
+                "seq_ids": seq_values,
+                "positions": pos_values,
+            }
+
         started = time.time()
         try:
-            with RelaySegmentClient(
-                str(spec.get("host", "")), int(spec.get("port", 0)),
-                n_embd=width, role=role,
-                timeout=float(spec.get("timeout", 60.0) or 60.0),
-            ) as client:
-                if role == "tail":
+            endpoint_key = (
+                str(spec.get("host", "")), int(spec.get("port", 0)), width, role,
+                float(spec.get("timeout", 60.0) or 60.0),
+            )
+            sessions = getattr(self, "_relay_sessions", None)
+            if sessions is None:
+                sessions = self._relay_sessions = {}
+            client = sessions.get(task_id)
+            if client is not None and getattr(client, "_relay_endpoint_key", None) != endpoint_key:
+                self._close_relay_session(task_id)
+                client = None
+            if client is None:
+                client = RelaySegmentClient(
+                    endpoint_key[0], endpoint_key[1], n_embd=width,
+                    role=role, timeout=endpoint_key[4],
+                )
+                client._relay_endpoint_key = endpoint_key
+                sessions[task_id] = client
+            if role == "tail":
+                if seq_meta is None:
                     outcome = client.forward_hidden_to_token(hidden_bytes, n_tokens=n_tokens)
                 else:
+                    outcome = client.forward_hidden_to_token(
+                        hidden_bytes, n_tokens=n_tokens, seq_meta=seq_meta)
+            else:
+                if seq_meta is None:
                     outcome = client.forward_hidden(hidden_bytes, n_tokens=n_tokens)
+                else:
+                    outcome = client.forward_hidden(
+                        hidden_bytes, n_tokens=n_tokens, seq_meta=seq_meta)
         except Exception as exc:
             logger.error("relay 段委托失败: %s", exc, exc_info=True)
+            self._close_relay_session(task_id)
             self._send_layer_result(task_id, {}, error=f"relay_segment_failed:{exc}")
             return
         elapsed_ms = (time.time() - started) * 1000
@@ -498,6 +560,7 @@ class PeerClient:
             logger.warning(
                 "relay 段委托未成功: task=%s step=%s code=%s", task_id, step, code
             )
+            self._close_relay_session(task_id)
             self._send_layer_result(task_id, {}, error=f"relay_segment_failed:{code}")
             return
 
@@ -523,6 +586,7 @@ class PeerClient:
             token = getattr(outcome, "token", None)
             if token is None:
                 self._send_layer_result(task_id, {}, error="relay tail 段未返回 token")
+                self._close_relay_session(task_id)
                 return
             response = {**common_response, "token": int(token)}
         else:
@@ -539,6 +603,7 @@ class PeerClient:
             except Exception as exc:
                 logger.error("relay 段返回的 hidden 无法还原: %s", exc, exc_info=True)
                 self._send_layer_result(task_id, {}, error=f"relay hidden 还原失败: {exc}")
+                self._close_relay_session(task_id)
                 return
             # Keep the relay contract symmetric with scheduler_pipeline:
             # raw f32 in both directions, with an explicit discriminator.
@@ -554,6 +619,26 @@ class PeerClient:
             n_tokens, elapsed_ms,
         )
         self._send_layer_result(task_id, response)
+
+    def _close_relay_session(self, task_id: str) -> None:
+        """Close one task-scoped relay connection and forget it."""
+        sessions = getattr(self, "_relay_sessions", None)
+        if not sessions:
+            return
+        client = sessions.pop(str(task_id), None)
+        if client is None:
+            return
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001 - cleanup must not mask pipeline state
+            logger.warning("relay session close failed: task=%s", task_id, exc_info=True)
+
+    def _close_all_relay_sessions(self) -> None:
+        sessions = getattr(self, "_relay_sessions", None)
+        if not sessions:
+            return
+        for task_id in list(sessions):
+            self._close_relay_session(task_id)
 
     def _handle_layer_forward_locked(self, data: dict) -> None:
         # ★ A1 / X 档（Y 档第二条缺口 8）：`engine == "relay_middle"` ⇒ 本节点**不跑层**，
@@ -762,22 +847,26 @@ class PeerClient:
     def _handle_pipeline_done(self, data: dict) -> None:
         task_id = data.get("task_id", "")
         if task_id:
-            with self._layer_config_lock:
-                self._local_pipeline_cancelled.discard(task_id)
-                self._local_pipeline_steps.pop(task_id, None)
-            with self._kv_cache_lock:
-                self._kv_cache.pop(task_id, None)
-            logger.info(f"🧹 流水线任务 {task_id} KV 缓存已清理")
+            with self._layer_execution_lock:
+                self._close_relay_session(task_id)
+                with self._layer_config_lock:
+                    self._local_pipeline_cancelled.discard(task_id)
+                    self._local_pipeline_steps.pop(task_id, None)
+                with self._kv_cache_lock:
+                    self._kv_cache.pop(task_id, None)
+                logger.info(f"🧹 流水线任务 {task_id} KV 缓存已清理")
 
     def _handle_pipeline_abort(self, data: dict) -> None:
         task_id = data.get("task_id", "")
         if task_id:
-            with self._layer_config_lock:
-                self._local_pipeline_steps.pop(task_id, None)
-            self._local_pipeline_cancelled.add(task_id)
-            with self._kv_cache_lock:
-                self._kv_cache.pop(task_id, None)
-            logger.info(f"流水线任务取消: {task_id}")
+            with self._layer_execution_lock:
+                self._close_relay_session(task_id)
+                with self._layer_config_lock:
+                    self._local_pipeline_steps.pop(task_id, None)
+                    self._local_pipeline_cancelled.add(task_id)
+                with self._kv_cache_lock:
+                    self._kv_cache.pop(task_id, None)
+                logger.info(f"流水线任务取消: {task_id}")
 
     # ------------------------------------------------------------------
     # 设备画像上报（心跳时附带）

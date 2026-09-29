@@ -432,7 +432,13 @@ class RelayTcpClient:
         self._sequence = 0
         self._closed = False
 
-    def request_token(self, hidden: bytes, *, n_tokens: int, quant: str = "none") -> int:
+    def request_token(self, hidden: bytes, *, n_tokens: int, quant: str = "none",
+                      seq_meta: dict[str, object] | None = None) -> int:
+        """Send hidden to a tail and receive its argmax token.
+
+        ``seq_meta`` carries explicit per-token sequence/position bindings for
+        decode. The legacy ``HIDDEN`` frame remains the default.
+        """
         if self._closed:
             raise RelayProtocolError("client_closed")
         count = int(n_tokens)
@@ -440,11 +446,17 @@ class RelayTcpClient:
             raise RelayProtocolError("token_count_exceeds_limit")
         if len(hidden) != expected_hidden_bytes(count, self.n_embd):
             raise RelayProtocolError("hidden_payload_size_mismatch")
-        payload = quantize_upload(hidden, count, self.n_embd, quant)
+        if seq_meta is None:
+            kind = RelayFrameKind.HIDDEN
+            payload = quantize_upload(hidden, count, self.n_embd, quant)
+        else:
+            kind = RelayFrameKind.HIDDEN_SEQ
+            payload = encode_hidden_seq(hidden, n_tokens=count, meta=seq_meta,
+                                        quant=quant, n_embd=self.n_embd)
         sequence = self._sequence
         send_frame(
             self._sock,
-            RelayFrame(RelayFrameKind.HIDDEN, sequence, n_tokens=count, payload=payload,
+            RelayFrame(kind, sequence, n_tokens=count, payload=payload,
                        quant=quant or "none"),
         )
         response = recv_frame(self._sock, max_payload_bytes=self.max_payload_bytes)
@@ -676,7 +688,8 @@ def serve_relay_connection(
 
     width = int(n_embd)
     limit = int(max_tokens)
-    max_payload = expected_hidden_bytes(limit, width)
+    max_payload = (expected_hidden_bytes(limit, width)
+                   + RELAY_SEQ_META_LIMIT + _SEQ_HEADER.size)
     sequence = 0
     frames = 0
     tokens = 0
@@ -704,6 +717,36 @@ def serve_relay_connection(
                     RelayFrame(RelayFrameKind.TOKEN, sequence, n_tokens=1, payload=_TOKEN.pack(-1)),
                 )
                 return RelayBridgeResult(frames, tokens, payload_bytes, True)
+            if frame.kind == RelayFrameKind.HIDDEN_SEQ:
+                hidden, n_tokens, meta = decode_hidden_seq(
+                    frame.payload, n_embd=width, quant=frame.quant)
+                if n_tokens != frame.n_tokens:
+                    raise RelayProtocolError("hidden_seq_token_count_mismatch")
+                if n_tokens < 1 or n_tokens > limit:
+                    raise RelayProtocolError("token_count_exceeds_limit")
+                if not hasattr(runner, "request_token_seq"):
+                    raise RelayProtocolError("hidden_seq_unsupported")
+                try:
+                    token = int(runner.request_token_seq(
+                        hidden, n_tokens=n_tokens, meta=meta))
+                except RelayProtocolError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Relay tail runner (seq) failed: code=%s",
+                                     RELAY_RUNNER_ERROR)
+                    raise RelayProtocolError(RELAY_RUNNER_ERROR) from exc
+                if token < 0:
+                    raise RelayProtocolError("runner_failed")
+                send_frame(
+                    sock,
+                    RelayFrame(RelayFrameKind.TOKEN, sequence, n_tokens=1,
+                               payload=_TOKEN.pack(token)),
+                )
+                frames += 1
+                tokens += n_tokens
+                payload_bytes += len(frame.payload)
+                sequence += 1
+                continue
             if frame.kind != RelayFrameKind.HIDDEN:
                 raise RelayProtocolError("hidden_frame_required")
             if frame.n_tokens < 1 or frame.n_tokens > limit:

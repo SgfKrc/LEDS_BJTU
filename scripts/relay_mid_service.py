@@ -178,6 +178,23 @@ class TailRunner:
         self._pos += count
         return int(np.asarray(logits)[-1].argmax())
 
+    def request_token_seq(self, hidden_bytes: bytes, *, n_tokens: int,
+                          meta: dict[str, object]) -> int:
+        """Tail variant with explicit per-token sequence positions."""
+        import numpy as np  # noqa: PLC0415
+
+        count = int(n_tokens)
+        incoming = np.frombuffer(hidden_bytes, dtype=np.float32).reshape(count, self.n_embd)
+        logits = self._engine.forward_layers_from_hidden(
+            incoming,
+            seq_ids=meta.get("seq_ids"),
+            positions=meta.get("positions"),
+            all_logits=True,
+        )
+        if logits is None:
+            return -1
+        return int(np.asarray(logits)[-1].argmax())
+
     def close(self) -> None:
         self.reset()
 
@@ -298,6 +315,23 @@ class ShimTailRunner:
         token = self._upstream.forward_hidden_to_token(incoming, n_past=self._pos)
         self._pos += count
         return int(token)
+
+    def request_token_seq(self, hidden_bytes: bytes, *, n_tokens: int,
+                          meta: dict[str, object]) -> int:
+        """Tail variant with explicit per-token sequence positions."""
+        import numpy as np  # noqa: PLC0415
+
+        count = int(n_tokens)
+        expected = count * int(self.n_embd) * 4
+        if len(hidden_bytes) != expected:
+            raise ValueError(
+                f"tail hidden bytes={len(hidden_bytes)} expected={expected}")
+        incoming = np.frombuffer(hidden_bytes, dtype=np.float32).reshape(count, self.n_embd)
+        return int(self._upstream.forward_hidden_to_token(
+            incoming,
+            seq_ids=meta.get("seq_ids"),
+            positions=meta.get("positions"),
+        ))
 
     def close(self) -> None:
         self.reset()

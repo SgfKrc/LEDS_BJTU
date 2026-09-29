@@ -99,10 +99,17 @@ class _TailRunner:
     def __init__(self, token: int = 4242) -> None:
         self.token = int(token)
         self.seen: list[tuple[int, bytes]] = []
+        self.seq_meta: dict[str, object] | None = None
         self.resets = 0
 
     def request_token(self, hidden: bytes, *, n_tokens: int) -> int:
         self.seen.append((n_tokens, hidden))
+        return self.token
+
+    def request_token_seq(self, hidden: bytes, *, n_tokens: int,
+                          meta: dict[str, object]) -> int:
+        self.seen.append((n_tokens, hidden))
+        self.seq_meta = meta
         return self.token
 
     def reset(self) -> None:
@@ -199,6 +206,28 @@ def test_tail_round_trip_returns_token():
     assert outcome.ok, outcome.error
     assert outcome.token == 31337
     assert outcome.hidden == b""
+
+
+def test_tail_seq_meta_round_trip_preserves_decode_positions():
+    runner = _TailRunner(token=31338)
+    listener, port = _listen()
+    try:
+        thread, _ = _serve_once(listener, runner, middle=False)
+        client = RelaySegmentClient("127.0.0.1", port, n_embd=N_EMBD, role="tail")
+        try:
+            outcome = client.forward_hidden_to_token(
+                _hidden(), n_tokens=N_TOKENS, seq_meta={
+                    "seq_ids": [0, 0], "positions": [17, 18],
+                })
+        finally:
+            client.close()
+        thread.join(timeout=5)
+    finally:
+        listener.close()
+
+    assert outcome.ok, outcome.error
+    assert outcome.token == 31338
+    assert runner.seq_meta == {"seq_ids": [0, 0], "positions": [17, 18]}
 
 
 def test_head_round_trip_returns_hidden():

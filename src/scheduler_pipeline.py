@@ -14,7 +14,6 @@ from config import (PIPELINE_MODEL_SYNC_TIMEOUT, PIPELINE_RELAY_ENABLED,
 # ★ #31 M2：层流水线支持的架构**单一事实来源**（此前在 4 处各写了一份 `{"qwen","qwen2"}`）
 from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
 from relay_segment_client import (
-    SEGMENT_ROLES,
     RelaySegmentClient,
     RelaySegmentError,
 )
@@ -758,7 +757,7 @@ class SchedulerPipelineMixin:
             self._relay_segment_clients = cache
         key = (
             str(spec["host"]), int(spec["port"]), int(n_embd),
-            float(spec["timeout"]),
+            str(spec.get("role", "middle")), float(spec["timeout"]),
         )
         current = cache.get(task_id)
         if current is not None and current[0] == key:
@@ -770,7 +769,7 @@ class SchedulerPipelineMixin:
                 logger.debug("close stale relay session failed", exc_info=True)
         client = RelaySegmentClient(
             str(spec["host"]), int(spec["port"]), n_embd=int(n_embd),
-            role="middle", timeout=float(spec["timeout"]),
+            role=str(spec.get("role", "middle")), timeout=float(spec["timeout"]),
         )
         cache[task_id] = (key, client)
         return client
@@ -2623,11 +2622,12 @@ class SchedulerPipelineMixin:
         返回 `None` 表示"不适用"（缺失 / 非法 / 超出 X 档范围）—— 调用方据此走**既有**拒绝路径。
         严格到"多一个未知键就整条不认"，避免"半懂"的规格被误用。
 
-        **角色（Y-(b) 放开）**：`head` / `middle` / `tail` 三选一，判据与
-        `relay_segment_client.SEGMENT_ROLES` **同源**（段侧三者均已实现：`middle` =
-        hidden → hidden，与本节点"中间节点返回 hidden_states"的既有契约对齐；`head` =
-        token → hidden；`tail` = hidden → token，末段返回 logits）。
-        角色的**区间语义**（head 须从 0 起、tail 须到 total_layers 止）在**切分校验**处检查 ——
+        **角色（当前 hidden 输入执行路径）**：`middle` / `tail` 二选一。`head` 需要
+        token → hidden 的独立上游协议，当前 scheduler/PeerClient 不接收该输入，因此在
+        配置解析层直接拒绝，避免 readiness 看似成功后首帧才失败。`middle` =
+        hidden → hidden，与本节点"中间节点返回 hidden_states"的既有契约对齐；`tail` =
+        hidden → token，末段返回 token。`head` 的 token → hidden 输入协议仍未接线。
+        角色的**区间语义**（tail 须到 total_layers 止）在**切分校验**处检查 ——
         这里只保证"角色合法 + 层区间存在且非空"。
         **★ Y 档第二条：层区间必填**。relay 段必须声明它**认领**的层区间
         `[layer_start, layer_end)` —— 这是修复「relay 段的层范围从未进入调度 ⇒ 主节点跑满
@@ -2641,8 +2641,8 @@ class SchedulerPipelineMixin:
                        "layer_start", "layer_end"}:
             return None
         role = str(raw.get("role", "")).strip().lower()
-        if role not in SEGMENT_ROLES:
-            return None     # head / middle / tail 三选一（段侧均已支持）
+        if role not in {"middle", "tail"}:
+            return None     # head 需要 token→hidden，上游协议尚未接线
         host = str(raw.get("host", "")).strip()
         if not is_loopback_host(host):
             return None     # 跨机必须走本地 SSH 隧道端点（Relay 传输层自身也强制 loopback）
@@ -2725,7 +2725,23 @@ class SchedulerPipelineMixin:
         started = time.time()
         client = self._relay_segment_client_for_task(task_id, spec, n_embd=width)
         try:
-            outcome = client.forward_hidden(hidden_bytes, n_tokens=n_tokens, seq_meta=seq_meta)
+            role = str(spec.get("role", "middle"))
+            if role == "tail":
+                if seq_meta is None:
+                    outcome = client.forward_hidden_to_token(
+                        hidden_bytes, n_tokens=n_tokens)
+                else:
+                    outcome = client.forward_hidden_to_token(
+                        hidden_bytes, n_tokens=n_tokens, seq_meta=seq_meta)
+            elif role == "middle":
+                if seq_meta is None:
+                    outcome = client.forward_hidden(hidden_bytes, n_tokens=n_tokens)
+                else:
+                    outcome = client.forward_hidden(
+                        hidden_bytes, n_tokens=n_tokens, seq_meta=seq_meta)
+            else:
+                raise RelaySegmentError("relay_role_unsupported", role=role,
+                                        detail="unsupported scheduler relay role")
         except Exception:
             self._close_relay_segment_client(task_id)
             raise
@@ -2736,7 +2752,7 @@ class SchedulerPipelineMixin:
             #   `_fallback_reason`（形如 `pipeline_error_result: ... relay_segment_failed:runner_failed#...`）。
             #   `detail` 只进可读消息；`RelaySegmentError.code` 仍是白名单码（可供线上/日志使用）。
             _code = outcome.error or "relay_internal_error"
-            raise RelaySegmentError(_code, role="middle", endpoint=outcome.endpoint,
+            raise RelaySegmentError(_code, role=str(spec.get("role", "middle")), endpoint=outcome.endpoint,
                                     detail=f"relay_segment_failed:{_code}")
 
         layer_lock = getattr(self, "_layer_config_lock", None)
@@ -2759,9 +2775,6 @@ class SchedulerPipelineMixin:
             "model_type": model_type,
             "chain_path": [*[str(item) for item in received_chain_path],
                            self.get_effective_node_id()],
-            "hidden_states": bytes(outcome.hidden),
-            "hidden_wire_format": RELAY_HIDDEN_WIRE_FORMAT,
-            "hidden_shape": hidden_shape,
             "metrics": {
                 "time_ms": round(elapsed_ms, 1),
                 "kv_cache": False,       # KV 在远端段，本节点没有本地 KV
@@ -2771,6 +2784,17 @@ class SchedulerPipelineMixin:
                 **outcome.to_metrics(),
             },
         }
+        if role == "tail":
+            if outcome.token is None:
+                raise RelaySegmentError("relay_internal_error", role=role,
+                                        detail="relay tail did not return token")
+            response["token"] = int(outcome.token)
+        else:
+            response.update({
+                "hidden_states": bytes(outcome.hidden),
+                "hidden_wire_format": RELAY_HIDDEN_WIRE_FORMAT,
+                "hidden_shape": hidden_shape,
+            })
         logger.info(
             f"🔁 relay 段委托完成: task={task_id}, step={step}, "
             f"段={outcome.role}@{spec['host']}:{spec['port']}, tokens={n_tokens}, "
@@ -4496,6 +4520,24 @@ class SchedulerPipelineMixin:
                             _encode_relay_hidden(hs_cpu)
                         )
                         forward_data["hidden_wire_format"] = RELAY_HIDDEN_WIRE_FORMAT
+                        # Relay stages must see the same absolute RoPE/KV
+                        # positions as the local first stage.  A new TCP
+                        # session is no longer opened per step, but explicit
+                        # metadata also keeps tail/middle correct for callers
+                        # that use more than one sequence.
+                        if hs_cpu.ndim < 2:
+                            raise RuntimeError("relay hidden must have token and embedding dimensions")
+                        hidden_seq = int(hs_cpu.shape[-2])
+                        hidden_batch = int(hs_cpu.numel() // (hidden_seq * int(hs_cpu.shape[-1])))
+                        prompt_tokens = int(input_ids.shape[-1])
+                        if is_prefill:
+                            positions_per_seq = list(range(hidden_seq))
+                        else:
+                            positions_per_seq = [prompt_tokens + step - 1] * hidden_seq
+                        forward_data["seq_ids"] = [
+                            seq_id for seq_id in range(hidden_batch) for _ in range(hidden_seq)
+                        ]
+                        forward_data["positions"] = positions_per_seq * hidden_batch
                     else:
                         forward_data["hidden_states"] = _b64.b64encode(
                             serialize_tensor_fast(hs_cpu)

@@ -185,18 +185,22 @@ def test_normalize_defaults_timeout():
 
 @pytest.mark.parametrize(
     ("role", "start", "end"),
-    [("head", 0, 8), ("middle", 8, 16), ("tail", 16, 24)],
+    [("middle", 8, 16), ("tail", 16, 24)],
 )
-def test_normalize_accepts_all_three_roles(role: str, start: int, end: int):
-    """★ Y-(b)：三角色（head / middle / tail）均被接受，且**原样**回带角色与层区间。
-
-    判据与 `relay_segment_client.SEGMENT_ROLES` 同源（段侧三者均已实现）。
-    """
+def test_normalize_accepts_hidden_input_roles(role: str, start: int, end: int):
+    """当前 scheduler relay 输入是 hidden，只接受 middle/tail。"""
     spec = SchedulerPipelineMixin._normalize_relay_segment(
         {"role": role, "host": "127.0.0.1", "port": 50183, "n_embd": 896,
          "layer_start": start, "layer_end": end})
     assert spec == {"role": role, "host": "127.0.0.1", "port": 50183, "n_embd": 896,
                     "timeout": 60.0, "layer_start": start, "layer_end": end}
+
+
+def test_normalize_rejects_head_until_token_input_protocol_is_wired():
+    spec = SchedulerPipelineMixin._normalize_relay_segment(
+        {"role": "head", "host": "127.0.0.1", "port": 50183, "n_embd": 896,
+         "layer_start": 0, "layer_end": 8})
+    assert spec is None
 
 
 # ---- _handle_layer_forward_via_relay：成功路径 ----------------------------
