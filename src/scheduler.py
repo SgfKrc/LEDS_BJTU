@@ -1900,6 +1900,22 @@ class Scheduler(
         #   ⇒ `pipeline_distributed_workers_unavailable` ⇒ `/api/chat` 503。
         node_list, relay_nodes = self._split_relay_nodes(node_list)
 
+        # ★ Y 档第二条（层区间认领 + 扣除）：relay 段认领的层由**远端段服务**执行，
+        #   不属于任何本机层节点。这里先校验认领（重叠 / 角色 / 连续性，任一不成立即
+        #   fail-closed），再把「本机层节点可用的层预算」`layer_budget` 作为分配上界 ——
+        #   这样 master 只会拿到 `[0, k)`，不再出现「master 跑满全部层、远端段在**已过
+        #   全部层**的 hidden 上重算」那个根因形态。
+        layer_budget = self._relay_claimed_layer_prefix(total_layers)
+
+        if layer_budget == 0:
+            # 全部层都被 relay 段认领 ⇒ 本机层节点无层可跑（主节点只做聚合，
+            # `master_participates` 会因此为 False，`_run_pipeline` 已有该分支）。
+            logger.info(
+                "全部层由 relay 段认领（本机层节点无层可跑）: %s",
+                [n["node_id"] for n in relay_nodes],
+            )
+            return self._append_relay_assignments([], relay_nodes, total_layers)
+
         if not node_list:
             if relay_nodes:
                 logger.info(
@@ -1910,7 +1926,7 @@ class Scheduler(
             logger.warning("没有可用的层前向节点参与流水线层拆分")
             return []
 
-        # 单节点：全部层给该节点。多节点时 master 也参与首段层计算，
+        # 单节点：全部（**未被 relay 段认领**的）层给该节点。多节点时 master 也参与首段层计算，
         # run_pipeline() 会先在 master 本地执行其层范围，再把 hidden_states
         # 交给第一个 worker，避免浪费主节点 CUDA 独显算力。
         if len(node_list) == 1:
@@ -1919,8 +1935,8 @@ class Scheduler(
                 "node_id": n["node_id"],
                 "role": n["role"],
                 "start_layer": 0,
-                "end_layer": total_layers,
-                "layers_count": total_layers,
+                "end_layer": layer_budget,
+                "layers_count": layer_budget,
                 "has_embedding": True,
                 "has_lm_head": True,
                 "score": 50.0,
@@ -1944,7 +1960,7 @@ class Scheduler(
                     configured_quant=QUANT_TYPE,
                 )
                 model_memory_mb = (
-                    total_layers * layer_mb + embedding_mb + lm_head_mb
+                    layer_budget * layer_mb + embedding_mb + lm_head_mb
                 ) * SAFE_VRAM_MARGIN
 
                 # 构建 nodes dict（GraphOrchestrator 需要的格式）
@@ -1967,16 +1983,17 @@ class Scheduler(
 
                     # 先确定 master 锚点和 I/O 头归属，再按真实内存负担校验。
                     assignments = self._normalize_master_anchor(
-                        assignments, node_list, total_layers
+                        assignments, node_list, layer_budget
                     )
                     assignments = self._apply_vram_constraints(assignments)
                     assignments = self._normalize_master_anchor(
-                        assignments, node_list, total_layers
+                        assignments, node_list, layer_budget
                     )
 
                     logger.info(
                         f"🧠 图算法智能编排完成: {len(assignments)} 节点, "
-                        f"总 {total_layers} 层, 策略=graph_orchestrator"
+                        f"本机 {layer_budget} 层 / 共 {total_layers} 层, "
+                        f"策略=graph_orchestrator"
                     )
                     for a in assignments:
                         logger.info(
@@ -2003,13 +2020,20 @@ class Scheduler(
         #   2. GraphOrchestrator 顶层抛异常
         #        → 外部回退到此 _simple_weight_assignment（算力权重分）
         # 两层回退确保即使图算法崩溃，系统仍能降级到可用状态。
-        return self._simple_weight_assignment(node_list, total_layers, relay_nodes)
+        return self._simple_weight_assignment(
+            node_list, layer_budget, relay_nodes, relay_total_layers=total_layers,
+        )
 
     def _simple_weight_assignment(self, node_list: list,
                                    total_layers: int,
-                                   relay_nodes: list | None = None) -> list:
+                                   relay_nodes: list | None = None,
+                                   relay_total_layers: int | None = None) -> list:
         """
         简单权重比例分配（节点数 ≤ GRAPH_ORCHESTRATOR_THRESHOLD 时使用）。
+
+        `total_layers` 是**本机层节点可用的层预算**（已扣除 relay 段认领层，即 `k`）；
+        `relay_total_layers` 是**模型总层数**，仅用于生成 relay 段条目（零层占位）。
+        两者**不可混用** —— 混用会让 relay 条目落在错误的层号上。
 
         算法:
           1. 计算各节点算力权重
@@ -2050,7 +2074,7 @@ class Scheduler(
             assignments = self._apply_vram_constraints(assignments)
             return self._append_relay_assignments(
                 self._normalize_master_anchor(assignments, node_list, total_layers),
-                relay_nodes, total_layers,
+                relay_nodes, relay_total_layers or total_layers,
             )
 
         # Step 2: 按比例分配全部 Transformer 层
@@ -2128,7 +2152,7 @@ class Scheduler(
 
         logger.info(
             f"动态分层计算完成: {len(assignments)} 节点, "
-            f"总 {total_layers} 层, 策略=simple_weight"
+            f"本机 {total_layers} 层, 策略=simple_weight"
         )
         for a in assignments:
             logger.info(
@@ -2137,7 +2161,83 @@ class Scheduler(
                 f"lm_head={a['has_lm_head']} score={a['score']}"
             )
 
-        return self._append_relay_assignments(assignments, relay_nodes or [], total_layers)
+        return self._append_relay_assignments(
+            assignments, relay_nodes or [], relay_total_layers or total_layers,
+        )
+
+    def _relay_claimed_layer_prefix(self, total_layers: int) -> int:
+        """★ Y 档第二条：校验 relay 段的**层区间认领**，返回"本机层节点可用的前缀长度" `k`。
+
+        语义：relay 段认领的层由**远端段服务**执行，不属于任何本机层节点。
+        在「链式单段」架构下（`_run_pipeline` 的 `full_chain = [master] + pipeline`，
+        每个层节点只能表达**一个连续区间**），唯一可表达的合法形态是：
+
+        **本机层节点跑 `[0, k)`，relay 段连续覆盖 `[k, total_layers)`。**
+
+        （`k == 0` 合法：全部层都由远端段跑，主节点只做聚合 —— `master_participates`
+        会因此为 False，`_run_pipeline` 已有该分支。）
+
+        校验（任一不成立即 **fail-closed**，抛 `ValueError`，绝不静默放过）：
+
+        1. 各段认领区间**互不重叠**；
+        2. **段角色与位置匹配**：`head` ⇒ `start == 0`；`tail` ⇒ `end == total_layers`；
+           `middle` ⇒ `start > 0` 且 `end < total_layers`；
+        3. 认领区间**连续覆盖**到 `total_layers`（中间不留空洞）—— 留空洞意味着那段层
+           无人执行，而那正是本线要修的根因形态（主节点"顺手"把别人的层也跑了）。
+        """
+        if total_layers <= 0:
+            raise ValueError(f"total_layers 非法: {total_layers}")
+
+        claims: list[tuple[int, int, str, str]] = []
+        with self._layer_config_lock:
+            relay_map = dict(getattr(self, "_relay_segment_map_cache", None) or {})
+        for node_id, spec in relay_map.items():
+            if not isinstance(spec, dict):
+                continue
+            try:
+                start = int(spec.get("layer_start", -1))
+                end = int(spec.get("layer_end", -1))
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"relay 段 {node_id} 的层区间不可解析: {spec!r}") from None
+            role = str(spec.get("role", "") or "")
+            if start < 0 or end <= start or end > total_layers:
+                raise ValueError(
+                    f"relay 段 {node_id} 的层区间越界: [{start}, {end}) / total={total_layers}")
+            claims.append((start, end, role, node_id))
+
+        if not claims:
+            return total_layers
+
+        for start, end, role, node_id in claims:
+            if role == "head" and start != 0:
+                raise ValueError(f"head 段 {node_id} 必须从 0 起，实际 [{start}, {end})")
+            if role == "tail" and end != total_layers:
+                raise ValueError(
+                    f"tail 段 {node_id} 必须覆盖到顶（{total_layers}），实际 [{start}, {end})")
+            if role == "middle" and (start == 0 or end == total_layers):
+                raise ValueError(
+                    f"middle 段 {node_id} 不得贴边，实际 [{start}, {end})（贴边应为 head/tail）")
+
+        ordered = sorted(claims, key=lambda item: item[0])
+        for left, right in zip(ordered, ordered[1:]):
+            if right[0] < left[1]:
+                raise ValueError(
+                    f"relay 段层区间重叠: [{left[0]}, {left[1]}) 与 [{right[0]}, {right[1]})")
+
+        k = ordered[0][0]
+        cursor = k
+        for start, end, _role, node_id in ordered:
+            if start != cursor:
+                raise ValueError(
+                    f"relay 段层区间不连续（{cursor} 处断裂，下一段为 {node_id} [{start}, {end})）"
+                    f" —— 空洞内的层将无人执行")
+            cursor = end
+        if cursor != total_layers:
+            raise ValueError(
+                f"relay 段层区间未覆盖到顶（止于 {cursor} / {total_layers}）"
+                f" —— 其上的层将无人执行")
+        return k
 
     def _split_relay_nodes(self, node_list: list) -> tuple[list, list]:
         """★ A1 / X 档（Y 档第二条缺口 1）：把 relay 段节点从**层分配**里摘出来。

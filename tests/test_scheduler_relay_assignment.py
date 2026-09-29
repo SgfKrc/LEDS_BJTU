@@ -149,3 +149,94 @@ def test_guard_split_relay_nodes_uses_the_real_predicate(monkeypatch):
 
     assert [n["node_id"] for n in remaining] == ["master"]
     assert [n["node_id"] for n in relay] == ["client2"]
+
+
+def _claim(role: str, start: int, end: int, port: int = 50283) -> dict:
+    """一条 relay 段规格（与 `_normalize_relay_segment` 的返回形状一致）。"""
+    return {"role": role, "host": "127.0.0.1", "port": port, "n_embd": 896,
+            "timeout": 60.0, "layer_start": start, "layer_end": end}
+
+
+def _claims(sched: Scheduler, claims: dict) -> None:
+    """注入 relay 段映射（`_relay_claimed_layer_prefix` 的输入真源）。"""
+    sched._relay_segment_map_cache = claims
+
+
+# ---- ★ Y 档第二条：层区间认领的校验（fail-closed）-------------------------
+
+
+def test_claimed_prefix_accepts_middle_plus_tail(monkeypatch):
+    """合法形态：本机跑 head `[0,8)`，middle 段 `[8,16)`，tail 段 `[16,24)` ⇒ k = 8。
+
+    这正是产品形态（master 做 head，Surface 上的 middle + tail 段覆盖其余）。
+    """
+    sched = _scheduler(monkeypatch, set())
+    _claims(sched, {"mid": _claim("middle", 8, 16), "tail": _claim("tail", 16, 24)})
+
+    assert sched._relay_claimed_layer_prefix(24) == 8
+
+
+def test_claimed_prefix_accepts_relay_only_topology(monkeypatch):
+    """极端但合法：`head` 段从 0 起 + `tail` 段到顶 ⇒ 本机无层（k = 0）。"""
+    sched = _scheduler(monkeypatch, set())
+    _claims(sched, {"head": _claim("head", 0, 8), "tail": _claim("tail", 8, 24)})
+
+    assert sched._relay_claimed_layer_prefix(24) == 0
+
+
+def test_claimed_prefix_without_claims_returns_total(monkeypatch):
+    """没有认领 ⇒ k = total（与接线前一致，对既有路径零影响）。"""
+    sched = _scheduler(monkeypatch, set())
+    _claims(sched, {})
+
+    assert sched._relay_claimed_layer_prefix(24) == 24
+
+
+@pytest.mark.parametrize(
+    ("claims", "why"),
+    [
+        ({"a": _claim("middle", 8, 16), "b": _claim("middle", 12, 20)}, "两段重叠"),
+        ({"a": _claim("middle", 8, 24)}, "middle 贴顶（应为 tail）"),
+        ({"a": _claim("middle", 0, 8), "b": _claim("tail", 8, 24)}, "middle 贴底（应为 head）"),
+        ({"a": _claim("head", 4, 8), "b": _claim("tail", 8, 24)}, "head 未从 0 起"),
+        ({"a": _claim("middle", 8, 16), "b": _claim("tail", 16, 20)}, "tail 未覆盖到顶"),
+        ({"a": _claim("middle", 8, 16)}, "中间空洞（8-16 之外无人认领）"),
+        ({"a": _claim("middle", 8, 30)}, "区间越界"),
+        ({"a": _claim("middle", 8, 8)}, "空区间"),
+    ],
+)
+def test_claimed_prefix_rejects_invalid(monkeypatch, claims, why):
+    """★ fail-closed：任一不成立的认领都必须**抛错**，绝不静默放过（`why` 即判据）。"""
+    sched = _scheduler(monkeypatch, set())
+    _claims(sched, claims)
+
+    with pytest.raises(ValueError):
+        sched._relay_claimed_layer_prefix(24)
+
+
+# ---- ★ Y 档第二条：认领层必须从本机节点的分配里**扣除** -------------------
+
+
+def test_assignment_deducts_claimed_layers_from_local_nodes(monkeypatch):
+    """★★ 真根因的回归判据：认领的层**被扣除** —— 本机节点只分到 `[0, k)`。
+
+    改造前：master 拿到 0-24（随后远端段在「已过全部层」的 hidden 上重算 8-16，
+    输出语义崩坏）。改造后：本机节点合计只分到 8 层，且上界 `<= 8`。
+    """
+    sched = _scheduler(monkeypatch, set())
+    _claims(sched, {"mid": _claim("middle", 8, 16), "tail": _claim("tail", 16, 24)})
+
+    result = sched.compute_layer_assignment()
+
+    learning = [a for a in result if a["layers_count"] > 0]
+    assert learning, "本机层节点应当仍有层可跑（0-8）"
+    assert sum(a["layers_count"] for a in learning) == 8
+    assert max(a["end_layer"] for a in learning) <= 8
+
+
+def test_assignment_with_all_layers_claimed_yields_no_local_layers(monkeypatch):
+    """全部层都被认领 ⇒ 本机**无层条目**产出（`layer_budget == 0` 的早返回）。"""
+    sched = _scheduler(monkeypatch, set())
+    _claims(sched, {"head": _claim("head", 0, 8), "tail": _claim("tail", 8, 24)})
+
+    assert sched.compute_layer_assignment() == []
