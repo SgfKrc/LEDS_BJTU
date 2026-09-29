@@ -2210,14 +2210,21 @@ class Scheduler(
             return total_layers
 
         for start, end, role, node_id in claims:
+            # `head` 段吃 **token 序列** ⇒ 必须从 0 起（否则没有 embedding 输入）。
             if role == "head" and start != 0:
                 raise ValueError(f"head 段 {node_id} 必须从 0 起，实际 [{start}, {end})")
+            # `tail` 段自己吐 **token**（远端做完 argmax）⇒ 必须覆盖到顶，否则它拿不到末层。
             if role == "tail" and end != total_layers:
                 raise ValueError(
                     f"tail 段 {node_id} 必须覆盖到顶（{total_layers}），实际 [{start}, {end})")
-            if role == "middle" and (start == 0 or end == total_layers):
+            # `middle` 段**吃 hidden** ⇒ 不能从 0 起（0 处还没有 hidden，只有 token 输入）；
+            #   但它**允许覆盖到顶** —— 它只输出 hidden，`lm_head` 由主节点在收到末节点回的
+            #   hidden 后自己跑（`scheduler_pipeline.py:4594-4595` 的推荐拓扑）
+            #   ⇒ `master[0,8) + middle[8,24)` 是**完全合法**的产品形态，不得误判为 tail。
+            if role == "middle" and start == 0:
                 raise ValueError(
-                    f"middle 段 {node_id} 不得贴边，实际 [{start}, {end})（贴边应为 head/tail）")
+                    f"middle 段 {node_id} 不能从 0 起（它吃 hidden；0 处应为本机节点或 head 段），"
+                    f"实际 [{start}, {end})")
 
         ordered = sorted(claims, key=lambda item: item[0])
         for left, right in zip(ordered, ordered[1:]):
@@ -2238,6 +2245,29 @@ class Scheduler(
                 f"relay 段层区间未覆盖到顶（止于 {cursor} / {total_layers}）"
                 f" —— 其上的层将无人执行")
         return k
+
+    def _relay_layer_claim_ranges(self, total_layers: int) -> dict[str, tuple[int, int]]:
+        """★ Y 档第二条：`{node_id: (start, end)}` —— 各 relay 段认领的层区间。
+
+        校验与 `_relay_claimed_layer_prefix` **同源**：先调它把规则跑一遍（任一不成立即抛
+        `ValueError`，fail-closed），再取区间 —— 避免两套判据漂移。
+        用途：capacity plan 里 relay 零层条目要带上认领区间，供下游层覆盖校验
+        （`pipeline_node_contract.validate_pipeline_nodes`）识别"这些层由远端段执行"。
+        """
+        self._relay_claimed_layer_prefix(total_layers)   # 校验（fail-closed）
+        with self._layer_config_lock:
+            relay_map = dict(getattr(self, "_relay_segment_map_cache", None) or {})
+        ranges: dict[str, tuple[int, int]] = {}
+        for node_id, spec in relay_map.items():
+            if not isinstance(spec, dict):
+                continue
+            try:
+                ranges[node_id] = (
+                    int(spec.get("layer_start", -1)), int(spec.get("layer_end", -1)),
+                )
+            except (TypeError, ValueError):
+                continue
+        return ranges
 
     def _split_relay_nodes(self, node_list: list) -> tuple[list, list]:
         """★ A1 / X 档（Y 档第二条缺口 1）：把 relay 段节点从**层分配**里摘出来。
@@ -2653,15 +2683,19 @@ class Scheduler(
         if not isinstance(plan, dict) or plan.get("admitted") is not True:
             return plan
         result = dict(plan)
-        # ★ A1 / X 档（Y 档第二条缺口 6）：`pipeline_layout_from_capacity_plan` 要求 assignments
-        #   **恰好连续覆盖全部层**，而 relay 段条目是**零层**（`layers_count == 0`）⇒ 会让它抛
-        #   `PipelineNodeContractError`（实测 `reason_code=pipeline_node_contract_invalid`，
-        #   而且异常消息为空，极难定位）。
-        #   ⇒ 只为 layout 计算**剔除**零层条目；下发给 worker 的 `assignments` 仍带它们
-        #   （主节点据此下发 `engine="relay_middle"`，worker 侧不加载层、只转发）。
+        # ★ A1 / X 档（Y 档第二条缺口 6 / 2b）：带**认领区间**的 relay 零层条目**不再剔除**。
+        #   它们现在是 `start_layer/end_layer = 认领区间`（如 `(8, 24)`）+ `claimed_layers`，
+        #   正好补上"`[k, total)` 由远端段执行"这一块覆盖，让 layout 校验
+        #   （**恰好连续覆盖全部层**）通过；而主节点自己只拿 `[0, k)`。
+        #   真正**无区间**的零层条目（异常形态）仍然剔除，避免污染 layout。
         layout_assignments = [
             item for item in (result.get("assignments") or [])
             if int(item.get("layers_count", 1) or 0) > 0
+            or (
+                str(item.get("capacity_source", "") or "") == "relay_exempt"
+                and isinstance(item.get("claimed_layers"), (list, tuple))
+                and len(item.get("claimed_layers") or ()) == 2
+            )
         ]
         try:
             layout = pipeline_layout_from_capacity_plan(
@@ -2669,6 +2703,16 @@ class Scheduler(
                 node_metadata=self._pipeline_node_metadata(),
             )
         except PipelineNodeContractError as exc:
+            logger.warning(
+                "布局契约校验失败: %s | layout_assignments=%s",
+                exc,
+                [
+                    {k: item.get(k) for k in
+                     ("node_id", "start_layer", "end_layer", "layers_count",
+                      "has_embedding", "has_lm_head", "capacity_source")}
+                    for item in layout_assignments
+                ],
+            )
             result.update({
                 "status": "rejected",
                 "admitted": False,
@@ -2909,12 +2953,36 @@ class Scheduler(
             }
         from config import PIPELINE_CAPACITY_SAFETY_MARGIN
 
+        # ★ Y 档第二条：relay 段认领的层由远端段执行 ⇒ 本机层节点的容量上界是 `k`
+        #   （未被认领的前缀）。这里复用调度层的**同一套校验**（重叠 / 角色 / 连续性）；
+        #   校验失败即拒绝（fail-closed），绝不静默按全量分层——那正是本线修的根因形态。
+        try:
+            total_layers_for_claim = int(descriptor.get("total_layers", 0) or 0)
+            local_layer_budget = (
+                self._relay_claimed_layer_prefix(total_layers_for_claim)
+                if total_layers_for_claim > 0 else None
+            )
+            relay_claims = (
+                self._relay_layer_claim_ranges(total_layers_for_claim)
+                if total_layers_for_claim > 0 else None
+            )
+        except ValueError as exc:
+            return {
+                "status": "rejected",
+                "admitted": False,
+                "reason_code": "relay_layer_claim_invalid",
+                "reason": str(exc),
+                "assignments": [],
+            }
+
         try:
             result = solve_pipeline_capacity(
                 descriptor,
                 self._get_pipeline_capacity_nodes(eligible_node_ids),
                 safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
                 require_distributed=require_distributed,
+                local_layer_budget=local_layer_budget,
+                relay_claims=relay_claims,
             )
         except PipelineCapacityError as exc:
             return {

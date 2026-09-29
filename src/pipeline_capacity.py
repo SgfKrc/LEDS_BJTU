@@ -163,25 +163,34 @@ def _required_bytes(raw_bytes: int, node: dict[str, Any], safety_margin: float) 
 
 def _relay_zero_layer_assignments(
     relay_nodes: list[dict[str, Any]], total_layers: int,
+    claims: dict[str, tuple[int, int]] | None = None,
 ) -> list[dict[str, Any]]:
-    """★ A1 / X 档（Y 档第二条缺口 6）：把 relay 段节点作为**零层**条目并入 assignments。
+    """★ A1 / X 档（Y 档第二条缺口 6/2b）：把 relay 段节点作为**零层**条目并入 assignments。
 
     主节点据此给它下发 `engine="relay_middle"` 配置（`scheduler_pipeline.py:298-302` 按
     `_relay_segment_for_worker()` 决定），worker 侧于是**不加载任何层**、只转发
     （`peer.py` 的 relay 分支）。
 
+    ★ Y 档第二条：条目带上该段**认领的层区间**（`claims[node_id]`，形如 `(8, 24)`）——
+    下游的层覆盖校验（`pipeline_node_contract.validate_pipeline_nodes`）必须知道
+    "`[8,24)` 由远端段执行"，否则会误判为"层没人覆盖"而拒掉合法拓扑。
+
     `plan_identity` / `plan_id` **不含**它们（那里只用上面的 `assignments`）⇒
     零层条目不改变 plan 的身份摘要。
     """
-    return [
-        {
+    claims = claims or {}
+    entries = []
+    for node in relay_nodes:
+        start, end = claims.get(node["node_id"], (total_layers, total_layers))
+        entries.append({
             "node_id": node["node_id"],
             "role": node["role"],
-            "start_layer": total_layers,
-            "end_layer": total_layers,
+            "start_layer": int(start),
+            "end_layer": int(end),
             "layers_count": 0,
             "has_embedding": False,
             "has_lm_head": False,
+            "claimed_layers": [int(start), int(end)],
             "raw_weight_bytes": 0,
             "required_bytes": 0,
             "capacity_bytes": node["capacity_bytes"],
@@ -191,9 +200,8 @@ def _relay_zero_layer_assignments(
             "execution_device": node["execution_device"],
             "capacity_source": "relay_exempt",
             "score": node["score"],
-        }
-        for node in relay_nodes
-    ]
+        })
+    return entries
 
 
 def solve_pipeline_capacity(
@@ -202,6 +210,8 @@ def solve_pipeline_capacity(
     *,
     safety_margin: float = 1.2,
     require_distributed: bool = False,
+    local_layer_budget: int | None = None,
+    relay_claims: dict[str, tuple[int, int]] | None = None,
 ) -> dict[str, Any]:
     """Return an all-or-nothing contiguous layer placement.
 
@@ -230,6 +240,17 @@ def solve_pipeline_capacity(
     relay_only = [n for n in usable if n.get("capacity_source") == "relay_exempt"]
     usable = [n for n in usable if n.get("capacity_source") != "relay_exempt"]
     total_layers = len(layer_bytes)
+    # ★ Y 档第二条：relay 段认领的层由**远端段服务**执行 ⇒ 本机层节点只需放下 `[0, k)`。
+    #   `local_layer_budget` 由调度层算出（`Scheduler._relay_claimed_layer_prefix`，那里带
+    #   重叠 / 角色 / 连续性校验）；缺省 = 全部层（对既有路径零影响）。
+    #   ⚠️ 末位本机节点**仍拿 `lm_head`**：主节点收到末节点回的 hidden 后要自己跑
+    #   Norm + LM Head（见 `scheduler_pipeline.py:4594-4595` 的推荐拓扑）⇒ 这正是不选
+    #   `tail` 段而选 `middle[8,24)` 的原因（tail 只回 token，拿不到 hidden）。
+    layer_budget = total_layers if local_layer_budget is None else int(local_layer_budget)
+    if not (0 <= layer_budget <= total_layers):
+        raise PipelineCapacityError(
+            f"local_layer_budget 越界: {layer_budget} / total={total_layers}"
+        )
     raw_model_bytes = (
         sum(layer_bytes) + embedding_bytes + per_node_bytes + output_bytes
     )
@@ -274,20 +295,24 @@ def solve_pipeline_capacity(
 
     @lru_cache(maxsize=None)
     def search(node_index: int, cursor: int, started: bool, used_count: int):
-        if cursor == total_layers:
-            if require_distributed and used_count < 2:
+        if cursor == layer_budget:
+            # ★ Y 档第二条：relay 段**算参与节点**（它承载远端段工件），只是不占本机容量
+            #   ⇒ "分布式"的判据是 `本机层节点数 + relay 段数 >= 2`，而不是只看前者。
+            #   否则 `master(0-8) + relay 段(8-24)` 这种**合法**拓扑会被误拒。
+            participating = used_count + len(relay_only)
+            if require_distributed and participating < 2:
                 return None
             return ()
         if node_index >= len(usable):
             return None
         node = usable[node_index]
         best = search(node_index + 1, cursor, started, used_count)
-        remaining = total_layers - cursor
+        remaining = layer_budget - cursor
         for count in range(remaining, 0, -1):
             end = cursor + count
             raw_bytes = prefix[end] - prefix[cursor] + per_node_bytes
             has_embedding = not started
-            has_lm_head = end == total_layers
+            has_lm_head = end == layer_budget
             if has_embedding:
                 raw_bytes += embedding_bytes
             if has_lm_head:
@@ -401,7 +426,7 @@ def solve_pipeline_capacity(
         "reason_code": "distributed_forced" if require_distributed else "",
         "plan_id": plan_id,
         "assignments": assignments + _relay_zero_layer_assignments(
-            relay_only, total_layers
+            relay_only, total_layers, relay_claims
         ),
         "control_only_nodes": [
             node["node_id"] for node in usable if node["node_id"] not in used_ids

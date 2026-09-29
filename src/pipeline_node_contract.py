@@ -359,6 +359,13 @@ def validate_pipeline_nodes(
     if len(architectures) > 1:
         raise PipelineNodeContractError("pipeline artifact architecture mismatch")
 
+    layered_indexes = [
+        i for i, n in enumerate(ordered)
+        if n.layer_range[1] > n.layer_range[0]
+        and str(getattr(n.capacity, "capacity_source", "") or "") != "relay_exempt"
+    ]
+    first_layered_index = layered_indexes[0] if layered_indexes else 0
+    last_layered_index = layered_indexes[-1] if layered_indexes else len(ordered) - 1
     cursor = 0
     for index, node in enumerate(ordered):
         start, end = node.layer_range
@@ -368,14 +375,23 @@ def validate_pipeline_nodes(
             )
         if node.artifact.model_sha256 != model_sha256:
             raise PipelineNodeContractError("pipeline model identity mismatch")
-        if node.has_embedding != (index == 0):
-            raise PipelineNodeContractError(
-                "only the first pipeline node must own embedding",
-            )
-        if node.has_lm_head != (index == len(ordered) - 1):
-            raise PipelineNodeContractError(
-                "only the last pipeline node must own LM Head",
-            )
+        # ★ Y 档第二条：relay 段是**零层占位**（层由远端段执行），可能排在最前/最后
+        #   ⇒ embedding / LM Head 的归属判据要落在「**有层的**首/末节点」上，而不是
+        #   简单的 index 0 / last。主节点收到末节点回的 hidden 后自己跑 Norm + LM Head
+        #   （`scheduler_pipeline.py:4594-4595` 的推荐拓扑）⇒ `master[0,8) + middle[8,24)`
+        #   这种形态里 master 既是有层的首节点、也是有层的末节点。
+        is_relay_placeholder = (
+            str(getattr(node.capacity, "capacity_source", "") or "") == "relay_exempt"
+        )
+        if not is_relay_placeholder:
+            if node.has_embedding != (index == first_layered_index):
+                raise PipelineNodeContractError(
+                    "only the first layered pipeline node must own embedding",
+                )
+            if node.has_lm_head != (index == last_layered_index):
+                raise PipelineNodeContractError(
+                    "only the last layered pipeline node must own LM Head",
+                )
         if node.kind == "cross_framework" and node.handoff_at is None:
             raise PipelineNodeContractError(
                 "cross_framework node requires an explicit handoff_at",
