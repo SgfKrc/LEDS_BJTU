@@ -74,6 +74,7 @@ _RELAY_ERROR_CODES = frozenset({
     "hidden_payload_size_mismatch",
     "hidden_seq_frame_required",
     "hidden_seq_meta_invalid",
+    "hidden_seq_meta_missing",
     "hidden_seq_meta_shape_invalid",
     "hidden_seq_meta_too_large",
     "hidden_seq_meta_truncated",
@@ -219,6 +220,13 @@ def _validate_hidden_seq_meta(meta: object, n_tokens: int) -> None:
     unknown = [key for key in meta if key not in allowed]
     if unknown:
         raise RelayProtocolError(f"hidden_seq_meta_unknown:{unknown[0]}")
+
+    # ★ decode 正确性（安全评审 #5）：`seq_ids` 与 `positions` **必须同时给出** ——
+    #   只给其一（或给空 meta）会静默退回"远端按 `n_past` 隐式自增"，那正是本协议
+    #   **明确禁止**的行为（见 `serve_relay_middle_connection` 处「绝不退回远端按隐式
+    #   位置猜」的注释）。宁可 fail-closed，也不产出"位置可能错"的 hidden。
+    if "seq_ids" not in meta or "positions" not in meta:
+        raise RelayProtocolError("hidden_seq_meta_missing")
 
     for key in ("n_seq_id", "seq_ids", "positions"):
         if key not in meta:

@@ -177,9 +177,15 @@ def test_middle_accepts_hidden_seq_metadata_with_frame_overhead():
 @pytest.mark.parametrize(
     ("meta", "reason"),
     [
-        ({"seq_ids": [0]}, "hidden_seq_meta_shape_invalid"),
-        ({"positions": [0, -1]}, "hidden_seq_meta_shape_invalid"),
-        ({"seq_ids": [0, 1], "extra": [0, 1]}, "hidden_seq_meta_unknown"),
+        # ★ 安全评审 #5：`seq_ids` / `positions` **必须同时给出** —— 只给其一会在 runner 侧
+        #   静默退回"远端按 n_past 隐式自增"，那是本协议明确禁止的（会静默算错位置）。
+        ({}, "hidden_seq_meta_missing"),
+        ({"seq_ids": [0]}, "hidden_seq_meta_missing"),
+        ({"positions": [0, 1]}, "hidden_seq_meta_missing"),
+        ({"seq_ids": [0, 0], "positions": [0, -1]}, "hidden_seq_meta_shape_invalid"),
+        ({"seq_ids": [0], "positions": [0]}, "hidden_seq_meta_shape_invalid"),
+        ({"seq_ids": [0, 1], "positions": [0, 1], "extra": [0, 1]},
+         "hidden_seq_meta_unknown"),
     ],
 )
 def test_hidden_seq_metadata_is_fail_closed(meta, reason):
@@ -201,7 +207,8 @@ def test_middle_rejects_outer_hidden_seq_token_count_mismatch():
         sock = socket.create_connection(("127.0.0.1", port), timeout=5.0)
         try:
             payload = encode_hidden_seq(b"\x00" * expected_hidden_bytes(2, n_embd),
-                                        n_tokens=2, meta={"seq_ids": [0, 0]})
+                                        n_tokens=2,
+                                        meta={"seq_ids": [0, 0], "positions": [0, 1]})
             send_frame(sock, RelayFrame(RelayFrameKind.HIDDEN_SEQ, 0, n_tokens=1,
                                         payload=payload))
             response = recv_frame(sock)
