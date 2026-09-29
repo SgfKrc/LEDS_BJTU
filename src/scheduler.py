@@ -1875,7 +1875,22 @@ class Scheduler(
                 and not self._node_is_island_gateway(n.get("device_info", {}))
             ]
 
+        # ★ A1 / X 档（Y 档第二条缺口 1）：把「由远端 relay 段代跑本段」的 worker 摘出来。
+        #   这类节点**不参与层分配**（`scheduler_pipeline.py:2256` 的注释即：它不需要本地
+        #   ModelHost / 模型），但**必须留在流水线里** —— 它承载 `engine="relay_middle"` 的端点段。
+        #   此前只有 `scheduler_pipeline` 的 assignment 构造路径认 relay 段，这条**动态分层**路
+        #   不认 ⇒ 它被当普通层节点分层（实测日志 `client_TABLET-2TLUCNU8: Layer 18-24 (6层)`）
+        #   ⇒ 而 worker 没有本地模型、无法确认分层释放 ACK
+        #   ⇒ `pipeline_distributed_workers_unavailable` ⇒ `/api/chat` 503。
+        node_list, relay_nodes = self._split_relay_nodes(node_list)
+
         if not node_list:
+            if relay_nodes:
+                logger.info(
+                    "仅 relay 段节点参与（不占层）: %s",
+                    [n["node_id"] for n in relay_nodes],
+                )
+                return self._append_relay_assignments([], relay_nodes, total_layers)
             logger.warning("没有可用的层前向节点参与流水线层拆分")
             return []
 
@@ -1953,7 +1968,9 @@ class Scheduler(
                             f"({a['layers_count']}层) embed={a['has_embedding']} "
                             f"lm_head={a['has_lm_head']} score={a['score']}"
                         )
-                    return assignments
+                    return self._append_relay_assignments(
+                        assignments, relay_nodes, total_layers
+                    )
             except Exception as e:
                 logger.warning(
                     f"图算法智能编排失败: {e}，回退到简单权重分配",
@@ -1970,10 +1987,11 @@ class Scheduler(
         #   2. GraphOrchestrator 顶层抛异常
         #        → 外部回退到此 _simple_weight_assignment（算力权重分）
         # 两层回退确保即使图算法崩溃，系统仍能降级到可用状态。
-        return self._simple_weight_assignment(node_list, total_layers)
+        return self._simple_weight_assignment(node_list, total_layers, relay_nodes)
 
     def _simple_weight_assignment(self, node_list: list,
-                                   total_layers: int) -> list:
+                                   total_layers: int,
+                                   relay_nodes: list | None = None) -> list:
         """
         简单权重比例分配（节点数 ≤ GRAPH_ORCHESTRATOR_THRESHOLD 时使用）。
 
@@ -2014,7 +2032,10 @@ class Scheduler(
                 assignments, node_list, total_layers
             )
             assignments = self._apply_vram_constraints(assignments)
-            return self._normalize_master_anchor(assignments, node_list, total_layers)
+            return self._append_relay_assignments(
+                self._normalize_master_anchor(assignments, node_list, total_layers),
+                relay_nodes, total_layers,
+            )
 
         # Step 2: 按比例分配全部 Transformer 层
         distributable = total_layers
@@ -2100,6 +2121,62 @@ class Scheduler(
                 f"lm_head={a['has_lm_head']} score={a['score']}"
             )
 
+        return self._append_relay_assignments(assignments, relay_nodes or [], total_layers)
+
+    def _split_relay_nodes(self, node_list: list) -> tuple[list, list]:
+        """★ A1 / X 档（Y 档第二条缺口 1）：把 relay 段节点从**层分配**里摘出来。
+
+        返回 `(参与层分配的节点, relay 段节点)`。判据是 `_relay_segment_for_worker()` 非空
+        （它已内含 `QLH_RELAY_ENABLED` 开关与请求级闸门）—— 开关默认关时**恒返回空**，
+        对既有路径零影响。
+
+        为什么必须摘：relay 段节点**没有本地模型**（`scheduler_pipeline.py:2256` 注释即
+        "this scheduler host does not need a local ModelHost/model loaded"）⇒ 若把它当普通层
+        节点分配层，worker 侧无法确认分层释放 ACK ⇒ `pipeline_distributed_workers_unavailable`。
+
+        两条动态分层路（`compute_layer_assignment` 与 `_simple_weight_assignment`）**都**要用它，
+        所以抽成方法而不是内联局部变量（首版内联就踩了 `NameError`）。
+        """
+        if not node_list:
+            return node_list, []
+        relay_for = getattr(self, "_relay_segment_for_worker", None)
+        if not callable(relay_for):
+            return node_list, []
+        relay_nodes = [n for n in node_list if relay_for(n["node_id"]) is not None]
+        if not relay_nodes:
+            return node_list, []
+        relay_ids = {n["node_id"] for n in relay_nodes}
+        return [n for n in node_list if n["node_id"] not in relay_ids], relay_nodes
+
+    def _append_relay_assignments(self, assignments: list, relay_nodes: list,
+                                  total_layers: int) -> list:
+        """★ A1 / X 档（Y 档第二条缺口 1）：把 relay 段节点以 `engine="relay_middle"` 追加进分层结果。
+
+        它们**不占层**（`layers_count=0`、`start_layer == end_layer == total_layers`），
+        `has_embedding` / `has_lm_head` 都为 False —— 层的 I/O 头仍归真正跑层的节点。
+        worker 侧据 `engine == "relay_middle"` 直接走 relay 分支
+        （`scheduler_pipeline.py:2255`），**不需要本地模型**。
+
+        刻意在**最后**追加（即 `_normalize_master_anchor` / `_apply_vram_constraints` 之后）：
+        那两个函数按"层数"推理，0 层条目不该参与它们的锚定与显存校验。
+        """
+        if not relay_nodes:
+            return assignments
+        resolved = getattr(self, "_relay_segment_for_worker", None)
+        for n in relay_nodes:
+            spec = resolved(n["node_id"]) if callable(resolved) else None
+            assignments.append({
+                "node_id": n["node_id"],
+                "role": n["role"],
+                "start_layer": total_layers,
+                "end_layer": total_layers,
+                "layers_count": 0,
+                "has_embedding": False,
+                "has_lm_head": False,
+                "score": round(float(n.get("score", 0.0) or 0.0), 1),
+                "engine": "relay_middle",
+                "relay_segment": spec,
+            })
         return assignments
 
     def _normalize_master_anchor(self, assignments: list, node_list: list,
