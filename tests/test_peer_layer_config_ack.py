@@ -189,9 +189,67 @@ def test_layer_ready_ack_echoes_generation(_stub_model_sync):
     assert len(sent) == 1, sent
     ack = sent[0]
     assert ack["status"] == "ready"
+    assert ack["layer_range"] == [0, 8], ack
     assert ack["generation"] == 11, ack
     assert _master_generation_gate(ack, {"generation": 11}) is True, ack
     assert _master_generation_gate(ack, {"generation": 12}) is False
+
+
+def test_layer_config_parse_error_ack_echoes_generation():
+    peer, sent = _peer()
+
+    peer._handle_layer_config({
+        "start_layer": "not-an-int", "end_layer": 8,
+        "node_id": "client1", "config_id": "cfg-parse", "generation": 13,
+    })
+
+    assert sent[0]["status"] == "error"
+    assert sent[0]["generation"] == 13
+
+
+def test_missing_assignment_error_ack_echoes_top_level_generation():
+    peer, sent = _peer()
+
+    peer._handle_layer_config({
+        "node_id": "client1", "config_id": "cfg-missing", "generation": 14,
+        "assignments": {},
+    })
+
+    assert sent[0]["status"] == "error"
+    assert sent[0]["generation"] == 14
+
+
+def test_layer_load_error_ack_echoes_generation(_stub_model_sync):
+    peer, sent = _peer()
+    peer._host = _Host()
+
+    def fail_load(**_kwargs):
+        raise RuntimeError("simulated load failure")
+
+    peer._host._host.load_model = fail_load
+    peer._handle_layer_config({
+        "start_layer": 0, "end_layer": 8,
+        "node_id": "client1", "config_id": "cfg-load", "generation": 16,
+        "model_id": "qwen2.5-0.5b-instruct", "model_sha256": "abc",
+        "model_type": "qwen2", "total_layers": 24,
+    })
+
+    assert sent[0]["status"] == "error"
+    assert sent[0]["generation"] == 16
+
+
+def test_relay_unknown_phase_is_rejected_with_generation():
+    peer, sent = _peer()
+
+    peer._handle_layer_config({
+        "start_layer": 8, "end_layer": 24,
+        "node_id": "client1", "config_id": "cfg-phase", "generation": 15,
+        "engine": "relay_middle", "phase": "commit-ish",
+    })
+
+    assert sent[0]["status"] == "error"
+    assert sent[0]["generation"] == 15
+    assert peer._active_layer_config is None
 
 
 def test_gate_is_inert_when_expected_has_no_generation():
