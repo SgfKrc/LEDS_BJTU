@@ -184,6 +184,8 @@ def test_middle_accepts_hidden_seq_metadata_with_frame_overhead():
         ({"positions": [0, 1]}, "hidden_seq_meta_missing"),
         ({"seq_ids": [0, 0], "positions": [0, -1]}, "hidden_seq_meta_shape_invalid"),
         ({"seq_ids": [0], "positions": [0]}, "hidden_seq_meta_shape_invalid"),
+        ({"n_seq_id": [2, 1], "seq_ids": [0, 0], "positions": [0, 1]},
+         "hidden_seq_multi_membership_unsupported"),
         ({"seq_ids": [0, 1], "positions": [0, 1], "extra": [0, 1]},
          "hidden_seq_meta_unknown"),
     ],
