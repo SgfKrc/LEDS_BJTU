@@ -650,6 +650,8 @@ class TestComputeLayerAssignment:
                 return _Decision()
 
         sched._role_override = "master"
+        # Keep the unit topology independent from the host process NODE_ID.
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: "master")
         sched._pipeline_reshard_coordinator = _Coordinator()
         sched._tcp_server = type("Server", (), {
             "get_client_ids": lambda self: ["worker-b", "task-full"],
