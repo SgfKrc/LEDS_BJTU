@@ -164,7 +164,30 @@ class TailRunner:
                               __import__("llama_cpp"), "__version__", "?")}), flush=True)
 
     def reset(self) -> None:
+        """★ 会话级清理：下一个任务必须能从位置 0 重新开始。
+
+        与 head/middle 不同（它们的 KV 在 `self._upstream` 内，由
+        `KeepHeadUpstream.reset()` 清），本类**直连** `LlamaCppEngine`，而
+        `forward_layers_from_hidden` 是"**直接在 KV 里占 `[n_past, n_past+n_tokens)`**"
+        （见 `src/llama_engine.py` 该方法说明）—— 下一个任务又从位置 0 开始
+        ⇒ 不在同一位置重跑前清 KV 就会 `llama_decode rc=-1`。
+
+        实测（2026-09-30 三机产品路径验收）：只重置 `self._pos` 时**第二个**
+        `POST /api/chat` 必失败，远端日志
+        `Relay tail runner (seq) failed: code=runner_failed` + `llama_decode 失败 rc=-1`，
+        `[session] frames=0 tokens=0 closed_cleanly=False error=runner_failed`。
+        `LlamaCppEngine.reset_kv_cache()` 是既有的 stateless no-op，**不能**替代
+        （`llama_engine` 的原话）。
+        """
         self._pos = 0
+        self._clear_native_kv()
+
+    def _clear_native_kv(self) -> None:
+        """清本段直连的那份原生 KV（`llama_cpp.LlamaContext.kv_cache_clear`）。"""
+        ctx = getattr(getattr(self._engine, "_model", None), "_ctx", None)
+        clear = getattr(ctx, "kv_cache_clear", None)
+        if callable(clear):
+            clear()
 
     def request_token(self, hidden_bytes: bytes, *, n_tokens: int) -> int:
         import numpy as np  # noqa: PLC0415
