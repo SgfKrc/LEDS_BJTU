@@ -74,13 +74,16 @@ _RELAY_ERROR_CODES = frozenset({
     "hidden_payload_size_mismatch",
     "hidden_seq_frame_required",
     "hidden_seq_meta_invalid",
+    "hidden_seq_meta_missing",
     "hidden_seq_meta_shape_invalid",
     "hidden_seq_meta_too_large",
     "hidden_seq_meta_truncated",
     "hidden_seq_meta_unknown",
+    "hidden_seq_multi_membership_unsupported",
     "hidden_seq_payload_too_small",
     "hidden_seq_token_count_mismatch",
     "hidden_seq_unsupported",
+    "hidden_sequence_mode_changed",
     #: ★ P4.5：远端不支持"送 token 跑上游段"这种请求（旧 runner）时 fail-loud。
     "token_frame_unsupported",
     #: ★ P4.5：`TOKENS` 帧里声明的 token 数与 payload 实际长度不一致。
@@ -220,6 +223,13 @@ def _validate_hidden_seq_meta(meta: object, n_tokens: int) -> None:
     if unknown:
         raise RelayProtocolError(f"hidden_seq_meta_unknown:{unknown[0]}")
 
+    # ★ decode 正确性（安全评审 #5）：`seq_ids` 与 `positions` **必须同时给出** ——
+    #   只给其一（或给空 meta）会静默退回"远端按 `n_past` 隐式自增"，那正是本协议
+    #   **明确禁止**的行为（见 `serve_relay_middle_connection` 处「绝不退回远端按隐式
+    #   位置猜」的注释）。宁可 fail-closed，也不产出"位置可能错"的 hidden。
+    if "seq_ids" not in meta or "positions" not in meta:
+        raise RelayProtocolError("hidden_seq_meta_missing")
+
     for key in ("n_seq_id", "seq_ids", "positions"):
         if key not in meta:
             continue
@@ -231,6 +241,8 @@ def _validate_hidden_seq_meta(meta: object, n_tokens: int) -> None:
                 raise RelayProtocolError("hidden_seq_meta_shape_invalid")
         if key == "n_seq_id" and any(value < 1 for value in values):
             raise RelayProtocolError("hidden_seq_meta_shape_invalid")
+        if key == "n_seq_id" and any(value != 1 for value in values):
+            raise RelayProtocolError("hidden_seq_multi_membership_unsupported")
 
 
 def encode_hidden_seq(hidden: bytes, *, n_tokens: int, meta: dict[str, object],
@@ -694,6 +706,7 @@ def serve_relay_connection(
     frames = 0
     tokens = 0
     payload_bytes = 0
+    hidden_mode: str | None = None
     try:
         while True:
             frame = recv_frame(sock, max_payload_bytes=max_payload)
@@ -717,6 +730,13 @@ def serve_relay_connection(
                     RelayFrame(RelayFrameKind.TOKEN, sequence, n_tokens=1, payload=_TOKEN.pack(-1)),
                 )
                 return RelayBridgeResult(frames, tokens, payload_bytes, True)
+            if frame.kind in {RelayFrameKind.HIDDEN, RelayFrameKind.HIDDEN_SEQ}:
+                frame_mode = (
+                    "seq" if frame.kind == RelayFrameKind.HIDDEN_SEQ else "plain"
+                )
+                if hidden_mode is not None and frame_mode != hidden_mode:
+                    raise RelayProtocolError("hidden_sequence_mode_changed")
+                hidden_mode = frame_mode
             if frame.kind == RelayFrameKind.HIDDEN_SEQ:
                 hidden, n_tokens, meta = decode_hidden_seq(
                     frame.payload, n_embd=width, quant=frame.quant)
@@ -842,6 +862,7 @@ def serve_relay_middle_connection(
     frames = 0
     tokens = 0
     payload_bytes = 0
+    hidden_mode: str | None = None
     try:
         while True:
             frame = recv_frame(sock, max_payload_bytes=max_payload)
@@ -863,6 +884,13 @@ def serve_relay_middle_connection(
                                payload=_TOKEN.pack(-1)),
                 )
                 return RelayBridgeResult(frames, tokens, payload_bytes, True)
+            if frame.kind in {RelayFrameKind.HIDDEN, RelayFrameKind.HIDDEN_SEQ}:
+                frame_mode = (
+                    "seq" if frame.kind == RelayFrameKind.HIDDEN_SEQ else "plain"
+                )
+                if hidden_mode is not None and frame_mode != hidden_mode:
+                    raise RelayProtocolError("hidden_sequence_mode_changed")
+                hidden_mode = frame_mode
             if frame.kind == RelayFrameKind.HIDDEN_SEQ:
                 # ★ P3 多序列：payload 自带 seq/pos；远端 runner 必须支持显式绑定，
                 # 否则 fail-loud（绝不退回"远端按隐式位置猜"——那会静默算错）。

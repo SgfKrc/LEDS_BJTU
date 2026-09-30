@@ -479,6 +479,7 @@ class TestComputeLayerAssignment:
         sched._layer_config_expected["worker-a"] = {
             "node_id": "worker-a",
             "config_id": "cfg-2",
+            "generation": 2,
             "phase": "prepare",
             "plan_id": "plan-2",
             "start_layer": 0,
@@ -488,11 +489,21 @@ class TestComputeLayerAssignment:
             "model_type": "qwen2",
         }
 
-        sched._handle_layer_config_ack("worker-a", {"data": {
+        stale_error = {
             "node_id": "worker-a",
             "config_id": "cfg-2",
+            "generation": 1,
             "status": "error",
             "error": "capacity changed",
+        }
+        sched._handle_layer_config_ack("worker-a", {"data": stale_error})
+
+        assert sched._pipeline_load_transaction["phase"] == "preparing"
+        assert aborted == []
+
+        sched._handle_layer_config_ack("worker-a", {"data": {
+            **stale_error,
+            "generation": 2,
         }})
 
         assert sched._pipeline_load_transaction["phase"] == "aborted"
@@ -639,6 +650,8 @@ class TestComputeLayerAssignment:
                 return _Decision()
 
         sched._role_override = "master"
+        # Keep the unit topology independent from the host process NODE_ID.
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: "master")
         sched._pipeline_reshard_coordinator = _Coordinator()
         sched._tcp_server = type("Server", (), {
             "get_client_ids": lambda self: ["worker-b", "task-full"],

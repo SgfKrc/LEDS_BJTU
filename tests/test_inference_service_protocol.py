@@ -2075,6 +2075,17 @@ def test_peer_layer_config_new_format(monkeypatch):
     assert peer._active_layer_config["config_id"] == "cfg-1"
 
 
+def test_peer_disconnect_marks_client_for_reregistration():
+    peer = make_peer()
+    peer._running = True
+    peer._close_all_relay_sessions = lambda: None
+    peer._handle_disconnect()
+
+    assert peer._running is False
+    assert peer._active_layer_config is None
+    assert peer._local_pipeline_steps == {}
+
+
 def test_peer_layer_config_missing_contract(monkeypatch):
     peer = make_peer()
     peer._handle_layer_config({

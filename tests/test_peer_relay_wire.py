@@ -62,9 +62,14 @@ def _peer(sent: list[dict], *, role: str = "middle") -> PeerClient:
     peer._kv_cache_lock = threading.RLock()
     peer._local_pipeline_cancelled = set()
     peer._local_pipeline_steps = {}
+    peer._active_pipeline_task_ids = set()
     peer._kv_cache = {}
     peer._relay_sessions = {}
     peer._active_layer_config = {
+        "engine": "relay_middle",
+        "config_id": "cfg-relay",
+        "model_sha256": "relay-sha",
+        "model_type": "qwen2",
         "relay_segment": {
             "host": "127.0.0.1",
             "port": 50283,
@@ -193,7 +198,13 @@ def test_peer_relay_reuses_task_session_until_terminal_event(monkeypatch, termin
     for step in (0, 1):
         payload = _payload(values, task_id="session-task")
         payload["step"] = step
-        peer._handle_layer_forward_via_relay(payload)
+        payload.update({
+            "config_id": "cfg-relay",
+            "model_sha256": "relay-sha",
+            "model_type": "qwen2",
+            "use_kv_cache": step > 0,
+        })
+        peer._handle_layer_forward(payload)
 
     assert len(_SessionRelayClient.instances) == 1
     session = _SessionRelayClient.instances[0]
@@ -202,6 +213,67 @@ def test_peer_relay_reuses_task_session_until_terminal_event(monkeypatch, termin
     getattr(peer, f"_handle_pipeline_{terminal_event}")({"task_id": "session-task"})
     assert session.close_calls == 1
     assert "session-task" not in peer._relay_sessions
+    assert "session-task" not in peer._active_pipeline_task_ids
+
+
+def test_peer_relay_rejects_forward_after_abort_before_connect(monkeypatch):
+    _SessionRelayClient.instances.clear()
+    monkeypatch.setattr("relay_segment_client.RelaySegmentClient", _SessionRelayClient)
+    sent: list[dict] = []
+    peer = _peer(sent)
+    peer._local_pipeline_cancelled.add("aborted-task")
+    payload = _payload(np.zeros((1, 2, 3), dtype=np.float32), task_id="aborted-task")
+    payload.update({
+        "config_id": "cfg-relay", "model_sha256": "relay-sha",
+        "model_type": "qwen2", "use_kv_cache": False,
+    })
+
+    peer._handle_layer_forward(payload)
+
+    assert _SessionRelayClient.instances == []
+    assert sent == []
+
+
+def test_peer_relay_rejects_out_of_order_step_before_connect(monkeypatch):
+    _SessionRelayClient.instances.clear()
+    monkeypatch.setattr("relay_segment_client.RelaySegmentClient", _SessionRelayClient)
+    sent: list[dict] = []
+    peer = _peer(sent)
+    peer._local_pipeline_steps["ordered-task"] = 0
+    peer._active_pipeline_task_ids.add("ordered-task")
+    payload = _payload(np.zeros((1, 2, 3), dtype=np.float32), task_id="ordered-task")
+    payload.update({
+        "step": 2,
+        "config_id": "cfg-relay", "model_sha256": "relay-sha",
+        "model_type": "qwen2", "use_kv_cache": True,
+    })
+
+    peer._handle_layer_forward(payload)
+
+    assert _SessionRelayClient.instances == []
+    assert len(sent) == 1
+    assert "越序" in sent[0]["error"]
+
+
+def test_peer_relay_success_records_step_and_rejects_duplicate_prefill(monkeypatch):
+    _SessionRelayClient.instances.clear()
+    monkeypatch.setattr("relay_segment_client.RelaySegmentClient", _SessionRelayClient)
+    sent: list[dict] = []
+    peer = _peer(sent)
+    payload = _payload(np.zeros((1, 2, 3), dtype=np.float32), task_id="duplicate-task")
+    payload.update({
+        "config_id": "cfg-relay", "model_sha256": "relay-sha",
+        "model_type": "qwen2", "use_kv_cache": False,
+    })
+
+    peer._handle_layer_forward(payload)
+    peer._handle_layer_forward(payload)
+
+    assert len(_SessionRelayClient.instances) == 1
+    assert _SessionRelayClient.instances[0].calls == 1
+    assert peer._local_pipeline_steps["duplicate-task"] == 0
+    assert len(sent) == 2
+    assert "重复 prefill" in sent[1]["error"]
 
 
 def test_peer_relay_sessions_close_on_release_and_disconnect():

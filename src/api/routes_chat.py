@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import ModuleType
 
+import asyncio
+
 from fastapi import APIRouter, File
 from api._routing import configure_route_module
 
@@ -199,12 +201,52 @@ async def experimental_speculative_chat(req: SpeculativeExperimentRequest):
         "request_id": _api_module._request_id_ctx.get("-"),
     }
 
-async def chat(req: ChatRequest):
+async def _watch_client_disconnect(request: Request, cancel_event,
+                                   generation_id: str = "") -> None:
+    """★ 2026-09-30：客户端断开 ⇒ 复用既有取消链路（与 `cancel_chat_generation` 同语义）。
+
+    此前 `/api/chat` 既不接收 `Request` 也不检测断开：实测 `curl -m 3` 切断后服务端
+    仍把 `max_new_tokens` 跑满（step 一路到 299/300）—— 纯浪费，分布式下还持续占着
+    远端 relay 段。`chat_stream` 靠 `yield` 抛错自然终止，这个同步端点需要显式轮询。
+
+    ⚠️ **不用 `Request.is_disconnected()`**：starlette 1.3 里它用「立即取消的
+    CancelScope」做**非阻塞**探测（`message = await self._receive()` 被当场取消），
+    只在该 receive 队列里**已经**躺着 `http.disconnect` 时才会返回 True。实测本服务
+    （uvicorn 0.49 + starlette 1.3）在 `/api/chat` 上恒返回 False —— watcher 明明在
+    按 0.25s 轮询（日志 `断开检测轮询中 polls=20/40`）却从不命中。
+    改成**带超时地真等** `receive()`：断开事件到达即返回，未到达则超时继续。
+    """
+    poll_timeout = 0.05
+    idle_sleep = 0.15
+    try:
+        while not cancel_event.is_set():
+            try:
+                message = await asyncio.wait_for(
+                    request._receive(), timeout=poll_timeout)
+            except asyncio.TimeoutError:
+                await asyncio.sleep(idle_sleep)
+                continue
+            if message.get("type") == "http.disconnect":
+                cancel_event.set()
+                _api_module.logger.info(
+                    "客户端已断开，已请求取消生成: generation=%s", generation_id or "-",
+                )
+                return
+    except asyncio.CancelledError:
+        raise
+    except Exception:                       # 断开检测本身失败不得影响请求
+        _api_module.logger.warning("客户端断开检测失败", exc_info=True)
+
+async def chat(req: ChatRequest, request: Request = None):
     """
     发送消息并获取模型回复（多轮对话）。
 
     自动维护对话历史 + KV 缓存。
     若模型未加载，自动尝试加载默认模型。
+
+    `request` 默认 `None` 只为**向后兼容**直接调用本协程的测试
+    （`tests/test_task_graph_api.py` 多处 `api_server.chat(req)`）；
+    经 FastAPI 路由进入时总会被注入真实 `Request`，断开检测才会生效。
     """
     generation_id, cancel_event = _api_module._register_generation(req.generation_id)
     req.generation_id = generation_id
@@ -236,6 +278,13 @@ async def chat(req: ChatRequest):
                     ) from exc
             return _api_module._execute_requested_chat(req, cancel_event)
 
+    watcher = None
+    if request is None:
+        _api_module.logger.debug(
+            "chat: 未注入 Request（直接调用），跳过客户端断开检测")
+    else:
+        watcher = asyncio.create_task(
+            _watch_client_disconnect(request, cancel_event, generation_id))
     try:
         result = await _api_module.run_in_threadpool(_run_chat_request)
     except _api_module.ChatGenerationCancelled as exc:
@@ -244,6 +293,8 @@ async def chat(req: ChatRequest):
             {"message": "生成已取消", "generation_id": exc.generation_id},
         ) from exc
     finally:
+        if watcher is not None:
+            watcher.cancel()
         _api_module._unregister_generation(generation_id, cancel_event)
     return _api_module.ChatResponse(
         content=result["content"],

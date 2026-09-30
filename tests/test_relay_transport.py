@@ -36,6 +36,11 @@ class _FakeRunner:
         self.requests.append((n_tokens, hidden))
         return 1000 + n_tokens
 
+    def request_token_seq(self, hidden: bytes, *, n_tokens: int,
+                          meta: dict[str, object]) -> int:
+        self.requests.append((n_tokens, hidden))
+        return 1000 + n_tokens
+
     def reset(self) -> None:
         self.resets += 1
 
@@ -117,6 +122,42 @@ def test_loopback_client_bridge_preserves_order_and_resets_runner():
     assert results[0].closed_cleanly is True
     assert results[0].frames == 2
     assert results[0].tokens == 4
+
+
+def test_tail_session_rejects_switch_between_explicit_and_implicit_positions():
+    listener = open_loopback_listener("127.0.0.1", 0)
+    port = listener.getsockname()[1]
+    runner = _FakeRunner()
+    results = []
+
+    def serve() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            results.append(serve_relay_connection(connection, runner, n_embd=2))
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    payload = b"\x00" * expected_hidden_bytes(1, 2)
+    client = RelayTcpClient("127.0.0.1", port, n_embd=2)
+    try:
+        assert client.request_token(
+            payload, n_tokens=1,
+            seq_meta={"seq_ids": [0], "positions": [7]},
+        ) == 1001
+        with pytest.raises(RelayProtocolError, match="hidden_sequence_mode_changed"):
+            client.request_token(payload, n_tokens=1)
+        client._closed = True
+        client._sock.close()
+        thread.join(timeout=3)
+    finally:
+        if not client._closed:
+            client._closed = True
+            client._sock.close()
+        listener.close()
+
+    assert not thread.is_alive()
+    assert len(runner.requests) == 1
+    assert results[0].error == "hidden_sequence_mode_changed"
 
 
 def test_close_frame_does_not_destroy_runner_across_sessions():

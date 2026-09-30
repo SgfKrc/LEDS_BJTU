@@ -26,7 +26,7 @@ def test_real_model_load_generate_unload(monkeypatch):
     if os.environ.get("QLH_RUN_REAL_MODEL_SMOKE") != "1":
         pytest.skip("设置 QLH_RUN_REAL_MODEL_SMOKE=1 才运行真实模型冒烟测试")
 
-    model_id = os.environ.get("QLH_SMOKE_MODEL_ID", "qwen-1_8b").strip()
+    model_id = os.environ.get("QLH_SMOKE_MODEL_ID", "").strip()
     engine = os.environ.get("QLH_SMOKE_ENGINE", "auto").strip() or "auto"
     quant_type = os.environ.get("QLH_SMOKE_QUANT", "int4").strip() or "int4"
     model_path = os.environ.get("QLH_SMOKE_MODEL_PATH", "").strip()
@@ -41,6 +41,14 @@ def test_real_model_load_generate_unload(monkeypatch):
     from inference_service.engine_host import EngineHost
     from inference_service.protocol import ChatRequest
     import model_config
+
+    # ★ 2026-09-30：默认 model_id 不再硬编码 —— 原先写死 `qwen-1_8b`，该模型已退役
+    #   （`models/` 下已无任何 1.8B 目录），于是一跑就 `模型 'qwen-1_8b' 未在注册表中
+    #   找到`。改为跟随主仓的画像默认模型，避免测试自身携带一个会过期的模型名。
+    if not model_id:
+        model_id = model_config.get_profile_default_model_id()
+    if not model_id:
+        pytest.fail("无法确定真实模型冒烟用的 model_id（QLH_SMOKE_MODEL_ID 未设置且画像默认不可用）")
 
     # Redirect a built-in slot for a local experiment without changing files
     # or process state outside this isolated, serial test.

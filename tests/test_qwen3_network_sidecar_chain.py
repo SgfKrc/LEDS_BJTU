@@ -187,14 +187,24 @@ def _spawn_real_node(tmp_path, node_id, port, allowed_peers, *,
         command,
         cwd=str(ROOT),
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     url = f"http://127.0.0.1:{port}{QWEN3_TRANSFER_PREFIX}/status"
     deadline = time.monotonic() + 120  # 真实 sidecar 加载权重慢
     while time.monotonic() < deadline:
         if process.poll() is not None:
+            detail = ""
+            if process.stderr is not None:
+                try:
+                    detail = process.stderr.read()[-4000:]
+                except OSError:
+                    detail = ""
             raise RuntimeError(
                 f"Qwen3 真实节点 {node_id} 退出 rc={process.returncode}（状态目录 {state_dir}）"
+                f"\n--- helper stderr (last 4000 chars) ---\n{detail}"
             )
         try:
             response = default_transfer_request("GET", url, {}, None)
