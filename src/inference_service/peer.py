@@ -278,17 +278,21 @@ class PeerClient:
         if str(cfg.get("engine", "pytorch") or "pytorch").lower() == "relay_middle":
             with self._layer_config_lock:
                 self._active_layer_config = dict(cfg)
-            # ⚠️ 阶段判定：主节点下发时带了 `"phase": "prepare"`（`scheduler_pipeline.py:313-321`）
-            #   ⇒ ACK 必须走 **`prepared`** 判据（`:1954-1965`：`status=="prepared"` 且
-            #   `phase=="prepare"` 且 `plan_id`/`layer_range`/`model_sha256`/`model_type`/`engine`
-            #   全等，且 `available_bytes >= required_bytes`）。
-            #   relay 节点不落任何层 ⇒ `available_bytes` 给一个足够大的占位值，
-            #   `required_bytes` 本就是 0（`pipeline_capacity` 的零层条目）。
-            self._send_layer_config_ack({
+            # ⚠️ 主节点**两阶段**下发同一个 config：
+            #   ① `phase="prepare"` ⇒ ACK 走 `prepared` 判据（`scheduler_pipeline.py:1972-1983`：
+            #      `status=="prepared"` 且 `phase=="prepare"` 且 `plan_id`/`layer_range`/
+            #      `model_sha256`/`model_type`/`engine` 全等，且 `available_bytes >= required_bytes`）；
+            #   ② `phase="commit"` ⇒ ACK 走 `ready` 判据（`:1997-2017`：`status=="ready"`、
+            #      `layer_range` 为 **list**、`model_sha256`/`model_type`/`engine` 全等）。
+            #   ★ 2026-09-30：此前本分支**不区分 phase、永远回 `prepared`** ⇒ commit 阶段
+            #   永远命中 `prepared_late`（"忽略已进入 commit 的迟到 prepare ACK"），
+            #   `_layer_config_pushed` 永不加入 ⇒ 主节点持续 `重发分层配置`（实测每 **1s**
+            #   一次），worker 也随之反复重设段。relay 节点不落任何层 ⇒ `available_bytes`
+            #   给足够大的占位值（`required_bytes` 本就是 0，见 `pipeline_capacity` 零层条目）。
+            phase = str(cfg.get("phase", "commit") or "commit")
+            common = {
                 "node_id": node_id,
                 "config_id": config_id,
-                "status": "prepared",
-                "phase": "prepare",
                 "plan_id": str(cfg.get("plan_id", "")),
                 "layer_range": [int(start), int(end)],
                 "model_sha256": expected_sha256,
@@ -296,13 +300,30 @@ class PeerClient:
                 "engine": "relay_middle",
                 "has_embedding": bool(has_embed),
                 "has_lm_head": bool(has_lm),
-                "available_bytes": 1 << 40,
-            })
-            logger.info(
-                "relay_middle 段配置就绪（本节点不加载层，段由远端服务持有）: "
-                "Layer %s-%s, config_id=%s",
-                start, end, config_id,
-            )
+                # ★ 2026-09-30：ACK **必须**回显 `generation` —— 主节点
+                #   `scheduler_pipeline.py:1926` 对**非 release** 的期望同样做 generation 门闩
+                #   （`if not expected.get("release") and "generation" in expected`），
+                #   而主节点写入的 `_layer_config_expected[node_id] = dict(config)`（`:390`）
+                #   本就带 generation。缺它 ⇒ 被 `忽略缺少或无效 generation 的层配置 ACK`。
+                "generation": int(cfg.get("generation", 0) or 0),
+            }
+            if phase == "commit":
+                self._send_layer_config_ack({**common, "status": "ready"})
+                logger.info(
+                    "relay_middle 段 commit 就绪（本节点不加载层，段由远端服务持有）: "
+                    "Layer %s-%s, config_id=%s",
+                    start, end, config_id,
+                )
+            else:
+                self._send_layer_config_ack({
+                    **common, "status": "prepared", "phase": "prepare",
+                    "available_bytes": 1 << 40,
+                })
+                logger.info(
+                    "relay_middle 段配置就绪（本节点不加载层，段由远端服务持有）: "
+                    "Layer %s-%s, config_id=%s",
+                    start, end, config_id,
+                )
             return
 
         try:
@@ -355,6 +376,9 @@ class PeerClient:
                 "config_id": config_id,
                 "status": "ready",
                 "layer_range": f"{start}-{end}",
+                # ★ 2026-09-30：同 relay 分支 —— 非 release 的层配置 ACK 也要回显
+                #   `generation`，否则主节点的 generation 门闩会把它整条忽略（见上）。
+                "generation": int(cfg.get("generation", 0) or 0),
             })
             logger.info(
                 f"✅ 层段加载完成: Layer {start}-{end}, config_id={config_id}"
