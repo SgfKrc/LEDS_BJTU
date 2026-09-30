@@ -161,6 +161,12 @@ def test_l_tier_cold_start_gguf_inference_and_tui_without_torch():
         cwd=repo_root,
         capture_output=True,
         text=True,
+        # ★ 必须显式指定编码：`text=True` 缺 `encoding` 时按 **locale 默认**解码
+        #   （中文 Windows 是 GBK）⇒ 探针输出里出现非 GBK 字节时 `_readerthread`
+        #   抛 UnicodeDecodeError，CPython 直接把 `stdout` 置为 **None** ⇒ 下面
+        #   那条 `in completed.stdout` 变成 TypeError（症状与根因相隔很远）。
+        encoding="utf-8",
+        errors="replace",
         timeout=30,
     )
     assert completed.returncode == 0, completed.stderr or completed.stdout
