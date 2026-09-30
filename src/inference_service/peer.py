@@ -117,12 +117,7 @@ class PeerClient:
             self._report_device_profile()
 
         def _on_disconnect() -> None:
-            with self._layer_execution_lock:
-                self._close_all_relay_sessions()
-            logger.warning("与主节点连接断开: %s:%s", self._master_host, self._master_port)
-            with self._layer_config_lock:
-                self._active_layer_config = None
-                self._local_pipeline_steps.clear()
+            self._handle_disconnect()
 
         client.on_heartbeat = _on_heartbeat
         client.on_disconnect = _on_disconnect
@@ -144,6 +139,19 @@ class PeerClient:
             "status": "failed",
             "reason": f"连接主节点 {self._master_host}:{self._master_port} 失败",
         }
+
+    def _handle_disconnect(self) -> None:
+        """Drop local pipeline state and let ``run_forever`` reconnect."""
+        # The receive loop owns the transport failure notification.  Mark the
+        # peer inactive so run_forever() drives a fresh registration; otherwise
+        # a reset socket leaves the process alive but orphaned.
+        self._running = False
+        with self._layer_execution_lock:
+            self._close_all_relay_sessions()
+        logger.warning("与主节点连接断开: %s:%s", self._master_host, self._master_port)
+        with self._layer_config_lock:
+            self._active_layer_config = None
+            self._local_pipeline_steps.clear()
 
     def run_forever(self) -> None:
         """阻塞运行：连接失败/断开后自动重连（简单退避）。"""
