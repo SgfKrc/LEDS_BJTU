@@ -39,6 +39,11 @@ def _run(
             cwd=cwd,
             capture_output=True,
             text=True,
+            # ★ 2026-09-30：`adb logcat` 里含非 GBK 字节（UTF-8 中文/符号）时，
+            #   默认编码解码会抛 `UnicodeDecodeError` 并**打断整个校验**（实测踩到）。
+            #   adb 输出是 UTF-8 ⇒ 显式指定并容错。
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=False,
             env=environment,
@@ -122,6 +127,53 @@ def _apk_has_arm64_worker(apk: Path) -> bool:
         return False
 
 
+def _device_logcat(adb: str, serial: str, lines: int = 4000) -> str:
+    """抓设备当前 logcat ring buffer（一次 dump，不阻塞跟随）。"""
+    result = _run([adb, "-s", serial, "logcat", "-d", "-v", "brief"],
+                  cwd=ROOT, timeout=90.0)
+    if not result["ok"]:
+        return ""
+    return "\n".join(result["stdout"].splitlines()[-lines:])
+
+
+def _device_process_alive(adb: str, serial: str, package: str) -> bool:
+    result = _run([adb, "-s", serial, "shell", "pidof", package], cwd=ROOT, timeout=20.0)
+    return bool(result["ok"] and result["stdout"].strip())
+
+
+def _logcat_native_evidence(logcat: str, package: str) -> dict[str, Any]:
+    """从 logcat 里提取**真机**证据，替代"安装+启动+ABI"式的推导。
+
+    ★ 2026-09-30（审计 P1 Android 条）：`arm64_native_worker` 此前只由
+    「APK 装了 + Activity 起来了 + 设备是 arm64」推导，**不能证明** JNI 层实际装载/运行。
+    这里改为要求两条**可观测**证据：
+
+    - `jni_library_loaded`：`nativeloader` 真的把包内的 `libqlh_llama_jni.so` 映射进来
+      （实测日志：`Load …/base.apk!/lib/arm64-v8a/libqlh_llama_jni.so using ns …`）；
+    - `foreground_service_started`：`ActivityManager` 放行前台服务
+      （实测：`Background started FGS: Allowed [callingPackage: <pkg>…`）。
+
+    `worker_service_referenced` 是**弱**证据（只说明系统见过 `TaskWorkerService`），
+    单列出来供人工判断，**不**计入硬判据。
+    """
+    lower = logcat.lower()
+    pkg_lower = package.lower()
+    jni_loaded = any(
+        "nativeloader" in line.lower() and "libqlh_llama_jni.so" in line.lower()
+        for line in logcat.splitlines()
+    )
+    fgs_started = any(
+        "background started fgs" in line.lower() and pkg_lower in line.lower()
+        for line in logcat.splitlines()
+    )
+    worker_referenced = "taskworkerservice" in lower
+    return {
+        "jni_library_loaded": jni_loaded,
+        "foreground_service_started": fgs_started,
+        "worker_service_referenced": worker_referenced,
+    }
+
+
 def validate(argv: list[str] | None = None) -> dict[str, Any]:
     parser = argparse.ArgumentParser(
         description="分层执行 QLH Android 构建、单元测试和设备证据检查。",
@@ -132,6 +184,8 @@ def validate(argv: list[str] | None = None) -> dict[str, Any]:
     parser.add_argument("--package", default="com.qlh.inference.debug")
     parser.add_argument("--install", action="store_true", help="安装已构建的 fullDebug APK")
     parser.add_argument("--launch", action="store_true", help="启动已安装的 Android Activity")
+    parser.add_argument("--settle-seconds", type=float, default=12.0,
+                        help="启动后等待多少秒再抓 logcat（等 Application/JNI 库就绪）")
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args(argv)
 
@@ -167,7 +221,7 @@ def validate(argv: list[str] | None = None) -> dict[str, Any]:
 
     if not args.skip_unit and wrapper.is_file() and result["checks"]["java"]:
         unit = _run(
-            [str(wrapper), ":app:testFullDebugUnitTest"],
+            [str(wrapper), ":app:testDebugUnitTest"],
             cwd=ANDROID_ROOT,
             environment=gradle_environment,
         )
@@ -179,10 +233,10 @@ def validate(argv: list[str] | None = None) -> dict[str, Any]:
     else:
         result["checks"]["jvm_unit_tests"] = False
 
-    apk = ANDROID_ROOT / "app" / "build" / "outputs" / "apk" / "full" / "debug" / "app-full-debug.apk"
+    apk = ANDROID_ROOT / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"
     if args.assemble and wrapper.is_file() and result["checks"]["java"]:
         build = _run(
-            [str(wrapper), ":app:assembleFullDebug"],
+            [str(wrapper), ":app:assembleDebug"],
             cwd=ANDROID_ROOT,
             environment=gradle_environment,
         )
@@ -218,18 +272,44 @@ def validate(argv: list[str] | None = None) -> dict[str, Any]:
                 result["install"] = install
                 result["checks"]["apk_install"] = bool(install["ok"])
         if args.launch:
+            # ★ 2026-09-30（真机 Y700 实测）：**不要用 `monkey`** —— 联想 ZUI 的
+            #   `AutoRunService` 会把 `monkey`（经 adb shell）拉起的进程判为
+            #   「system relative auto run」并**主动 kill**（实测 logcat：
+            #   `ProcessStateHandler … try to kill system relative auto run. package …`），
+            #   表现为"闪退"但其实不是崩溃。`am start` 走正常 Activity 启动路径，不被杀。
             launch = _run(
-                [adb, "-s", serial, "shell", "monkey", "-p", args.package, "1"],
+                [adb, "-s", serial, "shell", "am", "start", "-W",
+                 "-n", f"{args.package}/com.qlh.inference.MainActivity"],
                 cwd=ROOT,
-                timeout=30.0,
+                timeout=60.0,
             )
             result["launch"] = launch
             result["checks"]["apk_launch"] = bool(launch["ok"])
+            if launch["ok"]:
+                # 让 App 完成冷启动（进程 fork + Application/Activity 起来 + 加载 JNI 库）
+                # 再抓 logcat；否则 `nativeloader`/FGS 行可能还没出现。
+                time.sleep(float(args.settle_seconds))
         result["evidence"]["apk_device_control_plane"] = bool(
             result["checks"].get("apk_install") and result["checks"].get("apk_launch")
         )
+        # ★ 2026-09-30（审计 P1 Android 条）：`arm64_native_worker` 不再只由
+        #   「安装 + 启动 + ABI」推导 —— 必须叠加**真机可观测**证据：
+        #   进程存活 **且** JNI 库被 `nativeloader` 实际装载。任一条缺失即 False。
+        logcat = _device_logcat(adb, serial)
+        native_evidence = _logcat_native_evidence(logcat, args.package)
+        result["logcat_evidence"] = native_evidence
+        result["checks"]["device_process_alive"] = _device_process_alive(
+            adb, serial, args.package)
+        result["checks"]["device_jni_library_loaded"] = native_evidence["jni_library_loaded"]
+        result["checks"]["device_foreground_service_started"] = (
+            native_evidence["foreground_service_started"])
+        result["checks"]["device_worker_service_referenced"] = (
+            native_evidence["worker_service_referenced"])
         result["evidence"]["arm64_native_worker"] = bool(
-            result["evidence"]["apk_device_control_plane"] and arm64
+            result["evidence"]["apk_device_control_plane"]
+            and arm64
+            and result["checks"]["device_process_alive"]
+            and native_evidence["jni_library_loaded"]
         )
     else:
         result["checks"]["arm64_abi"] = "not_observed"
