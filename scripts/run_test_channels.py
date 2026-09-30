@@ -1,4 +1,11 @@
-"""Run the parallel, external-resource, and real-model test channels."""
+"""Run the parallel, external-resource, and real-model test channels.
+
+通道：`unit`（并行，排除重资源标记）→ `external`（串行）→ `smoke`
+（`real_model`，串行加载真实权重，**opt-in**：需 `QLH_RUN_REAL_MODEL_SMOKE=1`）。
+
+`--channel all` 会按上述顺序跑；smoke 未开启时**不影响退出码**，但跳过状态会写进
+`manifest.json` 的 `smoke` 字段 —— 避免"全绿"被误读成"real_model 也验过了"。
+"""
 
 from __future__ import annotations
 
@@ -253,6 +260,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     channels = ('unit', 'external')
     failures: list[str] = []
     runs: list[dict[str, object]] = []
+    #: ★ 2026-09-30：smoke（real_model）是 **opt-in** 通道，未开启时原先只打印一行
+    #: 就跳过、不影响退出码 ⇒ `--channel all` 跑绿会被误读成"real_model 也验过了"。
+    #: 这里把跳过状态**显式写进 manifest**，让"没跑"不可能被当成"通过"。
+    smoke_status: dict[str, object] = {
+        'requested': args.channel in ('all', 'smoke'),
+        'ran': False,
+        'reason': 'QLH_RUN_REAL_MODEL_SMOKE is not set to 1',
+    }
 
     def record_manifest() -> None:
         (artifact_dir / 'manifest.json').write_text(
@@ -263,6 +278,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     'dist': args.dist,
                     'repeat': args.repeat,
                     'order_seed': order_seed,
+                    'smoke': smoke_status,
                     'runs': runs,
                 },
                 ensure_ascii=False,
@@ -320,6 +336,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         else:
             print('\n[test-channels] smoke channel', flush=True)
+            smoke_status['ran'] = True
+            smoke_status['reason'] = ''
             for repetition in range(1, args.repeat + 1):
                 smoke_args = [
                     'tests',
