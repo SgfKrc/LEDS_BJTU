@@ -7,10 +7,15 @@ import threading
 import time
 import uuid
 import base64
+import hashlib
 
 from koakuma_engine import Capability, backend_id_for, runtime_supports
-from config import (PIPELINE_MODEL_SYNC_TIMEOUT, PIPELINE_RELAY_ENABLED,
-                    PIPELINE_RELAY_SEGMENTS)
+from config import (
+    PIPELINE_MODEL_SYNC_TIMEOUT,
+    PIPELINE_RELAY_ENABLED,
+    PIPELINE_RELAY_SEGMENTS,
+    TASK_WORKER_EXPERIMENTAL_ENABLED,
+)
 # ★ #31 M2：层流水线支持的架构**单一事实来源**（此前在 4 处各写了一份 `{"qwen","qwen2"}`）
 from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
 from relay_segment_client import (
@@ -99,6 +104,55 @@ def _decode_relay_hidden(raw: bytes, shape: object):
     return torch.frombuffer(memoryview(raw), dtype=torch.float32).reshape(shape).clone()
 
 
+def _decode_layer_stage_hidden_output(
+    output: object, *, n_tokens: int, n_embd: int,
+):
+    """Decode one v3 intermediate result into the pipeline tensor contract."""
+    if not isinstance(output, dict):
+        raise ValueError("layer stage output must be an object")
+    encoded = output.get("hidden_out_f32")
+    digest = output.get("hidden_out_sha256")
+    if not isinstance(encoded, str) or not isinstance(digest, str):
+        raise ValueError("layer stage hidden output requires bytes and digest")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise ValueError("layer stage hidden output is not valid base64") from exc
+    expected_bytes = int(n_tokens) * int(n_embd) * 4
+    if len(raw) != expected_bytes:
+        raise ValueError(
+            f"layer stage hidden length mismatch: {len(raw)} != {expected_bytes}"
+        )
+    actual_digest = hashlib.sha256(raw).hexdigest()
+    if actual_digest != digest:
+        raise ValueError("layer stage hidden digest mismatch")
+    return _decode_relay_hidden(raw, [int(n_tokens), int(n_embd)])
+
+
+def _layer_stage_result_to_pipeline_value(
+    output: object, *, hidden_spec: dict,
+):
+    """Map a v3 StageResult to the old pipeline step's explicit value shape."""
+    if not isinstance(output, dict):
+        raise ValueError("layer stage result must be an object")
+    n_tokens = int(hidden_spec.get("n_tokens", 0) or 0)
+    n_embd = int(hidden_spec.get("n_embd", 0) or 0)
+    if n_tokens < 1 or n_embd < 1:
+        raise ValueError("hidden_spec dimensions must be positive")
+    if "hidden_out_f32" in output:
+        return {
+            "kind": "hidden",
+            "hidden_states": _decode_layer_stage_hidden_output(
+                output, n_tokens=n_tokens, n_embd=n_embd,
+            ),
+            "token_argmax": output.get("token_argmax"),
+        }
+    token = output.get("token_argmax")
+    if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+        raise ValueError("tail layer stage result requires token_argmax")
+    return {"kind": "token", "token_argmax": token}
+
+
 class SchedulerPipelineMixin:
     def request_authoritative_layer_sync(
         self, *, require_distributed: bool = False,
@@ -126,6 +180,32 @@ class SchedulerPipelineMixin:
                     0, self._authoritative_layer_sync_requests - 1,
                 )
         return True
+
+
+    def _task_worker_layer_stage_ids(self, connected_ids: set[str]) -> set[str]:
+        """Return connected Android peers admitted for Route-A layer stages."""
+        if (
+            self._effective_role() != "master"
+            or not TASK_WORKER_EXPERIMENTAL_ENABLED
+        ):
+            return set()
+        try:
+            status = self._task_worker_control.status(role="master")
+        except Exception:
+            return set()
+        admitted = {
+            str(worker.get("node_id", ""))
+            for worker in status.get("workers", [])
+            if isinstance(worker, dict)
+            and worker.get("healthy")
+            and worker.get("layer_stage_dispatch_enabled")
+            and str(worker.get("node_id", "")) in connected_ids
+        }
+        with self._nodes_lock:
+            return {
+                node_id for node_id in admitted
+                if getattr(self.nodes.get(node_id), "node_type", "") == "android"
+            }
 
 
     def _push_layer_config_to_clients_locked(
@@ -157,6 +237,12 @@ class SchedulerPipelineMixin:
                 and node_id != self.get_effective_node_id()
                 and getattr(node, "node_type", "pc") == "pc"
             }
+        # Route A Android workers use v3 stage_offer and must never receive a
+        # legacy LAYER_CONFIG (which would make a layer worker look like a
+        # full-model worker and reintroduce the old opt-out path).
+        stage_releasable_worker_ids = self._task_worker_layer_stage_ids(
+            set(connected_ids)
+        )
 
         # A healthy full-model Task Worker has priority over legacy automatic
         # layer assignment. Keep its local model intact and release any stale
@@ -241,6 +327,7 @@ class SchedulerPipelineMixin:
                         "分布式请求忽略单机手动分层覆盖，改用多节点容量求解"
                     )
                 eligible_node_ids = set(layer_releasable_worker_ids)
+                eligible_node_ids.update(stage_releasable_worker_ids)
                 eligible_node_ids.update({"master", self.get_effective_node_id()})
                 capacity_plan = self.get_pipeline_capacity_plan(
                     eligible_node_ids,
@@ -282,14 +369,30 @@ class SchedulerPipelineMixin:
         else:
             layer_info = self.get_layer_assignments()
         assignments = {}
+        stage_assignments = {}
         from config import API_PORT
 
         for a in layer_info["assignments"]:
             nid = a["node_id"]
             if (
                 nid in {"master", self.get_effective_node_id()}
-                or nid not in layer_releasable_worker_ids
+                or (
+                    nid not in layer_releasable_worker_ids
+                    and nid not in stage_releasable_worker_ids
+                )
             ):
+                continue
+
+            if nid in stage_releasable_worker_ids:
+                # Keep the assignment in the active capacity plan for the
+                # execution/readiness contract, but do not materialize a
+                # local model segment or publish LAYER_CONFIG to Android.
+                a["execution"] = "stage_offer_v3"
+                a["stage_type"] = "layer_forward"
+                stage_assignments[nid] = {
+                    **dict(a),
+                }
+                self._clear_layer_config_state(nid)
                 continue
 
             # 新一轮配置开始后，旧 ACK 立即失效。
@@ -350,7 +453,7 @@ class SchedulerPipelineMixin:
         }
         configs = {**assignments, **releases}
         if capacity_plan is not None:
-            if not assignments:
+            if not assignments and not stage_assignments:
                 capacity_plan = dict(capacity_plan)
                 capacity_plan.update({
                     "status": "rejected",
@@ -359,17 +462,36 @@ class SchedulerPipelineMixin:
                     "assignments": [],
                     "transaction_phase": "rejected",
                 })
+            elif stage_assignments:
+                # The solver's plan is retained, while only legacy workers
+                # participate in the prepare/commit ACK transaction.
+                capacity_plan = dict(capacity_plan)
+                capacity_plan["assignments"] = [
+                    (
+                        stage_assignments.get(item.get("node_id"), item)
+                        if item.get("node_id") in stage_assignments else item
+                    )
+                    for item in capacity_plan.get("assignments", [])
+                ]
             with self._layer_config_lock:
                 self._pipeline_load_transaction = {
                     "config_id": config_id,
                     "generation": generation,
-                    "phase": "preparing" if assignments else "rejected",
+                    "phase": "preparing" if assignments or stage_assignments else "rejected",
                     "plan": dict(capacity_plan),
                     "worker_ids": set(assignments),
                     "prepared_nodes": set(),
                 }
-                self._active_pipeline_capacity_plan = None
+                self._active_pipeline_capacity_plan = (
+                    dict(capacity_plan) if stage_assignments and not assignments
+                    else None
+                )
         self._publish_layer_configs(configs)
+        if capacity_plan is not None and stage_assignments and not assignments:
+            # No legacy worker has an ACK to drive the transaction forward.
+            # Commit the master's local prefix explicitly, then expose the
+            # stage-only plan as active.
+            self._commit_pipeline_load_transaction(config_id)
         if assignments:
             logger.info(
                 f"分层配置已推送到 {len(assignments)} 个从节点，"
@@ -377,6 +499,142 @@ class SchedulerPipelineMixin:
             )
         else:
             logger.warning("没有可用的从节点接收分层配置")
+
+
+    def _stage_offer_assignment_ready(
+        self, node_id: str, assignment: dict,
+    ) -> tuple[bool, str]:
+        """Check a Route-A worker without consulting legacy layer ACK state."""
+        provider_factory = getattr(self, "_ensure_remote_task_worker_provider", None)
+        if not callable(provider_factory):
+            return False, "task_worker_provider_unavailable"
+        try:
+            provider = provider_factory(node_id)
+            capabilities = provider.inspect()
+            if not capabilities.healthy:
+                return False, "task_worker_provider_unhealthy"
+            if "layer_forward" not in capabilities.supported_stage_types:
+                return False, "layer_forward_not_advertised"
+            snapshot = self._task_worker_control.worker_snapshot(node_id)
+            if not snapshot.get("layer_stage_dispatch_enabled"):
+                return False, "layer_stage_dispatch_not_admitted"
+            raw_caps = snapshot.get("capabilities", {})
+            ranges = raw_caps.get("layer_ranges", []) if isinstance(raw_caps, dict) else []
+            requested = (
+                int(assignment.get("start_layer", -1)),
+                int(assignment.get("end_layer", -1)),
+            )
+            if ranges:
+                matches = any(
+                    isinstance(item, (list, tuple)) and len(item) == 2
+                    and int(item[0]) <= requested[0]
+                    and int(item[1]) >= requested[1]
+                    for item in ranges
+                )
+                if not matches:
+                    return False, "layer_range_not_advertised"
+            return True, "ready"
+        except Exception as exc:
+            logger.debug(
+                "stage offer readiness probe failed node=%s", node_id,
+                exc_info=True,
+            )
+            return False, type(exc).__name__
+
+
+    def _execute_layer_stage_offer(
+        self,
+        *,
+        node_id: str,
+        assignment: dict,
+        hidden_states,
+        model_identity,
+        workflow_id: str,
+        request_id: str,
+        stage_id: str,
+        context_size: int,
+        pos_base: int = 0,
+        want_hidden: bool = True,
+        middle_channel: str = "extract_hidden",
+        seq_ids: list[int] | None = None,
+        positions: list[int] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> dict:
+        """Execute one Route-A v3 layer stage and map its result to a step.
+
+        This helper is intentionally independent from the legacy token loop;
+        callers must own the surrounding prefill/decode/KV state machine.
+        """
+        from task_provider import StageAttempt, StageRequest
+        from task_worker_adapter import remote_provider_id
+
+        torch = require_torch()
+        if hidden_states is None or not hasattr(hidden_states, "detach"):
+            raise ValueError("layer stage requires a torch hidden tensor")
+        hidden = hidden_states.detach().to(
+            device="cpu", dtype=torch.float32,
+        ).contiguous()
+        if hidden.ndim != 2:
+            raise ValueError("layer stage hidden tensor must be [tokens, embedding]")
+        n_tokens, n_embd = (int(hidden.shape[0]), int(hidden.shape[1]))
+        raw = hidden.numpy().tobytes()
+        hidden_spec = {
+            "n_tokens": n_tokens,
+            "n_embd": n_embd,
+            "dtype": "float32",
+        }
+        stage_fields = {
+            "layer_range": [
+                int(assignment["start_layer"]),
+                int(assignment["end_layer"]),
+            ],
+            "handoff_at": int(assignment["end_layer"]),
+            "hidden_sha256": hashlib.sha256(raw).hexdigest(),
+            "hidden_spec": hidden_spec,
+            "middle_channel": middle_channel,
+        }
+        if seq_ids is not None:
+            stage_fields["seq_ids"] = list(seq_ids)
+        if positions is not None:
+            stage_fields["positions"] = list(positions)
+        request = StageRequest(
+            workflow_id=str(workflow_id),
+            request_id=str(request_id),
+            stage_id=str(stage_id),
+            stage_type="layer_forward",
+            provider_id=remote_provider_id(str(node_id)),
+            dependencies={},
+            root_input={
+                "hidden_f32": base64.b64encode(raw).decode("ascii"),
+                "context_size": int(context_size),
+                "pos_base": int(pos_base),
+                "want_hidden": bool(want_hidden),
+            },
+            model_identity=model_identity,
+            stage_fields=stage_fields,
+            runtime_context={"pipeline_route": "route_a"},
+        )
+        provider = self._ensure_remote_task_worker_provider(str(node_id))
+        reservation = provider.reserve(request)
+        attempt = StageAttempt(
+            attempt_id=f"att_{uuid.uuid4().hex}",
+            request=request,
+            provider_id=request.provider_id,
+            lease_id=f"lease_{uuid.uuid4().hex}",
+            lease_epoch=1,
+            lease_expires_at=time.time() + 60.0,
+        )
+        try:
+            result = provider.execute(
+                attempt,
+                reservation,
+                cancel_event or threading.Event(),
+            )
+            return _layer_stage_result_to_pipeline_value(
+                result.output, hidden_spec=hidden_spec,
+            )
+        finally:
+            provider.release(reservation.reservation_id)
 
 
     def _publish_layer_configs(self, configs: dict[str, dict]) -> None:
@@ -513,6 +771,24 @@ class SchedulerPipelineMixin:
             item["phase"] = "commit"
             commit_configs[node_id] = item
         if not commit_configs:
+            stage_only = bool(
+                not worker_ids
+                and any(
+                    item.get("execution") == "stage_offer_v3"
+                    for item in plan.get("assignments", [])
+                )
+            )
+            if stage_only:
+                with self._layer_config_lock:
+                    transaction = self._pipeline_load_transaction
+                    if transaction and transaction.get("config_id") == config_id:
+                        transaction["phase"] = "ready"
+                        self._active_pipeline_capacity_plan = dict(plan)
+                logger.info(
+                    "Route-A stage-only pipeline committed local assignment: config=%s",
+                    config_id,
+                )
+                return
             self._abort_pipeline_load_transaction(
                 config_id, "pipeline_commit_workers_missing",
                 "prepared worker set disappeared before commit",
@@ -3173,7 +3449,16 @@ class SchedulerPipelineMixin:
                 callable(relay_for_assignment)
                 and relay_for_assignment(node_id) is not None
             )
-            if is_relay_worker:
+            is_stage_offer_worker = assignment.get("execution") == "stage_offer_v3"
+            if is_stage_offer_worker:
+                layer_ready, stage_reason = self._stage_offer_assignment_ready(
+                    node_id, assignment,
+                )
+                ack = {
+                    "status": "ready" if layer_ready else "error",
+                    "error": "" if layer_ready else stage_reason,
+                }
+            elif is_relay_worker:
                 # ★ A1 / X 档（Y 档第二条缺口 3）：relay 段节点**不需要**加载本地层
                 #   （`:2255` 分支明说段工件由外边监督的 relay_mid_service 持有 ——
                 #   "this scheduler host does not need a local ModelHost/model loaded"）
@@ -3214,6 +3499,11 @@ class SchedulerPipelineMixin:
                     "worker_layer_load_failed",
                     f"从节点 {node_id} 模型同步或层加载失败: {error}",
                 )
+            elif not layer_ready and is_stage_offer_worker:
+                failure = (
+                    "worker_stage_offer_not_ready",
+                    f"从节点 {node_id} v3 layer_forward 未就绪: {error}",
+                )
             elif not layer_ready and expected:
                 failure = (
                     "worker_layer_loading",
@@ -3240,6 +3530,7 @@ class SchedulerPipelineMixin:
                 "config_id": expected.get("config_id", ""),
                 "model_id": expected.get("model_id", ""),
                 "layer_range": expected_range,
+                "execution": assignment.get("execution", "legacy_layer_config"),
             })
 
         if first_failure is None:
@@ -3486,7 +3777,16 @@ class SchedulerPipelineMixin:
             is_relay_worker = (
                 callable(relay_for_check) and relay_for_check(node_id) is not None
             )
-            if not is_relay_worker:
+            if node.get("execution") == "stage_offer_v3":
+                stage_ready, stage_reason = self._stage_offer_assignment_ready(
+                    node_id, node,
+                )
+                if not stage_ready:
+                    return False, (
+                        f"node {node_id} v3 layer_forward not ready: "
+                        f"{stage_reason}"
+                    )
+            elif not is_relay_worker:
                 with self._layer_config_lock:
                     expected = self._layer_config_expected.get(node_id, {})
                     ack = self._layer_config_acks.get(node_id, {})
@@ -3858,6 +4158,332 @@ class SchedulerPipelineMixin:
             return self._wait_for_layer_result(task_id, node_ids, timeout)
 
 
+    def _run_route_a_stage_pipeline(
+        self,
+        *,
+        prompt: str,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        session_id: str | None,
+        messages: list | None,
+        show_thinking: bool,
+        routing_preference: str,
+        stage_nodes: list[dict],
+        master_assignment: dict,
+        _stream_callback=None,
+        _cancel_event: threading.Event | None = None,
+    ) -> dict:
+        """Run a Route-A chain made only of v3 Android layer stages.
+
+        The legacy LAYER_FORWARD loop cannot share its KV ownership or wire
+        contract with a v3 task worker.  This path therefore owns the whole
+        prefill/decode sequence: the master computes its prefix, then each
+        Android assignment receives a v3 hidden handoff.  Mixed legacy/v3
+        chains remain rejected by the caller until they have one KV contract.
+        """
+        mgr = self._host
+        if not master_assignment or not master_assignment.get("layers_count", 0):
+            return {
+                "response": "",
+                "error": "route_a_requires_master_prefix",
+            }
+        if not mgr or not getattr(mgr, "tokenizer", None):
+            return {"response": "", "error": "route_a_tokenizer_not_ready"}
+
+        ok, readiness_error = self._verify_pipeline_readiness(stage_nodes)
+        if not ok:
+            return {"response": "", "error": readiness_error}
+
+        callbacks = self._require_callbacks()
+        try:
+            model_identity = callbacks.active_task_graph_model_identity()
+        except Exception as exc:
+            logger.warning("Route-A model identity lookup failed", exc_info=True)
+            model_identity = None
+        if model_identity is None:
+            return {"response": "", "error": "route_a_model_identity_unavailable"}
+
+        try:
+            ensure_layer_range = getattr(mgr, "ensure_layer_range", None)
+            if callable(ensure_layer_range):
+                ensure_layer_range(
+                    master_assignment["start_layer"],
+                    master_assignment["end_layer"],
+                    has_embedding=master_assignment.get("has_embedding", True),
+                    has_lm_head=master_assignment.get("has_lm_head", True),
+                )
+            else:
+                mgr.load_layer_range(
+                    master_assignment["start_layer"],
+                    master_assignment["end_layer"],
+                    has_embedding=master_assignment.get("has_embedding", True),
+                    has_lm_head=master_assignment.get("has_lm_head", True),
+                )
+        except Exception as exc:
+            logger.error("Route-A master prefix load failed", exc_info=True)
+            return {"response": "", "error": f"route_a_master_prefix_load_failed: {exc}"}
+
+        tokenizer = mgr.tokenizer
+        chat_messages = messages or [{"role": "user", "content": prompt}]
+        thinking_prompt = callbacks.thinking_system_prompt if show_thinking else None
+        thinking_prefill = "思考\n" if show_thinking else None
+        model_prompt = callbacks.build_model_chat_prompt(
+            tokenizer,
+            chat_messages,
+            system_prompt=thinking_prompt,
+            assistant_prefill=thinking_prefill,
+        )
+        inputs = tokenizer(model_prompt, return_tensors="pt")
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs.get("attention_mask")
+        prompt_len = int(input_ids.shape[1])
+        torch = self._scheduler_facade_global("torch")
+        config = getattr(getattr(mgr, "model", None), "config", None)
+        context_size = int(
+            getattr(config, "max_position_embeddings", None)
+            or getattr(config, "max_seq_len", None)
+            or 2048
+        )
+
+        task_id = uuid.uuid4().hex[:12]
+        worker_ids = [node["node_id"] for node in stage_nodes]
+        pipeline_metrics = {
+            "steps": [],
+            "total_time_ms": 0,
+            "kv_cache": True,
+            "chain_topology": True,
+            "engine": "distributed_pipeline",
+            "execution_mode": "route_a_stage_offer_v3",
+            "distributed_requested": True,
+            "distributed_used": True,
+            "fallback": False,
+            "fallback_reason": "",
+            "route": "master_pipeline_route_a",
+            "task_id": task_id,
+            "serving_node_id": self.get_effective_node_id(),
+            "workers_used": worker_ids,
+            "layer_assignments": stage_nodes,
+        }
+        generated_ids: list[int] = []
+        full_input_ids = input_ids
+        new_token_id: int | None = None
+        stop_sequences = []
+        merge_stops = getattr(mgr, "_merge_stop_sequences", None)
+        if callable(merge_stops):
+            stop_sequences = merge_stops(None)
+        get_eos = getattr(mgr, "_get_generation_eos_token_ids", None)
+        eos_token_ids = (
+            get_eos(stop_sequences)
+            if callable(get_eos)
+            else tokenizer.eos_token_id
+        )
+        if eos_token_ids is None:
+            eos_ids = {tokenizer.eos_token_id}
+        elif isinstance(eos_token_ids, int):
+            eos_ids = {eos_token_ids}
+        else:
+            eos_ids = set(eos_token_ids)
+        native_thinking_prompt = bool(
+            not show_thinking and "<think" in model_prompt[-128:].lower()
+        )
+        suppress_native_thinking = native_thinking_prompt
+        stream_buffer = ""
+        t_pipeline_start = time.time()
+
+        with self._pipeline_lock:
+            self._pipeline_active_tasks.add(task_id)
+            self._pipeline_task_contracts[task_id] = {
+                "config_id": f"route_a:{task_id}",
+                "model_sha256": getattr(model_identity, "sha256", ""),
+                "model_type": getattr(model_identity, "model_id", ""),
+                "worker_ids": worker_ids,
+                "last_node_id": worker_ids[-1],
+                "current_step": -1,
+            }
+        pipeline_stack = getattr(self._pipeline_context, "stack", None)
+        if pipeline_stack is None:
+            pipeline_stack = []
+            self._pipeline_context.stack = pipeline_stack
+        pipeline_stack.append({
+            "task_id": task_id,
+            "pipeline_nodes": stage_nodes,
+        })
+
+        try:
+            for step in range(max_new_tokens):
+                step_start = time.time()
+                if _cancel_event is not None and _cancel_event.is_set():
+                    return {
+                        "response": "",
+                        "error": "流水线任务已取消",
+                        "cancelled": True,
+                    }
+                with self._pipeline_lock:
+                    contract = self._pipeline_task_contracts.get(task_id)
+                    if contract is None:
+                        return {"response": "", "error": "route_a_task_contract_expired"}
+                    contract["current_step"] = step
+
+                is_prefill = step == 0
+                past_kv = None
+                if not is_prefill:
+                    with self._kv_cache_lock:
+                        past_kv = self._kv_cache.get(task_id)
+                    if past_kv is None:
+                        return {
+                            "response": "",
+                            "error": f"route_a_decode_step_{step}_missing_kv",
+                        }
+                local_input_ids = (
+                    input_ids
+                    if is_prefill
+                    else torch.tensor([[new_token_id]], dtype=torch.long)
+                )
+                local_result = mgr.forward_layers(
+                    input_ids=local_input_ids,
+                    attention_mask=attention_mask if is_prefill else None,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                    apply_lm_head=False,
+                )
+                if local_result.get("cache") is not None or local_result.get("past_key_values"):
+                    with self._kv_cache_lock:
+                        self._kv_cache[task_id] = _prefer_cache_state(local_result)
+                hidden = local_result.get("hidden_states")
+                if hidden is None:
+                    return {"response": "", "error": "route_a_master_missing_hidden"}
+                hidden = hidden.detach().to(device="cpu", dtype=torch.float32).contiguous()
+                if hidden.ndim == 3 and int(hidden.shape[0]) == 1:
+                    hidden = hidden.squeeze(0)
+                if hidden.ndim != 2:
+                    return {
+                        "response": "",
+                        "error": f"route_a_invalid_master_hidden_rank:{hidden.ndim}",
+                    }
+                n_tokens = int(hidden.shape[0])
+                positions = (
+                    list(range(n_tokens))
+                    if is_prefill
+                    else [prompt_len + step - 1] * n_tokens
+                )
+                current_hidden = hidden
+                stage_token = None
+                for index, assignment in enumerate(stage_nodes):
+                    last_stage = index == len(stage_nodes) - 1
+                    stage_result = self._execute_layer_stage_offer(
+                        node_id=assignment["node_id"],
+                        assignment=assignment,
+                        hidden_states=current_hidden,
+                        model_identity=model_identity,
+                        workflow_id=task_id,
+                        request_id=f"{task_id}:step:{step}",
+                        stage_id=f"{assignment['node_id']}:step:{step}",
+                        context_size=context_size,
+                        pos_base=0,
+                        want_hidden=not last_stage,
+                        middle_channel="extract_hidden",
+                        seq_ids=[0] * n_tokens,
+                        positions=positions,
+                        cancel_event=_cancel_event,
+                    )
+                    if last_stage:
+                        if stage_result.get("kind") != "token":
+                            return {"response": "", "error": "route_a_tail_missing_token"}
+                        stage_token = int(stage_result["token_argmax"])
+                    else:
+                        if stage_result.get("kind") != "hidden":
+                            return {"response": "", "error": "route_a_middle_missing_hidden"}
+                        current_hidden = stage_result["hidden_states"]
+                        n_tokens = int(current_hidden.shape[0])
+                if stage_token is None:
+                    return {"response": "", "error": "route_a_stage_chain_empty"}
+                new_token_id = stage_token
+                if new_token_id in eos_ids:
+                    break
+                generated_ids.append(new_token_id)
+                if _stream_callback:
+                    token_text = tokenizer.decode([new_token_id])
+                    if suppress_native_thinking:
+                        stream_buffer += token_text
+                        marker = stream_buffer.lower().find("</think>")
+                        if marker >= 0:
+                            visible = stream_buffer[marker + len("</think>"):]
+                            suppress_native_thinking = False
+                            stream_buffer = ""
+                            if visible:
+                                _stream_callback({"token": visible})
+                    else:
+                        _stream_callback({"token": token_text})
+                new_token_tensor = torch.tensor([[new_token_id]], dtype=torch.long)
+                full_input_ids = torch.cat([full_input_ids, new_token_tensor], dim=1)
+                step_ms = (time.time() - step_start) * 1000
+                pipeline_metrics["steps"].append({
+                    "step": step,
+                    "token": new_token_id,
+                    "time_ms": round(step_ms, 1),
+                    "mode": "prefill" if is_prefill else "decode",
+                })
+        except Exception as exc:
+            logger.error("Route-A stage pipeline failed", exc_info=True)
+            return {"response": "", "error": f"route_a_stage_execution_failed: {exc}"}
+        finally:
+            with self._kv_cache_lock:
+                self._kv_cache.pop(task_id, None)
+            self._clear_pipeline_runtime_state(task_id)
+            if pipeline_stack and pipeline_stack[-1].get("task_id") == task_id:
+                pipeline_stack.pop()
+
+        if generated_ids:
+            full_ids = torch.cat([
+                input_ids.squeeze(0),
+                torch.tensor(generated_ids, dtype=torch.long),
+            ], dim=0)
+            response_text = tokenizer.decode(full_ids, skip_special_tokens=True)
+            raw_new_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        else:
+            response_text = tokenizer.decode(
+                input_ids.squeeze(0), skip_special_tokens=True,
+            )
+            raw_new_text = ""
+        new_text, thinking_content = callbacks.format_model_response(
+            raw_new_text,
+            show_thinking,
+            native_thinking_prompt=native_thinking_prompt,
+        )
+        pipeline_metrics["total_time_ms"] = round(
+            (time.time() - t_pipeline_start) * 1000, 1
+        )
+        pipeline_metrics["tokens_generated"] = len(generated_ids)
+        pipeline_metrics["generated_tokens"] = len(generated_ids)
+        pipeline_metrics["nodes_used"] = len(stage_nodes)
+        pipeline_metrics["elapsed_seconds"] = round(
+            pipeline_metrics["total_time_ms"] / 1000, 3,
+        )
+        pipeline_metrics["tokens_per_second"] = round(
+            len(generated_ids) / (pipeline_metrics["total_time_ms"] / 1000)
+            if generated_ids and pipeline_metrics["total_time_ms"] > 0 else 0,
+            1,
+        )
+        accounting = self._record_pipeline_task_accounting(
+            task_id=task_id,
+            pipeline_nodes=stage_nodes,
+            success=True,
+        )
+        pipeline_metrics["node_task_accounting"] = accounting
+        pipeline_metrics["workers_counted"] = accounting.get("workers_counted", [])
+        pipeline_metrics["counted_nodes"] = accounting.get("counted_nodes", [])
+        result = {
+            "response": new_text,
+            "full_text": response_text,
+            "thinking": thinking_content,
+            "metrics": pipeline_metrics,
+        }
+        if _stream_callback:
+            _stream_callback({"done": True, **result})
+        return result
+
+
     def _check_preempt_conditions(self, current_step: int) -> bool:
         """
         检查是否满足抢占条件（防抖动 + 最小 token 阈值）。
@@ -4167,6 +4793,36 @@ class SchedulerPipelineMixin:
         ]
         # 按 start_layer 排序，确保 worker 流水线顺序正确
         pipeline_nodes.sort(key=lambda a: a.get("start_layer", 0))
+
+        stage_offer_nodes = [
+            node for node in pipeline_nodes
+            if node.get("execution") == "stage_offer_v3"
+        ]
+        if stage_offer_nodes:
+            # Route A owns the complete prefill/decode/KV sequence for a
+            # stage-only Android chain.  A mixed legacy/v3 chain remains
+            # fail-closed until both protocols share one KV state machine.
+            if len(stage_offer_nodes) == len(pipeline_nodes):
+                return self._run_route_a_stage_pipeline(
+                    prompt=prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    session_id=session_id,
+                    messages=messages,
+                    show_thinking=show_thinking,
+                    routing_preference=routing_preference,
+                    stage_nodes=stage_offer_nodes,
+                    master_assignment=master_assignment or {},
+                    _stream_callback=_stream_callback,
+                    _cancel_event=_cancel_event,
+                )
+            return {
+                "response": "",
+                "error": "route_a_mixed_legacy_execution_bridge_not_ready",
+                "execution": "stage_offer_v3",
+                "stage_nodes": [node.get("node_id") for node in stage_offer_nodes],
+            }
 
         if not pipeline_nodes:
             return {"response": "", "error": "没有可用的流水线从节点"}

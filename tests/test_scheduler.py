@@ -5581,6 +5581,109 @@ class TestPipelineOrchestrationIntegration:
         assert sched_with_workers.nodes["worker1"].task_count == 1
         assert sched_with_workers.nodes["worker2"].task_count == 1
 
+    def test_route_a_stage_pipeline_keeps_prefill_decode_positions(
+            self, sched_with_workers, monkeypatch):
+        """Route-A v3 stages own both prefill and decode position semantics."""
+        from model_host import model_host as _host
+        import torch
+
+        class Tokenizer:
+            eos_token_id = 999
+
+            def __call__(self, prompt, **kwargs):
+                return {
+                    "input_ids": torch.tensor([[11, 12]]),
+                    "attention_mask": torch.ones(1, 2, dtype=torch.long),
+                }
+
+            def decode(self, ids, **kwargs):
+                return "answer"
+
+        class Manager:
+            is_loaded = True
+            tokenizer = Tokenizer()
+            model = type("Model", (), {
+                "config": type("Config", (), {
+                    "max_position_embeddings": 128,
+                })(),
+            })()
+
+            def ensure_layer_range(self, *args, **kwargs):
+                pass
+
+            def forward_layers(self, **kwargs):
+                input_ids = kwargs["input_ids"]
+                seq_len = int(input_ids.shape[1])
+                return {
+                    "hidden_states": torch.ones(1, seq_len, 4),
+                    "past_key_values": ((torch.ones(1, 1, seq_len, 1),
+                                          torch.ones(1, 1, seq_len, 1)),),
+                }
+
+        monkeypatch.setattr(_host, "_manager", Manager())
+
+        class Callbacks:
+            thinking_system_prompt = ""
+
+            @staticmethod
+            def active_task_graph_model_identity():
+                return type("Identity", (), {
+                    "sha256": "a" * 64,
+                    "model_id": "qwen-test",
+                })()
+
+            @staticmethod
+            def build_model_chat_prompt(tokenizer, messages, **kwargs):
+                return "prompt"
+
+            @staticmethod
+            def format_model_response(text, show_thinking, **kwargs):
+                return text, ""
+
+        monkeypatch.setattr(sched_with_workers, "_require_callbacks", lambda: Callbacks())
+        monkeypatch.setattr(
+            sched_with_workers,
+            "_verify_pipeline_readiness",
+            lambda nodes: (True, "ok"),
+        )
+        stage_calls = []
+
+        def fake_stage(**kwargs):
+            stage_calls.append(kwargs)
+            return {"kind": "token", "token_argmax": 7}
+
+        monkeypatch.setattr(sched_with_workers, "_execute_layer_stage_offer", fake_stage)
+        result = sched_with_workers._run_route_a_stage_pipeline(
+            prompt="hello",
+            max_new_tokens=2,
+            temperature=0.0,
+            top_p=1.0,
+            session_id=None,
+            messages=None,
+            show_thinking=False,
+            routing_preference="auto",
+            stage_nodes=[{
+                "node_id": "android-1",
+                "execution": "stage_offer_v3",
+                "start_layer": 4,
+                "end_layer": 8,
+                "layers_count": 4,
+            }],
+            master_assignment={
+                "node_id": "master",
+                "start_layer": 0,
+                "end_layer": 4,
+                "layers_count": 4,
+                "has_embedding": True,
+                "has_lm_head": True,
+            },
+        )
+
+        assert result["metrics"]["execution_mode"] == "route_a_stage_offer_v3"
+        assert [call["positions"] for call in stage_calls] == [[0, 1], [2]]
+        assert all(call["want_hidden"] is False for call in stage_calls)
+        assert all(call["model_identity"].model_id == "qwen-test" for call in stage_calls)
+
     def test_run_pipeline_builds_native_prompt_from_history(
             self, sched_with_workers, monkeypatch):
         from model_host import model_host as _host

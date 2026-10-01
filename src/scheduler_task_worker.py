@@ -481,12 +481,24 @@ class SchedulerTaskWorkerMixin:
         if not self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED'):
             reject_reason = "worker_experiment_disabled"
             reject_retryable = True
-        elif not coordinator.get("manual_stage_dispatch_enabled"):
-            reject_reason = "worker_not_admitted"
-            reject_retryable = True
-        elif offer["provider_id"] != expected_provider:
-            reject_reason = "provider_identity_mismatch"
         else:
+            # Layer workers are admitted through the v3 layer capability gate;
+            # full-model stages keep the legacy manual dispatch gate.  Older
+            # coordinators do not publish the layer flag, so retain the
+            # connected/manual fallback for wire compatibility.
+            dispatch_enabled = (
+                coordinator.get("layer_stage_dispatch_enabled")
+                if offer.get("stage_type") == "layer_forward"
+                else coordinator.get("manual_stage_dispatch_enabled")
+            )
+            if offer.get("stage_type") == "layer_forward" and dispatch_enabled is None:
+                dispatch_enabled = coordinator.get("manual_stage_dispatch_enabled")
+            if not dispatch_enabled:
+                reject_reason = "worker_not_admitted"
+                reject_retryable = True
+        if not reject_reason and offer["provider_id"] != expected_provider:
+            reject_reason = "provider_identity_mismatch"
+        elif not reject_reason:
             capabilities = self._task_worker_capabilities()
             if offer["stage_type"] not in capabilities["stage_types"]:
                 reject_reason = "unsupported_stage_type"
@@ -573,6 +585,14 @@ class SchedulerTaskWorkerMixin:
                 dependencies=offer["dependencies"],
                 root_input=offer["root_input"],
                 model_identity=model_identity,
+                stage_fields={
+                    key: offer[key]
+                    for key in (
+                        "layer_range", "handoff_at", "hidden_sha256",
+                        "hidden_spec", "middle_channel", "seq_ids", "positions",
+                    )
+                    if key in offer
+                },
             )
             with self._host.full_chat_execution_lock:
                 with self._inference_lock:
@@ -882,6 +902,11 @@ class SchedulerTaskWorkerMixin:
                 for worker in healthy_workers
                 if str(worker.get("node_id", "")) not in full_model_worker_ids
             )
+            layer_stage_worker_ids = sorted(
+                str(worker.get("node_id", ""))
+                for worker in healthy_workers
+                if worker.get("layer_stage_dispatch_enabled")
+            )
         else:
             local_models = self._task_worker_capabilities().get("models", [])
             full_model_worker_ids = (
@@ -890,7 +915,16 @@ class SchedulerTaskWorkerMixin:
             workers_missing_full_model = (
                 [self.get_effective_node_id()] if connected and not local_models else []
             )
+            local_caps = self._task_worker_capabilities()
+            layer_stage_worker_ids = (
+                [self.get_effective_node_id()]
+                if connected
+                and "layer_forward" in local_caps.get("stage_types", [])
+                and local_caps.get("layer_ranges")
+                else []
+            )
         full_model_ready = bool(full_model_worker_ids)
+        layer_stage_ready = bool(layer_stage_worker_ids)
         if not self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED'):
             readiness_reason = "task_worker_experiment_disabled"
         elif not connected:
@@ -911,9 +945,21 @@ class SchedulerTaskWorkerMixin:
             "manual_stage_dispatch_enabled": bool(
                 self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED') and connected and full_model_ready
             ),
+            "layer_stage_dispatch_enabled": bool(
+                self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED')
+                and connected and layer_stage_ready
+            ),
             "full_model_worker_count": len(full_model_worker_ids),
             "full_model_worker_ids": full_model_worker_ids,
             "workers_missing_full_model": workers_missing_full_model,
+            "layer_stage_worker_count": len(layer_stage_worker_ids),
+            "layer_stage_worker_ids": layer_stage_worker_ids,
+            "workers_missing_layer_stage": sorted(
+                str(worker.get("node_id", ""))
+                for worker in healthy_workers
+                if str(worker.get("node_id", ""))
+                and not worker.get("layer_stage_dispatch_enabled")
+            ) if role == "master" else [],
             "worker_readiness_reason": readiness_reason,
             "admission_state": (
                 "n2_4_experimental_physical_validation_pending"
