@@ -198,6 +198,39 @@ def test_capacity_plan_id_is_stable_for_same_inputs():
     assert first["plan_id"] == second["plan_id"]
 
 
+def test_advertised_layer_ranges_constrain_worker_assignment():
+    master = node("master", 160, role="master", score=100)
+    android = node("android", 400, score=1)
+    android["layer_ranges"] = [[1, 4]]
+
+    plan = solve_pipeline_capacity(
+        descriptor(), [master, android], safety_margin=1.0,
+        require_distributed=True,
+    )
+
+    assert plan["admitted"] is True
+    assert [
+        (item["node_id"], item["start_layer"], item["end_layer"])
+        for item in plan["assignments"]
+    ] == [("master", 0, 1), ("android", 1, 4)]
+    assert plan["assignments"][1]["layer_ranges"] == [[1, 4]]
+
+
+def test_advertised_layer_ranges_reject_uncovered_cursor():
+    master = node("master", 160, role="master", score=100)
+    android = node("android", 400, score=1)
+    android["layer_ranges"] = [[2, 4]]
+
+    plan = solve_pipeline_capacity(
+        descriptor(), [master, android], safety_margin=1.0,
+        require_distributed=True,
+    )
+
+    assert plan["admitted"] is False
+    assert plan["reason_code"] == "pipeline_layer_range_coverage_insufficient"
+    assert plan["assignments"] == []
+
+
 def test_tied_embedding_is_charged_to_output_capacity():
     item = descriptor((100,))
     item["tie_word_embeddings"] = True

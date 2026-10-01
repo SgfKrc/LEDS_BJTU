@@ -361,6 +361,10 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
         expected_fields.add("resource_gate")
     if "layer_ranges" in capabilities:
         expected_fields.add("layer_ranges")
+    # A layer-only worker advertises a deterministic source-SHA alias instead
+    # of a full-model identity.  This marker is optional for older workers.
+    if "layer_worker" in capabilities:
+        expected_fields.add("layer_worker")
     # ★ 2026-09-23：中间段通道能力（可选，向后兼容）—— 让调度侧知道该节点中间段
     #   实际能走哪条通道（值域同 `_LAYER_FORWARD_MIDDLE_CHANNELS`）；缺失 = 未声明。
     if "middle_channel" in capabilities:
@@ -392,6 +396,10 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
                 "invalid_capabilities", "payload.capabilities.n_pos_per_embd",
                 "n_pos_per_embd must be 1 or 4",
             )
+    if "layer_worker" in capabilities:
+        _require_bool(
+            capabilities["layer_worker"], "payload.capabilities.layer_worker",
+        )
     stage_types = capabilities["stage_types"]
     if not isinstance(stage_types, list) or not stage_types:
         raise _error(

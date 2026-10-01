@@ -2560,6 +2560,27 @@ class Scheduler(
         with self._nodes_lock:
             snapshot = list(self.nodes.items())
 
+        # Task-worker v3 ranges are an execution contract, not merely a
+        # readiness hint. Feed admitted Android ranges into the capacity
+        # solver so it cannot produce an assignment the worker must reject.
+        layer_ranges_by_node: dict[str, list[list[int]]] = {}
+        if self._effective_role() == "master" and TASK_WORKER_EXPERIMENTAL_ENABLED:
+            try:
+                worker_status = self._task_worker_control.status(role="master")
+            except Exception:
+                worker_status = {}
+            for worker in worker_status.get("workers", []):
+                if not isinstance(worker, dict) or not worker.get("layer_stage_dispatch_enabled"):
+                    continue
+                capabilities = worker.get("capabilities")
+                if not isinstance(capabilities, dict):
+                    continue
+                ranges = capabilities.get("layer_ranges")
+                if isinstance(ranges, list) and ranges:
+                    node_id = str(worker.get("node_id", "") or "")
+                    if node_id:
+                        layer_ranges_by_node[node_id] = ranges
+
         records = []
         effective_id = self.get_effective_node_id()
         for node_id, node in snapshot:
@@ -2650,7 +2671,22 @@ class Scheduler(
                     except (TypeError, ValueError):
                         capacity_gb = 0.0
                 capacity_source = "ram.available_gb" if capacity_gb > 0 else ""
-            records.append({
+                # Android presence reports the same free-memory evidence as
+                # an absolute byte count.  Do not discard an admitted layer
+                # worker merely because it does not use the PC `ram` shape.
+                if capacity_gb <= 0:
+                    memory = device_info.get("memory", {})
+                    if isinstance(memory, dict):
+                        try:
+                            available_bytes = float(
+                                memory.get("available_bytes", 0) or 0
+                            )
+                        except (TypeError, ValueError):
+                            available_bytes = 0.0
+                        if available_bytes > 0:
+                            capacity_gb = available_bytes / (1024 ** 3)
+                            capacity_source = "memory.available_bytes"
+            record = {
                 "node_id": node_id,
                 "role": node.role,
                 "capacity_bytes": max(0, int(capacity_gb * 1024 ** 3)),
@@ -2659,7 +2695,10 @@ class Scheduler(
                 "execution_device": execution_device,
                 "capacity_source": capacity_source,
                 "score": self._compute_node_weight(device_info),
-            })
+            }
+            if node_id in layer_ranges_by_node:
+                record["layer_ranges"] = layer_ranges_by_node[node_id]
+            records.append(record)
         return records
 
     def _pipeline_node_metadata(self) -> dict[str, dict]:
@@ -3005,6 +3044,10 @@ class Scheduler(
         result["computed_at"] = time.time()
         result["transaction_phase"] = "planned" if result.get("admitted") else "rejected"
         result.setdefault("require_distributed", bool(require_distributed))
+        if result.get("reason_code") == "pipeline_layer_range_coverage_insufficient":
+            result["reason"] = (
+                "advertised layer_ranges cannot cover the requested contiguous layer interval"
+            )
         return self._attach_pipeline_node_contract(result)
 
     def _build_manual_pipeline_capacity_plan(

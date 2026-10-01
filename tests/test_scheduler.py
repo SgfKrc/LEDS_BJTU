@@ -386,6 +386,61 @@ class TestComputeLayerAssignment:
         assert plan["admitted"] is False
         assert plan["reason_code"] == "pipeline_capacity_nodes_unavailable"
 
+    def test_android_layer_worker_uses_byte_memory_capacity(self, sched):
+        """Android presence uses memory.available_bytes instead of PC ram shape."""
+        sched.nodes = {
+            "android-worker": NodeInfo(
+                node_id="android-worker", role="client", state=NodeState.ONLINE,
+                node_type="android",
+                device_info={
+                    "backend_id": "llama_cpp",
+                    "capabilities": [Capability.FORWARD_LAYERS],
+                    "memory": {"available_bytes": 3 * 1024 ** 3},
+                },
+            ),
+        }
+
+        records = sched._get_pipeline_capacity_nodes()
+
+        assert records == [{
+            "node_id": "android-worker",
+            "role": NodeRole.CLIENT,
+            "capacity_bytes": 3 * 1024 ** 3,
+            "reserve_bytes": records[0]["reserve_bytes"],
+            "runtime_multiplier": 2.0,
+            "execution_device": "cpu",
+            "capacity_source": "memory.available_bytes",
+            "score": records[0]["score"],
+        }]
+
+    def test_android_task_worker_ranges_reach_capacity_solver(self, sched, monkeypatch):
+        """Admitted v3 ranges are preserved as solver constraints."""
+        monkeypatch.setattr("scheduler.TASK_WORKER_EXPERIMENTAL_ENABLED", True)
+        sched._role_override = "master"
+        sched._task_worker_control.status = lambda role: {
+            "workers": [{
+                "node_id": "android-worker",
+                "healthy": True,
+                "layer_stage_dispatch_enabled": True,
+                "capabilities": {"layer_ranges": [[4, 16]]},
+            }],
+        }
+        sched.nodes = {
+            "android-worker": NodeInfo(
+                node_id="android-worker", role=NodeRole.CLIENT,
+                state=NodeState.ONLINE, node_type="android",
+                device_info={
+                    "backend_id": "llama_cpp",
+                    "capabilities": [Capability.FORWARD_LAYERS],
+                    "memory": {"available_bytes": 3 * 1024 ** 3},
+                },
+            ),
+        }
+
+        records = sched._get_pipeline_capacity_nodes()
+
+        assert records[0]["layer_ranges"] == [[4, 16]]
+
     def test_capacity_prepare_acks_all_workers_before_commit(self, sched):
         sent = []
         sched._tcp_server = type("Server", (), {

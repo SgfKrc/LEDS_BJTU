@@ -888,6 +888,7 @@ class SchedulerTaskWorkerMixin:
                 for worker in healthy_workers
                 if isinstance(worker.get("capabilities"), dict)
                 and bool(worker["capabilities"].get("models"))
+                and not bool(worker["capabilities"].get("layer_worker"))
                 and (
                     worker.get("worker_kind") != "android_full_worker"
                     or (

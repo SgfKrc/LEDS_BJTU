@@ -546,6 +546,26 @@ class RemoteFullWorkerProvider:
             for model in models
         )
 
+    @staticmethod
+    def _layer_model_matches(
+        requested: Optional[ModelIdentity], models: Any,
+    ) -> bool:
+        """Match the physical artifact identity used by Route A layer workers.
+
+        The coordinator's logical model id and revision may differ from the
+        deterministic layer alias, but the engine, format, and source digest
+        must remain exact so a crop from another model cannot be selected.
+        """
+        if requested is None or not isinstance(models, list):
+            return False
+        expected = requested.snapshot()
+        return any(
+            isinstance(model, dict)
+            and all(model.get(key) == expected.get(key)
+                    for key in ("engine", "format", "sha256"))
+            for model in models
+        )
+
     def inspect(self) -> ProviderCapabilities:
         snapshot = self._snapshot()
         capabilities = snapshot.get("capabilities", {})
@@ -612,10 +632,15 @@ class RemoteFullWorkerProvider:
         capabilities = snapshot.get("capabilities", {})
         if not isinstance(capabilities, dict):
             return False
+        matcher = (
+            self._layer_model_matches
+            if stage_type == "layer_forward"
+            else self._model_matches
+        )
         return bool(
             status.healthy
             and stage_type in status.supported_stage_types
-            and self._model_matches(
+            and matcher(
                 model_identity, capabilities.get("models", []),
             )
         )
@@ -677,9 +702,12 @@ class RemoteFullWorkerProvider:
                 code="model_identity_required",
                 provider_id=self.provider_id,
             )
-        if not self._model_matches(
-            request.model_identity, capabilities.get("models", []),
-        ):
+        matcher = (
+            self._layer_model_matches
+            if request.stage_type == "layer_forward"
+            else self._model_matches
+        )
+        if not matcher(request.model_identity, capabilities.get("models", [])):
             raise ProviderUnavailable(
                 "remote worker does not have the exact requested model",
                 code="model_identity_mismatch",

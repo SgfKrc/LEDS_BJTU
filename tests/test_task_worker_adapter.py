@@ -189,6 +189,47 @@ def test_remote_provider_uses_layer_gate_for_layer_forward_stage():
     assert "layer_forward" in status.supported_stage_types
 
 
+def test_layer_worker_matches_physical_identity_but_not_full_model_alias():
+    worker = TaskWorkerControlPlane()
+    coordinator = TaskWorkerControlPlane()
+    capabilities = _android_layer_capabilities()
+    capabilities["layer_worker"] = True
+    capabilities["models"] = [{
+        "model_id": "layer-aaaaaaaaaaaaaaaa",
+        "engine": "llama_cpp",
+        "format": "gguf",
+        "revision": "local-aaaaaaaaaaaa",
+        "sha256": "a" * 64,
+    }]
+    hello = worker.begin_worker_hello(
+        node_id="android_layer_alias_01",
+        worker_kind="android_full_worker",
+        capabilities=capabilities,
+    )
+    assert hello is not None
+    ack = coordinator.receive_on_coordinator(
+        "android_layer_alias_01", hello.snapshot(), coordinator_node_id="master",
+    )
+    assert ack.payload["accepted"] is True
+    snapshot = coordinator.worker_snapshot("android_layer_alias_01")
+    snapshot["manual_stage_dispatch_enabled"] = False
+    snapshot["layer_stage_dispatch_enabled"] = True
+    provider = RemoteFullWorkerProvider(
+        node_id="android_layer_alias_01",
+        peer_snapshot=lambda: snapshot,
+        send_message=lambda _message: None,
+    )
+    requested = ModelIdentity(
+        model_id="qwen3-5-2b",
+        engine="llama_cpp",
+        format="gguf",
+        revision="coordinator-rev",
+        sha256="a" * 64,
+    )
+    assert provider.supports_model_identity(requested, "layer_forward") is True
+    assert provider.supports_model_identity(requested, "full_inference") is False
+
+
 def test_route_a_stage_result_maps_hidden_bytes_back_to_pipeline_tensor():
     import struct
     from scheduler_pipeline import _layer_stage_result_to_pipeline_value
