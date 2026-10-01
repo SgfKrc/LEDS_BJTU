@@ -2976,9 +2976,17 @@ class Scheduler(
                     transaction_snapshot = None
                     transaction_plan = None
             if active:
+                if active.get("reason_code") == "pipeline_layer_range_coverage_insufficient":
+                    active["reason"] = (
+                        "advertised layer_ranges cannot cover the requested contiguous layer interval"
+                    )
                 return self._attach_pipeline_node_contract(active)
             if transaction_snapshot and transaction_plan:
                 transaction_plan.update(transaction_snapshot)
+                if transaction_plan.get("reason_code") == "pipeline_layer_range_coverage_insufficient":
+                    transaction_plan["reason"] = (
+                        "advertised layer_ranges cannot cover the requested contiguous layer interval"
+                    )
                 return self._attach_pipeline_node_contract(transaction_plan)
 
         if descriptor is None:
