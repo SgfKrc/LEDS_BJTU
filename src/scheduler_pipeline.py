@@ -3561,17 +3561,40 @@ class SchedulerPipelineMixin:
         return False
 
 
-    def _connected_pc_worker_ids(self) -> list[str]:
-        """Return online PC clients that can receive an authoritative config."""
+    def _connected_client_ids(self) -> set[str]:
+        """Return node ids of the TCP clients currently connected to this master."""
         server = self._tcp_server
         if not server or not getattr(server, "_running", False):
-            return []
+            return set()
         get_client_ids = getattr(server, "get_client_ids", None)
-        connected = set(
+        return set(
             get_client_ids()
             if callable(get_client_ids)
             else getattr(server, "clients", {}).keys()
         )
+
+
+    def _distributable_worker_ids(self) -> list[str]:
+        """Workers this master may hand work to, PC **or** admitted Android stage node.
+
+        ★ 2026-10-01 真机实测（Route A 阶段 1）：原先强制分布式路径只看
+        `_connected_pc_worker_ids()`，而它按 `node_type == "pc"` 过滤 ⇒ 一个已经
+        声明并**被准入**的 Android `layer_forward` 节点仍被挡在外面，
+        `force_distributed_assignment` 于是直接 `pipeline_distributed_workers_unavailable`
+        → 回退整模（实测 `fallback_reason` 正是"没有在线 PC 从节点可参与强制分布式分层"）。
+        这里把 stage 节点一并计入；准入判据**复用** `_task_worker_layer_stage_ids()`
+        （单一判据来源），不再另开一套。
+        """
+        worker_ids = self._connected_pc_worker_ids()
+        stage_ids = self._task_worker_layer_stage_ids(self._connected_client_ids())
+        if not stage_ids:
+            return worker_ids
+        return sorted({*worker_ids, *stage_ids})
+
+
+    def _connected_pc_worker_ids(self) -> list[str]:
+        """Return online PC clients that can receive an authoritative config."""
+        connected = self._connected_client_ids()
         local_node_id = self.get_effective_node_id()
         with self._nodes_lock:
             return sorted(
@@ -3609,7 +3632,7 @@ class SchedulerPipelineMixin:
         ):
             return readiness
 
-        worker_ids = self._connected_pc_worker_ids()
+        worker_ids = self._distributable_worker_ids()
         if not worker_ids:
             if force_distributed_assignment:
                 return {
