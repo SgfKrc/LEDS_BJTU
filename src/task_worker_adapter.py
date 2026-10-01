@@ -349,6 +349,15 @@ class TaskWorkerControlPlane:
             #   语义是「v2 及以上的数据面通道可用」，故与当前版本号解耦。
             snapshot["healthy"] and int(snapshot.get("selected_version") or 0) >= 2
         )
+        capabilities = snapshot.get("capabilities", {})
+        if not isinstance(capabilities, dict):
+            capabilities = {}
+        stage_types = capabilities.get("stage_types", [])
+        snapshot["layer_stage_dispatch_enabled"] = bool(
+            snapshot["manual_stage_dispatch_enabled"]
+            and "layer_forward" in stage_types
+            and capabilities.get("layer_ranges")
+        )
         return snapshot
 
     def status(self, *, role: str) -> dict[str, Any]:
@@ -377,6 +386,9 @@ class TaskWorkerControlPlane:
                 "adapter_connected": False,
                 "task_dispatch_enabled": False,
                 "manual_stage_dispatch_enabled": connected,
+                "layer_stage_dispatch_enabled": any(
+                    item.get("layer_stage_dispatch_enabled") for item in workers
+                ) if role == "master" else connected,
                 "lease_renew_enabled": connected,
                 "stage_cancel_enabled": connected,
                 "stage_message_replay_enabled": True,
@@ -558,13 +570,22 @@ class RemoteFullWorkerProvider:
             self._prune_pending_locked()
             active = len(self._reservations)
             closed = self._closed
+        manual_dispatch_enabled = bool(
+            snapshot.get("manual_stage_dispatch_enabled")
+        )
+        layer_dispatch_enabled = bool(
+            snapshot.get("layer_stage_dispatch_enabled")
+        )
         healthy = bool(
             not closed
             and snapshot.get("healthy")
             # ★ 2026-09-20：原为硬编码 `== 2`（第二处），协议升 v3 后 provider 恒 unhealthy。
             #   语义是「v2 及以上的数据面通道可用」，与具体版本号解耦。
             and int(snapshot.get("selected_version") or 0) >= 2
-            and snapshot.get("manual_stage_dispatch_enabled")
+            # Provider health is generic.  The reservation path applies the
+            # stage-specific gate so a layer-only capability cannot disable
+            # ordinary full_inference dispatch on the same worker.
+            and (manual_dispatch_enabled or layer_dispatch_enabled)
             and resource_admitted
         )
         return ProviderCapabilities(
@@ -637,6 +658,18 @@ class RemoteFullWorkerProvider:
                 "remote worker does not support the requested stage type",
                 code="unsupported_stage_type",
                 provider_id=self.provider_id,
+            )
+        stage_dispatch_enabled = (
+            bool(snapshot.get("layer_stage_dispatch_enabled"))
+            if request.stage_type == "layer_forward"
+            else bool(snapshot.get("manual_stage_dispatch_enabled"))
+        )
+        if not stage_dispatch_enabled:
+            raise ProviderUnavailable(
+                "remote worker is not admitted for the requested Stage type",
+                code="stage_dispatch_not_admitted",
+                provider_id=self.provider_id,
+                retryable=True,
             )
         if request.model_identity is None:
             raise ProviderUnavailable(
