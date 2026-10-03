@@ -2241,6 +2241,44 @@ class TestPipelineMessageDispatch:
         assert sent[-1]["engine"] == "relay_middle"
         assert sched._active_layer_config["config_id"] == "cfg-relay-stage"
 
+    def test_relay_middle_rehydrates_without_master_model_identity(
+            self, sched, monkeypatch):
+        """Restart metadata gaps must still admit endpoint-backed relay config."""
+        import scheduler_pipeline as pipeline_module
+
+        relay_spec = {
+            "role": "middle", "host": "127.0.0.1", "port": 50183,
+            "n_embd": 896, "timeout": 5.0, "layer_start": 8,
+            "layer_end": 16,
+        }
+        sent = []
+        fake_host = type("RelayHost", (), {
+            "is_loaded": False,
+            "model_loaded": False,
+            "layer_range": None,
+            "load_layer_range": lambda self, *args, **kwargs: (
+                (_ for _ in ()).throw(AssertionError("relay must not load local layers"))
+            ),
+        })()
+        sched._host = fake_host
+        sched._tcp_client = type("Client", (), {
+            "send_data": lambda self, payload, msg_type: sent.append(payload),
+        })()
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: "worker")
+        monkeypatch.setattr(pipeline_module, "PIPELINE_RELAY_ENABLED", True)
+
+        sched._handle_layer_config("master", {
+            "node_id": "worker", "config_id": "cfg-relay-gap",
+            "generation": 8, "start_layer": 24, "end_layer": 24,
+            "total_layers": 24, "engine": "relay_middle",
+            "relay_segment": relay_spec,
+        })
+
+        assert sent[-1]["status"] == "ready"
+        assert sent[-1]["config_id"] == "cfg-relay-gap"
+        assert sent[-1]["model_type"] == ""
+        assert sched._active_layer_config["engine"] == "relay_middle"
+
     def test_nested_legacy_rejection_ack_preserves_generation(
             self, sched, monkeypatch):
         """Wrapped legacy assignments must reject with their own generation."""

@@ -2023,21 +2023,27 @@ class SchedulerPipelineMixin:
             if target_node_id != node_id:
                 raise ValueError(f"层配置目标节点 {target_node_id} 与本节点 {node_id} 不一致")
             # ★ #31 M2：同上，走单一事实来源
-            if expected_model_type not in PIPELINE_RUNTIME_MODEL_TYPES:
+            relay_assignment = expected_engine == "relay_middle"
+            # Endpoint-backed relay workers own their model artifact remotely;
+            # allow a restart-time metadata gap to rehydrate their logical
+            # assignment using the relay segment contract alone.
+            if not relay_assignment and expected_model_type not in PIPELINE_RUNTIME_MODEL_TYPES:
                 raise ValueError(f"不支持的流水线模型架构: {expected_model_type or 'unknown'}")
             if expected_engine not in {"pytorch", "relay_middle"}:
                 raise ValueError(
                     f"分层配置引擎必须为 pytorch 或 relay_middle，实际为 {expected_engine}"
                 )
-            missing_contract = [
-                name for name, value in (
+            contract_fields = (
+                (("config_id", config_id),)
+                if relay_assignment
+                else (
                     ("config_id", config_id),
                     ("model_id", model_id),
                     ("model_sha256", expected_sha256),
                     ("total_layers", total_layers),
                 )
-                if not value
-            ]
+            )
+            missing_contract = [name for name, value in contract_fields if not value]
             if missing_contract:
                 raise ValueError(
                     "分层配置执行契约不完整: " + ", ".join(missing_contract)
