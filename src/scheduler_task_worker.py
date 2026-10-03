@@ -585,8 +585,13 @@ class SchedulerTaskWorkerMixin:
             # full-model stages keep the legacy manual dispatch gate.  Older
             # coordinators do not publish the layer flag, so retain the
             # connected/manual fallback for wire compatibility.
+            # ★ 2026-10-03：层段用**本机自己的**就绪判据（`self_layer_stage_dispatch_enabled`），
+            #   不是 `layer_stage_dispatch_enabled` —— 后者描述的是"别的 worker 里有没有
+            #   层段就绪的"，拿它判自己会把本机的合法 offer 拒成 `worker_not_admitted`。
+            #   未发布该字段的旧协调者仍回落到 `manual_stage_dispatch_enabled`。
             dispatch_enabled = (
-                coordinator.get("layer_stage_dispatch_enabled")
+                coordinator.get("self_layer_stage_dispatch_enabled",
+                                coordinator.get("layer_stage_dispatch_enabled"))
                 if offer.get("stage_type") == "layer_forward"
                 else coordinator.get("manual_stage_dispatch_enabled")
             )
@@ -1054,6 +1059,22 @@ class SchedulerTaskWorkerMixin:
             "layer_stage_dispatch_enabled": bool(
                 self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED')
                 and connected and layer_stage_ready
+            ),
+            # ★ 2026-10-03：上面那个字段的判据是 `layer_stage_worker_ids` —— 那是
+            #   **别的** worker 的 id 集合（用于向调度侧汇报"当前有谁在承层段"）。
+            #   而 worker 在 `_handle_task_worker_stage_offer` 里判"我是否被允许接
+            #   层段 Stage"时读的也是它 ⇒ 语义错位：本机明明声明了 layer_forward +
+            #   layer_ranges，却因为**别的**节点没就绪而把自己的 offer 拒成
+            #   `worker_not_admitted`（实测：三段链的 Surface 因此一直拒收）。
+            #   这里按**自己的** capabilities 给出同名字段，口径与 master 侧
+            #   `task_worker_adapter.py:359` 一致。
+            "self_layer_stage_dispatch_enabled": bool(
+                self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED')
+                and connected
+                and "layer_forward" in (
+                    self._task_worker_capabilities().get("stage_types") or []
+                )
+                and self._task_worker_capabilities().get("layer_ranges")
             ),
             "full_model_worker_count": len(full_model_worker_ids),
             "full_model_worker_ids": full_model_worker_ids,

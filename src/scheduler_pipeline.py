@@ -32,6 +32,13 @@ logger = logging.getLogger("scheduler")
 
 RELAY_HIDDEN_WIRE_FORMAT = "qlh.relay_hidden.f32.v1"
 
+#: 从节点心跳的**容忍上限**（秒）。取 45s 的 2 倍余量：App 侧
+#: `AndroidPresenceStateMachine.heartbeatIntervalMs = 45_000`（可配 5–120s，见
+#: `heartbeatIntervalSeconds.coerceIn(5, 120)`），而这里原先写死 10s ⇒ 45s 的间隔
+#: 必然被判过期（实测 `11.4s > 10s`）。Route A 要求 Android 参与 readiness 后才暴露。
+#: 与 task worker 控制面的 `health_timeout_seconds=120` 同量级。
+_WORKER_HEARTBEAT_MAX_AGE = 120.0
+
 
 def _kv_state_seq_len(past, model_type: str) -> tuple[int, int]:
     """从 KV 状态里取 `(槽位数, 已缓存序列长度)` —— **同时支持 tuple 与 Cache 对象**。
@@ -230,7 +237,10 @@ class SchedulerPipelineMixin:
         assignment 携带当前 PyTorch 模型身份和摘要。从节点缺少或模型不一致时
         先从主节点同步模型，校验成功并加载层范围后再返回 ready ACK。
         """
-        if not self._tcp_server or not self._tcp_server._running:
+        # `getattr` 而非直接取属性：`push_layer_config_to_clients()` 现在会在 task-worker
+        # hello 之后被调用（legacy 重算），而测试/嵌入场景下的 `_tcp_server` 桩可能没有
+        # `_running` ⇒ 直接取会 `AttributeError`（实测回归）。
+        if not self._tcp_server or not getattr(self._tcp_server, "_running", False):
             return
         get_client_ids = getattr(self._tcp_server, "get_client_ids", None)
         connected_ids = (
@@ -696,7 +706,27 @@ class SchedulerPipelineMixin:
             runtime_context={"pipeline_route": "route_a"},
         )
         provider = self._ensure_remote_task_worker_provider(str(node_id))
-        reservation = provider.reserve(request)
+        try:
+            reservation = provider.reserve(request)
+        except Exception as exc:
+            # ★ 2026-10-03：`reserve()` 有七个拒绝分支（provider_request_mismatch /
+            #   unsupported_stage_type / stage_dispatch_not_admitted /
+            #   model_identity_required / model_identity_mismatch /
+            #   remote_worker_unavailable / remote_worker_busy），但它们都只抛一句笼统
+            #   消息 ⇒ 跨机层段失败时看不出是哪一条。把 code 与两端身份一并打出来。
+            logger.warning(
+                "Route-A stage reserve 被拒: node=%s code=%s detail=%s "
+                "requested_identity=%s advertised=%s",
+                node_id, getattr(exc, "code", ""), exc,
+                getattr(request.model_identity, "snapshot", lambda: None)(),
+                [
+                    model for model in (
+                        provider._snapshot().get("capabilities", {}) or {}
+                    ).get("models", [])
+                ] if hasattr(provider, "_snapshot") else None,
+                exc_info=True,
+            )
+            raise
         attempt = StageAttempt(
             attempt_id=f"att_{uuid.uuid4().hex}",
             request=request,
@@ -3631,7 +3661,7 @@ class SchedulerPipelineMixin:
                 failure = ("worker_offline", f"从节点 {node_id} 已离线")
             elif not tcp_connected:
                 failure = ("worker_tcp_disconnected", f"从节点 {node_id} TCP 已断开")
-            elif heartbeat_age is None or heartbeat_age > 10:
+            elif heartbeat_age is None or heartbeat_age > _WORKER_HEARTBEAT_MAX_AGE:
                 age_text = "未知" if heartbeat_age is None else f"{heartbeat_age:.1f}s"
                 failure = (
                     "worker_heartbeat_stale",

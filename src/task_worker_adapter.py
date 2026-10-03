@@ -1004,8 +1004,15 @@ class RemoteFullWorkerProvider:
                 if payload["accepted"]:
                     pending.accepted = True
                 else:
+                    # ★ 2026-10-03：把 worker 给的 `reason_code` 带进消息。此前只塞进
+                    #   `code` 字段，异常在别处被转述成一层笼统的
+                    #   `route_a_stage_execution_failed: remote worker rejected the Stage offer`
+                    #   ⇒ 跨机层段失败时完全看不出是「身份不符」「租约过期」还是
+                    #   「不支持该 stage」，只能靠逐层加日志去猜。
                     pending.error = ProviderReservationError(
-                        "remote worker rejected the Stage offer",
+                        "remote worker rejected the Stage offer"
+                        f" (reason_code={payload['reason_code']}"
+                        f", retryable={bool(payload['retryable'])})",
                         code=payload["reason_code"],
                         provider_id=self.provider_id,
                         retryable=bool(payload["retryable"]),
