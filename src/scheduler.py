@@ -3435,23 +3435,6 @@ class Scheduler(
             if node is None or node.role == NodeRole.MASTER:
                 return
 
-        # REGISTER ACK precedes the client's task-worker hello. Fence this
-        # connection from legacy layer assignment until that hello is accepted.
-        if (
-            TASK_WORKER_EXPERIMENTAL_ENABLED
-            and getattr(node, "node_type", "pc") in {"pc", "android"}
-        ):
-            self._task_worker_control.mark_worker_connection_pending(client_id)
-            logger.info(
-                "legacy_layer_config skipped reason=task_worker_handshake_pending node=%s",
-                client_id,
-            )
-            self._push_node_list_to_client(client_id)
-            self._push_node_update_to_all_clients(
-                client_id, "add", self.nodes.get(client_id)
-            )
-            return
-
         qwen3_release = []
         with self._layer_config_lock:
             qwen3_transaction = self._qwen3_pipeline_dry_run
@@ -3470,7 +3453,21 @@ class Scheduler(
                 qwen3_release, best_effort=True,
             )
 
-        self.push_layer_config_to_clients()
+        # REGISTER ACK precedes the client's task-worker hello. Fence this
+        # connection from legacy layer assignment until that hello arrives.
+        # The hello handler resolves the fence and triggers a fresh push.
+        task_worker_handshake_pending = (
+            TASK_WORKER_EXPERIMENTAL_ENABLED
+            and getattr(node, "node_type", "pc") in {"pc", "android"}
+        )
+        if task_worker_handshake_pending:
+            self._task_worker_control.mark_worker_connection_pending(client_id)
+            logger.info(
+                "legacy_layer_config skipped reason=task_worker_handshake_pending node=%s",
+                client_id,
+            )
+        else:
+            self.push_layer_config_to_clients()
         self._push_node_list_to_client(client_id)
         self._push_node_update_to_all_clients(
             client_id, "add", self.nodes.get(client_id)

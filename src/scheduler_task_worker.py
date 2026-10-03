@@ -858,8 +858,12 @@ class SchedulerTaskWorkerMixin:
                         coordinator_node_id=self.get_effective_node_id(),
                     )
                     self._send_task_worker_to_node(client_id, ack)
-                    if ack.payload["accepted"]:
-                        self._task_worker_control.resolve_worker_connection_pending(client_id)
+                    # The registration fence must end for both an accepted
+                    # hello and a definitive rejection.  A rejected hello is
+                    # no longer negotiating the task-worker path, so legacy
+                    # scheduling can be recomputed for that connection.
+                    self._task_worker_control.resolve_worker_connection_pending(client_id)
+                    self.push_layer_config_to_clients()
                     if ack.payload["accepted"]:
                         self._ensure_remote_task_worker_provider(client_id)
                         # A node that has just advertised a complete model is

@@ -5469,6 +5469,7 @@ class TestPipelineOrchestrationIntegration:
         assert sched_master._layer_config_expected == {}
 
         sched_master._task_worker_control.resolve_worker_connection_pending(node.node_id)
+        assert sched_master._task_worker_control.pending_worker_ids() == set()
         monkeypatch.setattr(
             sched_master, "_task_worker_layer_stage_ids",
             lambda connected: {node.node_id} & connected,
