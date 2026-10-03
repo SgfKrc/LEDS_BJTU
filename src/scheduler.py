@@ -150,40 +150,55 @@ __all__ = [
 ]
 
 def _sample_pipeline_token_id(logits, temperature: float, top_p: float) -> int:
-    """Sample one token with the same zero-temperature semantics as local inference."""
-    torch_module = require_torch()
-    if logits is None or logits.ndim != 3 or logits.shape[0] != 1:
+    """Sample one token with the same zero-temperature semantics as local inference.
+
+    logits 的载体随主节点引擎而变：PyTorch 给张量，llama.cpp 给 numpy `[1, 1, n_vocab]`。
+    这里统一折成 numpy 再走同一条数值路径，避免为两种载体写两套采样逻辑（口径分叉
+    比多一次转换危险得多）。
+    """
+    import numpy as np
+
+    if logits is None or getattr(logits, "ndim", None) != 3 or logits.shape[0] != 1:
         shape = getattr(logits, "shape", None)
         raise ValueError(f"流水线 logits 形状无效: {shape}")
 
+    if hasattr(logits, "detach"):
+        values = logits.detach().to(device="cpu", dtype=None).numpy()
+    else:
+        values = np.asarray(logits)
     # Local ModelManager uses do_sample=False when temperature <= 0. Keeping
     # that exact contract also avoids dividing fp16/bf16 logits by 1e-8,
     # which can create infinities and poison the CUDA context in multinomial.
-    next_logits = logits[:, -1, :].float()
+    next_logits = values[:, -1, :].astype(np.float32)
     if float(temperature) <= 0:
-        return int(torch_module.argmax(next_logits, dim=-1).item())
+        return int(np.argmax(next_logits, axis=-1)[0])
 
     scaled_logits = next_logits / max(float(temperature), 1e-5)
-    if not bool(torch_module.isfinite(scaled_logits).all().item()):
+    if not bool(np.isfinite(scaled_logits).all()):
         raise RuntimeError("流水线 logits 包含 NaN/Inf，拒绝执行采样")
-    probs = torch_module.softmax(scaled_logits, dim=-1)
-    if not bool(torch_module.isfinite(probs).all().item()):
+    shifted = scaled_logits - np.max(scaled_logits, axis=-1, keepdims=True)
+    exponentials = np.exp(shifted)
+    probs = exponentials / np.sum(exponentials, axis=-1, keepdims=True)
+    if not bool(np.isfinite(probs).all()):
         raise RuntimeError("流水线采样概率包含 NaN/Inf")
 
-    sorted_probs, sorted_indices = torch_module.sort(probs, descending=True, dim=-1)
+    order = np.argsort(-probs, axis=-1)
+    sorted_probs = np.take_along_axis(probs, order, axis=-1)
     nucleus = min(1.0, max(0.0, float(top_p)))
-    cumsum = torch_module.cumsum(sorted_probs, dim=-1)
+    cumsum = np.cumsum(sorted_probs, axis=-1)
     cutoff = cumsum > nucleus
-    cutoff[..., 1:] = cutoff[..., :-1].clone()
+    cutoff[..., 1:] = cutoff[..., :-1].copy()
     cutoff[..., 0] = False
-    filtered_probs = sorted_probs.masked_fill(cutoff, 0.0)
-    probability_sum = filtered_probs.sum(dim=-1, keepdim=True)
-    if (not bool(torch_module.isfinite(probability_sum).all().item())
-            or bool((probability_sum <= 0).any().item())):
+    filtered_probs = np.where(cutoff, 0.0, sorted_probs)
+    probability_sum = np.sum(filtered_probs, axis=-1, keepdims=True)
+    if not bool(np.isfinite(probability_sum).all()) or bool((probability_sum <= 0).any()):
         raise RuntimeError("流水线采样概率无有效候选 token")
     filtered_probs = filtered_probs / probability_sum
-    sampled_rank = torch_module.multinomial(filtered_probs, 1)
-    return int(sorted_indices.gather(-1, sampled_rank)[0, 0].item())
+    # numpy 没有 multinomial：用逆变换采样，与 torch.multinomial 同分布。
+    uniform = np.random.random(size=(filtered_probs.shape[0], 1))
+    cumulative = np.cumsum(filtered_probs, axis=-1)
+    picked = np.argmax(cumulative >= uniform, axis=-1)
+    return int(order[0, picked[0]])
 
 def _bootstrap_api_port(default: int = 8000) -> int:
     """Return the master API port used for first-connect bootstrap."""

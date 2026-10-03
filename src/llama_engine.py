@@ -1712,6 +1712,39 @@ class LlamaCppEngine:
             info["memory"] = self.get_memory_usage()
         return info
 
+    def forward_lm_head(self, hidden_states):
+        """主节点的「架构感知 LM Head」：把末段回来的 hidden 投影成 logits。
+
+        llama.cpp 的 LM Head 就在同一份 GGUF 里，所以「算 LM Head」= 用 hidden 跑一次
+        `forward_layers_from_hidden` 并取 logits。**tied embeddings 的模型（Qwen2.5 就是）
+        根本不存 `output.weight`** —— llama.cpp 会让 `token_embd.weight` 兼任，
+        因此主节点只需拿到含 `token_embd` 的前段工件就能当流水线的头。这不是兜底，
+        是 GGUF 的常规形态（`TENSOR` 表里查不到 `output.weight` 属正常）。
+
+        返回形状 `[1, 1, n_vocab]`：调用方的 `_sample_pipeline_token_id` 契约要求 3 维且
+        首维为 1（与 PyTorch 侧 `forward_lm_head` 的输出同形）。
+        """
+        if not self.is_loaded:
+            raise RuntimeError("llama.cpp 模型未加载，无法执行 LM Head")
+        # `llama_decode` 会**占** KV 位置。主节点首段已经占了 `[0, n_tokens)`，若这里从
+        # `n_past=0` 重跑就会以 `rc=-1` 撞车（`forward_layers_from_hidden` 的文档里记过
+        # 这个坑）。LM Head 只把 hidden 投影成 logits、不关心位置语义，所以续在已用长度
+        # 之后即可 —— 它多占的一格不影响流水线自己的 `n_past` 推进。
+        n_past = int(getattr(self._model, "n_tokens", 0) or 0)
+        logits = self.forward_layers_from_hidden(
+            hidden_states, n_past=n_past, all_logits=False,
+        )
+        if logits is None:
+            raise RuntimeError("llama.cpp LM Head 未返回 logits")
+        import numpy as _np
+
+        array = _np.asarray(logits, dtype=_np.float32)
+        if array.ndim == 1:
+            array = array[None, None, :]
+        elif array.ndim == 2:
+            array = array[None, :, :]
+        return array
+
     def forward_layers(
         self,
         input_ids=None,
