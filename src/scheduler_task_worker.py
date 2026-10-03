@@ -51,6 +51,37 @@ class _TaskWorkerActiveAttempt:
 
 
 class SchedulerTaskWorkerMixin:
+    def _configured_layer_artifact(self) -> tuple[int, int] | None:
+        """从 env 指定的层段工件推导 `[start, end)`；取不到返回 None。
+
+        读同目录同名的 `.manifest.json`（`scripts/cut_layers.py` 产出）里的
+        `source_layer_range`。这里刻意**不依赖** master 下发的 layer config ——
+        声明必须能先于配置成立，否则首次 hello 会形成死锁（见
+        `_task_worker_capabilities` 里的说明）。
+        """
+        import json
+        import os
+        from pathlib import Path
+
+        model_path = os.environ.get("QLH_LAYER_GGUF", "").strip()
+        if not model_path:
+            return None
+        manifest_path = Path(model_path).with_suffix(".manifest.json")
+        if not manifest_path.is_file():
+            return None
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        value = data.get("source_layer_range")
+        if not (isinstance(value, list) and len(value) == 2):
+            return None
+        if any(isinstance(item, bool) or not isinstance(item, int) for item in value):
+            return None
+        if value[0] < 0 or value[1] <= value[0]:
+            return None
+        return (int(value[0]), int(value[1]))
+
     def _task_worker_capabilities(self) -> dict:
         """Build an honest PC Full Worker snapshot without loading a model."""
         engines = []
@@ -127,7 +158,6 @@ class SchedulerTaskWorkerMixin:
         stage_types = ["full_inference", "aggregate"]
         layer_ranges: list[list[int]] = []
         if layer_worker:
-            stage_types.append("layer_forward")
             layer_range = active_layer_config.get("layer_range")
             if (
                 isinstance(layer_range, (list, tuple))
@@ -138,6 +168,17 @@ class SchedulerTaskWorkerMixin:
                 )
             ):
                 layer_ranges.append([int(layer_range[0]), int(layer_range[1])])
+        else:
+            # 首次 hello 时 master 还没下发 layer config —— 它只对**已声明**层段能力的
+            # worker 下发。若这里只看 `_active_layer_config` 就形成死锁：声明为空 ⇒
+            # 分配器没有区间约束 ⇒ 分到手上没有的区间 ⇒ `layer_range_not_advertised`
+            # 被拒 ⇒ 永远拿不到配置。改为从**工件 manifest** 推导，使声明先于配置成立。
+            artifact = self._configured_layer_artifact()
+            if artifact is not None:
+                layer_worker = True
+                layer_ranges.append([artifact[0], artifact[1]])
+        if layer_worker and "layer_forward" not in stage_types:
+            stage_types.append("layer_forward")
         return {
             "stage_types": stage_types,
             "engines": engines,

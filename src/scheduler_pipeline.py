@@ -202,9 +202,16 @@ class SchedulerPipelineMixin:
             and str(worker.get("node_id", "")) in connected_ids
         }
         with self._nodes_lock:
+            # ★ 2026-10-03：PC 也能承层段 —— v3 `layer_forward` 已在
+            #   `EngineHost.execute_task_worker_stage` 实现，工件与 shim 经 env 配置。
+            #   此前这里硬编码只认 `android` ⇒ PC worker 即使声明了 `layer_forward`
+            #   + `layer_ranges` 也永远拿不到 `stage_offer_v3` 标记，层段永远派不到它。
+            #   `admitted` 已过 `layer_stage_dispatch_enabled` 门控（即已声明层段能力），
+            #   节点类型只用于排除不具备该能力的旧式节点。
             return {
                 node_id for node_id in admitted
-                if getattr(self.nodes.get(node_id), "node_type", "") == "android"
+                if getattr(self.nodes.get(node_id), "node_type", "")
+                in ("android", "pc")
             }
 
 
