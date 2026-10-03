@@ -250,14 +250,27 @@ class PeerClient:
             str(candidate.get("config_id", "") or "")
             if isinstance(candidate, dict) else ""
         )
-        if incoming_generation is not None:
-            with self._layer_config_lock:
-                latest_generation = int(
-                    getattr(self, "_latest_layer_config_generation", 0) or 0
+        with self._layer_config_lock:
+            latest_generation = int(
+                getattr(self, "_latest_layer_config_generation", 0) or 0
+            )
+            latest_config_id = str(
+                getattr(self, "_latest_layer_config_id", "") or ""
+            )
+            # Once a versioned assignment has been accepted, an unversioned
+            # legacy message is necessarily older than the active lifecycle.
+            # Accepting it would let a delayed release clear a newer relay
+            # config during a master reconnect.
+            if incoming_generation is None and latest_generation > 0:
+                logger.info(
+                    "ignore unversioned stale layer config node=%s config=%s latest=%s/%s",
+                    node_id,
+                    incoming_config_id or "legacy",
+                    latest_generation,
+                    latest_config_id or "legacy",
                 )
-                latest_config_id = str(
-                    getattr(self, "_latest_layer_config_id", "") or ""
-                )
+                return
+            if incoming_generation is not None:
                 stale = (
                     incoming_generation < latest_generation
                     or (

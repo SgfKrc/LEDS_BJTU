@@ -140,3 +140,27 @@ def test_stale_release_cannot_clear_newer_relay_config():
     assert sent == []
     assert peer._active_layer_config["config_id"] == "cfg-current"
     assert peer._local_pipeline_steps == {"task-current": 0}
+
+
+def test_unversioned_release_cannot_clear_newer_relay_config():
+    """Legacy delayed releases are fenced after a versioned assignment."""
+    peer, sent = _peer(node_id="client1")
+    peer._latest_layer_config_generation = 20
+    peer._latest_layer_config_id = "cfg-current"
+    peer._active_layer_config = {
+        "node_id": "client1",
+        "config_id": "cfg-current",
+        "generation": 20,
+        "engine": "relay_middle",
+    }
+    peer._local_pipeline_steps = {"task-current": 0}
+
+    peer._handle_layer_config({
+        "release": True,
+        "node_id": "client1",
+        "config_id": "cfg-legacy-release",
+    })
+
+    assert sent == []
+    assert peer._active_layer_config["config_id"] == "cfg-current"
+    assert peer._local_pipeline_steps == {"task-current": 0}
