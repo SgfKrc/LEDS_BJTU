@@ -51,13 +51,16 @@ class _TaskWorkerActiveAttempt:
 
 
 class SchedulerTaskWorkerMixin:
-    def _configured_layer_artifact(self) -> tuple[int, int] | None:
-        """从 env 指定的层段工件推导 `[start, end)`；取不到返回 None。
+    def _configured_layer_artifact(self) -> dict | None:
+        """从 env 指定的层段工件推导身份与层区间；取不到返回 None。
 
-        读同目录同名的 `.manifest.json`（`scripts/cut_layers.py` 产出）里的
-        `source_layer_range`。这里刻意**不依赖** master 下发的 layer config ——
-        声明必须能先于配置成立，否则首次 hello 会形成死锁（见
-        `_task_worker_capabilities` 里的说明）。
+        读同目录同名的 `.manifest.json`（`scripts/cut_layers.py` 产出）。这里刻意
+        **不依赖** master 下发的 layer config —— 声明必须能先于配置成立，否则首次
+        hello 会形成死锁（见 `_task_worker_capabilities` 里的说明）。
+
+        返回的 `sha256` 用**工件自身**的摘要（不是源模型摘要）：Route A 的 offer 身份
+        要与 worker 手上那份 GGUF 对齐，`task_worker_adapter._layer_model_matches`
+        比对的正是这一项。
         """
         import json
         import os
@@ -80,7 +83,13 @@ class SchedulerTaskWorkerMixin:
             return None
         if value[0] < 0 or value[1] <= value[0]:
             return None
-        return (int(value[0]), int(value[1]))
+        return {
+            "start": int(value[0]),
+            "end": int(value[1]),
+            "model_id": str(data.get("artifact", "") or Path(model_path).name),
+            "sha256": str(data.get("artifact_sha256", "") or ""),
+            "revision": str(data.get("generator_version", "") or ""),
+        }
 
     def _task_worker_capabilities(self) -> dict:
         """Build an honest PC Full Worker snapshot without loading a model."""
@@ -176,7 +185,19 @@ class SchedulerTaskWorkerMixin:
             artifact = self._configured_layer_artifact()
             if artifact is not None:
                 layer_worker = True
-                layer_ranges.append([artifact[0], artifact[1]])
+                layer_ranges.append([artifact["start"], artifact["end"]])
+                # 层段 worker 不加载整模 ⇒ `models` 会是空的，而 Route A 的 offer 身份
+                # 正是从这里取（`_route_a_stage_model_identity`）⇒ 缺了它整条链会以
+                # `route_a_stage_model_identity_unavailable` 失败。用**工件身份**顶上：
+                # `task_worker_adapter._layer_model_matches` 比对的就是 engine/format/sha256。
+                if artifact.get("sha256"):
+                    models.append({
+                        "model_id": artifact["model_id"],
+                        "engine": "llama_cpp",
+                        "format": "gguf",
+                        "revision": artifact["revision"],
+                        "sha256": artifact["sha256"],
+                    })
         if layer_worker and "layer_forward" not in stage_types:
             stage_types.append("layer_forward")
         return {

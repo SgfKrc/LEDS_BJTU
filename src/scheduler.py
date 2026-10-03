@@ -2589,6 +2589,12 @@ class Scheduler(
                 budget = capabilities.get("layer_budget")
                 if isinstance(budget, dict):
                     layer_budget_by_node[node_id] = budget
+        if layer_ranges_by_node or layer_budget_by_node:
+            logger.info(
+                "容量节点层段投影: ranges=%s budget=%s",
+                {k: v for k, v in layer_ranges_by_node.items()},
+                {k: v.get("max_layers") for k, v in layer_budget_by_node.items()},
+            )
 
         records = []
         effective_id = self.get_effective_node_id()
@@ -3019,7 +3025,7 @@ class Scheduler(
                 "model_type": str(descriptor.get("model_type", "") or ""),
                 "assignments": [],
             }
-        from config import PIPELINE_CAPACITY_SAFETY_MARGIN
+        from config import PIPELINE_CAPACITY_SAFETY_MARGIN, PIPELINE_PREFER_ALL_WORKERS
 
         # ★ Y 档第二条：relay 段认领的层由远端段执行 ⇒ 本机层节点的容量上界是 `k`
         #   （未被认领的前缀）。这里复用调度层的**同一套校验**（重叠 / 角色 / 连续性）；
@@ -3044,6 +3050,11 @@ class Scheduler(
             }
 
         try:
+            logger.info(
+                "容量求解输入: local_layer_budget=%s relay_claims=%s eligible=%s",
+                local_layer_budget, relay_claims,
+                sorted(eligible_node_ids) if eligible_node_ids else None,
+            )
             result = solve_pipeline_capacity(
                 descriptor,
                 self._get_pipeline_capacity_nodes(eligible_node_ids),
@@ -3051,6 +3062,7 @@ class Scheduler(
                 require_distributed=require_distributed,
                 local_layer_budget=local_layer_budget,
                 relay_claims=relay_claims,
+                prefer_all_workers=PIPELINE_PREFER_ALL_WORKERS,
             )
         except PipelineCapacityError as exc:
             return {
@@ -3063,6 +3075,12 @@ class Scheduler(
         result["computed_at"] = time.time()
         result["transaction_phase"] = "planned" if result.get("admitted") else "rejected"
         result.setdefault("require_distributed", bool(require_distributed))
+        logger.info(
+            "容量求解结果: admitted=%s reason=%s assignments=%s",
+            result.get("admitted"), result.get("reason_code"),
+            [(a.get("node_id"), a.get("start_layer"), a.get("end_layer"))
+             for a in result.get("assignments", [])],
+        )
         if result.get("reason_code") == "pipeline_layer_range_coverage_insufficient":
             result["reason"] = (
                 "advertised layer_ranges cannot cover the requested contiguous layer interval"

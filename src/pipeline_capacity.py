@@ -304,6 +304,7 @@ def solve_pipeline_capacity(
     require_distributed: bool = False,
     local_layer_budget: int | None = None,
     relay_claims: dict[str, tuple[int, int]] | None = None,
+    prefer_all_workers: bool = False,
 ) -> dict[str, Any]:
     """Return an all-or-nothing contiguous layer placement.
 
@@ -314,6 +315,12 @@ def solve_pipeline_capacity(
     deliberately rejected; the returned plan must contain at least two
     participating nodes. This is used by an explicitly distributed request,
     while ordinary capacity inspection remains single-node efficient.
+
+    ``prefer_all_workers`` flips the optimization between feasible placements
+    from "fewest nodes" (default: least network hops) to "most nodes" — the
+    latter is what exercises multi-segment chains (master + middle + tail),
+    which the default criterion would never pick because two segments are
+    always fewer.
     """
 
     safety_margin = _positive_float(safety_margin, "safety_margin")
@@ -443,12 +450,12 @@ def solve_pipeline_capacity(
                 best = candidate
                 continue
             candidate_key = (
-                len(candidate),
+                (-len(candidate) if prefer_all_workers else len(candidate)),
                 -min(usable[value[0]]["capacity_bytes"] - value[4] for value in candidate),
                 -sum(usable[value[0]]["score"] for value in candidate),
             )
             best_key = (
-                len(best),
+                (-len(best) if prefer_all_workers else len(best)),
                 -min(usable[value[0]]["capacity_bytes"] - value[4] for value in best),
                 -sum(usable[value[0]]["score"] for value in best),
             )

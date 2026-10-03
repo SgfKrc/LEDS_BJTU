@@ -208,11 +208,16 @@ class SchedulerPipelineMixin:
             #   + `layer_ranges` 也永远拿不到 `stage_offer_v3` 标记，层段永远派不到它。
             #   `admitted` 已过 `layer_stage_dispatch_enabled` 门控（即已声明层段能力），
             #   节点类型只用于排除不具备该能力的旧式节点。
-            return {
+            selected = {
                 node_id for node_id in admitted
                 if getattr(self.nodes.get(node_id), "node_type", "")
                 in ("android", "pc")
             }
+        logger.info(
+            "层段 worker 准入: admitted=%s selected=%s",
+            sorted(admitted), sorted(selected),
+        )
+        return selected
 
 
     def _push_layer_config_to_clients_locked(
@@ -4877,6 +4882,13 @@ class SchedulerPipelineMixin:
         assignments = [
             a for a in layer_info.get("assignments", []) if _participates(a)
         ]
+        logger.info(
+            "Route-A 分配原始: raw=%s filtered=%s",
+            [(a.get("node_id"), a.get("start_layer"), a.get("end_layer"),
+              a.get("layers_count"), a.get("execution"))
+             for a in layer_info.get("assignments", [])],
+            [a.get("node_id") for a in assignments],
+        )
         assignments.sort(key=lambda a: a.get("start_layer", 0))
 
         master_ids = {"master", self.get_effective_node_id()}
@@ -4898,6 +4910,12 @@ class SchedulerPipelineMixin:
             node for node in pipeline_nodes
             if node.get("execution") == "stage_offer_v3"
         ]
+        logger.info(
+            "Route-A 节点筛选: pipeline=%s stage_offer=%s execution=%s",
+            [n.get("node_id") for n in pipeline_nodes],
+            [n.get("node_id") for n in stage_offer_nodes],
+            [(n.get("node_id"), n.get("execution")) for n in pipeline_nodes],
+        )
         if stage_offer_nodes:
             # Route A owns the complete prefill/decode/KV sequence for a
             # stage-only Android chain.  A mixed legacy/v3 chain remains
