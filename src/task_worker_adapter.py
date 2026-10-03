@@ -76,6 +76,9 @@ class TaskWorkerControlPlane:
         self._workers: dict[str, dict[str, Any]] = {}
         self._coordinator: dict[str, Any] = {}
         self._worker_hello_pending = False
+        # REGISTER ACK may precede the peer's task-worker hello. Fence that
+        # connection from legacy layer assignment during this handshake.
+        self._coordinator_pending_workers: set[str] = set()
         self._seen: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
         self._seen_order: collections.deque[tuple[str, str]] = collections.deque()
         self._rejected_message_count = 0
@@ -289,6 +292,18 @@ class TaskWorkerControlPlane:
         with self._lock:
             self._rejected_message_count += 1
 
+    def mark_worker_connection_pending(self, peer_id: str) -> None:
+        with self._lock:
+            self._coordinator_pending_workers.add(str(peer_id))
+
+    def resolve_worker_connection_pending(self, peer_id: str) -> None:
+        with self._lock:
+            self._coordinator_pending_workers.discard(str(peer_id))
+
+    def pending_worker_ids(self) -> set[str]:
+        with self._lock:
+            return set(self._coordinator_pending_workers)
+
     def mark_coordinator_heartbeat(self) -> None:
         with self._lock:
             if self._coordinator.get("connected"):
@@ -296,6 +311,7 @@ class TaskWorkerControlPlane:
 
     def disconnect_worker(self, peer_id: str) -> None:
         with self._lock:
+            self._coordinator_pending_workers.discard(str(peer_id))
             worker = self._workers.get(peer_id)
             if worker is not None:
                 worker["connected"] = False

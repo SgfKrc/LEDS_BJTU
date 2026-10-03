@@ -163,6 +163,17 @@ def test_android_layer_worker_is_admitted_without_full_model_dispatch_gate():
     assert snapshot["capabilities"]["models"]
 
 
+def test_pending_worker_fence_is_resolved_by_hello_and_disconnect():
+    control = TaskWorkerControlPlane()
+    control.mark_worker_connection_pending("worker_pending")
+    assert control.pending_worker_ids() == {"worker_pending"}
+    control.resolve_worker_connection_pending("worker_pending")
+    assert control.pending_worker_ids() == set()
+    control.mark_worker_connection_pending("worker_pending")
+    control.disconnect_worker("worker_pending")
+    assert control.pending_worker_ids() == set()
+
+
 def test_remote_provider_uses_layer_gate_for_layer_forward_stage():
     coordinator = TaskWorkerControlPlane()
     worker = TaskWorkerControlPlane()

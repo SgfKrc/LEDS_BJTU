@@ -5412,6 +5412,70 @@ class TestPipelineOrchestrationIntegration:
         assert readiness["ready"] is False
         assert readiness["reason_code"] == "worker_layer_loading"
 
+    def test_registration_pending_task_worker_skips_legacy_layer_push(
+            self, sched_master, monkeypatch):
+        import scheduler as scheduler_mod
+
+        monkeypatch.setattr(scheduler_mod, "TASK_WORKER_EXPERIMENTAL_ENABLED", True)
+        node = NodeInfo(
+            node_id="surface-stage", role="client", state=NodeState.ONLINE,
+            node_type="pc", address="100.100.52.106:8888",
+            last_heartbeat=time.time(),
+        )
+        sched_master.nodes[node.node_id] = node
+        sched_master._tcp_server.clients = {node.node_id: True}
+        pushes = []
+        monkeypatch.setattr(
+            sched_master, "push_layer_config_to_clients",
+            lambda: pushes.append("legacy"),
+        )
+        monkeypatch.setattr(sched_master, "_push_node_list_to_client", lambda _id: None)
+        monkeypatch.setattr(
+            sched_master, "_push_node_update_to_all_clients",
+            lambda *args: None,
+        )
+
+        sched_master._on_tcp_registration_confirmed(node.node_id)
+
+        assert pushes == []
+        assert sched_master._task_worker_control.pending_worker_ids() == {
+            node.node_id,
+        }
+
+        sched_master._push_layer_config_to_clients_locked()
+        assert sched_master._layer_config_expected == {}
+
+    def test_layer_push_admits_peer_after_task_worker_hello_resolution(
+            self, sched_master, monkeypatch):
+        import scheduler as scheduler_mod
+
+        monkeypatch.setattr(scheduler_mod, "TASK_WORKER_EXPERIMENTAL_ENABLED", True)
+        node = NodeInfo(
+            node_id="surface-stage", role="client", state=NodeState.ONLINE,
+            node_type="pc", address="100.100.52.106:8888",
+            last_heartbeat=time.time(),
+        )
+        sched_master.nodes[node.node_id] = node
+        sched_master._tcp_server.clients = {node.node_id: True}
+        sched_master._task_worker_control.mark_worker_connection_pending(node.node_id)
+        monkeypatch.setattr(
+            sched_master._tcp_server, "send_layer_config",
+            lambda node_id, config: None,
+            raising=False,
+        )
+
+        # No capability admission yet: a pending connection is still fenced.
+        sched_master._push_layer_config_to_clients_locked()
+        assert sched_master._layer_config_expected == {}
+
+        sched_master._task_worker_control.resolve_worker_connection_pending(node.node_id)
+        monkeypatch.setattr(
+            sched_master, "_task_worker_layer_stage_ids",
+            lambda connected: {node.node_id} & connected,
+        )
+        sched_master._push_layer_config_to_clients_locked()
+        assert node.node_id not in sched_master._layer_config_expected
+
     # ----------------------------------------------------------
     # 场景 1：master 在线，所有 worker 离线 → fallback 本地推理
     # ----------------------------------------------------------

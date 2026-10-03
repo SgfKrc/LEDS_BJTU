@@ -250,6 +250,16 @@ class SchedulerPipelineMixin:
                 and node_id != self.get_effective_node_id()
                 and getattr(node, "node_type", "pc") == "pc"
             }
+        try:
+            pending_worker_ids = self._task_worker_control.pending_worker_ids()
+        except Exception:
+            pending_worker_ids = set()
+        if pending_worker_ids:
+            releasable_legacy_ids.difference_update(pending_worker_ids)
+            logger.info(
+                "legacy layer config fenced pending task-worker hello: %s",
+                sorted(pending_worker_ids & set(connected_ids)),
+            )
         # ★ 2026-10-03：**已声明 v3 层段能力的节点必须排除在这条线路之外** —— 不只是
         #   不给它派 legacy 层段，而是**连配置都不要推**。否则它会按 legacy 语义去
         #   `ensure_pipeline_assignment_available` 同步工件，在跨机（非 loopback、

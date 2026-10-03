@@ -859,6 +859,8 @@ class SchedulerTaskWorkerMixin:
                     )
                     self._send_task_worker_to_node(client_id, ack)
                     if ack.payload["accepted"]:
+                        self._task_worker_control.resolve_worker_connection_pending(client_id)
+                    if ack.payload["accepted"]:
                         self._ensure_remote_task_worker_provider(client_id)
                         # A node that has just advertised a complete model is
                         # a Full Worker, not a layer partition.  Registration

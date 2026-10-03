@@ -3435,6 +3435,23 @@ class Scheduler(
             if node is None or node.role == NodeRole.MASTER:
                 return
 
+        # REGISTER ACK precedes the client's task-worker hello. Fence this
+        # connection from legacy layer assignment until that hello is accepted.
+        if (
+            TASK_WORKER_EXPERIMENTAL_ENABLED
+            and getattr(node, "node_type", "pc") in {"pc", "android"}
+        ):
+            self._task_worker_control.mark_worker_connection_pending(client_id)
+            logger.info(
+                "legacy_layer_config skipped reason=task_worker_handshake_pending node=%s",
+                client_id,
+            )
+            self._push_node_list_to_client(client_id)
+            self._push_node_update_to_all_clients(
+                client_id, "add", self.nodes.get(client_id)
+            )
+            return
+
         qwen3_release = []
         with self._layer_config_lock:
             qwen3_transaction = self._qwen3_pipeline_dry_run
