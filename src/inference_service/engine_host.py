@@ -2006,6 +2006,18 @@ class EngineHost:
         hidden = np.frombuffer(raw, dtype=np.float32).reshape(n_tokens, n_embd)
         upstream = self._layer_forward_upstream()
 
+        # ★ 2026-10-03：批次**从位置 0 开始**就说明这是新 prompt 的 prefill ⇒ 必须先清
+        #   子进程的 KV。否则下一个请求会带着上一个请求残留的位置（实测：
+        #   `the last position stored in the KV cache for sequence 0 is X = 45`，而 batch
+        #   的起始位置是 0 ⇒ `llama_decode rc=-1`、`decode: failed to initialize batch`）。
+        #   与 JNI 侧 `qlh_layer_batch_starts_at_zero` 同语义 —— 那里是每步判一次，
+        #   这里按 Stage 判（一个 Stage = 一整段 prefill 或一次 decode）。
+        starts_at_zero = (
+            positions[0] == 0 if positions else n_past == 0
+        )
+        if starts_at_zero:
+            upstream.reset()
+
         if want_hidden:
             out = upstream.forward_hidden_to_hidden(
                 hidden, n_past=n_past, seq_ids=seq_ids, positions=positions,
