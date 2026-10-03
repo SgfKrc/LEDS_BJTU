@@ -25,7 +25,7 @@ from relay_segment_client import (
 )
 from relay_transport import is_loopback_host
 from scheduler_types import PreemptState
-from torch_runtime import require_torch
+from torch_runtime import loaded_torch
 
 logger = logging.getLogger("scheduler")
 
@@ -85,17 +85,56 @@ def _prefer_cache_state(result) -> object:
     return result["past_key_values"]
 
 
+def _hidden_to_raw_f32(hidden) -> tuple[bytes, int, int]:
+    """把 hidden 归一成 `(raw_le_f32_bytes, n_tokens, n_embd)` —— **不要求 torch**。
+
+    线格式本来就是 raw little-endian f32（见 `_encode_relay_hidden` 与
+    `transport_port.serialize_tensor`），所以这里要做的只有「二维 → CPU f32 连续 →
+    bytes」。给 torch tensor 就沿用它的 `.detach().to(...)`（语义最准）；没有 torch 的
+    边缘构建（免安装版）走 numpy —— 那种运行时里 hidden 本来就出自 `llama_cpp`/numpy，
+    不该为了转一次字节序而要求装 torch。
+    """
+    if hidden is None:
+        raise ValueError("layer stage requires a hidden tensor")
+    detach = getattr(hidden, "detach", None)
+    if callable(detach):
+        torch = loaded_torch()
+        if torch is None:
+            raise ValueError(
+                "收到 torch 张量但当前运行时没有 torch —— "
+                "边缘构建请直接传 numpy 数组"
+            )
+        cpu = detach().to(device="cpu", dtype=torch.float32).contiguous()
+        if cpu.ndim != 2:
+            raise ValueError("layer stage hidden tensor must be [tokens, embedding]")
+        return (
+            cpu.numpy().tobytes(),
+            int(cpu.shape[0]),
+            int(cpu.shape[1]),
+        )
+    import numpy as _np
+
+    array = _np.asarray(hidden)
+    if array.ndim != 2:
+        raise ValueError("layer stage hidden tensor must be [tokens, embedding]")
+    if array.dtype != _np.float32:
+        array = array.astype(_np.float32)
+    array = _np.ascontiguousarray(array)
+    return array.tobytes(), int(array.shape[0]), int(array.shape[1])
+
+
 def _encode_relay_hidden(tensor) -> tuple[str, list[int]]:
     """Encode relay input as the explicit raw-f32 wire contract."""
-    torch = require_torch()
-    cpu = tensor.detach().to(device="cpu", dtype=torch.float32).contiguous()
-    return base64.b64encode(cpu.numpy().tobytes()).decode("ascii"), [
-        int(size) for size in cpu.shape
-    ]
+    raw, n_tokens, n_embd = _hidden_to_raw_f32(tensor)
+    return base64.b64encode(raw).decode("ascii"), [n_tokens, n_embd]
 
 
 def _decode_relay_hidden(raw: bytes, shape: object):
-    """Decode and validate a relay raw-f32 payload on the Torch side."""
+    """Decode and validate a relay raw-f32 payload.
+
+    返回 torch 张量（有 torch 时）或 numpy 数组（无 torch 的边缘构建）—— 两者在下游
+    都按 `[tokens, embedding]` f32 使用。
+    """
     if not isinstance(shape, list) or not shape or any(
         isinstance(size, bool) or not isinstance(size, int) or size <= 0
         for size in shape
@@ -108,7 +147,11 @@ def _decode_relay_hidden(raw: bytes, shape: object):
         raise ValueError(
             f"relay raw f32 length mismatch: bytes={len(raw)} expected={expected_items * 4}"
         )
-    torch = require_torch()
+    torch = loaded_torch()
+    if torch is None:
+        import numpy as _np
+
+        return _np.frombuffer(memoryview(raw), dtype=_np.float32).reshape(shape).copy()
     return torch.frombuffer(memoryview(raw), dtype=torch.float32).reshape(shape).clone()
 
 
@@ -424,7 +467,16 @@ class SchedulerPipelineMixin:
             ):
                 continue
 
-            if nid in stage_releasable_worker_ids:
+            if (
+                nid in stage_releasable_worker_ids
+                # ★ relay 段不属于 v3 stage 名单：它的层由远端 relay_mid_service
+                #   代跑，本节点只转发（下面 `relay_segment` 分支会给它
+                #   `engine="relay_middle"`）。若这里把它标成 `stage_offer_v3`，
+                #   `_run_pipeline` 就会按 v3 数据面去要它的层区间，而它手上根本没有
+                #   那段工件 ⇒ `layer_range_not_advertised`（实测：relay 链被误路由到
+                #   Route-A stage 路径后卡在这里）。
+                and self._relay_segment_for_worker(nid) is None
+            ):
                 # Keep the assignment in the active capacity plan for the
                 # execution/readiness contract, but do not materialize a
                 # local model segment or publish LAYER_CONFIG to Android.
@@ -652,16 +704,7 @@ class SchedulerPipelineMixin:
         from task_provider import StageAttempt, StageRequest
         from task_worker_adapter import remote_provider_id
 
-        torch = require_torch()
-        if hidden_states is None or not hasattr(hidden_states, "detach"):
-            raise ValueError("layer stage requires a torch hidden tensor")
-        hidden = hidden_states.detach().to(
-            device="cpu", dtype=torch.float32,
-        ).contiguous()
-        if hidden.ndim != 2:
-            raise ValueError("layer stage hidden tensor must be [tokens, embedding]")
-        n_tokens, n_embd = (int(hidden.shape[0]), int(hidden.shape[1]))
-        raw = hidden.numpy().tobytes()
+        raw, n_tokens, n_embd = _hidden_to_raw_f32(hidden_states)
         hidden_spec = {
             "n_tokens": n_tokens,
             "n_embd": n_embd,
@@ -1019,8 +1062,13 @@ class SchedulerPipelineMixin:
         """
         获取主节点当前加载模型的 SHA256。
 
-        对当前已加载或已显式准备的 PyTorch Safetensors/BIN 模型计算摘要。
-        llama.cpp/GGUF 不支持层拆分，不得作为流水线模型基准。
+        口径由**主节点引擎自己的描述器**给出：PyTorch 侧是目录内 artifact 的联合哈希
+        （`model_sync.compute_model_sha256`），llama.cpp 侧是整份 GGUF 的文件摘要
+        （`LlamaCppEngine._pipeline_file_sha256`）。两者都只用于「各节点是否握着同一份
+        权重」的自证，混合部署时以主节点为准。
+
+        旧注释写的是「llama.cpp/GGUF 不支持层拆分，不得作为流水线模型基准」—— 那是
+        `BackendId.LLAMA_CPP` 声明 `FORWARD_LAYERS` 之前的判据，已不成立。
         """
         from model_sync import compute_model_sha256
 
@@ -1043,6 +1091,9 @@ class SchedulerPipelineMixin:
             or ''
         )
         if not model_path or not os.path.isdir(model_path):
+            # 单文件（GGUF）走不到这里：描述器已给出 `model_sha256` 并在上面返回。
+            # `compute_model_sha256` 的语义是「目录内 artifact 联合哈希」，对单文件
+            # 无意义，故不放宽 —— 缺描述器的 GGUF 引擎视为不可校验。
             return ""
 
         try:
@@ -2777,7 +2828,9 @@ class SchedulerPipelineMixin:
                     config_id=config_id, model_sha256=model_sha256,
                     model_type=model_type, received_chain_path=received_chain_path,
                 )
-            require_torch()
+            # 数据面经 `transport_port.serialize_tensor` ⇒ `serialize_tensor_fast`
+            # （`TNR0` magic + numpy frombuffer），**不经过 torch**。此前在这里前置
+            # `require_torch()`，会让无 torch 的边缘节点在走到这一段时直接失败。
             from transport_port import deserialize_tensor, serialize_tensor
             if actual_model_type != model_type:
                 layer_config_invalid = True
@@ -4960,7 +5013,10 @@ class SchedulerPipelineMixin:
         Returns:
             {"response": str, "thinking": str, "metrics": dict, ...}
         """
-        require_torch()
+        # 流水线数据面只经 `serialize_tensor_fast` / `deserialize_tensor_fast`
+        # （`TNR0` magic + numpy frombuffer），**不需要 torch**。此前这里前置
+        # `require_torch()`，与 `koakuma_engine` 里「llama.cpp 不需要 torch 也能做层
+        # 前向」的能力声明自相矛盾，也让无 torch 的边缘主节点在流水线入口就失败。
         import uuid
         from transport_port import MessageType, deserialize_tensor, serialize_tensor
         # ★ 与 worker 的 `deserialize_tensor_fast` 对称：fast 走 `TNR0` magic（numpy
@@ -5121,8 +5177,23 @@ class SchedulerPipelineMixin:
         pipeline_config_id = str(next(iter(config_ids)))
         pipeline_model_sha256 = str(next(iter(model_hashes)))
         pipeline_model_type = str(next(iter(model_types)))
+        # 主节点的模型类型一律取自**它自己的描述器**：PyTorch 侧能从 `mgr.model.config`
+        # 读，llama.cpp 侧根本没有 `model`/`config`（权重在 GGUF 里）——原实现只看后者
+        # ⇒ 去 torch 的主节点这里恒为空串，与 worker 契约永远对不上，每次请求都被判
+        # 「模型已变化」。描述器是两条引擎路径共同的单一事实来源。
+        master_descriptor = {}
+        get_master_descriptor = getattr(mgr, "get_pipeline_descriptor", None)
+        if callable(get_master_descriptor):
+            try:
+                master_descriptor = get_master_descriptor() or {}
+            except Exception:
+                master_descriptor = {}
         master_model_type = str(
-            getattr(getattr(getattr(mgr, "model", None), "config", None), "model_type", "")
+            master_descriptor.get("model_type", "")
+            or getattr(
+                getattr(getattr(mgr, "model", None), "config", None),
+                "model_type", "",
+            )
             or ""
         ).lower()
         if (master_model_type != pipeline_model_type
@@ -5394,7 +5465,14 @@ class SchedulerPipelineMixin:
                             self._kv_cache[task_id] = _prefer_cache_state(local_result)
                     if "hidden_states" not in local_result:
                         raise RuntimeError("主节点首段未返回 hidden_states")
-                    hs_cpu = local_result["hidden_states"].detach().cpu()
+                    # hidden 的载体随引擎不同：PyTorch 给张量（要 `.detach().cpu()`），
+                    # llama.cpp 给 numpy `[tokens, n_embd]` f32。下游只把它当 payload 用。
+                    raw_hidden = local_result["hidden_states"]
+                    hs_cpu = (
+                        raw_hidden.detach().cpu()
+                        if hasattr(raw_hidden, "detach")
+                        else raw_hidden
+                    )
                     import base64 as _b64
                     relay_segment = (
                         self._relay_segment_for_worker(first_node_id, routing_preference)
