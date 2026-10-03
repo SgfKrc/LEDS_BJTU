@@ -585,17 +585,20 @@ class SchedulerTaskWorkerMixin:
             # full-model stages keep the legacy manual dispatch gate.  Older
             # coordinators do not publish the layer flag, so retain the
             # connected/manual fallback for wire compatibility.
-            # ★ 2026-10-03：层段用**本机自己的**就绪判据（`self_layer_stage_dispatch_enabled`），
-            #   不是 `layer_stage_dispatch_enabled` —— 后者描述的是"别的 worker 里有没有
-            #   层段就绪的"，拿它判自己会把本机的合法 offer 拒成 `worker_not_admitted`。
-            #   未发布该字段的旧协调者仍回落到 `manual_stage_dispatch_enabled`。
-            dispatch_enabled = (
-                coordinator.get("self_layer_stage_dispatch_enabled",
-                                coordinator.get("layer_stage_dispatch_enabled"))
-                if offer.get("stage_type") == "layer_forward"
-                else coordinator.get("manual_stage_dispatch_enabled")
-            )
-            if offer.get("stage_type") == "layer_forward" and dispatch_enabled is None:
+            # ★ 2026-10-03：层段的准入判据必须来自**本机自己的** capabilities。
+            #   两个坑：① 原来的 `coordinator["layer_stage_dispatch_enabled"]` 描述的是
+            #   "别的 worker 里有没有层段就绪的"（见 `get_task_worker_protocol_status` 里
+            #   `layer_stage_worker_ids` 的构造）⇒ 拿它判自己会把本机的合法 offer 拒成
+            #   `worker_not_admitted`；② 想把"自己的判据"塞进 `coordinator_snapshot()`
+            #   也走不通 —— 那返回的是**协调者**的快照，不是本机的状态。所以直接在本地算，
+            #   口径与 master 侧 `task_worker_adapter.py:359` 一致。
+            if offer.get("stage_type") == "layer_forward":
+                capabilities = self._task_worker_capabilities()
+                dispatch_enabled = bool(
+                    capabilities.get("layer_ranges")
+                    and "layer_forward" in (capabilities.get("stage_types") or [])
+                )
+            else:
                 dispatch_enabled = coordinator.get("manual_stage_dispatch_enabled")
             if not dispatch_enabled:
                 reject_reason = "worker_not_admitted"
