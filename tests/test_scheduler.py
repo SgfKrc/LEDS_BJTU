@@ -5477,6 +5477,29 @@ class TestPipelineOrchestrationIntegration:
         sched_master._push_layer_config_to_clients_locked()
         assert node.node_id not in sched_master._layer_config_expected
 
+    def test_model_transition_defers_release_and_flushes_one_push(
+            self, sched_master, monkeypatch):
+        """Transient model metadata must not publish release over a new config."""
+        pushed = []
+        monkeypatch.setattr(
+            sched_master,
+            "_push_layer_config_to_clients_locked",
+            lambda **_kwargs: pushed.append(True),
+        )
+
+        sched_master._begin_layer_config_model_change()
+        sched_master.push_layer_config_to_clients()
+        # The authoritative refresh uses the internal push helper, so it must
+        # honor the same fence as ordinary status/hello-triggered pushes.
+        assert sched_master.request_authoritative_layer_sync() is True
+        assert pushed == []
+        assert sched_master._layer_config_push_deferred is True
+
+        sched_master._end_layer_config_model_change()
+        assert pushed == [True]
+        assert sched_master._layer_config_model_change_depth == 0
+        assert sched_master._layer_config_push_deferred is False
+
     # ----------------------------------------------------------
     # 场景 1：master 在线，所有 worker 离线 → fallback 本地推理
     # ----------------------------------------------------------

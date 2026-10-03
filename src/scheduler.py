@@ -1015,6 +1015,12 @@ class Scheduler(
         self._layer_config_retry_state: dict[str, dict] = {}
         self._layer_config_lock = threading.Lock()
         self._layer_config_push_lock = threading.Lock()
+        # Model transitions temporarily invalidate the local descriptor. Do
+        # not publish a transient release from concurrent status callbacks.
+        self._layer_config_model_change_depth = 0
+        self._layer_config_push_deferred = False
+        self._layer_config_push_deferred_authoritative = False
+        self._layer_config_push_deferred_require_distributed = False
         self._layer_execution_lock = threading.RLock()
         self._active_pipeline_task_ids: set[str] = set()
         self._pending_layer_config: Optional[tuple[str, dict]] = None
@@ -3405,8 +3411,58 @@ class Scheduler(
         }
 
     def push_layer_config_to_clients(self) -> None:
+        with self._layer_config_lock:
+            if self._layer_config_model_change_depth:
+                self._layer_config_push_deferred = True
+                logger.info(
+                    "defer layer config push during model transition depth=%d",
+                    self._layer_config_model_change_depth,
+                )
+                return
         with self._layer_config_push_lock:
             self._push_layer_config_to_clients_locked()
+
+    def _begin_layer_config_model_change(self) -> None:
+        """Fence transient pushes while the local model is being replaced."""
+        with self._layer_config_lock:
+            self._layer_config_model_change_depth += 1
+
+    def _end_layer_config_model_change(self) -> None:
+        """End a model transition and flush one deferred push."""
+        with self._layer_config_push_lock:
+            with self._layer_config_lock:
+                self._layer_config_model_change_depth = max(
+                    0, self._layer_config_model_change_depth - 1,
+                )
+                flush = (
+                    self._layer_config_model_change_depth == 0
+                    and self._layer_config_push_deferred
+                )
+                authoritative = bool(
+                    self._layer_config_push_deferred_authoritative
+                )
+                require_distributed = bool(
+                    self._layer_config_push_deferred_require_distributed
+                )
+                if flush:
+                    self._layer_config_push_deferred = False
+                    self._layer_config_push_deferred_authoritative = False
+                    self._layer_config_push_deferred_require_distributed = False
+            if flush:
+                if authoritative:
+                    with self._layer_config_lock:
+                        self._authoritative_layer_sync_requests += 1
+                try:
+                    self._push_layer_config_to_clients_locked(
+                        require_distributed=require_distributed,
+                    )
+                finally:
+                    if authoritative:
+                        with self._layer_config_lock:
+                            self._authoritative_layer_sync_requests = max(
+                                0,
+                                self._authoritative_layer_sync_requests - 1,
+                            )
 
     def _task_worker_full_model_ids(self) -> set[str]:
         """Return healthy Task Worker peers that advertise a full model."""
