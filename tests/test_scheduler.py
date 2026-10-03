@@ -441,6 +441,48 @@ class TestComputeLayerAssignment:
 
         assert records[0]["layer_ranges"] == [[4, 16]]
 
+    def test_android_task_worker_layer_budget_reaches_capacity_solver(self, sched, monkeypatch):
+        """设备自荐的层容量必须随 `layer_ranges` 一起投影进求解器输入 ——
+
+        `layer_ranges` 是"当前已就绪、马上能跑的区间"，`layer_budget.max_layers`
+        是"本地裁层后能承载的上限"；两者都要到求解器手上，它才能决策。
+        """
+        monkeypatch.setattr("scheduler.TASK_WORKER_EXPERIMENTAL_ENABLED", True)
+        sched._role_override = "master"
+        sched._task_worker_control.status = lambda role: {
+            "workers": [{
+                "node_id": "android-worker",
+                "healthy": True,
+                "layer_stage_dispatch_enabled": True,
+                "capabilities": {
+                    "layer_ranges": [[4, 16]],
+                    "layer_budget": {
+                        "available_bytes": 3 * 1024 ** 3,
+                        "per_layer_bytes": 64 * 1024 ** 2,
+                        "max_layers": 12,
+                        "local_cut": False,
+                    },
+                },
+            }],
+        }
+        sched.nodes = {
+            "android-worker": NodeInfo(
+                node_id="android-worker", role=NodeRole.CLIENT,
+                state=NodeState.ONLINE, node_type="android",
+                device_info={
+                    "backend_id": "llama_cpp",
+                    "capabilities": [Capability.FORWARD_LAYERS],
+                    "memory": {"available_bytes": 3 * 1024 ** 3},
+                },
+            ),
+        }
+
+        records = sched._get_pipeline_capacity_nodes()
+
+        assert records[0]["layer_ranges"] == [[4, 16]]
+        assert records[0]["layer_budget"]["max_layers"] == 12
+        assert records[0]["layer_budget"]["local_cut"] is False
+
     def test_capacity_prepare_acks_all_workers_before_commit(self, sched):
         sent = []
         sched._tcp_server = type("Server", (), {
