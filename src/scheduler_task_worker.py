@@ -83,10 +83,14 @@ class SchedulerTaskWorkerMixin:
             return None
         if value[0] < 0 or value[1] <= value[0]:
             return None
+        # `model_id` 取**文件名**，不用 manifest 的 `artifact` 字段：后者是相对路径
+        # （含 `\`），而协议对它的要求是 `^[A-Za-z0-9_.:-]{1,128}$` —— 反斜杠不合法 ⇒
+        # 整个 hello 会被判 `payload.capabilities.models[0].model_id is invalid`，worker
+        # 永远进不了 `admitted`（实测：这条错误被 legacy 通道的噪声盖了很久才浮出来）。
         return {
             "start": int(value[0]),
             "end": int(value[1]),
-            "model_id": str(data.get("artifact", "") or Path(model_path).name),
+            "model_id": Path(model_path).name,
             "sha256": str(data.get("artifact_sha256", "") or ""),
             "revision": str(data.get("generator_version", "") or ""),
         }

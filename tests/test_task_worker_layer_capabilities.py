@@ -60,6 +60,39 @@ class TestLayerCapabilities:
         assert "layer_forward" in caps["stage_types"]
         assert caps["layer_ranges"] == []
 
+    def test_artifact_derived_model_id_is_protocol_safe(self, tmp_path, monkeypatch):
+        """从工件 manifest 推导的 `model_id` 必须能过协议正则。
+
+        manifest 的 `artifact` 字段是**相对路径**（如 `models\\x.gguf`），而
+        `task_worker_protocol._SAFE_ID = ^[A-Za-z0-9_.:-]{1,128}$` 不允许反斜杠 ⇒
+        直接拿它当 `model_id` 会让整个 hello 被判
+        `payload.capabilities.models[0].model_id is invalid`，worker 永远进不了
+        `admitted`（实测踩到，且被 legacy 通道的噪声盖了很久）。
+        """
+        import json
+
+        from task_worker_protocol import _SAFE_ID, _validate_capabilities
+
+        gguf = tmp_path / "qwen25-05b-f16-cut-16-20.gguf"
+        gguf.write_bytes(b"")
+        (tmp_path / "qwen25-05b-f16-cut-16-20.manifest.json").write_text(
+            json.dumps({
+                "source_layer_range": [16, 20],
+                "artifact": "models\\qwen25-05b-f16-cut-16-20.gguf",
+                "artifact_sha256": "a" * 64,
+                "generator_version": 2,
+            }),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("QLH_LAYER_GGUF", str(gguf))
+
+        caps = _capabilities()
+        model_id = caps["models"][0]["model_id"]
+        assert _SAFE_ID.match(model_id), f"model_id 不合法: {model_id!r}"
+        assert "\\" not in model_id
+        assert caps["layer_ranges"] == [[16, 20]]
+        _validate_capabilities(caps, version=3)
+
 
 class TestLayerCapabilitiesSurviveProtocolValidation:
     """声明的形状必须能被协议侧接受（否则 hello 直接被拒）。"""
