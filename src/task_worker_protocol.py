@@ -423,6 +423,12 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     #   后者是"当前已就绪、马上能跑的区间"，前者是"能承载的上限"。
     if "layer_budget" in capabilities:
         expected_fields.add("layer_budget")
+    # ★ 2026-10-03：relay 中段角色（本节点不加载层，段由远端 relay 服务持有）。
+    #   声明侧早已在发这个键（`scheduler_task_worker._task_worker_capabilities`），
+    #   但这里没有放行 ⇒ 该 worker 的 hello 会以 `unknown=['relay_middle']` 被判
+    #   `field_mismatch`。与其余可选键同样按「出现才允许」处理。
+    if "relay_middle" in capabilities:
+        expected_fields.add("relay_middle")
     _require_exact_fields(
         capabilities,
         expected_fields,

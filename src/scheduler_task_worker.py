@@ -121,8 +121,25 @@ class SchedulerTaskWorkerMixin:
         layer_worker = bool(
             active_layer_config or getattr(self._host, "layer_range", None)
         )
+        # ★ 2026-10-03：载了层段工件就同时承担 v3 层段 Stage。此前 `stage_types` 硬编码
+        #   两个整模类型，而层段执行路径（`_handle_task_worker_stage_offer`）已实现 ——
+        #   结果是 PC worker 永远不会被派到 `layer_forward`。
+        stage_types = ["full_inference", "aggregate"]
+        layer_ranges: list[list[int]] = []
+        if layer_worker:
+            stage_types.append("layer_forward")
+            layer_range = active_layer_config.get("layer_range")
+            if (
+                isinstance(layer_range, (list, tuple))
+                and len(layer_range) == 2
+                and not any(
+                    isinstance(value, bool) or not isinstance(value, int)
+                    for value in layer_range
+                )
+            ):
+                layer_ranges.append([int(layer_range[0]), int(layer_range[1])])
         return {
-            "stage_types": ["full_inference", "aggregate"],
+            "stage_types": stage_types,
             "engines": engines,
             "models": models,
             "max_concurrency": 1,
@@ -132,6 +149,8 @@ class SchedulerTaskWorkerMixin:
             # layer-config contract, so advertising no full-model identity
             # must not cause the coordinator to opt it out of layer work.
             "layer_worker": layer_worker,
+            # 当前**就绪、马上能跑**的层区间（与 `layer_budget` 的"承载上限"分工明确）。
+            "layer_ranges": layer_ranges,
             "relay_middle": bool(
                 active_layer_config
                 and str(active_layer_config.get("engine", ""))
