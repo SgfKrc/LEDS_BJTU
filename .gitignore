@@ -91,6 +91,8 @@ models/.cache/
 # Large binaries
 models/*.gguf
 models/**/*.gguf
+# 裁层/对照产物的 manifest 属本地产物
+models/*.manifest.json
 models/*.sha256
 models_pc/*.7z
 models_android/*.7z
