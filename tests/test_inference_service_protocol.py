@@ -1394,6 +1394,38 @@ def test_task_graph_active_identity_none_without_model():
     assert host._active_task_graph_model_identity() is None
 
 
+def test_task_graph_active_identity_uses_prepared_pipeline(monkeypatch):
+    """distributed-only 已准备模型（未物化权重）也要能给出身份。
+
+    `prepare-pipeline` 按设计不加载权重，而 Route A 要求活动模型身份；身份从它
+    inspect 出的描述符取，否则两者互斥、跨框架阶段链无法准入。
+    """
+    host = EngineHost()  # 真实 ModelHost：model_loaded=False
+    target = host._host
+    monkeypatch.setattr(target, "_pipeline_distributed_only", True, raising=False)
+    monkeypatch.setattr(
+        target,
+        "_pipeline_descriptor",
+        {
+            "model_id": "qwen2.5-0.5b-instruct",
+            "model_sha256": "596062f9" + "0" * 56,
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        target, "_active_model_id", "qwen2.5-0.5b-instruct", raising=False
+    )
+
+    identity = host._active_task_graph_model_identity()
+
+    assert identity is not None
+    assert identity.model_id == "qwen2.5-0.5b-instruct"
+    assert identity.engine == "pytorch"
+    assert identity.format == "safetensors"
+    assert identity.revision == "prepared"
+    assert identity.sha256.startswith("596062f9")
+
+
 def test_task_graph_with_slot_real_execution(monkeypatch):
     """真实执行 execute_task_graph_chat_with_slot 主体（不 monkeypatch
     执行体）：本地模板分支全链路——会话切换/历史维护/run_template/

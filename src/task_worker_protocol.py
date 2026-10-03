@@ -570,6 +570,11 @@ def _validate_resource_gate(value: Any) -> None:
 def _validate_metadata(value: Any, *, version: int) -> None:
     metadata = _require_object(value, "payload.metadata")
     allowed = {"usage", "usage_estimated", "tokens_per_second", "model"}
+    # ★ 2026-10-03：层段（`layer_forward`）结果的**对账字段** —— Android executor 会
+    #   回记实际生效的中间段通道、交接点与是否尾段，供 master 与请求对账。它们与 v2
+    #   的 `model` 同属审计信息，此前被这里拒掉 ⇒ 回程 result 解码失败、请求只能等到
+    #   超时（真机表现为 `remote Stage response timed out`）。
+    allowed |= {"stage", "middle_channel", "handoff_at", "tail"}
     if not set(metadata).issubset(allowed):
         raise _error(
             "invalid_fields", "payload.metadata",

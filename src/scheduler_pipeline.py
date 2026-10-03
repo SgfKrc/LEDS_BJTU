@@ -4456,7 +4456,9 @@ class SchedulerPipelineMixin:
                         assignment=assignment,
                         hidden_states=current_hidden,
                         model_identity=stage_model_identity,
-                        workflow_id=task_id,
+                        # ★ 协议要求 `wf_` 前缀（`_WORKFLOW_ID = ^wf_[A-Za-z0-9_-]{8,96}$`）；
+                        #   Route A 原先直接传裸 `task_id`（12 位 hex），会被 offer 校验拒掉。
+                        workflow_id=f"wf_{task_id}",
                         request_id=f"{task_id}:step:{step}",
                         stage_id=f"{assignment['node_id']}:step:{step}",
                         context_size=context_size,

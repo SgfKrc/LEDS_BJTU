@@ -2657,9 +2657,39 @@ def _ensure_local_task_provider() -> None:
             raise
 
 
+def _prepared_pipeline_model_identity() -> Optional[ModelIdentity]:
+    """Identity of an explicit distributed-only artifact that is not materialized.
+
+    `POST /api/models/prepare-pipeline` 刻意不物化权重，但它把 inspect 出的描述符
+    （`model_sha256` / 模型 id / 路径 / 引擎）留在了 model_manager 上 ⇒ 层流水线需要的
+    "当前模型身份"从那里取。否则 Route A 会陷入死锁：它要求活动模型身份，而活动身份
+    要求 `model_loaded`，distributed-only 路径按设计又不加载权重。
+    """
+    if not getattr(model_manager, "is_pipeline_prepared", False):
+        return None
+    descriptor = model_manager.get_pipeline_descriptor() or {}
+    model_id = str(
+        getattr(model_manager, "active_model_id", "") or descriptor.get("model_id", "")
+    )
+    sha256 = str(descriptor.get("model_sha256", "") or "").lower()
+    if not model_id or not sha256:
+        return None
+    try:
+        return ModelIdentity(
+            model_id=model_id,
+            engine="pytorch",
+            format="safetensors",
+            revision="prepared",
+            sha256=sha256,
+        )
+    except ValueError:
+        logger.warning("已准备的流水线模型身份非法", exc_info=True)
+        return None
+
+
 def _active_task_graph_model_identity() -> Optional[ModelIdentity]:
     if not model_host.model_loaded or not model_manager.is_loaded:
-        return None
+        return _prepared_pipeline_model_identity()
     engine = backend_id_for(model_manager)
     model_path = str(getattr(model_manager, "_model_path", "") or "")
     model_id = str(getattr(model_manager, "active_model_id", "") or "")

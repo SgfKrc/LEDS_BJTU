@@ -5821,6 +5821,8 @@ class TestPipelineOrchestrationIntegration:
         )
 
         assert result["metrics"]["execution_mode"] == "route_a_stage_offer_v3"
+        # ★ 协议要求 `wf_` 前缀（`_WORKFLOW_ID`）；裸 task_id 会被 offer 校验拒掉。
+        assert all(call["workflow_id"].startswith("wf_") for call in stage_calls)
         assert [call["positions"] for call in stage_calls] == [[0, 1], [2]]
         assert all(call["want_hidden"] is False for call in stage_calls)
         assert all(

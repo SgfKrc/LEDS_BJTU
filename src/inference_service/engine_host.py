@@ -1992,6 +1992,41 @@ class EngineHost:
 
 
 
+    def _prepared_pipeline_model_identity(self):
+        """distributed-only 已准备模型的身份（未物化权重也能给出）。
+
+        `prepare-pipeline` 刻意不加载权重，但它把 inspect 出的描述符（`model_sha256`
+        / 模型 id / 路径 / 引擎）留在了宿主上 ⇒ 身份从那里取。否则 Route A 会陷入
+        "要活动身份就必须先物化权重、而 distributed-only 路径按设计不加载"的死锁。
+        """
+        from task_provider import ModelIdentity
+
+        host = self._host
+        if not getattr(host, "is_pipeline_prepared", False):
+            return None
+        try:
+            descriptor = host.get_pipeline_descriptor() or {}
+        except Exception:
+            logger.warning("读取已准备的流水线描述符失败", exc_info=True)
+            return None
+        model_id = str(
+            getattr(host, "active_model_id", "") or descriptor.get("model_id", "")
+        )
+        sha256 = str(descriptor.get("model_sha256", "") or "").lower()
+        if not model_id or not sha256:
+            return None
+        try:
+            return ModelIdentity(
+                model_id=model_id,
+                engine="pytorch",
+                format="safetensors",
+                revision="prepared",
+                sha256=sha256,
+            )
+        except ValueError:
+            logger.warning("已准备的流水线模型身份非法", exc_info=True)
+            return None
+
     def _active_task_graph_model_identity(
         self,
     ) -> Dict[str, Any]:
@@ -2000,7 +2035,7 @@ class EngineHost:
         import hashlib
         from task_provider import ModelIdentity
         if not self._host.model_loaded or not self._host.is_loaded:
-            return None
+            return self._prepared_pipeline_model_identity()
         engine = backend_id_for(self._host)
         model_path = str(getattr(self._host, "_model_path", "") or "")
         model_id = str(getattr(self._host, "active_model_id", "") or "")

@@ -146,6 +146,30 @@ def test_worker_capability_lists_and_concurrency_are_bounded(golden):
     assert concurrency_error.value.code == "invalid_capabilities"
 
 
+def test_layer_forward_result_metadata_is_accepted():
+    """层段结果回记的对账字段必须被接受。
+
+    Android executor 会回记 `stage`/`middle_channel`/`handoff_at`/`tail`；它们此前
+    不在允许集合里 ⇒ 回程 result 解码失败、master 只能等到超时（真机表现为
+    `remote Stage response timed out`）。
+    """
+    from task_worker_protocol import _validate_metadata
+
+    _validate_metadata(
+        {
+            "model": "layer-f6dab6b7",
+            "stage": "layer_forward",
+            "middle_channel": "extract_hidden",
+            "handoff_at": 24,
+            "tail": "true",
+        },
+        version=3,
+    )
+
+    with pytest.raises(WorkerProtocolError):
+        _validate_metadata({"not_a_known_field": 1}, version=3)
+
+
 def test_hello_capabilities_may_advertise_layer_budget(golden):
     """★ 2026-10-03：设备自荐层容量（`layer_budget`）是**可选**能力键（向后兼容）。
 
