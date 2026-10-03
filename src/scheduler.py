@@ -3443,7 +3443,15 @@ class Scheduler(
             )
             if capabilities.get("models") and not has_layer_stage:
                 node_id = str(worker.get("node_id", "") or "")
-                if node_id:
+                # ★ relay 宿主不是 Full Worker：它**不能**声明 `forward_layers`
+                #   （声明了就会拒绝 legacy 层配置，而 relay 委派正是走那条通道 ——
+                #   实测 Surface 报「本节点是 v3 层段 worker，拒绝 legacy 分层配置」），
+                #   所以这里的 `has_layer_stage` 恒为假。但它要的**恰恰**是那份 legacy
+                #   层配置，不该被当 Full Worker 释放预留，否则 relay 链丢掉中间段。
+                is_relay_host = bool(
+                    node_id and self._relay_segment_for_worker(node_id) is not None
+                )
+                if node_id and not is_relay_host:
                     worker_ids.add(node_id)
         return worker_ids
 
