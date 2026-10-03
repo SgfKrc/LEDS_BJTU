@@ -349,6 +349,15 @@ class SchedulerPipelineMixin:
         #   「主节点已释放本设备的分层 worker 预留」⇒ 它直接掉出层段 worker 名单
         #   （实测：Surface 因此从 `admitted` 里消失）。
         #   它手上有工件，v3 stage offer 走的是 offer 里带的 hidden，不需要 master 推模型。
+        # Record endpoint-backed relay hosts before removing v3 stage workers
+        # from the legacy candidate set. A relay worker may advertise
+        # ``layer_forward`` from a local artifact, but it still needs the
+        # logical ``relay_middle`` assignment after a master restart; the
+        # remote relay service owns that segment's data path.
+        relay_worker_ids = {
+            node_id for node_id in releasable_legacy_ids
+            if self._relay_segment_for_worker(node_id) is not None
+        }
         releasable_legacy_ids -= self._task_worker_layer_stage_ids(set(connected_ids))
         # Route A Android workers use v3 stage_offer and must never receive a
         # legacy LAYER_CONFIG (which would make a layer worker look like a
@@ -365,10 +374,6 @@ class SchedulerPipelineMixin:
         )
         # A node explicitly assigned to an endpoint-backed relay segment is
         # still a pipeline participant even if it also advertises a full model.
-        relay_worker_ids = {
-            node_id for node_id in releasable_legacy_ids
-            if self._relay_segment_for_worker(node_id) is not None
-        }
         full_worker_release_ids.difference_update(relay_worker_ids)
         layer_releasable_worker_ids = releasable_legacy_ids - full_worker_release_ids
 
@@ -409,6 +414,31 @@ class SchedulerPipelineMixin:
         #   ⇒ hybrid 会被静默拦掉，master **不推层配置**）
         if (not master_sha256 or not model_id
                 or model_type not in PIPELINE_RUNTIME_MODEL_TYPES):
+            # Relay hosts can be rehydrated without local model metadata.
+            # During master restart, releasing them here races the next
+            # assignment/ACK and leaves the relay with no active config.
+            relay_assignments = {}
+            relay_total_layers = self._get_total_model_layers()
+            for node_id in relay_worker_ids:
+                relay_segment = self._relay_segment_for_worker(node_id)
+                if relay_segment is None:
+                    continue
+                relay_assignments[node_id] = {
+                    "node_id": node_id,
+                    "config_id": config_id,
+                    "generation": generation,
+                    "start_layer": relay_total_layers,
+                    "end_layer": relay_total_layers,
+                    "has_embedding": False,
+                    "has_lm_head": False,
+                    "model_id": model_id,
+                    "model_sha256": master_sha256,
+                    "model_type": model_type,
+                    "total_layers": relay_total_layers,
+                    "engine": "relay_middle",
+                    "phase": "commit",
+                    "relay_segment": relay_segment,
+                }
             releases = {
                 node_id: {
                     "node_id": node_id,
@@ -417,8 +447,9 @@ class SchedulerPipelineMixin:
                     "release": True,
                 }
                 for node_id in releasable_legacy_ids
+                if node_id not in relay_assignments
             }
-            self._publish_layer_configs(releases)
+            self._publish_layer_configs({**relay_assignments, **releases})
             logger.warning("主节点尚未加载可校验的 PyTorch 模型，暂不推送层配置")
             return
 
