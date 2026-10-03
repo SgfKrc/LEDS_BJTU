@@ -3606,6 +3606,14 @@ class SchedulerPipelineMixin:
             )
             error = str(ack.get("error", ""))
 
+            # ★ 2026-10-03：v3 层段 worker 的 legacy ACK 故意是 error（见
+            #   `_handle_layer_config_locked` 的同名分流）⇒ 它**不参与** legacy 就绪判据。
+            #   否则会先命中下面的 `not layer_ready and error` 分支，报成
+            #   「模型同步或层加载失败」并卡住整个请求 —— 而它其实是通过 v3 stage offer
+            #   就绪的，legacy 通道与它无关。
+            if is_stage_offer_worker:
+                continue
+
             failure = None
             if node_info is None:
                 failure = ("worker_not_registered", f"从节点 {node_id} 未注册")
