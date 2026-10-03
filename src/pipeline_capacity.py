@@ -79,6 +79,41 @@ def _normalize_layer_ranges(
     return tuple(sorted(set(normalized)))
 
 
+def _normalize_layer_budget(value: Any, field: str) -> dict[str, Any]:
+    """Validate a worker's self-declared forward-layer budget.
+
+    与 `layer_ranges` 的分工：`layer_ranges` 是该节点**当前已就绪、马上能跑**的区间；
+    `layer_budget.max_layers` 是它在本地裁层之后**能承载的层数上限**。有了后者，
+    调度可以把任意连续区间分配给具备本地裁层条件的节点，而不是只能迁就它手上
+    那份预先切好的工件。
+    """
+    if not isinstance(value, dict):
+        raise PipelineCapacityError(f"{field} must be an object")
+    for key in ("available_bytes", "per_layer_bytes", "max_layers"):
+        if key not in value:
+            raise PipelineCapacityError(f"{field}.{key} is required")
+    available_bytes = _non_negative_int(
+        value["available_bytes"], f"{field}.available_bytes"
+    )
+    per_layer_bytes = _non_negative_int(
+        value["per_layer_bytes"], f"{field}.per_layer_bytes"
+    )
+    if per_layer_bytes <= 0:
+        raise PipelineCapacityError(f"{field}.per_layer_bytes must be positive")
+    max_layers = _non_negative_int(value["max_layers"], f"{field}.max_layers")
+    if max_layers <= 0:
+        raise PipelineCapacityError(f"{field}.max_layers must be positive")
+    local_cut = value.get("local_cut", False)
+    if not isinstance(local_cut, bool):
+        raise PipelineCapacityError(f"{field}.local_cut must be a boolean")
+    return {
+        "available_bytes": available_bytes,
+        "per_layer_bytes": per_layer_bytes,
+        "max_layers": max_layers,
+        "local_cut": local_cut,
+    }
+
+
 def _descriptor_costs(
     descriptor: dict[str, Any],
 ) -> tuple[list[int], int, int, int]:
@@ -194,6 +229,11 @@ def _normalize_nodes(
                 raw.get("layer_ranges"),
                 f"node[{node_id}].layer_ranges",
                 total_layers=total_layers,
+            )
+        # ★ 2026-10-03：设备自荐的层容量（本地裁层后可承载的层数上限）。
+        if "layer_budget" in raw:
+            normalized["layer_budget"] = _normalize_layer_budget(
+                raw.get("layer_budget"), f"node[{node_id}].layer_budget"
             )
         usable.append(normalized)
     usable.sort(
@@ -362,12 +402,20 @@ def solve_pipeline_capacity(
         remaining = layer_budget - cursor
         for count in range(remaining, 0, -1):
             end = cursor + count
-            allowed_ranges = node.get("layer_ranges")
-            if allowed_ranges is not None and not any(
-                start <= cursor and end <= allowed_end
-                for start, allowed_end in allowed_ranges
-            ):
+            # ★ 2026-10-03：`layer_budget.max_layers` 是承载上界，始终生效。
+            advertised_budget = node.get("layer_budget")
+            if advertised_budget is not None and count > advertised_budget["max_layers"]:
                 continue
+            # 只有当设备声明"能按分配在本地裁层"（`local_cut=true`）时，`layer_ranges`
+            # 才降级为"当前已就绪"的信息、不再限制分配；否则它仍是硬约束 ——
+            # 派给设备一个它手上没有工件的区间，请求必然失败。
+            if advertised_budget is None or not advertised_budget.get("local_cut"):
+                allowed_ranges = node.get("layer_ranges")
+                if allowed_ranges is not None and not any(
+                    start <= cursor and end <= allowed_end
+                    for start, allowed_end in allowed_ranges
+                ):
+                    continue
             raw_bytes = prefix[end] - prefix[cursor] + per_node_bytes
             has_embedding = not started
             has_lm_head = end == layer_budget

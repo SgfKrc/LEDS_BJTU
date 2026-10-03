@@ -2564,6 +2564,11 @@ class Scheduler(
         # readiness hint. Feed admitted Android ranges into the capacity
         # solver so it cannot produce an assignment the worker must reject.
         layer_ranges_by_node: dict[str, list[list[int]]] = {}
+        # ★ 2026-10-03：设备自荐的层容量（本地裁层后可承载的层数上限）。与
+        #   `layer_ranges` 同源（v3 hello capabilities）但语义不同：ranges 是
+        #   "当前已就绪、马上能跑的区间"，budget 是"能自裁并承载的上限" ⇒ 有了它，
+        #   求解器才能给该节点分配任意连续区间，而不是被它预置的那一段钉死。
+        layer_budget_by_node: dict[str, dict] = {}
         if self._effective_role() == "master" and TASK_WORKER_EXPERIMENTAL_ENABLED:
             try:
                 worker_status = self._task_worker_control.status(role="master")
@@ -2575,11 +2580,15 @@ class Scheduler(
                 capabilities = worker.get("capabilities")
                 if not isinstance(capabilities, dict):
                     continue
+                node_id = str(worker.get("node_id", "") or "")
+                if not node_id:
+                    continue
                 ranges = capabilities.get("layer_ranges")
                 if isinstance(ranges, list) and ranges:
-                    node_id = str(worker.get("node_id", "") or "")
-                    if node_id:
-                        layer_ranges_by_node[node_id] = ranges
+                    layer_ranges_by_node[node_id] = ranges
+                budget = capabilities.get("layer_budget")
+                if isinstance(budget, dict):
+                    layer_budget_by_node[node_id] = budget
 
         records = []
         effective_id = self.get_effective_node_id()
@@ -2698,6 +2707,8 @@ class Scheduler(
             }
             if node_id in layer_ranges_by_node:
                 record["layer_ranges"] = layer_ranges_by_node[node_id]
+            if node_id in layer_budget_by_node:
+                record["layer_budget"] = layer_budget_by_node[node_id]
             records.append(record)
         return records
 

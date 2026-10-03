@@ -356,6 +356,45 @@ def _validate_model_identity(value: Any, field: str) -> dict[str, Any]:
     return model
 
 
+def _validate_layer_budget(value: Any) -> None:
+    """校验设备自荐的层容量（`capabilities.layer_budget`，可选字段）。"""
+    budget = _require_object(value, "payload.capabilities.layer_budget")
+    for key in ("available_bytes", "per_layer_bytes", "max_layers"):
+        if key not in budget:
+            raise _error(
+                "invalid_capabilities",
+                f"payload.capabilities.layer_budget.{key}",
+                f"layer_budget.{key} is required",
+            )
+    _require_int(
+        budget["available_bytes"],
+        "payload.capabilities.layer_budget.available_bytes",
+        minimum=0,
+    )
+    _require_int(
+        budget["per_layer_bytes"],
+        "payload.capabilities.layer_budget.per_layer_bytes",
+        minimum=1,
+    )
+    max_layers = _require_int(
+        budget["max_layers"],
+        "payload.capabilities.layer_budget.max_layers",
+        minimum=1,
+    )
+    # 上限只防荒谬值，远大于任何现役模型的层数。
+    if max_layers > 1024:
+        raise _error(
+            "invalid_capabilities",
+            "payload.capabilities.layer_budget.max_layers",
+            "max_layers must be <= 1024",
+        )
+    if "local_cut" in budget:
+        _require_bool(
+            budget["local_cut"],
+            "payload.capabilities.layer_budget.local_cut",
+        )
+
+
 def _validate_capabilities(value: Any, *, version: int) -> None:
     capabilities = _require_object(value, "payload.capabilities")
     expected_fields = {"stage_types", "engines", "models", "max_concurrency"}
@@ -379,11 +418,18 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     # ★ 2026-09-23：M-RoPE 模型的位置分量数（1 或 4）—— 供调度侧构造 hidden spec / 判据用。
     if "n_pos_per_embd" in capabilities:
         expected_fields.add("n_pos_per_embd")
+    # ★ 2026-10-03：层容量自荐（可选，向后兼容）—— 设备按自身可用内存申报"本地裁层
+    #   之后最多能承载多少层"，并声明是否具备本地裁层条件。与 `layer_ranges` 分工：
+    #   后者是"当前已就绪、马上能跑的区间"，前者是"能承载的上限"。
+    if "layer_budget" in capabilities:
+        expected_fields.add("layer_budget")
     _require_exact_fields(
         capabilities,
         expected_fields,
         "payload.capabilities",
     )
+    if "layer_budget" in capabilities:
+        _validate_layer_budget(capabilities["layer_budget"])
     if "middle_channel" in capabilities:
         channel = _require_string(
             capabilities["middle_channel"], "payload.capabilities.middle_channel",
