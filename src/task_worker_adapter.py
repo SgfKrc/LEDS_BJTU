@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import collections
 import hashlib
+import logging
 import queue
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
+
+logger = logging.getLogger(__name__)
 
 from task_provider import (
     DEPENDENCY_FAILURES_KEY,
@@ -950,6 +953,26 @@ class RemoteFullWorkerProvider:
                     field="payload.attempt_id",
                 )
             if not self._identity_matches(payload, pending.attempt):
+                # ★ 2026-10-03：这类不匹配此前只报码、看不出是哪个字段对不上，
+                #   真机排 Route A 时只能反复试。把两侧值一并打出来。
+                logger.warning(
+                    "Stage response identity mismatch: reply=%s expected=%s",
+                    {
+                        key: payload.get(key)
+                        for key in (
+                            "workflow_id", "stage_id", "attempt_id",
+                            "lease_id", "lease_epoch", "provider_id",
+                        )
+                    },
+                    {
+                        "workflow_id": pending.attempt.request.workflow_id,
+                        "stage_id": pending.attempt.request.stage_id,
+                        "attempt_id": pending.attempt.attempt_id,
+                        "lease_id": pending.attempt.lease_id,
+                        "lease_epoch": pending.attempt.lease_epoch,
+                        "provider_id": pending.attempt.provider_id,
+                    },
+                )
                 raise WorkerProtocolError(
                     "Stage response identity does not match the pending attempt",
                     code="attempt_identity_mismatch",
