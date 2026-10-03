@@ -640,6 +640,13 @@ class SchedulerPipelineMixin:
             stage_fields["seq_ids"] = list(seq_ids)
         if positions is not None:
             stage_fields["positions"] = list(positions)
+        # ★ 2026-10-03：把每步的 hidden 摘要打出来。跨机 D→L 的分叉定位需要与 relay
+        #   路径（同层范围、同 prompt）的输出**逐位对照**，而此前链路上没有任何可对照
+        #   的中间量 —— 只能看到"最终 token 不同"，无法判断差异出在 master 段还是设备段。
+        logger.info(
+            "Route-A stage handoff: node=%s stage=%s tokens=%d hidden_sha256=%s",
+            node_id, stage_id, n_tokens, stage_fields["hidden_sha256"],
+        )
         request = StageRequest(
             workflow_id=str(workflow_id),
             request_id=str(request_id),
