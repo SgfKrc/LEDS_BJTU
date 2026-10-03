@@ -552,6 +552,8 @@ class LlamaCppEngine:
         # 层数/摘要去推层配置（`get_pipeline_descriptor` 缓存的就是它们）。
         self._pipeline_descriptor = None
         self._pipeline_sha_cache = {}
+        # KV 是新 context 的，占用计数跟着归零（见 `_kv_used_cells`）。
+        self._kv_used = 0
         model_profile = model_profile if isinstance(model_profile, dict) else {}
         self._chat_template = str(model_profile.get("template") or "")
         self._thinking_mode = str(model_profile.get("thinking") or "unknown")
@@ -1712,6 +1714,20 @@ class LlamaCppEngine:
             info["memory"] = self.get_memory_usage()
         return info
 
+    def _kv_used_cells(self) -> int:
+        """当前 context 里 KV 已占用的格数（**自行跟踪**）。
+
+        `llama-cpp-python` 没有暴露 `llama_get_kv_cache_used_cells`，而 `Llama.n_tokens`
+        只在它自己的 `generate`/`create_completion` 路径里维护 —— 本引擎的层段 forward
+        直接调原生 `llama_decode` ⇒ 两者都拿不到真实占用（实测：拿 `n_tokens` 恒为 0，
+        LM Head 每次从位置 0 重跑 ⇒ `llama_decode rc=-1`）。
+
+        所以由两个 `forward_layers_*` 入口累加、`load_model` 归零。它只服务于「给辅助
+        decode 找位置」（如 LM Head），**不**参与主流水线的 `n_past` —— 那条由调度层的
+        整数句柄驱动，两者互不影响。
+        """
+        return max(0, int(getattr(self, "_kv_used", 0) or 0))
+
     def forward_lm_head(self, hidden_states):
         """主节点的「架构感知 LM Head」：把末段回来的 hidden 投影成 logits。
 
@@ -1726,11 +1742,15 @@ class LlamaCppEngine:
         """
         if not self.is_loaded:
             raise RuntimeError("llama.cpp 模型未加载，无法执行 LM Head")
-        # `llama_decode` 会**占** KV 位置。主节点首段已经占了 `[0, n_tokens)`，若这里从
+        # `llama_decode` 会**占** KV 位置。主节点首段已经占了若干格，若这里从
         # `n_past=0` 重跑就会以 `rc=-1` 撞车（`forward_layers_from_hidden` 的文档里记过
-        # 这个坑）。LM Head 只把 hidden 投影成 logits、不关心位置语义，所以续在已用长度
-        # 之后即可 —— 它多占的一格不影响流水线自己的 `n_past` 推进。
-        n_past = int(getattr(self._model, "n_tokens", 0) or 0)
+        # 这个坑）。LM Head 只把 hidden 投影成 logits、不关心位置语义，所以续在**实际
+        # 已用格数**之后即可。
+        #
+        # ⚠️ 不能用 `llama_cpp.Llama.n_tokens`：那个计数只在它自己的
+        #    `generate`/`create_completion` 路径里维护，而本引擎的层段 forward 直接走
+        #    原生 `llama_decode` ⇒ 它恒为 0，等于又从 0 开始。实测症状正是 `rc=-1`。
+        n_past = self._kv_used_cells()
         logits = self.forward_layers_from_hidden(
             hidden_states, n_past=n_past, all_logits=False,
         )
@@ -1849,10 +1869,12 @@ class LlamaCppEngine:
                         raise RuntimeError(
                             f"llama_get_embeddings_ith({i}) 返回空（embeddings 通道未生效？）")
                     rows.append(np.ctypeslib.as_array(p, shape=(n_embd,)).copy())
+                self._kv_used = self._kv_used_cells() + n_tokens
                 return np.stack(rows, axis=0)          # [n_tokens, n_embd]
             emb_ptr = M.llama_get_embeddings_ith(native_ctx, n_tokens - 1)
             if not emb_ptr:
                 raise RuntimeError("llama_get_embeddings_ith 返回空（embeddings 通道未生效？）")
+            self._kv_used = self._kv_used_cells() + n_tokens
             return np.ctypeslib.as_array(emb_ptr, shape=(n_embd,)).copy()
         finally:
             M.llama_batch_free(batch)
@@ -1945,6 +1967,9 @@ class LlamaCppEngine:
             if rc != 0:
                 raise RuntimeError(f"llama_decode 失败 rc={rc}")
             n_vocab = int(M.llama_vocab_n_tokens(M.llama_model_get_vocab(native_model)))
+            # KV 占用自行跟踪（见 `_kv_used_cells`）：本函数直接走原生 `llama_decode`，
+            # `Llama.n_tokens` 不会更新。
+            self._kv_used = self._kv_used_cells() + n_tokens
             if all_logits:
                 rows = [np.ctypeslib.as_array(M.llama_get_logits_ith(native_ctx, i),
                                               shape=(n_vocab,)).copy() for i in range(n_tokens)]
