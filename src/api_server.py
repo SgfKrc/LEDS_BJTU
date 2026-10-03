@@ -2927,6 +2927,20 @@ def _execute_task_worker_stage(
                 provider_id=stage_request.provider_id,
                 same_provider_retryable=True,
             ) from exc
+    if stage_request.stage_type == "layer_forward":
+        # ★ 2026-10-03：本函数是 `EngineHost.execute_task_worker_stage` 的**同源副本**
+        #   （见 `inference_service/engine_host.py` 顶部注释），PC 侧在 api_server 进程里
+        #   走的是**这一份** ⇒ 只改 `engine_host.py` 不会让本机以层段 worker 身份工作
+        #   （实测：Surface 连上后每个 offer 都回
+        #   `TaskGraphError: 不支持的 Stage 类型: layer_forward`）。
+        #   委托过去复用同一份实现；本模块的 self 不是 EngineHost，先补齐它需要的缓存槽。
+        from inference_service.engine_host import EngineHost as _EngineHost
+
+        if not hasattr(self, "_layer_upstream"):
+            self._layer_upstream = None
+        return _EngineHost.__dict__["_execute_layer_forward_stage"](
+            self, stage_request, provider_cancel_event,
+        )
     raise TaskGraphError(f"不支持的 Stage 类型: {stage_request.stage_type}")
 
 
