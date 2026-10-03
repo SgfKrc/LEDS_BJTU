@@ -4716,8 +4716,14 @@ def _normalize_quant_for_engine(quant_type: str, engine: str) -> str:
         return "island"
 
     quant = raw.lower()
+    # ★ 2026-10-03：允许 fp32（`model_module` 内部的 `runtime_quant` 也用这个名字）。
+    #   跨框架 D→L 的对照基准（`relay_experiment` 的 d2l_mainrepo 路径）上游是
+    #   `torch.float32`，而端点此前只收 fp16/int8/int4 ⇒ 端点路径无法与基准同精度
+    #   对齐，对拍结果会掺进纯精度造成的分叉。
+    if quant in ("f32", "fp32", "float32"):
+        return "fp32"
     if quant not in ("fp16", "int8", "int4"):
-        raise HTTPException(400, f"不支持的量化类型: {quant}，可选: fp16, int8, int4")
+        raise HTTPException(400, f"不支持的量化类型: {quant}，可选: fp32, fp16, int8, int4")
     return quant
 
 

@@ -4464,7 +4464,11 @@ class SchedulerPipelineMixin:
                         context_size=context_size,
                         pos_base=0,
                         want_hidden=not last_stage,
-                        middle_channel="extract_hidden",
+                        # ★ 2026-10-03：层段接力必须走 **keep-head** 通道（末层输出，
+                        #   `output_norm` **之前**）—— 协议里 `extract_hidden` 是旧默认，
+                        #   会多一次 `output_norm`。传错通道会让跨机 D→L 从 decode 起
+                        #   分叉（真机实测：首 token 一致、第 3 个 token 起偏）。
+                        middle_channel="keep_head_layer_out",
                         seq_ids=[0] * n_tokens,
                         positions=positions,
                         cancel_event=_cancel_event,
