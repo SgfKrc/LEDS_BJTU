@@ -183,6 +183,8 @@ docs/agent_tool/
 # 以及上手/流水线要用到的工具）。
 scripts/*
 !scripts/model_tools/
+# 设备侧按需裁层的依赖（Termux 侧跑，见 scripts/model_tools/qlh_device_cut_range.sh）
+!scripts/cut_layers.py
 !scripts/model_tools.py
 !scripts/android_validation.py
 !scripts/edge_preflight.py
