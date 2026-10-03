@@ -5390,8 +5390,18 @@ class SchedulerPipelineMixin:
 
             with self._pipeline_lock:
                 contract = self._pipeline_task_contracts.get(task_id)
-                if contract is None:
-                    return {"response": "", "error": "流水线任务执行契约已失效"}
+            if contract is None:
+                # ★ 这一处必须走与其它失败路径相同的**统一中止流程**：任务已经派发过
+                #   （worker 侧的 `_active_pipeline_task_ids` 已置位），只 `return` 会让
+                #   它在 worker 上**永远**留着 —— 此后每一次层配置都会被判「本节点仍有
+                #   流水线任务执行中」而延后，节点从此再也收不到新配置
+                #   （实测：Surface 卡在 `active=['bae88f27f26e']`，master 连发 6 次配置
+                #   都无人 ACK，链路整体失效）。
+                step_error = "流水线任务执行契约已失效"
+                self._broadcast_pipeline_abort(pipeline_nodes, task_id, step_error)
+                self._clear_pipeline_runtime_state(task_id)
+                return {"response": "", "error": step_error}
+            with self._pipeline_lock:
                 contract["current_step"] = step
                 prefix = f"{task_id}:"
                 for stale_key in list(self._pipeline_results):
@@ -5491,7 +5501,11 @@ class SchedulerPipelineMixin:
                         if hs_cpu.ndim < 2:
                             raise RuntimeError("relay hidden must have token and embedding dimensions")
                         hidden_seq = int(hs_cpu.shape[-2])
-                        hidden_batch = int(hs_cpu.numel() // (hidden_seq * int(hs_cpu.shape[-1])))
+                        # `numel()` 是 torch 的；llama.cpp 侧的 hidden 是 numpy，用 `.size`。
+                        hidden_items = (
+                            hs_cpu.numel() if hasattr(hs_cpu, "numel") else hs_cpu.size
+                        )
+                        hidden_batch = int(hidden_items // (hidden_seq * int(hs_cpu.shape[-1])))
                         prompt_tokens = int(input_ids.shape[-1])
                         if is_prefill:
                             positions_per_seq = list(range(hidden_seq))
