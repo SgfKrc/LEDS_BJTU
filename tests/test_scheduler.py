@@ -5500,6 +5500,41 @@ class TestPipelineOrchestrationIntegration:
         assert sched_master._layer_config_model_change_depth == 0
         assert sched_master._layer_config_push_deferred is False
 
+    def test_failed_transition_flush_is_retried_with_authoritative_intent(
+            self, sched_master, monkeypatch):
+        """A transient publish failure must not lose the post-transition sync."""
+        calls = []
+
+        def fail_once(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise RuntimeError("temporary publish failure")
+
+        monkeypatch.setattr(
+            sched_master, "_push_layer_config_to_clients_locked", fail_once,
+        )
+
+        sched_master._begin_layer_config_model_change()
+        assert sched_master.request_authoritative_layer_sync(
+            require_distributed=True,
+        ) is True
+        sched_master._end_layer_config_model_change()
+
+        assert sched_master._layer_config_push_deferred is True
+        assert sched_master._layer_config_push_deferred_authoritative is True
+        assert sched_master._layer_config_push_deferred_require_distributed is True
+
+        sched_master.push_layer_config_to_clients()
+
+        assert calls == [
+            {"require_distributed": True},
+            {"require_distributed": True},
+        ]
+        assert sched_master._layer_config_push_deferred is False
+        assert sched_master._layer_config_push_deferred_authoritative is False
+        assert sched_master._layer_config_push_deferred_require_distributed is False
+        assert sched_master._authoritative_layer_sync_requests == 0
+
     # ----------------------------------------------------------
     # 场景 1：master 在线，所有 worker 离线 → fallback 本地推理
     # ----------------------------------------------------------

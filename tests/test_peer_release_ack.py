@@ -96,6 +96,27 @@ def test_release_for_another_node_is_ignored():
     assert peer._active_layer_config == {"stale": True}
 
 
+def test_foreign_release_does_not_advance_generation_watermark():
+    """A release addressed to another peer must not fence local configs."""
+    peer, sent = _peer(node_id="client1")
+
+    peer._handle_layer_config({
+        "release": True,
+        "node_id": "client2",
+        "config_id": "foreign",
+        "generation": 99,
+    })
+    peer._handle_layer_config({
+        "release": True,
+        "node_id": "client1",
+        "config_id": "local",
+        "generation": 1,
+    })
+
+    assert peer._latest_layer_config_generation == 1
+    assert sent[-1]["config_id"] == "local"
+
+
 def test_stale_release_cannot_clear_newer_relay_config():
     """A delayed restart release must not erase the current relay assignment."""
     peer, sent = _peer(node_id="client1")

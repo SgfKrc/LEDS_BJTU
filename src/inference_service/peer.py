@@ -209,6 +209,18 @@ class PeerClient:
     def _handle_layer_config_locked(self, data: dict) -> None:
         node_id = self._node_id
 
+        # Validate an explicitly targeted message before touching the local
+        # generation watermark.  A release for another peer must not be able
+        # to advance this client's fence and reject a later valid config.
+        if isinstance(data, dict) and data.get("release"):
+            target_node_id = str(data.get("node_id", node_id))
+            if target_node_id != node_id:
+                logger.warning(
+                    "忽略目标不匹配的分层释放: target=%s local=%s",
+                    target_node_id, node_id,
+                )
+                return
+
         # Config callbacks run on independent receiver threads. Reject an
         # older generation before it can clear a newer relay assignment.
         candidate = data
@@ -218,6 +230,16 @@ class PeerClient:
             and isinstance(data.get(node_id), dict)
         ):
             candidate = data[node_id]
+        if (
+            isinstance(candidate, dict)
+            and candidate.get("node_id") is not None
+            and str(candidate.get("node_id")) != node_id
+        ):
+            logger.warning(
+                "忽略目标不匹配的分层配置: target=%s local=%s",
+                candidate.get("node_id"), node_id,
+            )
+            return
         incoming_generation = None
         if isinstance(candidate, dict) and "generation" in candidate:
             try:
@@ -261,10 +283,6 @@ class PeerClient:
 
         # 兼容两种格式：新版直接是 assignment；旧版 {node_id: assignment}
         if isinstance(data, dict) and data.get("release"):
-            target_node_id = str(data.get("node_id", node_id))
-            if target_node_id != node_id:
-                logger.warning("忽略目标不匹配的分层释放: target=%s local=%s", target_node_id, node_id)
-                return
             self._close_all_relay_sessions()
             with self._layer_config_lock:
                 self._active_layer_config = None

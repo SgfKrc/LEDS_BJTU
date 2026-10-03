@@ -3411,21 +3411,55 @@ class Scheduler(
         }
 
     def push_layer_config_to_clients(self) -> None:
-        with self._layer_config_lock:
-            if self._layer_config_model_change_depth:
-                self._layer_config_push_deferred = True
-                logger.info(
-                    "defer layer config push during model transition depth=%d",
-                    self._layer_config_model_change_depth,
-                )
-                return
         with self._layer_config_push_lock:
-            self._push_layer_config_to_clients_locked()
+            # Keep the transition check under the same lock used by the
+            # publisher.  Otherwise a transition can begin after the check
+            # but before the publish and still leak a transient release.
+            with self._layer_config_lock:
+                if self._layer_config_model_change_depth:
+                    self._layer_config_push_deferred = True
+                    logger.info(
+                        "defer layer config push during model transition depth=%d",
+                        self._layer_config_model_change_depth,
+                    )
+                    return
+                retry_authoritative = bool(
+                    self._layer_config_push_deferred_authoritative
+                )
+                retry_require_distributed = bool(
+                    self._layer_config_push_deferred_require_distributed
+                )
+                if retry_authoritative:
+                    self._authoritative_layer_sync_requests += 1
+            try:
+                self._push_layer_config_to_clients_locked(
+                    require_distributed=retry_require_distributed,
+                )
+            except Exception:
+                # Keep the deferred request armed so a later status/hello
+                # callback can retry it after a transient publish failure.
+                raise
+            else:
+                with self._layer_config_lock:
+                    self._layer_config_push_deferred = False
+                    self._layer_config_push_deferred_authoritative = False
+                    self._layer_config_push_deferred_require_distributed = False
+            finally:
+                if retry_authoritative:
+                    with self._layer_config_lock:
+                        self._authoritative_layer_sync_requests = max(
+                            0,
+                            self._authoritative_layer_sync_requests - 1,
+                        )
 
     def _begin_layer_config_model_change(self) -> None:
         """Fence transient pushes while the local model is being replaced."""
-        with self._layer_config_lock:
-            self._layer_config_model_change_depth += 1
+        # Serialize with an in-flight publish before marking the transition.
+        # This gives the fence a linearization point: either a push completes
+        # before the transition, or it is deferred after the transition starts.
+        with self._layer_config_push_lock:
+            with self._layer_config_lock:
+                self._layer_config_model_change_depth += 1
 
     def _end_layer_config_model_change(self) -> None:
         """End a model transition and flush one deferred push."""
@@ -3457,6 +3491,16 @@ class Scheduler(
                         require_distributed=require_distributed,
                     )
                 except Exception:
+                    with self._layer_config_lock:
+                        self._layer_config_push_deferred = True
+                        self._layer_config_push_deferred_authoritative = (
+                            self._layer_config_push_deferred_authoritative
+                            or authoritative
+                        )
+                        self._layer_config_push_deferred_require_distributed = (
+                            self._layer_config_push_deferred_require_distributed
+                            or require_distributed
+                        )
                     logger.warning(
                         "deferred layer config flush failed after model transition",
                         exc_info=True,

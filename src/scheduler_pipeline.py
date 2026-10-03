@@ -230,32 +230,35 @@ class SchedulerPipelineMixin:
         """
         if self._effective_role() != "master":
             return False
-        with self._layer_config_lock:
-            if self._layer_config_model_change_depth:
-                self._layer_config_push_deferred = True
-                self._layer_config_push_deferred_authoritative = True
-                self._layer_config_push_deferred_require_distributed = (
-                    self._layer_config_push_deferred_require_distributed
-                    or bool(require_distributed)
-                )
-                logger.info(
-                    "defer authoritative layer sync during model transition depth=%d",
-                    self._layer_config_model_change_depth,
-                )
-                return True
-            self._authoritative_layer_sync_requests += 1
-        try:
-            # Explicit distributed requests bypass a single-node capacity plan;
-            # ordinary authoritative refreshes preserve the existing policy.
-            with self._layer_config_push_lock:
+        # Check the fence and publish under one lock order.  A check performed
+        # before acquiring `_layer_config_push_lock` can race with begin/end
+        # and publish a transient release during a model transition.
+        with self._layer_config_push_lock:
+            with self._layer_config_lock:
+                if self._layer_config_model_change_depth:
+                    self._layer_config_push_deferred = True
+                    self._layer_config_push_deferred_authoritative = True
+                    self._layer_config_push_deferred_require_distributed = (
+                        self._layer_config_push_deferred_require_distributed
+                        or bool(require_distributed)
+                    )
+                    logger.info(
+                        "defer authoritative layer sync during model transition depth=%d",
+                        self._layer_config_model_change_depth,
+                    )
+                    return True
+                self._authoritative_layer_sync_requests += 1
+            try:
+                # Explicit distributed requests bypass a single-node capacity plan;
+                # ordinary authoritative refreshes preserve the existing policy.
                 self._push_layer_config_to_clients_locked(
                     require_distributed=require_distributed,
                 )
-        finally:
-            with self._layer_config_lock:
-                self._authoritative_layer_sync_requests = max(
-                    0, self._authoritative_layer_sync_requests - 1,
-                )
+            finally:
+                with self._layer_config_lock:
+                    self._authoritative_layer_sync_requests = max(
+                        0, self._authoritative_layer_sync_requests - 1,
+                    )
         return True
 
 
