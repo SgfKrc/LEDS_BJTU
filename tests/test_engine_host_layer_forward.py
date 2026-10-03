@@ -31,6 +31,13 @@ class _FakeUpstream:
     def __init__(self):
         self.hidden_calls = []
         self.token_calls = []
+        self.reset_count = 0
+
+    def reset(self):
+        # 批次从位置 0 开始时（新 prompt 的 prefill）上游必须清 KV，否则上一个请求的
+        # 位置会残留（`decode: failed to initialize batch`）。见
+        # `EngineHost._execute_layer_forward_stage`。
+        self.reset_count += 1
 
     def forward_hidden_to_hidden(self, hidden, *, n_past=0, seq_ids=None, positions=None):
         self.hidden_calls.append(
@@ -85,6 +92,30 @@ def _host(upstream):
 
 
 class TestIntermediateStage:
+    def test_resets_kv_when_batch_starts_at_zero(self):
+        """新 prompt 的 prefill（positions 从 0 起）必须先清上游 KV。
+
+        否则上一个请求的位置会残留，llama.cpp 报
+        `the last position stored in the KV cache for sequence 0 is X = 45` 而 batch
+        起始位置是 0 ⇒ `decode: failed to initialize batch`（实测：三段链的第二个请求
+        起必失败）。
+        """
+        upstream = _FakeUpstream()
+        _host(upstream)._execute_layer_forward_stage(
+            _request(want_hidden=True, positions=[0, 1, 2]),
+            SimpleNamespace(is_set=lambda: False),
+        )
+        assert upstream.reset_count == 1
+
+    def test_does_not_reset_kv_on_incremental_decode(self):
+        """decode 步（positions 不从 0 起）**不能**清 KV —— 那会丢掉 prefill 的上下文。"""
+        upstream = _FakeUpstream()
+        _host(upstream)._execute_layer_forward_stage(
+            _request(want_hidden=True, positions=[41, 42, 43]),
+            SimpleNamespace(is_set=lambda: False),
+        )
+        assert upstream.reset_count == 0
+
     def test_returns_hidden_with_digest(self):
         upstream = _FakeUpstream()
         result = _host(upstream)._execute_layer_forward_stage(
