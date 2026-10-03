@@ -2390,6 +2390,34 @@ class SchedulerPipelineMixin:
                     )
                 )
                 self._layer_config_acks[client_id] = dict(data)
+                # ★ 2026-10-03：v3 层段 worker 会**明确拒绝** legacy 配置（它手上有工件、
+                #   层段由 stage offer 驱动，见 `_handle_layer_config_locked` 里的同名分流）。
+                #   这不是"未就绪"，而是"不参与这条通道" ⇒ 把它从待 ACK 集合里摘掉，
+                #   既不计入 commit 门槛、也不阻塞请求。否则整个 `distributed_required`
+                #   会以 `pipeline workers not ready: layer_stage_worker_rejects_legacy_config`
+                #   失败（实测）。摘除这一步必须在这里做：master 是在**节点注册那一刻**
+                #   推送 legacy 配置的，那时 hello 还没往返，按 capabilities 排除不可靠。
+                if (
+                    str(data.get("status", "")) == "error"
+                    and str(data.get("error", ""))
+                    == "layer_stage_worker_rejects_legacy_config"
+                ):
+                    self._layer_config_expected.pop(client_id, None)
+                    self._layer_config_pushed.discard(client_id)
+                    self._layer_config_retry_state.pop(client_id, None)
+                    transaction = self._pipeline_load_transaction
+                    if (
+                        transaction
+                        and transaction.get("config_id") == expected.get("config_id")
+                    ):
+                        remaining = set(transaction.get("worker_ids", set()))
+                        remaining.discard(client_id)
+                        transaction["worker_ids"] = remaining
+                    logger.info(
+                        "v3 层段 worker 不参与 legacy 分层通道，已摘除: node=%s",
+                        client_id,
+                    )
+                    return
                 if not (ready or prepared or prepared_late):
                     # ★ 诊断：把 ACK 与期望的**逐字段差异**一次打全 ——
                     #   排障跨机 relay 时，ACK 恒判失败却完全看不出是哪个字段不等
