@@ -8,10 +8,9 @@ rem
 rem  Usage: bjtu [launcher|ui|tui|chat|tui_commands.py args...]
 rem         bjtu --help       print TUI commands and options (no backend)
 rem
-rem  One-click launch: start backend (if not running), wait until
-rem  /api/health is ready, then enter TUI. Backend keeps running
-rem  after TUI exits; stop it with /shutdown inside TUI, or by
-rem  closing the "QLH Backend API" window / pressing Ctrl+C there.
+rem  Interactive mode forwards to start_tui.bat: the backend starts
+rem  in-process (BackendSupervisor) and stops when the TUI exits.
+rem  To keep a backend running, start `python src\api_server.py` directly.
 rem
 rem  Install: add this file's directory (project root) to PATH.
 rem  This file MUST stay in the project root (same dir as src/).

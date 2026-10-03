@@ -1,7 +1,7 @@
 # .githooks —— 本地 git 钩子（入库，需手动启用）
 
-仓库原先**没有任何自动化检查**，`.git/hooks/` 里那 4 个钩子全是 Git LFS 装的。这里提供
-一套**入库的**钩子，让文档问题在推送前就被拦住；同一套检查在
+`.git/hooks/` 里的 4 个钩子是 Git LFS 装的。这里提供一套**入库的**钩子，让文档问题在推送前
+就被拦住；同一套检查在
 [`.github/workflows/checks.yml`](../.github/workflows/checks.yml) 里作为兜底再跑一遍。
 
 ## 启用
@@ -10,8 +10,7 @@
 git config core.hooksPath .githooks     # 或 ./.githooks/install.sh / .\.githooks\install.ps1
 ```
 
-`core.hooksPath` 是仓库级 config、不随 clone 传播，所以**每台机器要装一次**（不装不影响
-使用，只是少一层本地拦截，CI 仍会兜底）。
+`core.hooksPath` 是仓库级 config、不随 clone 传播，**每台机器装一次**；未安装时 CI 仍会跑同一套检查。
 
 ## 内容
 
