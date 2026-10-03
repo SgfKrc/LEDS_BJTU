@@ -9,6 +9,7 @@ import time
 import uuid
 import base64
 import hashlib
+import math
 
 from koakuma_engine import Capability, backend_id_for, runtime_supports
 from config import (
@@ -105,28 +106,41 @@ def _hidden_to_raw_f32(hidden) -> tuple[bytes, int, int]:
                 "边缘构建请直接传 numpy 数组"
             )
         cpu = detach().to(device="cpu", dtype=torch.float32).contiguous()
-        if cpu.ndim != 2:
-            raise ValueError("layer stage hidden tensor must be [tokens, embedding]")
+        if cpu.ndim < 2:
+            raise ValueError(
+                "layer stage hidden tensor must have token and embedding dimensions"
+            )
+        shape = tuple(int(size) for size in cpu.shape)
         return (
             cpu.numpy().tobytes(),
-            int(cpu.shape[0]),
-            int(cpu.shape[1]),
+            int(math.prod(shape[:-1])),
+            int(shape[-1]),
         )
     import numpy as _np
 
     array = _np.asarray(hidden)
-    if array.ndim != 2:
-        raise ValueError("layer stage hidden tensor must be [tokens, embedding]")
+    if array.ndim < 2:
+        raise ValueError(
+            "layer stage hidden tensor must have token and embedding dimensions"
+        )
     if array.dtype != _np.float32:
         array = array.astype(_np.float32)
     array = _np.ascontiguousarray(array)
-    return array.tobytes(), int(array.shape[0]), int(array.shape[1])
+    shape = tuple(int(size) for size in array.shape)
+    return array.tobytes(), int(math.prod(shape[:-1])), int(shape[-1])
 
 
 def _encode_relay_hidden(tensor) -> tuple[str, list[int]]:
     """Encode relay input as the explicit raw-f32 wire contract."""
     raw, n_tokens, n_embd = _hidden_to_raw_f32(tensor)
-    return base64.b64encode(raw).decode("ascii"), [n_tokens, n_embd]
+    shape = getattr(tensor, "shape", None)
+    if shape is None:
+        import numpy as _np
+        shape = _np.asarray(tensor).shape
+    shape = [int(size) for size in shape]
+    if len(shape) < 2 or math.prod(shape[:-1]) != n_tokens or shape[-1] != n_embd:
+        raise ValueError("relay hidden shape is inconsistent with raw f32 payload")
+    return base64.b64encode(raw).decode("ascii"), shape
 
 
 def _decode_relay_hidden(raw: bytes, shape: object):
