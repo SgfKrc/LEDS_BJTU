@@ -2933,15 +2933,22 @@ def _execute_task_worker_stage(
         #   走的是**这一份** ⇒ 只改 `engine_host.py` 不会让本机以层段 worker 身份工作
         #   （实测：Surface 连上后每个 offer 都回
         #   `TaskGraphError: 不支持的 Stage 类型: layer_forward`）。
-        #   委托过去复用同一份实现；本模块的 self 不是 EngineHost，先补齐它需要的缓存槽。
-        from inference_service.engine_host import EngineHost as _EngineHost
+        #   委托同一份实现；但本函数是**模块级**（没有 `self`），所以用一个模块级缓存实例
+        #   承载 keep-head 上游（它本来就按 env 创建一次后复用，重载 500MB GGUF 代价高）。
+        global _LAYER_STAGE_HOST
+        if _LAYER_STAGE_HOST is None:
+            from inference_service.engine_host import EngineHost as _EngineHost
 
-        if not hasattr(self, "_layer_upstream"):
-            self._layer_upstream = None
-        return _EngineHost.__dict__["_execute_layer_forward_stage"](
-            self, stage_request, provider_cancel_event,
+            _LAYER_STAGE_HOST = _EngineHost()
+        return _LAYER_STAGE_HOST._execute_layer_forward_stage(
+            stage_request, provider_cancel_event,
         )
     raise TaskGraphError(f"不支持的 Stage 类型: {stage_request.stage_type}")
+
+
+#: 模块级缓存：`_execute_task_worker_stage` 是模块级函数（无 `self`），层段 Stage 需要
+#: 一个持有 keep-head 上游的载体。上游按 env 创建一次后复用（重载 500MB GGUF 代价高）。
+_LAYER_STAGE_HOST = None
 
 
 def _execute_task_graph_chat_with_slot(
