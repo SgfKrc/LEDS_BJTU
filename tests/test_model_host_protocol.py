@@ -61,6 +61,75 @@ class TestInferenceHostProtocol:
         host = ModelHost()
         host.model_loaded = True
         assert host.model_loaded is True
+
+
+class TestSwitchModelAfterGgufEngine:
+    """#31：GGUF 路径把 LlamaCppEngine 装成 _manager 之后，必须能切回非 GGUF 引擎。"""
+
+    class _FakeGgufEngine:
+        """模拟 LlamaCppEngine：有 unload，没有 switch_model。"""
+
+        def __init__(self):
+            self.unloaded = False
+
+        def unload(self):
+            self.unloaded = True
+
+    class _FakeManager:
+        """模拟 ModelManager：接受 switch_model 并记录调用。"""
+
+        def __init__(self):
+            self.calls = []
+
+        def switch_model(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"success": True, "model_id": kwargs.get("model_id")}
+
+    def _host_with_gguf_engine(self):
+        host = ModelHost()
+        engine = self._FakeGgufEngine()
+        object.__setattr__(host, "_manager", engine)
+        # 复现 _load_gguf_model 写进实例字典的镜像属性
+        object.__setattr__(host, "model_loaded", True)
+        object.__setattr__(host, "_engine_type", "llama_cpp")
+        object.__setattr__(host, "quant_type", "gguf")
+        object.__setattr__(host, "model_path", "/tmp/x.gguf")
+        return host, engine
+
+    def test_switch_back_drops_gguf_engine_and_mirrored_attrs(self, monkeypatch):
+        import model_host as model_host_module
+
+        fresh = self._FakeManager()
+        monkeypatch.setattr(model_host_module, "_LazyModelManager", lambda: fresh)
+
+        host, engine = self._host_with_gguf_engine()
+        result = host.switch_model(model_id="qwen2.5-0.5b-instruct", engine="pytorch")
+
+        assert result["success"] is True
+        assert engine.unloaded is True, "GGUF 引擎必须先卸载"
+        assert fresh.calls[0]["engine"] == "pytorch"
+        # 镜像属性必须移除，否则读取时命中的仍是上一档的值（_engine_type 会停在
+        # "llama_cpp"，让 api_server 走 GGUF 分支）
+        instance_dict = object.__getattribute__(host, "__dict__")
+        for name in ("_engine_type", "quant_type", "model_path",
+                     "active_model_id", "_active_model_id"):
+            assert name not in instance_dict, f"{name} 应已被移除"
+
+    def test_gguf_path_untouched_when_manager_has_switch_model(self, monkeypatch):
+        """本来就是管理器时，走原路径：不卸载、不新建。"""
+        import model_host as model_host_module
+
+        def _boom():
+            raise AssertionError("不应新建懒管理器")
+
+        monkeypatch.setattr(model_host_module, "_LazyModelManager", _boom)
+
+        existing = self._FakeManager()
+        host = ModelHost(manager=existing)
+        result = host.switch_model(model_id="m", engine="pytorch")
+
+        assert result["success"] is True
+        assert existing.calls[0]["engine"] == "pytorch"
         host.generation_config["max_new_tokens"] = 2048
         assert host.generation_config["max_new_tokens"] == 2048
 
