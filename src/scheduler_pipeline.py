@@ -3958,10 +3958,10 @@ class SchedulerPipelineMixin:
 
             # 心跳新鲜度
             heartbeat_age = time.time() - node_info.last_heartbeat
-            if heartbeat_age > 10:
+            if heartbeat_age > _WORKER_HEARTBEAT_MAX_AGE:
                 return False, (
                     f"节点 {node_id} 心跳过期 "
-                    f"({heartbeat_age:.1f}s > 10s)"
+                    f"({heartbeat_age:.1f}s > {_WORKER_HEARTBEAT_MAX_AGE:.0f}s)"
                 )
 
             # ★ A1 / X 档（Y 档第二条缺口 3 的**第二处**同型判据）：relay 段节点**不需要**
