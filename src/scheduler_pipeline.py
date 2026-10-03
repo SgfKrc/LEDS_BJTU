@@ -542,6 +542,49 @@ class SchedulerPipelineMixin:
             return False, type(exc).__name__
 
 
+    def _route_a_stage_model_identity(self, node_id: str):
+        """Return the physical artifact identity a Route-A stage worker advertised.
+
+        Route A 的层段在**设备**上执行，用的是设备手上那份 GGUF 工件 ⇒ offer 必须
+        带该工件的身份（`engine=llama_cpp` / `format=gguf` / 该工件 manifest 的源模型
+        摘要），而不是 master 自己那份模型的摘要 —— 后者是 safetensors，两者永远不等。
+        `task_worker_adapter._layer_model_matches` 比对的正是 engine/format/sha256。
+
+        取不到时返回 None，由调用方 fail-closed（不退回 master 身份：那必然不匹配）。
+        """
+        from task_provider import ModelIdentity
+
+        try:
+            status = self._task_worker_control.status(role="master")
+        except Exception:
+            logger.warning("Route-A stage identity lookup failed", exc_info=True)
+            return None
+        for worker in (status or {}).get("workers", []):
+            if not isinstance(worker, dict):
+                continue
+            if str(worker.get("node_id", "")) != node_id:
+                continue
+            capabilities = worker.get("capabilities")
+            models = (
+                capabilities.get("models") if isinstance(capabilities, dict) else None
+            )
+            if not isinstance(models, list) or not models:
+                return None
+            model = models[0]
+            if not isinstance(model, dict):
+                return None
+            try:
+                return ModelIdentity(
+                    model_id=str(model.get("model_id", "")),
+                    engine=str(model.get("engine", "")),
+                    format=str(model.get("format", "")),
+                    revision=str(model.get("revision", "")),
+                    sha256=str(model.get("sha256", "")),
+                )
+            except ValueError:
+                return None
+        return None
+
     def _execute_layer_stage_offer(
         self,
         *,
@@ -4394,11 +4437,25 @@ class SchedulerPipelineMixin:
                 stage_token = None
                 for index, assignment in enumerate(stage_nodes):
                     last_stage = index == len(stage_nodes) - 1
+                    # ★ 层段在设备上执行、用的是设备手上那份工件 ⇒ offer 带**该工件的
+                    #   身份**：engine/format/sha256 必须与 worker 宣告的一致，否则
+                    #   `_layer_model_matches` 会以 `model_identity_mismatch` 拒绝。
+                    stage_model_identity = self._route_a_stage_model_identity(
+                        assignment["node_id"]
+                    )
+                    if stage_model_identity is None:
+                        return {
+                            "response": "",
+                            "error": (
+                                "route_a_stage_model_identity_unavailable:"
+                                f"{assignment['node_id']}"
+                            ),
+                        }
                     stage_result = self._execute_layer_stage_offer(
                         node_id=assignment["node_id"],
                         assignment=assignment,
                         hidden_states=current_hidden,
-                        model_identity=model_identity,
+                        model_identity=stage_model_identity,
                         workflow_id=task_id,
                         request_id=f"{task_id}:step:{step}",
                         stage_id=f"{assignment['node_id']}:step:{step}",

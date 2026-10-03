@@ -483,6 +483,35 @@ class TestComputeLayerAssignment:
         assert records[0]["layer_budget"]["max_layers"] == 12
         assert records[0]["layer_budget"]["local_cut"] is False
 
+    def test_route_a_stage_identity_comes_from_worker_artifact(self, sched):
+        """Route A 的 offer 必须带 **worker 宣告的工件身份**（engine/format/sha256），
+        而不是 master 自己那份模型的摘要 —— 层段在设备上执行、用的是设备的 GGUF，
+        而 master 侧是 safetensors，两者格式不同，永远不匹配。"""
+        sched._task_worker_control.status = lambda role: {
+            "workers": [{
+                "node_id": "android-worker",
+                "capabilities": {"models": [{
+                    "model_id": "layer-f6dab6b72d243419",
+                    "engine": "llama_cpp",
+                    "format": "gguf",
+                    "revision": "local",
+                    "sha256": (
+                        "f6dab6b72d243419856d9a45921ce886"
+                        "bec0af5b920e241bc93f478434d98954"
+                    ),
+                }]},
+            }],
+        }
+
+        identity = sched._route_a_stage_model_identity("android-worker")
+
+        assert identity is not None
+        assert identity.engine == "llama_cpp"
+        assert identity.format == "gguf"
+        assert identity.sha256.startswith("f6dab6b7")
+        # 找不到该节点 / 没有可用的 models ⇒ None（调用方 fail-closed）
+        assert sched._route_a_stage_model_identity("missing-node") is None
+
     def test_capacity_prepare_acks_all_workers_before_commit(self, sched):
         sent = []
         sched._tcp_server = type("Server", (), {
@@ -5750,6 +5779,21 @@ class TestPipelineOrchestrationIntegration:
             return {"kind": "token", "token_argmax": 7}
 
         monkeypatch.setattr(sched_with_workers, "_execute_layer_stage_offer", fake_stage)
+        # ★ Route A 的 offer 带**设备工件身份**（层段在设备上执行、用设备的 GGUF），
+        #   而不是 master 的模型身份 —— 后者是 safetensors，`_layer_model_matches`
+        #   比 engine/format/sha256，必然拒绝。
+        sched_with_workers._task_worker_control.status = lambda role: {
+            "workers": [{
+                "node_id": "android-1",
+                "capabilities": {"models": [{
+                    "model_id": "layer-android1",
+                    "engine": "llama_cpp",
+                    "format": "gguf",
+                    "revision": "local",
+                    "sha256": "c" * 64,
+                }]},
+            }],
+        }
         result = sched_with_workers._run_route_a_stage_pipeline(
             prompt="hello",
             max_new_tokens=2,
@@ -5779,7 +5823,12 @@ class TestPipelineOrchestrationIntegration:
         assert result["metrics"]["execution_mode"] == "route_a_stage_offer_v3"
         assert [call["positions"] for call in stage_calls] == [[0, 1], [2]]
         assert all(call["want_hidden"] is False for call in stage_calls)
-        assert all(call["model_identity"].model_id == "qwen-test" for call in stage_calls)
+        assert all(
+            call["model_identity"].model_id == "layer-android1"
+            and call["model_identity"].engine == "llama_cpp"
+            and call["model_identity"].format == "gguf"
+            for call in stage_calls
+        )
 
     def test_run_pipeline_builds_native_prompt_from_history(
             self, sched_with_workers, monkeypatch):
