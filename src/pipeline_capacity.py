@@ -393,6 +393,42 @@ def solve_pipeline_capacity(
         }
 
     @lru_cache(maxsize=None)
+    def _range_shortfall(candidate) -> int:
+        """声明了 `layer_ranges` 的节点中，分配区间**没有正好跑满** advertised 区间的个数。
+
+        `layer_ranges` 的语义是"该节点手上**已经有工件**的区间"。只把它当 ⊆ 约束是不够的：
+        在 `prefer_all_workers`（节点数最多）下，求解器会尽量把每个节点切小，于是这个
+        节点会拿到自己工件覆盖不到的另一段，offer 必然被 `layer_range_not_advertised`
+        拒掉。
+
+        ⚠️ **未参与的节点同样计入**。否则"完全不用这台 worker"（它不在 candidate 里 ⇒
+        不计）会与"让它跑满自己的区间"并列在 0，随后 `prefer_all_workers` 又把节点数
+        更多、但区间切碎的解选出来 —— 实测踩到（Surface 被分到 `[1,16)`）。
+        """
+        used: dict[int, tuple[int, int]] = {
+            value[0]: (value[1], value[2]) for value in candidate
+        }
+        shortfall = 0
+        for index, node in enumerate(usable):
+            ranges = node.get("layer_ranges")
+            if not ranges:
+                continue
+            # 与 `search` 里的硬约束保持同一条件：设备声明了"能按分配在本地裁层"
+            # （`layer_budget.local_cut=true`）时，`layer_ranges` 只表示"当前已就绪"，
+            # 不再是它的能力边界 ⇒ 不参与"是否跑满"的衡量。
+            budget = node.get("layer_budget")
+            if budget is not None and budget.get("local_cut"):
+                continue
+            span = used.get(index)
+            if span is None:
+                shortfall += 1
+                continue
+            cursor, end = span
+            if not any(start == cursor and stop == end for start, stop in ranges):
+                shortfall += 1
+        return shortfall
+
+    @lru_cache(maxsize=None)
     def search(node_index: int, cursor: int, started: bool, used_count: int):
         if cursor == layer_budget:
             # ★ Y 档第二条：relay 段**算参与节点**（它承载远端段工件），只是不占本机容量
@@ -450,11 +486,13 @@ def solve_pipeline_capacity(
                 best = candidate
                 continue
             candidate_key = (
+                _range_shortfall(candidate),
                 (-len(candidate) if prefer_all_workers else len(candidate)),
                 -min(usable[value[0]]["capacity_bytes"] - value[4] for value in candidate),
                 -sum(usable[value[0]]["score"] for value in candidate),
             )
             best_key = (
+                _range_shortfall(best),
                 (-len(best) if prefer_all_workers else len(best)),
                 -min(usable[value[0]]["capacity_bytes"] - value[4] for value in best),
                 -sum(usable[value[0]]["score"] for value in best),

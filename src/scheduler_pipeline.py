@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 import uuid
@@ -249,6 +250,14 @@ class SchedulerPipelineMixin:
                 and node_id != self.get_effective_node_id()
                 and getattr(node, "node_type", "pc") == "pc"
             }
+        # ★ 2026-10-03：**已声明 v3 层段能力的节点必须排除在这条线路之外** —— 不只是
+        #   不给它派 legacy 层段，而是**连配置都不要推**。否则它会按 legacy 语义去
+        #   `ensure_pipeline_assignment_available` 同步工件，在跨机（非 loopback、
+        #   不在信任 CIDR）时被 `MODEL_API_SOURCE_UNTRUSTED` 拒绝，进而
+        #   「主节点已释放本设备的分层 worker 预留」⇒ 它直接掉出层段 worker 名单
+        #   （实测：Surface 因此从 `admitted` 里消失）。
+        #   它手上有工件，v3 stage offer 走的是 offer 里带的 hidden，不需要 master 推模型。
+        releasable_legacy_ids -= self._task_worker_layer_stage_ids(set(connected_ids))
         # Route A Android workers use v3 stage_offer and must never receive a
         # legacy LAYER_CONFIG (which would make a layer worker look like a
         # full-model worker and reintroduce the old opt-out path).
@@ -1685,6 +1694,32 @@ class SchedulerPipelineMixin:
         ack_generation = (
             data.get("generation", 0) if isinstance(data, dict) else 0
         )
+        # ★ 2026-10-03：本节点若是 **v3 层段 worker**（env 已指定层段工件），就不该接受
+        #   legacy `LAYER_CONFIG`。它手上有工件、层段由 v3 stage offer 驱动；legacy 语义
+        #   却要求它 `ensure_pipeline_assignment_available` 去同步模型 —— 跨机时被
+        #   `MODEL_API_SOURCE_UNTRUSTED` 拒（非 loopback、不在信任 CIDR），随后
+        #   「主节点已释放本设备的分层 worker 预留」⇒ 它掉出层段 worker 名单，永远进不了
+        #   `admitted`（实测：Surface 注册后 6 ms 就被释放，此后每轮重连重复一次）。
+        #   判据必须落在 worker 自己身上：主节点在**节点注册那一刻**就推送 legacy 配置，
+        #   早于 hello 往返 ⇒ master 侧按 capabilities 排除在时序上不可靠（已踩到）。
+        if (
+            isinstance(data, dict)
+            and not data.get("release")
+            and os.environ.get("QLH_LAYER_GGUF", "").strip()
+        ):
+            logger.info(
+                "本节点是 v3 层段 worker，拒绝 legacy 分层配置: config=%s",
+                data.get("config_id", ""),
+            )
+            self._send_layer_config_ack({
+                "node_id": node_id,
+                "config_id": str(data.get("config_id", "")),
+                "generation": ack_generation,
+                "status": "error",
+                "error": "layer_stage_worker_rejects_legacy_config",
+                "timestamp": time.time(),
+            })
+            return
         if isinstance(data, dict) and data.get("release"):
             target_node_id = str(data.get("node_id", node_id))
             if target_node_id != node_id:
