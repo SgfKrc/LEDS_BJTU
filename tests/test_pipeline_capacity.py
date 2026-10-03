@@ -42,6 +42,109 @@ def node(node_id, capacity_mb, *, role="client", score=10):
     }
 
 
+def test_declared_layer_budget_caps_that_node_layers():
+    """设备自荐的层数上限必须被分配器尊重 —— 它是"本地裁层后能承载的上限"，
+    不是"当前工件已就绪的区间"，所以分配器可以给它任意连续区间，但不能超过层数。"""
+    plan = solve_pipeline_capacity(
+        descriptor(),
+        [
+            {
+                **node("worker-a", 500),
+                "layer_budget": {
+                    "available_bytes": 500 * MIB,
+                    "per_layer_bytes": 100 * MIB,
+                    "max_layers": 2,
+                    "local_cut": True,
+                },
+            },
+            node("worker-b", 400),
+        ],
+        safety_margin=1.0,
+    )
+
+    assert plan["admitted"] is True
+    by_node = {item["node_id"]: item for item in plan["assignments"]}
+    assert by_node["worker-a"]["layers_count"] == 2
+    assert sum(item["layers_count"] for item in plan["assignments"]) == 4
+
+
+def test_layer_budget_rejects_malformed_payload():
+    bad_budgets = (
+        {"available_bytes": 1 * MIB, "per_layer_bytes": 0, "max_layers": 2},
+        {"available_bytes": 1 * MIB, "per_layer_bytes": 1 * MIB, "max_layers": 0},
+        {"available_bytes": 1 * MIB, "per_layer_bytes": 1 * MIB},
+        {
+            "available_bytes": 1 * MIB,
+            "per_layer_bytes": 1 * MIB,
+            "max_layers": 2,
+            "local_cut": "yes",
+        },
+    )
+    for bad in bad_budgets:
+        with pytest.raises(PipelineCapacityError):
+            solve_pipeline_capacity(
+                descriptor(),
+                [
+                    {**node("worker-a", 500), "layer_budget": bad},
+                    node("worker-b", 400),
+                ],
+                safety_margin=1.0,
+            )
+
+
+def test_layer_budget_supersedes_fixed_layer_ranges():
+    """申报了 `layer_budget` 的节点：`layer_ranges` 只代表"当前已就绪"，
+    不再作为分配硬约束 —— 否则设备永远被它预置的那一段钉死。"""
+    plan = solve_pipeline_capacity(
+        descriptor(),
+        [
+            {
+                **node("worker-a", 500),
+                "layer_ranges": [[0, 1]],
+                "layer_budget": {
+                    "available_bytes": 500 * MIB,
+                    "per_layer_bytes": 100 * MIB,
+                    "max_layers": 3,
+                    "local_cut": True,
+                },
+            },
+            node("worker-b", 400),
+        ],
+        safety_margin=1.0,
+    )
+
+    assert plan["admitted"] is True
+    by_node = {item["node_id"]: item for item in plan["assignments"]}
+    assert by_node["worker-a"]["layers_count"] == 3
+    assert by_node["worker-a"]["start_layer"] == 0
+
+
+def test_layer_budget_without_local_cut_keeps_fixed_ranges():
+    """设备没声明"能本地裁层"时，`layer_ranges` 仍是硬约束 —— 否则会派给它一个
+    手上没有工件的区间，请求必然失败。"""
+    plan = solve_pipeline_capacity(
+        descriptor(),
+        [
+            {
+                **node("worker-a", 500),
+                "layer_ranges": [[0, 2]],
+                "layer_budget": {
+                    "available_bytes": 500 * MIB,
+                    "per_layer_bytes": 100 * MIB,
+                    "max_layers": 3,
+                    "local_cut": False,
+                },
+            },
+            node("worker-b", 400),
+        ],
+        safety_margin=1.0,
+    )
+
+    by_node = {item["node_id"]: item for item in plan["assignments"]}
+    assert by_node["worker-a"]["start_layer"] == 0
+    assert by_node["worker-a"]["end_layer"] == 2
+
+
 def test_aggregate_capacity_admits_when_no_single_node_fits():
     plan = solve_pipeline_capacity(
         descriptor(),
@@ -196,6 +299,39 @@ def test_capacity_plan_id_is_stable_for_same_inputs():
     second = solve_pipeline_capacity(descriptor(), list(reversed(nodes)), safety_margin=1.0)
 
     assert first["plan_id"] == second["plan_id"]
+
+
+def test_advertised_layer_ranges_constrain_worker_assignment():
+    master = node("master", 160, role="master", score=100)
+    android = node("android", 400, score=1)
+    android["layer_ranges"] = [[1, 4]]
+
+    plan = solve_pipeline_capacity(
+        descriptor(), [master, android], safety_margin=1.0,
+        require_distributed=True,
+    )
+
+    assert plan["admitted"] is True
+    assert [
+        (item["node_id"], item["start_layer"], item["end_layer"])
+        for item in plan["assignments"]
+    ] == [("master", 0, 1), ("android", 1, 4)]
+    assert plan["assignments"][1]["layer_ranges"] == [[1, 4]]
+
+
+def test_advertised_layer_ranges_reject_uncovered_cursor():
+    master = node("master", 160, role="master", score=100)
+    android = node("android", 400, score=1)
+    android["layer_ranges"] = [[2, 4]]
+
+    plan = solve_pipeline_capacity(
+        descriptor(), [master, android], safety_margin=1.0,
+        require_distributed=True,
+    )
+
+    assert plan["admitted"] is False
+    assert plan["reason_code"] == "pipeline_layer_range_coverage_insufficient"
+    assert plan["assignments"] == []
 
 
 def test_tied_embedding_is_charged_to_output_capacity():

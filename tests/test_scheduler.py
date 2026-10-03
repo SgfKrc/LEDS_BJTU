@@ -386,6 +386,132 @@ class TestComputeLayerAssignment:
         assert plan["admitted"] is False
         assert plan["reason_code"] == "pipeline_capacity_nodes_unavailable"
 
+    def test_android_layer_worker_uses_byte_memory_capacity(self, sched):
+        """Android presence uses memory.available_bytes instead of PC ram shape."""
+        sched.nodes = {
+            "android-worker": NodeInfo(
+                node_id="android-worker", role="client", state=NodeState.ONLINE,
+                node_type="android",
+                device_info={
+                    "backend_id": "llama_cpp",
+                    "capabilities": [Capability.FORWARD_LAYERS],
+                    "memory": {"available_bytes": 3 * 1024 ** 3},
+                },
+            ),
+        }
+
+        records = sched._get_pipeline_capacity_nodes()
+
+        assert records == [{
+            "node_id": "android-worker",
+            "role": NodeRole.CLIENT,
+            "capacity_bytes": 3 * 1024 ** 3,
+            "reserve_bytes": records[0]["reserve_bytes"],
+            "runtime_multiplier": 2.0,
+            "execution_device": "cpu",
+            "capacity_source": "memory.available_bytes",
+            "score": records[0]["score"],
+        }]
+
+    def test_android_task_worker_ranges_reach_capacity_solver(self, sched, monkeypatch):
+        """Admitted v3 ranges are preserved as solver constraints."""
+        monkeypatch.setattr("scheduler.TASK_WORKER_EXPERIMENTAL_ENABLED", True)
+        sched._role_override = "master"
+        sched._task_worker_control.status = lambda role: {
+            "workers": [{
+                "node_id": "android-worker",
+                "healthy": True,
+                "layer_stage_dispatch_enabled": True,
+                "capabilities": {"layer_ranges": [[4, 16]]},
+            }],
+        }
+        sched.nodes = {
+            "android-worker": NodeInfo(
+                node_id="android-worker", role=NodeRole.CLIENT,
+                state=NodeState.ONLINE, node_type="android",
+                device_info={
+                    "backend_id": "llama_cpp",
+                    "capabilities": [Capability.FORWARD_LAYERS],
+                    "memory": {"available_bytes": 3 * 1024 ** 3},
+                },
+            ),
+        }
+
+        records = sched._get_pipeline_capacity_nodes()
+
+        assert records[0]["layer_ranges"] == [[4, 16]]
+
+    def test_android_task_worker_layer_budget_reaches_capacity_solver(self, sched, monkeypatch):
+        """设备自荐的层容量必须随 `layer_ranges` 一起投影进求解器输入 ——
+
+        `layer_ranges` 是"当前已就绪、马上能跑的区间"，`layer_budget.max_layers`
+        是"本地裁层后能承载的上限"；两者都要到求解器手上，它才能决策。
+        """
+        monkeypatch.setattr("scheduler.TASK_WORKER_EXPERIMENTAL_ENABLED", True)
+        sched._role_override = "master"
+        sched._task_worker_control.status = lambda role: {
+            "workers": [{
+                "node_id": "android-worker",
+                "healthy": True,
+                "layer_stage_dispatch_enabled": True,
+                "capabilities": {
+                    "layer_ranges": [[4, 16]],
+                    "layer_budget": {
+                        "available_bytes": 3 * 1024 ** 3,
+                        "per_layer_bytes": 64 * 1024 ** 2,
+                        "max_layers": 12,
+                        "local_cut": False,
+                    },
+                },
+            }],
+        }
+        sched.nodes = {
+            "android-worker": NodeInfo(
+                node_id="android-worker", role=NodeRole.CLIENT,
+                state=NodeState.ONLINE, node_type="android",
+                device_info={
+                    "backend_id": "llama_cpp",
+                    "capabilities": [Capability.FORWARD_LAYERS],
+                    "memory": {"available_bytes": 3 * 1024 ** 3},
+                },
+            ),
+        }
+
+        records = sched._get_pipeline_capacity_nodes()
+
+        assert records[0]["layer_ranges"] == [[4, 16]]
+        assert records[0]["layer_budget"]["max_layers"] == 12
+        assert records[0]["layer_budget"]["local_cut"] is False
+
+    def test_route_a_stage_identity_comes_from_worker_artifact(self, sched):
+        """Route A 的 offer 必须带 **worker 宣告的工件身份**（engine/format/sha256），
+        而不是 master 自己那份模型的摘要 —— 层段在设备上执行、用的是设备的 GGUF，
+        而 master 侧是 safetensors，两者格式不同，永远不匹配。"""
+        sched._task_worker_control.status = lambda role: {
+            "workers": [{
+                "node_id": "android-worker",
+                "capabilities": {"models": [{
+                    "model_id": "layer-f6dab6b72d243419",
+                    "engine": "llama_cpp",
+                    "format": "gguf",
+                    "revision": "local",
+                    "sha256": (
+                        "f6dab6b72d243419856d9a45921ce886"
+                        "bec0af5b920e241bc93f478434d98954"
+                    ),
+                }]},
+            }],
+        }
+
+        identity = sched._route_a_stage_model_identity("android-worker")
+
+        assert identity is not None
+        assert identity.engine == "llama_cpp"
+        assert identity.format == "gguf"
+        assert identity.sha256.startswith("f6dab6b7")
+        # 找不到该节点 / 没有可用的 models ⇒ None（调用方 fail-closed）
+        assert sched._route_a_stage_model_identity("missing-node") is None
+
     def test_capacity_prepare_acks_all_workers_before_commit(self, sched):
         sent = []
         sched._tcp_server = type("Server", (), {
@@ -5286,6 +5412,71 @@ class TestPipelineOrchestrationIntegration:
         assert readiness["ready"] is False
         assert readiness["reason_code"] == "worker_layer_loading"
 
+    def test_registration_pending_task_worker_skips_legacy_layer_push(
+            self, sched_master, monkeypatch):
+        import scheduler as scheduler_mod
+
+        monkeypatch.setattr(scheduler_mod, "TASK_WORKER_EXPERIMENTAL_ENABLED", True)
+        node = NodeInfo(
+            node_id="surface-stage", role="client", state=NodeState.ONLINE,
+            node_type="pc", address="100.100.52.106:8888",
+            last_heartbeat=time.time(),
+        )
+        sched_master.nodes[node.node_id] = node
+        sched_master._tcp_server.clients = {node.node_id: True}
+        pushes = []
+        monkeypatch.setattr(
+            sched_master, "push_layer_config_to_clients",
+            lambda: pushes.append("legacy"),
+        )
+        monkeypatch.setattr(sched_master, "_push_node_list_to_client", lambda _id: None)
+        monkeypatch.setattr(
+            sched_master, "_push_node_update_to_all_clients",
+            lambda *args: None,
+        )
+
+        sched_master._on_tcp_registration_confirmed(node.node_id)
+
+        assert pushes == []
+        assert sched_master._task_worker_control.pending_worker_ids() == {
+            node.node_id,
+        }
+
+        sched_master._push_layer_config_to_clients_locked()
+        assert sched_master._layer_config_expected == {}
+
+    def test_layer_push_admits_peer_after_task_worker_hello_resolution(
+            self, sched_master, monkeypatch):
+        import scheduler as scheduler_mod
+
+        monkeypatch.setattr(scheduler_mod, "TASK_WORKER_EXPERIMENTAL_ENABLED", True)
+        node = NodeInfo(
+            node_id="surface-stage", role="client", state=NodeState.ONLINE,
+            node_type="pc", address="100.100.52.106:8888",
+            last_heartbeat=time.time(),
+        )
+        sched_master.nodes[node.node_id] = node
+        sched_master._tcp_server.clients = {node.node_id: True}
+        sched_master._task_worker_control.mark_worker_connection_pending(node.node_id)
+        monkeypatch.setattr(
+            sched_master._tcp_server, "send_layer_config",
+            lambda node_id, config: None,
+            raising=False,
+        )
+
+        # No capability admission yet: a pending connection is still fenced.
+        sched_master._push_layer_config_to_clients_locked()
+        assert sched_master._layer_config_expected == {}
+
+        sched_master._task_worker_control.resolve_worker_connection_pending(node.node_id)
+        assert sched_master._task_worker_control.pending_worker_ids() == set()
+        monkeypatch.setattr(
+            sched_master, "_task_worker_layer_stage_ids",
+            lambda connected: {node.node_id} & connected,
+        )
+        sched_master._push_layer_config_to_clients_locked()
+        assert node.node_id not in sched_master._layer_config_expected
+
     # ----------------------------------------------------------
     # 场景 1：master 在线，所有 worker 离线 → fallback 本地推理
     # ----------------------------------------------------------
@@ -5580,6 +5771,131 @@ class TestPipelineOrchestrationIntegration:
         assert sched_with_workers.nodes["master"].task_count == 1
         assert sched_with_workers.nodes["worker1"].task_count == 1
         assert sched_with_workers.nodes["worker2"].task_count == 1
+
+    def test_route_a_stage_pipeline_keeps_prefill_decode_positions(
+            self, sched_with_workers, monkeypatch):
+        """Route-A v3 stages own both prefill and decode position semantics."""
+        from model_host import model_host as _host
+        import torch
+
+        class Tokenizer:
+            eos_token_id = 999
+
+            def __call__(self, prompt, **kwargs):
+                return {
+                    "input_ids": torch.tensor([[11, 12]]),
+                    "attention_mask": torch.ones(1, 2, dtype=torch.long),
+                }
+
+            def decode(self, ids, **kwargs):
+                return "answer"
+
+        class Manager:
+            is_loaded = True
+            tokenizer = Tokenizer()
+            model = type("Model", (), {
+                "config": type("Config", (), {
+                    "max_position_embeddings": 128,
+                })(),
+            })()
+
+            def ensure_layer_range(self, *args, **kwargs):
+                pass
+
+            def forward_layers(self, **kwargs):
+                input_ids = kwargs["input_ids"]
+                seq_len = int(input_ids.shape[1])
+                return {
+                    "hidden_states": torch.ones(1, seq_len, 4),
+                    "past_key_values": ((torch.ones(1, 1, seq_len, 1),
+                                          torch.ones(1, 1, seq_len, 1)),),
+                }
+
+        monkeypatch.setattr(_host, "_manager", Manager())
+
+        class Callbacks:
+            thinking_system_prompt = ""
+
+            @staticmethod
+            def active_task_graph_model_identity():
+                return type("Identity", (), {
+                    "sha256": "a" * 64,
+                    "model_id": "qwen-test",
+                })()
+
+            @staticmethod
+            def build_model_chat_prompt(tokenizer, messages, **kwargs):
+                return "prompt"
+
+            @staticmethod
+            def format_model_response(text, show_thinking, **kwargs):
+                return text, ""
+
+        monkeypatch.setattr(sched_with_workers, "_require_callbacks", lambda: Callbacks())
+        monkeypatch.setattr(
+            sched_with_workers,
+            "_verify_pipeline_readiness",
+            lambda nodes: (True, "ok"),
+        )
+        stage_calls = []
+
+        def fake_stage(**kwargs):
+            stage_calls.append(kwargs)
+            return {"kind": "token", "token_argmax": 7}
+
+        monkeypatch.setattr(sched_with_workers, "_execute_layer_stage_offer", fake_stage)
+        # ★ Route A 的 offer 带**设备工件身份**（层段在设备上执行、用设备的 GGUF），
+        #   而不是 master 的模型身份 —— 后者是 safetensors，`_layer_model_matches`
+        #   比 engine/format/sha256，必然拒绝。
+        sched_with_workers._task_worker_control.status = lambda role: {
+            "workers": [{
+                "node_id": "android-1",
+                "capabilities": {"models": [{
+                    "model_id": "layer-android1",
+                    "engine": "llama_cpp",
+                    "format": "gguf",
+                    "revision": "local",
+                    "sha256": "c" * 64,
+                }]},
+            }],
+        }
+        result = sched_with_workers._run_route_a_stage_pipeline(
+            prompt="hello",
+            max_new_tokens=2,
+            temperature=0.0,
+            top_p=1.0,
+            session_id=None,
+            messages=None,
+            show_thinking=False,
+            routing_preference="auto",
+            stage_nodes=[{
+                "node_id": "android-1",
+                "execution": "stage_offer_v3",
+                "start_layer": 4,
+                "end_layer": 8,
+                "layers_count": 4,
+            }],
+            master_assignment={
+                "node_id": "master",
+                "start_layer": 0,
+                "end_layer": 4,
+                "layers_count": 4,
+                "has_embedding": True,
+                "has_lm_head": True,
+            },
+        )
+
+        assert result["metrics"]["execution_mode"] == "route_a_stage_offer_v3"
+        # ★ 协议要求 `wf_` 前缀（`_WORKFLOW_ID`）；裸 task_id 会被 offer 校验拒掉。
+        assert all(call["workflow_id"].startswith("wf_") for call in stage_calls)
+        assert [call["positions"] for call in stage_calls] == [[0, 1], [2]]
+        assert all(call["want_hidden"] is False for call in stage_calls)
+        assert all(
+            call["model_identity"].model_id == "layer-android1"
+            and call["model_identity"].engine == "llama_cpp"
+            and call["model_identity"].format == "gguf"
+            for call in stage_calls
+        )
 
     def test_run_pipeline_builds_native_prompt_from_history(
             self, sched_with_workers, monkeypatch):

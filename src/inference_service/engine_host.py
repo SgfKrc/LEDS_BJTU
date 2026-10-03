@@ -513,6 +513,9 @@ class EngineHost:
         self._host: ModelHost = ModelHost()
         self._model_change_lock = threading.RLock()
         self._layers: List[str] = []  # 已加载层段（1.2 与 model 侧真实状态对齐）
+        # ★ 2026-10-03：v3 层段 Stage 的 keep-head 上游（`KeepHeadUpstream`）。子进程隔离
+        #   由它自理；这里只负责按 env 配置创建一次并复用（重载 500MB GGUF 代价高）。
+        self._layer_upstream: Any = None
         self._gen_lock = threading.RLock()
         self._generations: Dict[str, threading.Event] = {}
         # 1.2c 宿主适配状态（api_server 全局 → 实例属性）
@@ -1892,7 +1895,143 @@ class EngineHost:
                     provider_id=stage_request.provider_id,
                     same_provider_retryable=True,
                 ) from exc
+        if stage_request.stage_type == "layer_forward":
+            return self._execute_layer_forward_stage(
+                stage_request, provider_cancel_event,
+            )
         raise TaskGraphError(f"不支持的 Stage 类型: {stage_request.stage_type}")
+
+    # ------------------------------------------------------------------
+    # v3 层段 Stage（`layer_forward`）—— PC 侧执行
+    # ------------------------------------------------------------------
+
+    def _layer_forward_upstream(self):
+        """按 env 配置创建并复用 keep-head 上游（进程隔离由 `KeepHeadUpstream` 自理）。
+
+        env（PC 侧没有像 Android 那样的工件目录扫描，这是唯一的配置入口）：
+          * `QLH_LAYER_GGUF`         —— 本节点负责的**裁层 GGUF** 路径（必填）
+          * `QLH_KEEP_HEAD_SHIM`     —— `qlh_keep_head.dll` 路径（必填）
+          * `QLH_LAYER_N_CTX` / `QLH_LAYER_N_BATCH` / `QLH_LAYER_THREADS` /
+            `QLH_LAYER_N_SEQ_MAX`   —— 可选，缺省 4096 / 2048 / 8 / 1
+
+        ⚠️ 不要图省事绕开隔离：`qlh_keep_head.dll` 经 `libllama.dll` 依赖**按 basename**
+        解析的 `ggml-base.dll` / `ggml.dll`，与 pip `llama_cpp` 是**同名不同版本**；
+        Windows loader 在进程生命周期内只认第一个加载的，绑定不可撤销（`WinError 127`
+        的根因，见 `llama_keep_head._shim_abi_collides_with_llama_cpp`）。
+        """
+        import os
+
+        if self._layer_upstream is not None:
+            return self._layer_upstream
+        model_path = os.environ.get("QLH_LAYER_GGUF", "").strip()
+        shim_path = os.environ.get("QLH_KEEP_HEAD_SHIM", "").strip()
+        if not model_path or not shim_path:
+            raise TaskGraphError(
+                "层段 Stage 需要 QLH_LAYER_GGUF 与 QLH_KEEP_HEAD_SHIM 环境变量"
+            )
+        from llama_keep_head import KeepHeadUnavailable, KeepHeadUpstream
+
+        def _env_int(name: str, default: int) -> int:
+            raw = os.environ.get(name, "").strip()
+            try:
+                return max(1, int(raw)) if raw else default
+            except ValueError:
+                return default
+
+        try:
+            self._layer_upstream = KeepHeadUpstream(
+                shim_path,
+                model_path,
+                mode="nextn",
+                n_ctx=_env_int("QLH_LAYER_N_CTX", 4096),
+                n_batch=_env_int("QLH_LAYER_N_BATCH", 2048),
+                n_threads=_env_int("QLH_LAYER_THREADS", 8),
+                n_seq_max=_env_int("QLH_LAYER_N_SEQ_MAX", 1),
+            )
+        except KeepHeadUnavailable as exc:
+            raise TaskGraphError(f"层段 keep-head 上游不可用：{exc}") from exc
+        return self._layer_upstream
+
+    def _execute_layer_forward_stage(
+        self,
+        stage_request,
+        provider_cancel_event: threading.Event,
+    ) -> Dict[str, Any]:
+        """执行一次 v3 层段 Stage：吃上游 hidden，产 hidden（中间段）或 token（尾段）。
+
+        结果形状对齐 `scheduler_pipeline._layer_stage_result_to_pipeline_value`：
+          * 中间段（`root_input.want_hidden == true`）⇒
+            `{"hidden_out_f32": b64, "hidden_out_sha256": sha256(原始 f32 字节), "token_argmax": None}`
+          * 尾段 ⇒ `{"token_argmax": int}`
+
+        `metadata` 由 `scheduler_task_worker` 侧用 `sanitize_result_metadata` 统一净化，
+        它只取 `usage` / `usage_estimated` / `tokens_per_second` / `model` 四项，
+        不会动这两个字段。
+        """
+        import base64
+        import hashlib
+
+        import numpy as np
+
+        from task_graph import TaskGraphError as _StageError
+
+        if provider_cancel_event.is_set():
+            raise _StageError("层段 Stage 在开始前已被取消")
+
+        root_input = stage_request.root_input or {}
+        encoded = root_input.get("hidden_f32")
+        if not isinstance(encoded, str):
+            raise _StageError("层段 Stage 缺少 root_input.hidden_f32")
+        stage_fields = stage_request.stage_fields or {}
+        spec = stage_fields.get("hidden_spec") or {}
+        n_tokens = int(spec.get("n_tokens", 0) or 0)
+        n_embd = int(spec.get("n_embd", 0) or 0)
+        if n_tokens < 1 or n_embd < 1:
+            raise _StageError("层段 Stage 的 hidden_spec 维度必须为正")
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except Exception as exc:
+            raise _StageError("层段 Stage 的 hidden_f32 不是合法 base64") from exc
+        if len(raw) != n_tokens * n_embd * 4:
+            raise _StageError(
+                f"层段 Stage 的 hidden 长度不符：{len(raw)} != {n_tokens * n_embd * 4}"
+            )
+
+        want_hidden = bool(root_input.get("want_hidden", False))
+        seq_ids = stage_fields.get("seq_ids")
+        positions = stage_fields.get("positions")
+        # `positions` 给定时 `n_past` 被忽略；缺省退化为从 `pos_base` 起递增。
+        n_past = int(root_input.get("pos_base", 0) or 0)
+
+        hidden = np.frombuffer(raw, dtype=np.float32).reshape(n_tokens, n_embd)
+        upstream = self._layer_forward_upstream()
+
+        # ★ 2026-10-03：批次**从位置 0 开始**就说明这是新 prompt 的 prefill ⇒ 必须先清
+        #   子进程的 KV。否则下一个请求会带着上一个请求残留的位置（实测：
+        #   `the last position stored in the KV cache for sequence 0 is X = 45`，而 batch
+        #   的起始位置是 0 ⇒ `llama_decode rc=-1`、`decode: failed to initialize batch`）。
+        #   与 JNI 侧 `qlh_layer_batch_starts_at_zero` 同语义 —— 那里是每步判一次，
+        #   这里按 Stage 判（一个 Stage = 一整段 prefill 或一次 decode）。
+        starts_at_zero = (
+            positions[0] == 0 if positions else n_past == 0
+        )
+        if starts_at_zero:
+            upstream.reset()
+
+        if want_hidden:
+            out = upstream.forward_hidden_to_hidden(
+                hidden, n_past=n_past, seq_ids=seq_ids, positions=positions,
+            )
+            out_raw = np.ascontiguousarray(out, dtype=np.float32).tobytes()
+            return {
+                "hidden_out_f32": base64.b64encode(out_raw).decode("ascii"),
+                "hidden_out_sha256": hashlib.sha256(out_raw).hexdigest(),
+                "token_argmax": None,
+            }
+        token = upstream.forward_hidden_to_token(
+            hidden, n_past=n_past, seq_ids=seq_ids, positions=positions,
+        )
+        return {"token_argmax": int(token)}
 
     # ------------------------------------------------------------------
     # 1.2d task_graph 执行段（复制自 api_server.py:2571-3321，源文件不动）
@@ -1992,6 +2131,41 @@ class EngineHost:
 
 
 
+    def _prepared_pipeline_model_identity(self):
+        """distributed-only 已准备模型的身份（未物化权重也能给出）。
+
+        `prepare-pipeline` 刻意不加载权重，但它把 inspect 出的描述符（`model_sha256`
+        / 模型 id / 路径 / 引擎）留在了宿主上 ⇒ 身份从那里取。否则 Route A 会陷入
+        "要活动身份就必须先物化权重、而 distributed-only 路径按设计不加载"的死锁。
+        """
+        from task_provider import ModelIdentity
+
+        host = self._host
+        if not getattr(host, "is_pipeline_prepared", False):
+            return None
+        try:
+            descriptor = host.get_pipeline_descriptor() or {}
+        except Exception:
+            logger.warning("读取已准备的流水线描述符失败", exc_info=True)
+            return None
+        model_id = str(
+            getattr(host, "active_model_id", "") or descriptor.get("model_id", "")
+        )
+        sha256 = str(descriptor.get("model_sha256", "") or "").lower()
+        if not model_id or not sha256:
+            return None
+        try:
+            return ModelIdentity(
+                model_id=model_id,
+                engine="pytorch",
+                format="safetensors",
+                revision="prepared",
+                sha256=sha256,
+            )
+        except ValueError:
+            logger.warning("已准备的流水线模型身份非法", exc_info=True)
+            return None
+
     def _active_task_graph_model_identity(
         self,
     ) -> Dict[str, Any]:
@@ -2000,7 +2174,7 @@ class EngineHost:
         import hashlib
         from task_provider import ModelIdentity
         if not self._host.model_loaded or not self._host.is_loaded:
-            return None
+            return self._prepared_pipeline_model_identity()
         engine = backend_id_for(self._host)
         model_path = str(getattr(self._host, "_model_path", "") or "")
         model_id = str(getattr(self._host, "active_model_id", "") or "")

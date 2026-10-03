@@ -1,10 +1,10 @@
 # KTransformers 算子级优化调研 + QLH 算法/数据层优化方向
 
-> 状态：**现行（调研报告）**
+> 状态：**现行**
+> 更新日期：2026-10-02
+> 适用范围：KTransformers 算子级优化的迁移调研，以及 QLH 算法层／数据层（PyTorch 上游）的优化方向与联合排期。
 >
-> 更新日期：2026-09-24
->
-> 结论摘要见 §1；可行性建议见 §6；联合排期见 §7；**待裁决的口径冲突**见 §8。
+> 结论摘要见 §1；可行性建议见 §6；联合排期见 §7；**未决的口径冲突**见 §8。
 
 ---
 
@@ -26,7 +26,7 @@
 3. **最该做的一件事反而最便宜**：KT 相对 llama.cpp 的 27.79× 是**它自研 AMX kernel vs llama.cpp CPU 实现**的差距 —— 而同一份 AMX/AVX-512 实现**已经在主仓 vendor 的 llama.cpp 里**（`ggml/src/ggml-cpu/amx/mmq.cpp`、`ggml/src/CMakeLists.txt:387-401`）。所以**不要重写 llama.cpp kernel，要核实 QLH 实际构建是否打开这些变体**。
 4. **KT 的算法级近似与 QLH 的默认判据直接冲突**：Expert Deferral、选择性专家激活可以作为科研对照，但不能绕过 QLH 的**逐 token argmax 一致、fail-closed**生产门。
 
-**本报告的正式定位**：研究对象是 `model_module.py` 及其后续拆分后的 PyTorch 上游组件；研究结果必须能与未优化 PyTorch、整模 llama.cpp 和连续层分布式三组基线比较。研究代码受 feature gate 控制，不进入 Koakuma backend 枚举，不进入 Edge 最小发行，也不让 KTransformers 依赖进入主仓运行时。
+**本文的定位**：研究对象是 `model_module.py` 及其后续拆分后的 PyTorch 上游组件；研究结果必须能与未优化 PyTorch、整模 llama.cpp 和连续层分布式三组基线比较。研究代码受 feature gate 控制，不进入 Koakuma backend 枚举，不进入 Edge 最小发行，也不让 KTransformers 依赖进入主仓运行时。
 
 ---
 
@@ -161,7 +161,7 @@ Gate/Up 融合实现、GPTQ/Marlin/FP8 依赖栈。它们可以作为外部对�
 
 ---
 
-## 8. ⚠️ 本轮发现的待裁决口径冲突
+## 8. ⚠️ 未决的口径冲突
 
 **同一件事（"层该推给上游还是下游"）在两处文档里结论方向相反**：
 
@@ -201,7 +201,7 @@ decode 重复输入 prompt 最后一个 token，不含 LM head、采样或真实
 `mean/pow/rsqrt` 的输入为 FP32，而线性层主要为 FP16；这说明单看参数 dtype 会漏掉混合中间算子形态。
 
 **测量边界**：metadata dispatch/profiler 插桩使总墙钟达到未插桩约 8.46×（prefill）/10.58×（decode）；因此绝不引用
-插桩墙钟作为性能数据。算子 CUDA self time 用于同一 profile 内的热点排序，不能跨 GPU/版本外推；本报告也不含 llama.cpp
+插桩墙钟作为性能数据。算子 CUDA self time 用于同一 profile 内的热点排序，不能跨 GPU/版本外推；本文也不含 llama.cpp
 对照，不能解释两份 D→L 文档中方向相反的边际层耗时。3 秒负载预热后 prefill 样本仍有约 15.8% 的变异系数，说明笔记本 GPU 时钟/运行状态仍会显著影响测量；该轮 wall time 只作为受控配置下的观察，不作为路由阈值或跨引擎成本结论。单机路由成本仍须用同一实验身份的重复切点记录，经
 `fit_segment_profile` 拆成固定开销和边际每层，并遵守 `relay_cut_plan.py` 的多轮/来源门禁。
 
@@ -274,7 +274,7 @@ wall time 只作本机诊断，不作为准入结果：样本是单 GPU、单 pr
 
 ### 8.6 硬件准入与运行时接入拆票
 
-只读 Codex 子 agent 审计确认 CPU 与 RTX 4060 的旧 profile 不可组成阶段校准对：旧 CPU 是 `[0,2)`/FP32/8-token/单样本，CUDA 是 `[0,12)`/FP16/64-token/固定 token decode；旧报告也没有主机与输入身份。HW 票新增 `scripts/torch_hardware_admit.py`，显式绑定模型权重/manifest、tokenizer、输入 token SHA、主机、运行时、dtype、线程数、实际 KV tensor 结构及逐样本未插桩时延；decode 成本使用同设备整模参考生成的 token trace 重放，另以完整自回归分段请求作正确性门，二者不混称。CPU/CUDA 控制组统一 FP32，部署默认 CPU FP32/CUDA FP16 另行观察。没有第二张 CUDA 卡时，任何结论仅限实测设备对、方向、层段和运行时构建，不外推到多 CUDA。
+本地代码核实确认 CPU 与 RTX 4060 的旧 profile 不可组成阶段校准对：旧 CPU 是 `[0,2)`/FP32/8-token/单样本，CUDA 是 `[0,12)`/FP16/64-token/固定 token decode；旧报告也没有主机与输入身份。HW 票新增 `scripts/torch_hardware_admit.py`，显式绑定模型权重/manifest、tokenizer、输入 token SHA、主机、运行时、dtype、线程数、实际 KV tensor 结构及逐样本未插桩时延；decode 成本使用同设备整模参考生成的 token trace 重放，另以完整自回归分段请求作正确性门，二者不混称。CPU/CUDA 控制组统一 FP32，部署默认 CPU FP32/CUDA FP16 另行观察。没有第二张 CUDA 卡时，任何结论仅限实测设备对、方向、层段和运行时构建，不外推到多 CUDA。
 
 **2026-09-23 实测**：本机 `DESKTOP-KL4JIK7` / Windows 10，同一 Qwen2.5-0.5B 工件（manifest `40133469…12a2b9`、权重 SHA-256 `fdf756fa…fb7fe`）、同 tokenizer、8 线程，CPU `.venv-test` (`torch 2.13.0+cpu`) 与 RTX 4060 Laptop GPU `.venv-qwen3-sidecar` (`torch 2.13.0+cu126`) 分开执行；Transformers 均为 5.17.0。FP32 控制组为 64/256-token prompt × `[0,4)`/`[0,12)`/`[0,24)` × prefill/decode，每格 1 次 warmup + 5 次未插桩样本；decode 每样本是 8 个从同设备整模 greedy trace 取值的 teacher-forced forward。另有真实 greedy 8-step 完整模型与 CPU↔CUDA 12/12 分段全链正确性/时延样本。CPU 与 CUDA 完整模型在两条 token 轨迹上逐 token 一致；12 个 CPU/CUDA KV 结构（shape/dtype/layout）指纹逐项一致，设备放置单独记录。CPU/CUDA wheel build 不同，因此这是受控 FP32 的设备-运行时组合对照，不声称隔离了 GPU 硬件的纯因果效应。
 
@@ -320,7 +320,7 @@ wall time 只作本机诊断，不作为准入结果：样本是单 GPU、单 pr
 
 - 最终证据：`cuda-fp32-pcore-t1-interop1-telemetry-v3-w20-20260924.json`、`cpu-cuda-pcore-t1-telemetry-v3-comparison-20260924.json`。共 423 个 telemetry 样本（GPU 254、系统 169），错误 0，所有 6 个 range 和 4 个异构方向均有窗口边界。
 - CUDA timing：仅 `256:24 prefill` 超 CV 门（`0.1194`）；CPU 两格仍超门，异构 64/256 两组方向均有 timing 不稳，比较器结果 `matched_fp32_cpu_cuda_pair=true`、`phase_cost_matrix_admitted=false`、`same_host_cpu_cuda_split_admitted=false`、`production_runtime_enabled=false`。
-- GPU 状态旁证：`clocks.sm=210–2490 MHz`，温度 `58–73°C`；GPU 利用率从 0% 到 99%；active reason 位出现 `0x0/0x1/0x4/0x24`。其中 `0x1` 与 GPU idle 语义一致，但本轮不能仅凭同期变化断言某个 reason 是 timing 长尾的唯一根因；未取得管理员权限，未做 `nvidia-smi -lgc` 锁频对照。
+- GPU 状态旁证：`clocks.sm=210–2490 MHz`，温度 `58–73°C`；GPU 利用率从 0% 到 99%；active reason 位出现 `0x0/0x1/0x4/0x24`。其中 `0x1` 与 GPU idle 语义一致，但仅凭同期变化不能断言某个 reason 是 timing 长尾的唯一根因；未取得管理员权限，未做 `nvidia-smi -lgc` 锁频对照。
 - 工具回归：`tests/test_torch_hardware_admit.py` **18 passed**，CPU 诊断 **3 passed**；telemetry 只诊断，不改 CV 门、不解锁运行时。下一步限定为管理员锁频或提高持续 GPU 利用率的受控对照；`TORCH-RUNTIME-ADMIT-01` 继续锁定。
 
 另跑部署默认精度观察（1 次 warmup、每格 3 次未插桩样本）：CUDA 整模 FP16 reference 下，CPU FP32→CUDA FP16 的 64-token prefill/decode exact，256-token prefill 不 exact；CUDA FP16→CPU FP32 的 64-token prefill 不 exact、256-token exact，所测 decode token 均 exact。边界张量分别为 `[1,64,896]`/`[1,256,896]`，CPU→CUDA FP32→FP16 转换最大绝对误差约 `0.115`。结果说明混合精度层段的 prefill 正确性受 prompt 影响，部署默认组合不准入；证据 `local_docs/evidence/torch-hardware-admit/cuda-deployment-default.json`。
@@ -335,11 +335,11 @@ wall time 只作本机诊断，不作为准入结果：样本是单 GPU、单 pr
 
 ## 9. 明确标注为「未核实」的条目
 
-1. KT 与 **vLLM** 是否另有官方整合（本轮只找到它用 vLLM 项目的 `llmcompressor` 做 GPU 量化）。
-2. KT 的 **AMX kernel 是否已回流 llama.cpp**（旧文档只写"考虑贡献"，本轮未查到对应 PR）。
+1. KT 与 **vLLM** 是否另有官方整合（只找到它用 vLLM 项目的 `llmcompressor` 做 GPU 量化）。
+2. KT 的 **AMX kernel 是否已回流 llama.cpp**（旧文档只写"考虑贡献"，未查到对应 PR）。
 3. KT 的 **ARM64(KML) / Windows** 后端成熟度与实际性能（README 只列为可选构建，roadmap 仍在探索）。
 4. §6 里所有**收益数字在 QLH 设备/模型上的外推**都属估计，**非实测**。
-5. §7 的方向冲突**本轮未做新实测裁决**。
+5. §7 的方向冲突**未做新实测裁决**。
 
 ---
 

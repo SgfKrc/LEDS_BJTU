@@ -1,6 +1,6 @@
-# QLH 主仓子模块（**只保留与主仓功能直接相关者**）
+# 主仓子模块（只保留与主仓功能直接相关者）
 #
-# ★ 2026-09-20 用户裁定：开发/实验工具**不再作为子模块**，改为**工作区独立目录**
+# 2026-09-20 起：开发/实验工具不再作为子模块，改为工作区独立目录
 #   （各自独立 clone，`.gitignore` 覆盖，不进主仓）：
 #     - tools/docagent            → https://github.com/SgfKrc/qlh-docagent.git
 #     - tools/reasonix-codex-bridge → https://github.com/SgfKrc/reasonix-codex-bridge.git

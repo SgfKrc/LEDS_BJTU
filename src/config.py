@@ -430,6 +430,10 @@ PIPELINE_CAPACITY_SAFETY_MARGIN = _env_float(
 PIPELINE_CAPACITY_RESERVE_MB = _env_float(
     "QLH_PIPELINE_CAPACITY_RESERVE_MB", 512.0, min_val=0.0, max_val=32768.0,
 )
+# ★ 2026-10-03：容量求解器的默认准则是「节点数最少」（省网络开销，对普通请求合理），
+#   因此多段拓扑（如 master + 中间段 + 尾段）永远不会被选中 —— 两段总是更少。
+#   打开这个开关后，可行解之间改为**优先用尽可用节点**。验证多段链路时需要它。
+PIPELINE_PREFER_ALL_WORKERS = _env_bool("QLH_PIPELINE_PREFER_ALL_WORKERS", False)
 PIPELINE_ASSIGNMENT_CACHE_MAX_MB = _env_float(
     "QLH_PIPELINE_ASSIGNMENT_CACHE_MAX_MB", 4096.0, min_val=128.0, max_val=1048576.0,
 )

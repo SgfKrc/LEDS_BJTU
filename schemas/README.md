@@ -1,9 +1,10 @@
 # QLH 模型部署契约 Schema（M0 冻结，2026-08-06）
 
-本目录是 [一键模型部署与自治集群远期计划](../docs/一键模型部署与自治集群远期计划.md)
-§16 M0「冻结契约与事实源」的产物：六个 JSON Schema（draft-07）及
+本目录是模型舰队部署计划的 M0「冻结契约与事实源」的产物（该计划文档随发布仓外置，见
+`qlh-release/docs/一键模型部署与自治集群远期计划.md`）：六个 JSON Schema（draft-07）及
 `model-fleet-compatibility.json` 作为模型生命周期、迁移和集群档案的**跨语言契约**。
-Python（jsonschema）与 TS（ajv）两侧使用同一批 fixture 验证，结果必须一致。
+Python（jsonschema）与 TS（ajv）两侧使用同一批 fixture 验证，结果必须一致；TS 侧测试随
+控制面外置，不在本仓。
 
 ## Schema 清单
 

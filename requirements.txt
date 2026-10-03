@@ -31,7 +31,7 @@ bitsandbytes>=0.45.0             # INT4/INT8 量化（Windows + CUDA 12.x 兼容
 #
 # ⚠️ Windows 上还存在一个与编码相关的坑：非 UTF-8 模式下 torch.compile 会抛
 #    `'gbk' codec can't decode ...`（torch/inductor/triton 内部按 GBK 解码源码）。
-#    本仓的启动脚本（qlh.bat / koakuma.bat / bjtu.bat / start_backend.bat / start_tui.bat）
+#    本仓的启动脚本（qlh.bat / K-Llama.bat / koakuma.bat / bjtu.bat / start_backend.bat / start_tui.bat）
 #    已统一设置 `PYTHONUTF8=1` 与 `PYTHONIOENCODING=utf-8`；手工起进程时请自行设置。
 
 # --- 网络通信（标准库）---

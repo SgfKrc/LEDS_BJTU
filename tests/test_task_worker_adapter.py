@@ -1,4 +1,6 @@
 import copy
+import base64
+import hashlib
 import sys
 import os
 import socket
@@ -102,6 +104,13 @@ def _android_capabilities(*, resource_admitted=True):
     }
 
 
+def _android_layer_capabilities(*, resource_admitted=True):
+    capabilities = _android_capabilities(resource_admitted=resource_admitted)
+    capabilities["stage_types"] = ["layer_forward"]
+    capabilities["layer_ranges"] = [[4, 8]]
+    return capabilities
+
+
 def _admitted_control_plane():
     worker = TaskWorkerControlPlane()
     coordinator = TaskWorkerControlPlane()
@@ -131,6 +140,137 @@ def _admitted_android_control_plane():
     assert ack.payload["accepted"] is True
     worker.receive_on_worker(ack.snapshot())
     return coordinator, worker
+
+
+def test_android_layer_worker_is_admitted_without_full_model_dispatch_gate():
+    coordinator = TaskWorkerControlPlane()
+    # Negotiate a layer-only peer and keep the assertion focused on the
+    # dedicated layer gate rather than the full-model dispatch state.
+    layer_worker = TaskWorkerControlPlane()
+    hello = layer_worker.begin_worker_hello(
+        node_id="android_layer_01",
+        worker_kind="android_full_worker",
+        capabilities=_android_layer_capabilities(),
+    )
+    assert hello is not None
+    ack = coordinator.receive_on_coordinator(
+        "android_layer_01", hello.snapshot(), coordinator_node_id="master",
+    )
+    assert ack.payload["accepted"] is True
+    snapshot = coordinator.worker_snapshot("android_layer_01")
+    assert snapshot["manual_stage_dispatch_enabled"] is True
+    assert snapshot["layer_stage_dispatch_enabled"] is True
+    assert snapshot["capabilities"]["models"]
+
+
+def test_pending_worker_fence_is_resolved_by_hello_and_disconnect():
+    control = TaskWorkerControlPlane()
+    control.mark_worker_connection_pending("worker_pending")
+    assert control.pending_worker_ids() == {"worker_pending"}
+    control.resolve_worker_connection_pending("worker_pending")
+    assert control.pending_worker_ids() == set()
+    control.mark_worker_connection_pending("worker_pending")
+    control.disconnect_worker("worker_pending")
+    assert control.pending_worker_ids() == set()
+
+
+def test_remote_provider_uses_layer_gate_for_layer_forward_stage():
+    coordinator = TaskWorkerControlPlane()
+    worker = TaskWorkerControlPlane()
+    hello = worker.begin_worker_hello(
+        node_id="android_layer_01",
+        worker_kind="android_full_worker",
+        capabilities=_android_layer_capabilities(),
+    )
+    assert hello is not None
+    ack = coordinator.receive_on_coordinator(
+        "android_layer_01", hello.snapshot(), coordinator_node_id="master",
+    )
+    assert ack.payload["accepted"] is True
+    snapshot = coordinator.worker_snapshot("android_layer_01")
+    snapshot["manual_stage_dispatch_enabled"] = False
+    snapshot["layer_stage_dispatch_enabled"] = True
+    provider = RemoteFullWorkerProvider(
+        node_id="android_layer_01",
+        peer_snapshot=lambda: snapshot,
+        send_message=lambda _message: None,
+    )
+    status = provider.inspect()
+    assert status.healthy is True
+    assert "layer_forward" in status.supported_stage_types
+
+
+def test_layer_worker_matches_physical_identity_but_not_full_model_alias():
+    worker = TaskWorkerControlPlane()
+    coordinator = TaskWorkerControlPlane()
+    capabilities = _android_layer_capabilities()
+    capabilities["layer_worker"] = True
+    capabilities["models"] = [{
+        "model_id": "layer-aaaaaaaaaaaaaaaa",
+        "engine": "llama_cpp",
+        "format": "gguf",
+        "revision": "local-aaaaaaaaaaaa",
+        "sha256": "a" * 64,
+    }]
+    hello = worker.begin_worker_hello(
+        node_id="android_layer_alias_01",
+        worker_kind="android_full_worker",
+        capabilities=capabilities,
+    )
+    assert hello is not None
+    ack = coordinator.receive_on_coordinator(
+        "android_layer_alias_01", hello.snapshot(), coordinator_node_id="master",
+    )
+    assert ack.payload["accepted"] is True
+    snapshot = coordinator.worker_snapshot("android_layer_alias_01")
+    snapshot["manual_stage_dispatch_enabled"] = False
+    snapshot["layer_stage_dispatch_enabled"] = True
+    provider = RemoteFullWorkerProvider(
+        node_id="android_layer_alias_01",
+        peer_snapshot=lambda: snapshot,
+        send_message=lambda _message: None,
+    )
+    requested = ModelIdentity(
+        model_id="qwen3-5-2b",
+        engine="llama_cpp",
+        format="gguf",
+        revision="coordinator-rev",
+        sha256="a" * 64,
+    )
+    assert provider.supports_model_identity(requested, "layer_forward") is True
+    assert provider.supports_model_identity(requested, "full_inference") is False
+
+
+def test_route_a_stage_result_maps_hidden_bytes_back_to_pipeline_tensor():
+    import struct
+    from scheduler_pipeline import _layer_stage_result_to_pipeline_value
+
+    raw = struct.pack("<4f", 0.25, -1.5, 3.0, 4.5)
+    output = {
+        "hidden_out_f32": base64.b64encode(raw).decode("ascii"),
+        "hidden_out_sha256": hashlib.sha256(raw).hexdigest(),
+        "token_argmax": 7,
+    }
+    mapped = _layer_stage_result_to_pipeline_value(
+        output, hidden_spec={"n_tokens": 2, "n_embd": 2},
+    )
+    assert mapped["kind"] == "hidden"
+    assert mapped["token_argmax"] == 7
+    assert mapped["hidden_states"].shape == (2, 2)
+    assert mapped["hidden_states"].flatten().tolist() == [0.25, -1.5, 3.0, 4.5]
+
+
+def test_route_a_stage_result_rejects_hidden_digest_mismatch():
+    from scheduler_pipeline import _layer_stage_result_to_pipeline_value
+
+    with pytest.raises(ValueError, match="digest"):
+        _layer_stage_result_to_pipeline_value(
+            {
+                "hidden_out_f32": base64.b64encode(b"\x00" * 8).decode("ascii"),
+                "hidden_out_sha256": "0" * 64,
+            },
+            hidden_spec={"n_tokens": 1, "n_embd": 2},
+        )
 
 
 def _model_identity():
@@ -1262,6 +1402,58 @@ def test_full_task_worker_takes_precedence_over_automatic_layer_assignment(
     assert sent[-1][1]["release"] is True
     assert "start_layer" not in sent[-1][1]
     assert "worker_01" in scheduler._pipeline_worker_opt_out
+
+
+def test_route_a_android_assignment_never_publishes_legacy_layer_config(monkeypatch):
+    from scheduler import NodeInfo, NodeRole, NodeState, Scheduler
+
+    scheduler = Scheduler()
+    scheduler._role_override = "master"
+    scheduler.nodes["android_01"] = NodeInfo(
+        node_id="android_01",
+        role=NodeRole.CLIENT,
+        node_type="android",
+        state=NodeState.ONLINE,
+    )
+    sent = []
+    scheduler._tcp_server = type("Server", (), {
+        "_running": True,
+        "clients": {"android_01": object()},
+        "get_client_ids": lambda self: ["android_01"],
+        "send_layer_config": lambda self, node_id, payload: sent.append(
+            (node_id, payload)
+        ),
+    })()
+    monkeypatch.setattr(scheduler, "get_effective_node_id", lambda: "master")
+    monkeypatch.setattr(
+        scheduler,
+        "_task_worker_layer_stage_ids",
+        lambda connected: {"android_01"},
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "get_layer_assignments",
+        lambda: {"assignments": [
+            {"node_id": "master", "start_layer": 0, "end_layer": 4},
+            {"node_id": "android_01", "start_layer": 4, "end_layer": 8},
+        ]},
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_get_active_pipeline_model_info",
+        lambda: {
+            "model_id": "qwen-1_8b",
+            "model_sha256": "1" * 64,
+            "model_type": "qwen",
+            "total_layers": 8,
+            "quant_type": "fp16",
+        },
+    )
+
+    scheduler.push_layer_config_to_clients()
+
+    assert sent == []
+    assert scheduler._layer_config_expected == {}
 
 
 @pytest.mark.parametrize("previously_opted_out", [False, True])

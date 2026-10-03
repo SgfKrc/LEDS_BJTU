@@ -398,7 +398,27 @@ class ModelHost:
                 "model_name": model_id,
                 "error": None,
             }
-        return self._manager.switch_model(
+        # ★ 切回非 GGUF 引擎前，先确认 `_manager` 仍是模型管理器：`_load_gguf_model`
+        #   会把 `LlamaCppEngine` 装成 `_manager`（它没有 `switch_model`），此时直接
+        #   转发会抛 AttributeError。
+        # ★ 切回非 GGUF 引擎前，先确认 `_manager` 仍是模型管理器：`_load_gguf_model`
+        #   会把 `LlamaCppEngine` 装成 `_manager`（它没有 `switch_model`），此时直接
+        #   转发会抛 AttributeError。
+        manager = self._manager
+        if not hasattr(manager, "switch_model"):
+            if hasattr(manager, "unload"):
+                manager.unload()
+            object.__setattr__(self, "_manager", _LazyModelManager())
+            object.__setattr__(self, "model_loaded", False)
+            # `_load_gguf_model` 用 object.__setattr__ 把这些镜像属性写进了**实例字典**
+            # （绕过 __getattr__ 代理），读取时命中实例字典。留着会把上一档的值带进
+            # 新引擎 —— 尤其 `_engine_type` 停在 "llama_cpp" 时，api_server 会按 GGUF
+            # 分支处理请求，把请求 kwargs 原样喂给 torch。移除后恢复代理语义。
+            for _name in ("_engine_type", "quant_type", "model_path",
+                          "active_model_id", "_active_model_id"):
+                object.__getattribute__(self, "__dict__").pop(_name, None)
+            manager = self._manager
+        return manager.switch_model(
             model_id=model_id,
             quant_type=quant_type,
             profile=profile,

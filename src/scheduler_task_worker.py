@@ -20,6 +20,7 @@ from task_provider import (
 from task_worker_adapter import RemoteFullWorkerProvider, remote_provider_id
 from task_worker_protocol import (
     PROTOCOL_VERSION as TASK_WORKER_PROTOCOL_VERSION,
+    RUNTIME_PROFILE_UNSPECIFIED,
     WorkerMessage,
     WorkerProtocolError,
     build_message as build_task_worker_message,
@@ -50,6 +51,50 @@ class _TaskWorkerActiveAttempt:
 
 
 class SchedulerTaskWorkerMixin:
+    def _configured_layer_artifact(self) -> dict | None:
+        """从 env 指定的层段工件推导身份与层区间；取不到返回 None。
+
+        读同目录同名的 `.manifest.json`（`scripts/cut_layers.py` 产出）。这里刻意
+        **不依赖** master 下发的 layer config —— 声明必须能先于配置成立，否则首次
+        hello 会形成死锁（见 `_task_worker_capabilities` 里的说明）。
+
+        返回的 `sha256` 用**工件自身**的摘要（不是源模型摘要）：Route A 的 offer 身份
+        要与 worker 手上那份 GGUF 对齐，`task_worker_adapter._layer_model_matches`
+        比对的正是这一项。
+        """
+        import json
+        import os
+        from pathlib import Path
+
+        model_path = os.environ.get("QLH_LAYER_GGUF", "").strip()
+        if not model_path:
+            return None
+        manifest_path = Path(model_path).with_suffix(".manifest.json")
+        if not manifest_path.is_file():
+            return None
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        value = data.get("source_layer_range")
+        if not (isinstance(value, list) and len(value) == 2):
+            return None
+        if any(isinstance(item, bool) or not isinstance(item, int) for item in value):
+            return None
+        if value[0] < 0 or value[1] <= value[0]:
+            return None
+        # `model_id` 取**文件名**，不用 manifest 的 `artifact` 字段：后者是相对路径
+        # （含 `\`），而协议对它的要求是 `^[A-Za-z0-9_.:-]{1,128}$` —— 反斜杠不合法 ⇒
+        # 整个 hello 会被判 `payload.capabilities.models[0].model_id is invalid`，worker
+        # 永远进不了 `admitted`（实测：这条错误被 legacy 通道的噪声盖了很久才浮出来）。
+        return {
+            "start": int(value[0]),
+            "end": int(value[1]),
+            "model_id": Path(model_path).name,
+            "sha256": str(data.get("artifact_sha256", "") or ""),
+            "revision": str(data.get("generator_version", "") or ""),
+        }
+
     def _task_worker_capabilities(self) -> dict:
         """Build an honest PC Full Worker snapshot without loading a model."""
         engines = []
@@ -120,22 +165,76 @@ class SchedulerTaskWorkerMixin:
         layer_worker = bool(
             active_layer_config or getattr(self._host, "layer_range", None)
         )
+        # ★ 2026-10-03：载了层段工件就同时承担 v3 层段 Stage。此前 `stage_types` 硬编码
+        #   两个整模类型，而层段执行路径（`_handle_task_worker_stage_offer`）已实现 ——
+        #   结果是 PC worker 永远不会被派到 `layer_forward`。
+        stage_types = ["full_inference", "aggregate"]
+        layer_ranges: list[list[int]] = []
+        if layer_worker:
+            layer_range = active_layer_config.get("layer_range")
+            if (
+                isinstance(layer_range, (list, tuple))
+                and len(layer_range) == 2
+                and not any(
+                    isinstance(value, bool) or not isinstance(value, int)
+                    for value in layer_range
+                )
+            ):
+                layer_ranges.append([int(layer_range[0]), int(layer_range[1])])
+        else:
+            # 首次 hello 时 master 还没下发 layer config —— 它只对**已声明**层段能力的
+            # worker 下发。若这里只看 `_active_layer_config` 就形成死锁：声明为空 ⇒
+            # 分配器没有区间约束 ⇒ 分到手上没有的区间 ⇒ `layer_range_not_advertised`
+            # 被拒 ⇒ 永远拿不到配置。改为从**工件 manifest** 推导，使声明先于配置成立。
+            artifact = self._configured_layer_artifact()
+            if artifact is not None:
+                layer_worker = True
+                layer_ranges.append([artifact["start"], artifact["end"]])
+                # 层段 worker 不加载整模 ⇒ `models` 会是空的，而 Route A 的 offer 身份
+                # 正是从这里取（`_route_a_stage_model_identity`）⇒ 缺了它整条链会以
+                # `route_a_stage_model_identity_unavailable` 失败。用**工件身份**顶上：
+                # `task_worker_adapter._layer_model_matches` 比对的就是 engine/format/sha256。
+                if artifact.get("sha256"):
+                    models.append({
+                        "model_id": artifact["model_id"],
+                        "engine": "llama_cpp",
+                        "format": "gguf",
+                        "revision": artifact["revision"],
+                        "sha256": artifact["sha256"],
+                    })
+        if layer_worker and "layer_forward" not in stage_types:
+            stage_types.append("layer_forward")
         return {
-            "stage_types": ["full_inference", "aggregate"],
+            "stage_types": stage_types,
             "engines": engines,
             "models": models,
             "max_concurrency": 1,
+            "runtime_profile": self._runtime_profile_for_capabilities(),
             # A distributed-only layer/relay worker is intentionally not a
             # Full Worker.  Its segment capability is negotiated by the
             # layer-config contract, so advertising no full-model identity
             # must not cause the coordinator to opt it out of layer work.
             "layer_worker": layer_worker,
+            # 当前**就绪、马上能跑**的层区间（与 `layer_budget` 的"承载上限"分工明确）。
+            "layer_ranges": layer_ranges,
             "relay_middle": bool(
                 active_layer_config
                 and str(active_layer_config.get("engine", ""))
                 == "relay_middle"
             ),
         }
+
+    @staticmethod
+    def _runtime_profile_for_capabilities() -> str:
+        """Return the launcher-selected release profile without probing engines."""
+        try:
+            from device_profiler import detect_runtime_profile
+
+            return detect_runtime_profile()
+        except Exception:
+            # A malformed or partial slim installation must remain visible as
+            # unspecified; it must never claim a stronger release profile.
+            return RUNTIME_PROFILE_UNSPECIFIED
 
 
     def _send_task_worker_hello(
@@ -481,12 +580,32 @@ class SchedulerTaskWorkerMixin:
         if not self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED'):
             reject_reason = "worker_experiment_disabled"
             reject_retryable = True
-        elif not coordinator.get("manual_stage_dispatch_enabled"):
-            reject_reason = "worker_not_admitted"
-            reject_retryable = True
-        elif offer["provider_id"] != expected_provider:
-            reject_reason = "provider_identity_mismatch"
         else:
+            # Layer workers are admitted through the v3 layer capability gate;
+            # full-model stages keep the legacy manual dispatch gate.  Older
+            # coordinators do not publish the layer flag, so retain the
+            # connected/manual fallback for wire compatibility.
+            # ★ 2026-10-03：层段的准入判据必须来自**本机自己的** capabilities。
+            #   两个坑：① 原来的 `coordinator["layer_stage_dispatch_enabled"]` 描述的是
+            #   "别的 worker 里有没有层段就绪的"（见 `get_task_worker_protocol_status` 里
+            #   `layer_stage_worker_ids` 的构造）⇒ 拿它判自己会把本机的合法 offer 拒成
+            #   `worker_not_admitted`；② 想把"自己的判据"塞进 `coordinator_snapshot()`
+            #   也走不通 —— 那返回的是**协调者**的快照，不是本机的状态。所以直接在本地算，
+            #   口径与 master 侧 `task_worker_adapter.py:359` 一致。
+            if offer.get("stage_type") == "layer_forward":
+                capabilities = self._task_worker_capabilities()
+                dispatch_enabled = bool(
+                    capabilities.get("layer_ranges")
+                    and "layer_forward" in (capabilities.get("stage_types") or [])
+                )
+            else:
+                dispatch_enabled = coordinator.get("manual_stage_dispatch_enabled")
+            if not dispatch_enabled:
+                reject_reason = "worker_not_admitted"
+                reject_retryable = True
+        if not reject_reason and offer["provider_id"] != expected_provider:
+            reject_reason = "provider_identity_mismatch"
+        elif not reject_reason:
             capabilities = self._task_worker_capabilities()
             if offer["stage_type"] not in capabilities["stage_types"]:
                 reject_reason = "unsupported_stage_type"
@@ -573,6 +692,14 @@ class SchedulerTaskWorkerMixin:
                 dependencies=offer["dependencies"],
                 root_input=offer["root_input"],
                 model_identity=model_identity,
+                stage_fields={
+                    key: offer[key]
+                    for key in (
+                        "layer_range", "handoff_at", "hidden_sha256",
+                        "hidden_spec", "middle_channel", "seq_ids", "positions",
+                    )
+                    if key in offer
+                },
             )
             with self._host.full_chat_execution_lock:
                 with self._inference_lock:
@@ -743,6 +870,12 @@ class SchedulerTaskWorkerMixin:
                         coordinator_node_id=self.get_effective_node_id(),
                     )
                     self._send_task_worker_to_node(client_id, ack)
+                    # The registration fence must end for both an accepted
+                    # hello and a definitive rejection.  A rejected hello is
+                    # no longer negotiating the task-worker path, so legacy
+                    # scheduling can be recomputed for that connection.
+                    self._task_worker_control.resolve_worker_connection_pending(client_id)
+                    self.push_layer_config_to_clients()
                     if ack.payload["accepted"]:
                         self._ensure_remote_task_worker_provider(client_id)
                         # A node that has just advertised a complete model is
@@ -868,6 +1001,7 @@ class SchedulerTaskWorkerMixin:
                 for worker in healthy_workers
                 if isinstance(worker.get("capabilities"), dict)
                 and bool(worker["capabilities"].get("models"))
+                and not bool(worker["capabilities"].get("layer_worker"))
                 and (
                     worker.get("worker_kind") != "android_full_worker"
                     or (
@@ -882,6 +1016,11 @@ class SchedulerTaskWorkerMixin:
                 for worker in healthy_workers
                 if str(worker.get("node_id", "")) not in full_model_worker_ids
             )
+            layer_stage_worker_ids = sorted(
+                str(worker.get("node_id", ""))
+                for worker in healthy_workers
+                if worker.get("layer_stage_dispatch_enabled")
+            )
         else:
             local_models = self._task_worker_capabilities().get("models", [])
             full_model_worker_ids = (
@@ -890,7 +1029,16 @@ class SchedulerTaskWorkerMixin:
             workers_missing_full_model = (
                 [self.get_effective_node_id()] if connected and not local_models else []
             )
+            local_caps = self._task_worker_capabilities()
+            layer_stage_worker_ids = (
+                [self.get_effective_node_id()]
+                if connected
+                and "layer_forward" in local_caps.get("stage_types", [])
+                and local_caps.get("layer_ranges")
+                else []
+            )
         full_model_ready = bool(full_model_worker_ids)
+        layer_stage_ready = bool(layer_stage_worker_ids)
         if not self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED'):
             readiness_reason = "task_worker_experiment_disabled"
         elif not connected:
@@ -911,9 +1059,37 @@ class SchedulerTaskWorkerMixin:
             "manual_stage_dispatch_enabled": bool(
                 self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED') and connected and full_model_ready
             ),
+            "layer_stage_dispatch_enabled": bool(
+                self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED')
+                and connected and layer_stage_ready
+            ),
+            # ★ 2026-10-03：上面那个字段的判据是 `layer_stage_worker_ids` —— 那是
+            #   **别的** worker 的 id 集合（用于向调度侧汇报"当前有谁在承层段"）。
+            #   而 worker 在 `_handle_task_worker_stage_offer` 里判"我是否被允许接
+            #   层段 Stage"时读的也是它 ⇒ 语义错位：本机明明声明了 layer_forward +
+            #   layer_ranges，却因为**别的**节点没就绪而把自己的 offer 拒成
+            #   `worker_not_admitted`（实测：三段链的 Surface 因此一直拒收）。
+            #   这里按**自己的** capabilities 给出同名字段，口径与 master 侧
+            #   `task_worker_adapter.py:359` 一致。
+            "self_layer_stage_dispatch_enabled": bool(
+                self._scheduler_facade_global('TASK_WORKER_EXPERIMENTAL_ENABLED')
+                and connected
+                and "layer_forward" in (
+                    self._task_worker_capabilities().get("stage_types") or []
+                )
+                and self._task_worker_capabilities().get("layer_ranges")
+            ),
             "full_model_worker_count": len(full_model_worker_ids),
             "full_model_worker_ids": full_model_worker_ids,
             "workers_missing_full_model": workers_missing_full_model,
+            "layer_stage_worker_count": len(layer_stage_worker_ids),
+            "layer_stage_worker_ids": layer_stage_worker_ids,
+            "workers_missing_layer_stage": sorted(
+                str(worker.get("node_id", ""))
+                for worker in healthy_workers
+                if str(worker.get("node_id", ""))
+                and not worker.get("layer_stage_dispatch_enabled")
+            ) if role == "master" else [],
             "worker_readiness_reason": readiness_reason,
             "admission_state": (
                 "n2_4_experimental_physical_validation_pending"

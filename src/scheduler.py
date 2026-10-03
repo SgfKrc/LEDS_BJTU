@@ -2560,6 +2560,42 @@ class Scheduler(
         with self._nodes_lock:
             snapshot = list(self.nodes.items())
 
+        # Task-worker v3 ranges are an execution contract, not merely a
+        # readiness hint. Feed admitted Android ranges into the capacity
+        # solver so it cannot produce an assignment the worker must reject.
+        layer_ranges_by_node: dict[str, list[list[int]]] = {}
+        # ★ 2026-10-03：设备自荐的层容量（本地裁层后可承载的层数上限）。与
+        #   `layer_ranges` 同源（v3 hello capabilities）但语义不同：ranges 是
+        #   "当前已就绪、马上能跑的区间"，budget 是"能自裁并承载的上限" ⇒ 有了它，
+        #   求解器才能给该节点分配任意连续区间，而不是被它预置的那一段钉死。
+        layer_budget_by_node: dict[str, dict] = {}
+        if self._effective_role() == "master" and TASK_WORKER_EXPERIMENTAL_ENABLED:
+            try:
+                worker_status = self._task_worker_control.status(role="master")
+            except Exception:
+                worker_status = {}
+            for worker in worker_status.get("workers", []):
+                if not isinstance(worker, dict) or not worker.get("layer_stage_dispatch_enabled"):
+                    continue
+                capabilities = worker.get("capabilities")
+                if not isinstance(capabilities, dict):
+                    continue
+                node_id = str(worker.get("node_id", "") or "")
+                if not node_id:
+                    continue
+                ranges = capabilities.get("layer_ranges")
+                if isinstance(ranges, list) and ranges:
+                    layer_ranges_by_node[node_id] = ranges
+                budget = capabilities.get("layer_budget")
+                if isinstance(budget, dict):
+                    layer_budget_by_node[node_id] = budget
+        if layer_ranges_by_node or layer_budget_by_node:
+            logger.info(
+                "容量节点层段投影: ranges=%s budget=%s",
+                {k: v for k, v in layer_ranges_by_node.items()},
+                {k: v.get("max_layers") for k, v in layer_budget_by_node.items()},
+            )
+
         records = []
         effective_id = self.get_effective_node_id()
         for node_id, node in snapshot:
@@ -2650,7 +2686,22 @@ class Scheduler(
                     except (TypeError, ValueError):
                         capacity_gb = 0.0
                 capacity_source = "ram.available_gb" if capacity_gb > 0 else ""
-            records.append({
+                # Android presence reports the same free-memory evidence as
+                # an absolute byte count.  Do not discard an admitted layer
+                # worker merely because it does not use the PC `ram` shape.
+                if capacity_gb <= 0:
+                    memory = device_info.get("memory", {})
+                    if isinstance(memory, dict):
+                        try:
+                            available_bytes = float(
+                                memory.get("available_bytes", 0) or 0
+                            )
+                        except (TypeError, ValueError):
+                            available_bytes = 0.0
+                        if available_bytes > 0:
+                            capacity_gb = available_bytes / (1024 ** 3)
+                            capacity_source = "memory.available_bytes"
+            record = {
                 "node_id": node_id,
                 "role": node.role,
                 "capacity_bytes": max(0, int(capacity_gb * 1024 ** 3)),
@@ -2659,7 +2710,12 @@ class Scheduler(
                 "execution_device": execution_device,
                 "capacity_source": capacity_source,
                 "score": self._compute_node_weight(device_info),
-            })
+            }
+            if node_id in layer_ranges_by_node:
+                record["layer_ranges"] = layer_ranges_by_node[node_id]
+            if node_id in layer_budget_by_node:
+                record["layer_budget"] = layer_budget_by_node[node_id]
+            records.append(record)
         return records
 
     def _pipeline_node_metadata(self) -> dict[str, dict]:
@@ -2937,9 +2993,17 @@ class Scheduler(
                     transaction_snapshot = None
                     transaction_plan = None
             if active:
+                if active.get("reason_code") == "pipeline_layer_range_coverage_insufficient":
+                    active["reason"] = (
+                        "advertised layer_ranges cannot cover the requested contiguous layer interval"
+                    )
                 return self._attach_pipeline_node_contract(active)
             if transaction_snapshot and transaction_plan:
                 transaction_plan.update(transaction_snapshot)
+                if transaction_plan.get("reason_code") == "pipeline_layer_range_coverage_insufficient":
+                    transaction_plan["reason"] = (
+                        "advertised layer_ranges cannot cover the requested contiguous layer interval"
+                    )
                 return self._attach_pipeline_node_contract(transaction_plan)
 
         if descriptor is None:
@@ -2961,7 +3025,7 @@ class Scheduler(
                 "model_type": str(descriptor.get("model_type", "") or ""),
                 "assignments": [],
             }
-        from config import PIPELINE_CAPACITY_SAFETY_MARGIN
+        from config import PIPELINE_CAPACITY_SAFETY_MARGIN, PIPELINE_PREFER_ALL_WORKERS
 
         # ★ Y 档第二条：relay 段认领的层由远端段执行 ⇒ 本机层节点的容量上界是 `k`
         #   （未被认领的前缀）。这里复用调度层的**同一套校验**（重叠 / 角色 / 连续性）；
@@ -2986,6 +3050,11 @@ class Scheduler(
             }
 
         try:
+            logger.info(
+                "容量求解输入: local_layer_budget=%s relay_claims=%s eligible=%s",
+                local_layer_budget, relay_claims,
+                sorted(eligible_node_ids) if eligible_node_ids else None,
+            )
             result = solve_pipeline_capacity(
                 descriptor,
                 self._get_pipeline_capacity_nodes(eligible_node_ids),
@@ -2993,6 +3062,7 @@ class Scheduler(
                 require_distributed=require_distributed,
                 local_layer_budget=local_layer_budget,
                 relay_claims=relay_claims,
+                prefer_all_workers=PIPELINE_PREFER_ALL_WORKERS,
             )
         except PipelineCapacityError as exc:
             return {
@@ -3005,6 +3075,16 @@ class Scheduler(
         result["computed_at"] = time.time()
         result["transaction_phase"] = "planned" if result.get("admitted") else "rejected"
         result.setdefault("require_distributed", bool(require_distributed))
+        logger.info(
+            "容量求解结果: admitted=%s reason=%s assignments=%s",
+            result.get("admitted"), result.get("reason_code"),
+            [(a.get("node_id"), a.get("start_layer"), a.get("end_layer"))
+             for a in result.get("assignments", [])],
+        )
+        if result.get("reason_code") == "pipeline_layer_range_coverage_insufficient":
+            result["reason"] = (
+                "advertised layer_ranges cannot cover the requested contiguous layer interval"
+            )
         return self._attach_pipeline_node_contract(result)
 
     def _build_manual_pipeline_capacity_plan(
@@ -3373,7 +3453,21 @@ class Scheduler(
                 qwen3_release, best_effort=True,
             )
 
-        self.push_layer_config_to_clients()
+        # REGISTER ACK precedes the client's task-worker hello. Fence this
+        # connection from legacy layer assignment until that hello arrives.
+        # The hello handler resolves the fence and triggers a fresh push.
+        task_worker_handshake_pending = (
+            TASK_WORKER_EXPERIMENTAL_ENABLED
+            and getattr(node, "node_type", "pc") in {"pc", "android"}
+        )
+        if task_worker_handshake_pending:
+            self._task_worker_control.mark_worker_connection_pending(client_id)
+            logger.info(
+                "legacy_layer_config skipped reason=task_worker_handshake_pending node=%s",
+                client_id,
+            )
+        else:
+            self.push_layer_config_to_clients()
         self._push_node_list_to_client(client_id)
         self._push_node_update_to_all_clients(
             client_id, "add", self.nodes.get(client_id)

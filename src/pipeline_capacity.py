@@ -42,6 +42,78 @@ def _positive_float(value: Any, field: str) -> float:
     return parsed
 
 
+def _normalize_layer_ranges(
+    value: Any,
+    field: str,
+    *,
+    total_layers: int | None = None,
+) -> tuple[tuple[int, int], ...]:
+    """Validate a worker's advertised half-open layer intervals."""
+    if not isinstance(value, (list, tuple)):
+        raise PipelineCapacityError(f"{field} must be a list of [start, end) ranges")
+    normalized: list[tuple[int, int]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise PipelineCapacityError(
+                f"{field}[{index}] must be a [start, end) range"
+            )
+        start, end = item
+        if (
+            isinstance(start, bool)
+            or isinstance(end, bool)
+            or not isinstance(start, int)
+            or not isinstance(end, int)
+        ):
+            raise PipelineCapacityError(
+                f"{field}[{index}] bounds must be integers"
+            )
+        if start < 0 or end <= start:
+            raise PipelineCapacityError(
+                f"{field}[{index}] must satisfy 0 <= start < end"
+            )
+        if total_layers is not None and end > total_layers:
+            raise PipelineCapacityError(
+                f"{field}[{index}] exceeds total_layers={total_layers}"
+            )
+        normalized.append((start, end))
+    return tuple(sorted(set(normalized)))
+
+
+def _normalize_layer_budget(value: Any, field: str) -> dict[str, Any]:
+    """Validate a worker's self-declared forward-layer budget.
+
+    与 `layer_ranges` 的分工：`layer_ranges` 是该节点**当前已就绪、马上能跑**的区间；
+    `layer_budget.max_layers` 是它在本地裁层之后**能承载的层数上限**。有了后者，
+    调度可以把任意连续区间分配给具备本地裁层条件的节点，而不是只能迁就它手上
+    那份预先切好的工件。
+    """
+    if not isinstance(value, dict):
+        raise PipelineCapacityError(f"{field} must be an object")
+    for key in ("available_bytes", "per_layer_bytes", "max_layers"):
+        if key not in value:
+            raise PipelineCapacityError(f"{field}.{key} is required")
+    available_bytes = _non_negative_int(
+        value["available_bytes"], f"{field}.available_bytes"
+    )
+    per_layer_bytes = _non_negative_int(
+        value["per_layer_bytes"], f"{field}.per_layer_bytes"
+    )
+    if per_layer_bytes <= 0:
+        raise PipelineCapacityError(f"{field}.per_layer_bytes must be positive")
+    max_layers = _non_negative_int(value["max_layers"], f"{field}.max_layers")
+    if max_layers <= 0:
+        raise PipelineCapacityError(f"{field}.max_layers must be positive")
+    local_cut = value.get("local_cut", False)
+    if not isinstance(local_cut, bool):
+        raise PipelineCapacityError(f"{field}.local_cut must be a boolean")
+    return {
+        "available_bytes": available_bytes,
+        "per_layer_bytes": per_layer_bytes,
+        "max_layers": max_layers,
+        "local_cut": local_cut,
+    }
+
+
 def _descriptor_costs(
     descriptor: dict[str, Any],
 ) -> tuple[list[int], int, int, int]:
@@ -107,7 +179,11 @@ def _descriptor_costs(
     return layer_bytes, embedding_bytes, per_node_bytes, output_bytes
 
 
-def _normalize_nodes(nodes: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _normalize_nodes(
+    nodes: list[dict[str, Any]],
+    *,
+    total_layers: int | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if not isinstance(nodes, list):
         raise PipelineCapacityError("nodes must be a list")
     usable: list[dict[str, Any]] = []
@@ -136,7 +212,7 @@ def _normalize_nodes(nodes: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
                 "capacity_source": capacity_source,
             })
             continue
-        usable.append({
+        normalized = {
             "node_id": node_id,
             "role": str(raw.get("role", "client") or "client"),
             "capacity_bytes": capacity_bytes,
@@ -147,7 +223,19 @@ def _normalize_nodes(nodes: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
             "score": float(raw.get("score", 0.0) or 0.0),
             "capacity_source": capacity_source,
             "execution_device": str(raw.get("execution_device", "unknown") or "unknown"),
-        })
+        }
+        if "layer_ranges" in raw:
+            normalized["layer_ranges"] = _normalize_layer_ranges(
+                raw.get("layer_ranges"),
+                f"node[{node_id}].layer_ranges",
+                total_layers=total_layers,
+            )
+        # ★ 2026-10-03：设备自荐的层容量（本地裁层后可承载的层数上限）。
+        if "layer_budget" in raw:
+            normalized["layer_budget"] = _normalize_layer_budget(
+                raw.get("layer_budget"), f"node[{node_id}].layer_budget"
+            )
+        usable.append(normalized)
     usable.sort(
         key=lambda node: (
             node["role"] != "master",
@@ -216,6 +304,7 @@ def solve_pipeline_capacity(
     require_distributed: bool = False,
     local_layer_budget: int | None = None,
     relay_claims: dict[str, tuple[int, int]] | None = None,
+    prefer_all_workers: bool = False,
 ) -> dict[str, Any]:
     """Return an all-or-nothing contiguous layer placement.
 
@@ -226,6 +315,12 @@ def solve_pipeline_capacity(
     deliberately rejected; the returned plan must contain at least two
     participating nodes. This is used by an explicitly distributed request,
     while ordinary capacity inspection remains single-node efficient.
+
+    ``prefer_all_workers`` flips the optimization between feasible placements
+    from "fewest nodes" (default: least network hops) to "most nodes" — the
+    latter is what exercises multi-segment chains (master + middle + tail),
+    which the default criterion would never pick because two segments are
+    always fewer.
     """
 
     safety_margin = _positive_float(safety_margin, "safety_margin")
@@ -234,7 +329,7 @@ def solve_pipeline_capacity(
     layer_bytes, embedding_bytes, per_node_bytes, output_bytes = _descriptor_costs(
         descriptor
     )
-    usable, excluded = _normalize_nodes(nodes)
+    usable, excluded = _normalize_nodes(nodes, total_layers=len(layer_bytes))
     # ★ A1 / X 档（Y 档第二条缺口 6）：relay 段节点**不占层、不计容量**，但**算参与节点**。
     #   `scheduler.py` 的 `_get_pipeline_capacity_nodes` 给它打 `capacity_source="relay_exempt"`
     #   （段工件在远端 relay_mid_service，本节点只转发 ⇒ 不需要本地容量预算）。
@@ -298,6 +393,42 @@ def solve_pipeline_capacity(
         }
 
     @lru_cache(maxsize=None)
+    def _range_shortfall(candidate) -> int:
+        """声明了 `layer_ranges` 的节点中，分配区间**没有正好跑满** advertised 区间的个数。
+
+        `layer_ranges` 的语义是"该节点手上**已经有工件**的区间"。只把它当 ⊆ 约束是不够的：
+        在 `prefer_all_workers`（节点数最多）下，求解器会尽量把每个节点切小，于是这个
+        节点会拿到自己工件覆盖不到的另一段，offer 必然被 `layer_range_not_advertised`
+        拒掉。
+
+        ⚠️ **未参与的节点同样计入**。否则"完全不用这台 worker"（它不在 candidate 里 ⇒
+        不计）会与"让它跑满自己的区间"并列在 0，随后 `prefer_all_workers` 又把节点数
+        更多、但区间切碎的解选出来 —— 实测踩到（Surface 被分到 `[1,16)`）。
+        """
+        used: dict[int, tuple[int, int]] = {
+            value[0]: (value[1], value[2]) for value in candidate
+        }
+        shortfall = 0
+        for index, node in enumerate(usable):
+            ranges = node.get("layer_ranges")
+            if not ranges:
+                continue
+            # 与 `search` 里的硬约束保持同一条件：设备声明了"能按分配在本地裁层"
+            # （`layer_budget.local_cut=true`）时，`layer_ranges` 只表示"当前已就绪"，
+            # 不再是它的能力边界 ⇒ 不参与"是否跑满"的衡量。
+            budget = node.get("layer_budget")
+            if budget is not None and budget.get("local_cut"):
+                continue
+            span = used.get(index)
+            if span is None:
+                shortfall += 1
+                continue
+            cursor, end = span
+            if not any(start == cursor and stop == end for start, stop in ranges):
+                shortfall += 1
+        return shortfall
+
+    @lru_cache(maxsize=None)
     def search(node_index: int, cursor: int, started: bool, used_count: int):
         if cursor == layer_budget:
             # ★ Y 档第二条：relay 段**算参与节点**（它承载远端段工件），只是不占本机容量
@@ -314,6 +445,20 @@ def solve_pipeline_capacity(
         remaining = layer_budget - cursor
         for count in range(remaining, 0, -1):
             end = cursor + count
+            # ★ 2026-10-03：`layer_budget.max_layers` 是承载上界，始终生效。
+            advertised_budget = node.get("layer_budget")
+            if advertised_budget is not None and count > advertised_budget["max_layers"]:
+                continue
+            # 只有当设备声明"能按分配在本地裁层"（`local_cut=true`）时，`layer_ranges`
+            # 才降级为"当前已就绪"的信息、不再限制分配；否则它仍是硬约束 ——
+            # 派给设备一个它手上没有工件的区间，请求必然失败。
+            if advertised_budget is None or not advertised_budget.get("local_cut"):
+                allowed_ranges = node.get("layer_ranges")
+                if allowed_ranges is not None and not any(
+                    start <= cursor and end <= allowed_end
+                    for start, allowed_end in allowed_ranges
+                ):
+                    continue
             raw_bytes = prefix[end] - prefix[cursor] + per_node_bytes
             has_embedding = not started
             has_lm_head = end == layer_budget
@@ -341,12 +486,14 @@ def solve_pipeline_capacity(
                 best = candidate
                 continue
             candidate_key = (
-                len(candidate),
+                _range_shortfall(candidate),
+                (-len(candidate) if prefer_all_workers else len(candidate)),
                 -min(usable[value[0]]["capacity_bytes"] - value[4] for value in candidate),
                 -sum(usable[value[0]]["score"] for value in candidate),
             )
             best_key = (
-                len(best),
+                _range_shortfall(best),
+                (-len(best) if prefer_all_workers else len(best)),
                 -min(usable[value[0]]["capacity_bytes"] - value[4] for value in best),
                 -sum(usable[value[0]]["score"] for value in best),
             )
@@ -360,6 +507,38 @@ def solve_pipeline_capacity(
             max(0, node["capacity_bytes"] - node["reserve_bytes"])
             for node in usable
         )
+        # Distinguish a topology contract failure from a plain memory
+        # shortage. Re-run the same admission with the range contract
+        # removed; only a plan that becomes admissible proves the advertised
+        # ranges are the cause of the rejection.
+        range_constrained = any(node.get("layer_ranges") is not None for node in usable)
+        unconstrained_admission = False
+        if range_constrained:
+            unconstrained_nodes = [
+                {key: value for key, value in node.items() if key != "layer_ranges"}
+                for node in usable
+            ]
+            unconstrained = solve_pipeline_capacity(
+                descriptor,
+                unconstrained_nodes + relay_only,
+                safety_margin=safety_margin,
+                require_distributed=require_distributed,
+                local_layer_budget=local_layer_budget,
+                relay_claims=relay_claims,
+            )
+            unconstrained_admission = bool(unconstrained.get("admitted"))
+        if range_constrained and unconstrained_admission:
+            return {
+                **base,
+                "status": "rejected",
+                "admitted": False,
+                "reason_code": "pipeline_layer_range_coverage_insufficient",
+                "reason": "advertised layer_ranges cannot cover the requested contiguous layer interval",
+                "allocatable_bytes": allocatable_bytes,
+                "raw_capacity_deficit_bytes": max(0, raw_model_bytes - allocatable_bytes),
+                "assignments": [],
+                "control_only_nodes": [node["node_id"] for node in usable],
+            }
         return {
             **base,
             "status": "rejected",
@@ -380,7 +559,7 @@ def solve_pipeline_capacity(
     for node_index, start, end, raw_bytes, required, has_embedding, has_lm_head in solved:
         node = usable[node_index]
         used_ids.add(node["node_id"])
-        assignments.append({
+        assignment = {
             "node_id": node["node_id"],
             "role": node["role"],
             "start_layer": start,
@@ -397,28 +576,42 @@ def solve_pipeline_capacity(
             "execution_device": node["execution_device"],
             "capacity_source": node["capacity_source"],
             "score": node["score"],
-        })
+        }
+        if "layer_ranges" in node:
+            assignment["layer_ranges"] = [
+                [range_start, range_end]
+                for range_start, range_end in node["layer_ranges"]
+            ]
+        assignments.append(assignment)
 
     plan_identity = {
         "descriptor_sha256": str(descriptor.get("model_sha256", "") or ""),
         "model_id": base["model_id"],
         "safety_margin": safety_margin,
-        "assignments": [
-            {
-                key: item[key]
-                for key in (
-                    "node_id", "start_layer", "end_layer", "has_embedding",
-                    "has_lm_head", "required_bytes", "capacity_bytes",
-                )
-            }
-            for item in assignments
-        ],
+        "assignments": [],
     }
+    for item in assignments:
+        identity_item = {
+            key: item[key]
+            for key in (
+                "node_id", "start_layer", "end_layer", "has_embedding",
+                "has_lm_head", "required_bytes", "capacity_bytes",
+            )
+        }
+        if "layer_ranges" in item:
+            identity_item["layer_ranges"] = item["layer_ranges"]
+        plan_identity["assignments"].append(identity_item)
     plan_id = hashlib.sha256(
         json.dumps(plan_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     full_model_fits = []
     for node in usable:
+        allowed_ranges = node.get("layer_ranges")
+        if allowed_ranges is not None and not any(
+            start <= 0 and total_layers <= end
+            for start, end in allowed_ranges
+        ):
+            continue
         required = _required_bytes(raw_model_bytes, node, safety_margin)
         if required <= node["capacity_bytes"]:
             full_model_fits.append(node["node_id"])

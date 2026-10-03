@@ -58,6 +58,15 @@ MODEL_PROFILE_METADATA: dict[str, dict] = {
         "resources": {"min_ram_gb": 3.0, "min_vram_gb": 1.5, "min_disk_gb": 2.0, "edge_compatible": True},
         "evidence": {"probe_ticket": "M-SM-B1", "artifact_digest_mode": "missing"},
     },
+    "qwen25-05b-f16": {
+        "revision": "contrast-qwen25-0.5b-f16-v1",
+        "template": "qwen_chat_v1",
+        "thinking": "unknown",
+        "vision": "unknown",
+        "roles": ("answer", "summarizer"),
+        "resources": {"min_ram_gb": 3.0, "min_vram_gb": 1.5, "min_disk_gb": 2.0, "edge_compatible": True},
+        "evidence": {"artifact_digest_mode": "missing"},
+    },
     "qwen3-0.6b": {
         "revision": "builtin-qwen3-0.6b-v2",
         "template": "qwen3_chat_v1",
@@ -268,6 +277,23 @@ BUILTIN_MODELS: list[ModelConfig] = [
         huggingface_id="Qwen/Qwen2.5-0.5B-Instruct",
         quant_types=["fp16", "int8", "int4", "Q4_K_M"],
         description="亚 1B 轻量 Qwen2.5 基线。用于链路、模板和上下文策略对照，不承诺回答正确率。",
+        location="external",
+    ),
+    ModelConfig(
+        model_id="qwen25-05b-f16",
+        name="Qwen2.5-0.5B-Instruct (F16 GGUF)",
+        model_type="gguf",
+        model_path="",
+        gguf_path=os.path.join(_APP_ROOT, "models", "qwen25-05b-f16.gguf"),
+        recommended_vram_gb=1.5,
+        max_context=32768,
+        is_experimental=True,
+        huggingface_id="Qwen/Qwen2.5-0.5B-Instruct",
+        quant_types=["fp16"],
+        description=(
+            "Qwen2.5-0.5B 的 F16 GGUF 整模。用于跨框架分段执行的对照基准 —— "
+            "与设备侧（Y700）持有的同一份工件，便于 L→L 与 D→L 两条路径对拍。"
+        ),
         location="external",
     ),
     ModelConfig(

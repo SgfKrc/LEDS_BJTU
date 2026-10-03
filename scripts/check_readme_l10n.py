@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""README 中英双语同步检查（trivial 级别）。
+"""README 中英双语同步检查。
 
 断言：
 1. 中英 README 顶部互链存在；
@@ -22,7 +22,6 @@ EN = ROOT / "docs" / "README.en.md"
 SECTION_MAP = {
     "主仓做什么": "What the Main Repository Does",
     "架构总览": "Architecture Overview",
-    "这是什么软件：系统软件还是用户软件？": "Is This System Software or User Software?",
     "层流水线与跨框架逐层接力": "Layer Pipeline and Cross-Framework Layer Relay",
     "当前状态": "Current Status",
     "主仓边界": "Main Repository Boundary",

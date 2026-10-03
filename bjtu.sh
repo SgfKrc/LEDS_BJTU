@@ -4,9 +4,8 @@
 #
 #  用法: bjtu [launcher|ui|tui|chat|tui_commands.py 参数...]
 #
-#  一键启动: 自动启动后端(若未运行) -> 等待就绪 -> 进入 TUI。
-#  退出 TUI 后后端继续运行; 停止后端:
-#      kill "$(cat logs/backend_tui.pid)"
+#  交互模式转发 start_tui.sh: 后端在当前进程内启动 (BackendSupervisor)，
+#  随 TUI 退出而停止; 需要常驻后端请直接运行 `python src/api_server.py`。
 #
 #  安装(任意一种):
 #     ln -s <项目根>/bjtu.sh /usr/local/bin/bjtu

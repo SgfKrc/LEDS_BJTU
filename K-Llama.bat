@@ -2,7 +2,7 @@
 chcp 65001 >nul
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
-rem Kllama is the current project name; the canonical entry script is still qlh.py.
+rem K-Llama is the recommended alias for qlh.py; the canonical entry script is qlh.py.
 rem This launcher is an alias only: identical behaviour, arguments passed through.
 rem Keep this launcher ASCII-only for cmd.exe code-page safety.
 cd /d "%~dp0"

@@ -21,6 +21,11 @@ MAX_PROTOCOL_VERSION = 3
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 FULL_WORKER_KINDS = frozenset({"pc_full_worker", "android_full_worker"})
 
+# Runtime profiles are part of the release capability contract.  Keep this
+# dependency-free so protocol validation can run in the slim worker process.
+RUNTIME_PROFILES = ("llama_cpp_only", "torch_cpu", "torch_cuda")
+RUNTIME_PROFILE_UNSPECIFIED = "unspecified"
+
 MESSAGE_TYPES = frozenset({
     "hello",
     "hello_ack",
@@ -351,6 +356,45 @@ def _validate_model_identity(value: Any, field: str) -> dict[str, Any]:
     return model
 
 
+def _validate_layer_budget(value: Any) -> None:
+    """校验设备自荐的层容量（`capabilities.layer_budget`，可选字段）。"""
+    budget = _require_object(value, "payload.capabilities.layer_budget")
+    for key in ("available_bytes", "per_layer_bytes", "max_layers"):
+        if key not in budget:
+            raise _error(
+                "invalid_capabilities",
+                f"payload.capabilities.layer_budget.{key}",
+                f"layer_budget.{key} is required",
+            )
+    _require_int(
+        budget["available_bytes"],
+        "payload.capabilities.layer_budget.available_bytes",
+        minimum=0,
+    )
+    _require_int(
+        budget["per_layer_bytes"],
+        "payload.capabilities.layer_budget.per_layer_bytes",
+        minimum=1,
+    )
+    max_layers = _require_int(
+        budget["max_layers"],
+        "payload.capabilities.layer_budget.max_layers",
+        minimum=1,
+    )
+    # 上限只防荒谬值，远大于任何现役模型的层数。
+    if max_layers > 1024:
+        raise _error(
+            "invalid_capabilities",
+            "payload.capabilities.layer_budget.max_layers",
+            "max_layers must be <= 1024",
+        )
+    if "local_cut" in budget:
+        _require_bool(
+            budget["local_cut"],
+            "payload.capabilities.layer_budget.local_cut",
+        )
+
+
 def _validate_capabilities(value: Any, *, version: int) -> None:
     capabilities = _require_object(value, "payload.capabilities")
     expected_fields = {"stage_types", "engines", "models", "max_concurrency"}
@@ -361,6 +405,12 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
         expected_fields.add("resource_gate")
     if "layer_ranges" in capabilities:
         expected_fields.add("layer_ranges")
+    # A layer-only worker advertises a deterministic source-SHA alias instead
+    # of a full-model identity.  This marker is optional for older workers.
+    if "layer_worker" in capabilities:
+        expected_fields.add("layer_worker")
+    if "runtime_profile" in capabilities:
+        expected_fields.add("runtime_profile")
     # ★ 2026-09-23：中间段通道能力（可选，向后兼容）—— 让调度侧知道该节点中间段
     #   实际能走哪条通道（值域同 `_LAYER_FORWARD_MIDDLE_CHANNELS`）；缺失 = 未声明。
     if "middle_channel" in capabilities:
@@ -368,11 +418,24 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     # ★ 2026-09-23：M-RoPE 模型的位置分量数（1 或 4）—— 供调度侧构造 hidden spec / 判据用。
     if "n_pos_per_embd" in capabilities:
         expected_fields.add("n_pos_per_embd")
+    # ★ 2026-10-03：层容量自荐（可选，向后兼容）—— 设备按自身可用内存申报"本地裁层
+    #   之后最多能承载多少层"，并声明是否具备本地裁层条件。与 `layer_ranges` 分工：
+    #   后者是"当前已就绪、马上能跑的区间"，前者是"能承载的上限"。
+    if "layer_budget" in capabilities:
+        expected_fields.add("layer_budget")
+    # ★ 2026-10-03：relay 中段角色（本节点不加载层，段由远端 relay 服务持有）。
+    #   声明侧早已在发这个键（`scheduler_task_worker._task_worker_capabilities`），
+    #   但这里没有放行 ⇒ 该 worker 的 hello 会以 `unknown=['relay_middle']` 被判
+    #   `field_mismatch`。与其余可选键同样按「出现才允许」处理。
+    if "relay_middle" in capabilities:
+        expected_fields.add("relay_middle")
     _require_exact_fields(
         capabilities,
         expected_fields,
         "payload.capabilities",
     )
+    if "layer_budget" in capabilities:
+        _validate_layer_budget(capabilities["layer_budget"])
     if "middle_channel" in capabilities:
         channel = _require_string(
             capabilities["middle_channel"], "payload.capabilities.middle_channel",
@@ -391,6 +454,21 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
             raise _error(
                 "invalid_capabilities", "payload.capabilities.n_pos_per_embd",
                 "n_pos_per_embd must be 1 or 4",
+            )
+    if "layer_worker" in capabilities:
+        _require_bool(
+            capabilities["layer_worker"], "payload.capabilities.layer_worker",
+        )
+    if "runtime_profile" in capabilities:
+        runtime_profile = _require_string(
+            capabilities["runtime_profile"],
+            "payload.capabilities.runtime_profile",
+            pattern=_SAFE_ID,
+        )
+        if runtime_profile != RUNTIME_PROFILE_UNSPECIFIED and runtime_profile not in RUNTIME_PROFILES:
+            raise _error(
+                "invalid_capabilities", "payload.capabilities.runtime_profile",
+                "runtime_profile is not a supported release profile",
             )
     stage_types = capabilities["stage_types"]
     if not isinstance(stage_types, list) or not stage_types:
@@ -498,6 +576,11 @@ def _validate_resource_gate(value: Any) -> None:
 def _validate_metadata(value: Any, *, version: int) -> None:
     metadata = _require_object(value, "payload.metadata")
     allowed = {"usage", "usage_estimated", "tokens_per_second", "model"}
+    # ★ 2026-10-03：层段（`layer_forward`）结果的**对账字段** —— Android executor 会
+    #   回记实际生效的中间段通道、交接点与是否尾段，供 master 与请求对账。它们与 v2
+    #   的 `model` 同属审计信息，此前被这里拒掉 ⇒ 回程 result 解码失败、请求只能等到
+    #   超时（真机表现为 `remote Stage response timed out`）。
+    allowed |= {"stage", "middle_channel", "handoff_at", "tail"}
     if not set(metadata).issubset(allowed):
         raise _error(
             "invalid_fields", "payload.metadata",

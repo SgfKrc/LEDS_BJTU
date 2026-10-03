@@ -146,6 +146,65 @@ def test_worker_capability_lists_and_concurrency_are_bounded(golden):
     assert concurrency_error.value.code == "invalid_capabilities"
 
 
+def test_layer_forward_result_metadata_is_accepted():
+    """层段结果回记的对账字段必须被接受。
+
+    Android executor 会回记 `stage`/`middle_channel`/`handoff_at`/`tail`；它们此前
+    不在允许集合里 ⇒ 回程 result 解码失败、master 只能等到超时（真机表现为
+    `remote Stage response timed out`）。
+    """
+    from task_worker_protocol import _validate_metadata
+
+    _validate_metadata(
+        {
+            "model": "layer-f6dab6b7",
+            "stage": "layer_forward",
+            "middle_channel": "extract_hidden",
+            "handoff_at": 24,
+            "tail": "true",
+        },
+        version=3,
+    )
+
+    with pytest.raises(WorkerProtocolError):
+        _validate_metadata({"not_a_known_field": 1}, version=3)
+
+
+def test_hello_capabilities_may_advertise_layer_budget(golden):
+    """★ 2026-10-03：设备自荐层容量（`layer_budget`）是**可选**能力键（向后兼容）。
+
+    它与 `layer_ranges` 分工：后者是"当前已就绪、马上能跑的区间"，前者是
+    "本地裁层之后能承载的层数上限"。
+    """
+    hello = copy.deepcopy(golden["messages"][0])
+    hello["payload"]["capabilities"]["layer_budget"] = {
+        "available_bytes": 8 * 1024 * 1024 * 1024,
+        "per_layer_bytes": 512 * 1024 * 1024,
+        "max_layers": 12,
+        "local_cut": True,
+    }
+    decode_message(hello)          # 允许
+
+    missing_key = copy.deepcopy(golden["messages"][0])
+    missing_key["payload"]["capabilities"]["layer_budget"] = {
+        "available_bytes": 1,
+        "per_layer_bytes": 1,
+    }
+    with pytest.raises(WorkerProtocolError) as missing_error:
+        decode_message(missing_key)
+    assert missing_error.value.code == "invalid_capabilities"
+
+    bad_layers = copy.deepcopy(golden["messages"][0])
+    bad_layers["payload"]["capabilities"]["layer_budget"] = {
+        "available_bytes": 1,
+        "per_layer_bytes": 1,
+        "max_layers": 0,
+    }
+    with pytest.raises(WorkerProtocolError) as layers_error:
+        decode_message(bad_layers)
+    assert layers_error.value.code == "invalid_integer"
+
+
 def test_hello_capabilities_may_advertise_middle_channel_and_n_pos_per_embd(golden):
     """★ 2026-09-23：中间段通道与 M-RoPE 位置分量数是**可选**能力键（向后兼容）。"""
     hello = copy.deepcopy(golden["messages"][0])
@@ -164,6 +223,18 @@ def test_hello_capabilities_may_advertise_middle_channel_and_n_pos_per_embd(gold
     with pytest.raises(WorkerProtocolError) as npos_error:
         decode_message(bad_npos)
     assert npos_error.value.code == "invalid_capabilities"
+
+
+def test_hello_capabilities_may_advertise_runtime_profile(golden):
+    hello = copy.deepcopy(golden["messages"][0])
+    hello["payload"]["capabilities"]["runtime_profile"] = "llama_cpp_only"
+    decode_message(hello)
+
+    invalid = copy.deepcopy(golden["messages"][0])
+    invalid["payload"]["capabilities"]["runtime_profile"] = "torch_edge"
+    with pytest.raises(WorkerProtocolError) as captured:
+        decode_message(invalid)
+    assert captured.value.code == "invalid_capabilities"
 
 
 def test_hello_ack_fields_cannot_claim_an_invalid_negotiation(golden):

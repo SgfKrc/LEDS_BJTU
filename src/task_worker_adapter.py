@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import collections
 import hashlib
+import logging
 import queue
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
+
+logger = logging.getLogger(__name__)
 
 from task_provider import (
     DEPENDENCY_FAILURES_KEY,
@@ -73,6 +76,9 @@ class TaskWorkerControlPlane:
         self._workers: dict[str, dict[str, Any]] = {}
         self._coordinator: dict[str, Any] = {}
         self._worker_hello_pending = False
+        # REGISTER ACK may precede the peer's task-worker hello. Fence that
+        # connection from legacy layer assignment during this handshake.
+        self._coordinator_pending_workers: set[str] = set()
         self._seen: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
         self._seen_order: collections.deque[tuple[str, str]] = collections.deque()
         self._rejected_message_count = 0
@@ -286,6 +292,18 @@ class TaskWorkerControlPlane:
         with self._lock:
             self._rejected_message_count += 1
 
+    def mark_worker_connection_pending(self, peer_id: str) -> None:
+        with self._lock:
+            self._coordinator_pending_workers.add(str(peer_id))
+
+    def resolve_worker_connection_pending(self, peer_id: str) -> None:
+        with self._lock:
+            self._coordinator_pending_workers.discard(str(peer_id))
+
+    def pending_worker_ids(self) -> set[str]:
+        with self._lock:
+            return set(self._coordinator_pending_workers)
+
     def mark_coordinator_heartbeat(self) -> None:
         with self._lock:
             if self._coordinator.get("connected"):
@@ -293,6 +311,7 @@ class TaskWorkerControlPlane:
 
     def disconnect_worker(self, peer_id: str) -> None:
         with self._lock:
+            self._coordinator_pending_workers.discard(str(peer_id))
             worker = self._workers.get(peer_id)
             if worker is not None:
                 worker["connected"] = False
@@ -349,6 +368,15 @@ class TaskWorkerControlPlane:
             #   语义是「v2 及以上的数据面通道可用」，故与当前版本号解耦。
             snapshot["healthy"] and int(snapshot.get("selected_version") or 0) >= 2
         )
+        capabilities = snapshot.get("capabilities", {})
+        if not isinstance(capabilities, dict):
+            capabilities = {}
+        stage_types = capabilities.get("stage_types", [])
+        snapshot["layer_stage_dispatch_enabled"] = bool(
+            snapshot["manual_stage_dispatch_enabled"]
+            and "layer_forward" in stage_types
+            and capabilities.get("layer_ranges")
+        )
         return snapshot
 
     def status(self, *, role: str) -> dict[str, Any]:
@@ -377,6 +405,9 @@ class TaskWorkerControlPlane:
                 "adapter_connected": False,
                 "task_dispatch_enabled": False,
                 "manual_stage_dispatch_enabled": connected,
+                "layer_stage_dispatch_enabled": any(
+                    item.get("layer_stage_dispatch_enabled") for item in workers
+                ) if role == "master" else connected,
                 "lease_renew_enabled": connected,
                 "stage_cancel_enabled": connected,
                 "stage_message_replay_enabled": True,
@@ -534,6 +565,26 @@ class RemoteFullWorkerProvider:
             for model in models
         )
 
+    @staticmethod
+    def _layer_model_matches(
+        requested: Optional[ModelIdentity], models: Any,
+    ) -> bool:
+        """Match the physical artifact identity used by Route A layer workers.
+
+        The coordinator's logical model id and revision may differ from the
+        deterministic layer alias, but the engine, format, and source digest
+        must remain exact so a crop from another model cannot be selected.
+        """
+        if requested is None or not isinstance(models, list):
+            return False
+        expected = requested.snapshot()
+        return any(
+            isinstance(model, dict)
+            and all(model.get(key) == expected.get(key)
+                    for key in ("engine", "format", "sha256"))
+            for model in models
+        )
+
     def inspect(self) -> ProviderCapabilities:
         snapshot = self._snapshot()
         capabilities = snapshot.get("capabilities", {})
@@ -558,13 +609,22 @@ class RemoteFullWorkerProvider:
             self._prune_pending_locked()
             active = len(self._reservations)
             closed = self._closed
+        manual_dispatch_enabled = bool(
+            snapshot.get("manual_stage_dispatch_enabled")
+        )
+        layer_dispatch_enabled = bool(
+            snapshot.get("layer_stage_dispatch_enabled")
+        )
         healthy = bool(
             not closed
             and snapshot.get("healthy")
             # ★ 2026-09-20：原为硬编码 `== 2`（第二处），协议升 v3 后 provider 恒 unhealthy。
             #   语义是「v2 及以上的数据面通道可用」，与具体版本号解耦。
             and int(snapshot.get("selected_version") or 0) >= 2
-            and snapshot.get("manual_stage_dispatch_enabled")
+            # Provider health is generic.  The reservation path applies the
+            # stage-specific gate so a layer-only capability cannot disable
+            # ordinary full_inference dispatch on the same worker.
+            and (manual_dispatch_enabled or layer_dispatch_enabled)
             and resource_admitted
         )
         return ProviderCapabilities(
@@ -591,10 +651,15 @@ class RemoteFullWorkerProvider:
         capabilities = snapshot.get("capabilities", {})
         if not isinstance(capabilities, dict):
             return False
+        matcher = (
+            self._layer_model_matches
+            if stage_type == "layer_forward"
+            else self._model_matches
+        )
         return bool(
             status.healthy
             and stage_type in status.supported_stage_types
-            and self._model_matches(
+            and matcher(
                 model_identity, capabilities.get("models", []),
             )
         )
@@ -638,15 +703,30 @@ class RemoteFullWorkerProvider:
                 code="unsupported_stage_type",
                 provider_id=self.provider_id,
             )
+        stage_dispatch_enabled = (
+            bool(snapshot.get("layer_stage_dispatch_enabled"))
+            if request.stage_type == "layer_forward"
+            else bool(snapshot.get("manual_stage_dispatch_enabled"))
+        )
+        if not stage_dispatch_enabled:
+            raise ProviderUnavailable(
+                "remote worker is not admitted for the requested Stage type",
+                code="stage_dispatch_not_admitted",
+                provider_id=self.provider_id,
+                retryable=True,
+            )
         if request.model_identity is None:
             raise ProviderUnavailable(
                 "remote execution requires an exact model identity",
                 code="model_identity_required",
                 provider_id=self.provider_id,
             )
-        if not self._model_matches(
-            request.model_identity, capabilities.get("models", []),
-        ):
+        matcher = (
+            self._layer_model_matches
+            if request.stage_type == "layer_forward"
+            else self._model_matches
+        )
+        if not matcher(request.model_identity, capabilities.get("models", [])):
             raise ProviderUnavailable(
                 "remote worker does not have the exact requested model",
                 code="model_identity_mismatch",
@@ -889,6 +969,26 @@ class RemoteFullWorkerProvider:
                     field="payload.attempt_id",
                 )
             if not self._identity_matches(payload, pending.attempt):
+                # ★ 2026-10-03：这类不匹配此前只报码、看不出是哪个字段对不上，
+                #   真机排 Route A 时只能反复试。把两侧值一并打出来。
+                logger.warning(
+                    "Stage response identity mismatch: reply=%s expected=%s",
+                    {
+                        key: payload.get(key)
+                        for key in (
+                            "workflow_id", "stage_id", "attempt_id",
+                            "lease_id", "lease_epoch", "provider_id",
+                        )
+                    },
+                    {
+                        "workflow_id": pending.attempt.request.workflow_id,
+                        "stage_id": pending.attempt.request.stage_id,
+                        "attempt_id": pending.attempt.attempt_id,
+                        "lease_id": pending.attempt.lease_id,
+                        "lease_epoch": pending.attempt.lease_epoch,
+                        "provider_id": pending.attempt.provider_id,
+                    },
+                )
                 raise WorkerProtocolError(
                     "Stage response identity does not match the pending attempt",
                     code="attempt_identity_mismatch",
@@ -904,8 +1004,15 @@ class RemoteFullWorkerProvider:
                 if payload["accepted"]:
                     pending.accepted = True
                 else:
+                    # ★ 2026-10-03：把 worker 给的 `reason_code` 带进消息。此前只塞进
+                    #   `code` 字段，异常在别处被转述成一层笼统的
+                    #   `route_a_stage_execution_failed: remote worker rejected the Stage offer`
+                    #   ⇒ 跨机层段失败时完全看不出是「身份不符」「租约过期」还是
+                    #   「不支持该 stage」，只能靠逐层加日志去猜。
                     pending.error = ProviderReservationError(
-                        "remote worker rejected the Stage offer",
+                        "remote worker rejected the Stage offer"
+                        f" (reason_code={payload['reason_code']}"
+                        f", retryable={bool(payload['retryable'])})",
                         code=payload["reason_code"],
                         provider_id=self.provider_id,
                         retryable=bool(payload["retryable"]),

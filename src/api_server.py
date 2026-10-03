@@ -2657,9 +2657,39 @@ def _ensure_local_task_provider() -> None:
             raise
 
 
+def _prepared_pipeline_model_identity() -> Optional[ModelIdentity]:
+    """Identity of an explicit distributed-only artifact that is not materialized.
+
+    `POST /api/models/prepare-pipeline` 刻意不物化权重，但它把 inspect 出的描述符
+    （`model_sha256` / 模型 id / 路径 / 引擎）留在了 model_manager 上 ⇒ 层流水线需要的
+    "当前模型身份"从那里取。否则 Route A 会陷入死锁：它要求活动模型身份，而活动身份
+    要求 `model_loaded`，distributed-only 路径按设计又不加载权重。
+    """
+    if not getattr(model_manager, "is_pipeline_prepared", False):
+        return None
+    descriptor = model_manager.get_pipeline_descriptor() or {}
+    model_id = str(
+        getattr(model_manager, "active_model_id", "") or descriptor.get("model_id", "")
+    )
+    sha256 = str(descriptor.get("model_sha256", "") or "").lower()
+    if not model_id or not sha256:
+        return None
+    try:
+        return ModelIdentity(
+            model_id=model_id,
+            engine="pytorch",
+            format="safetensors",
+            revision="prepared",
+            sha256=sha256,
+        )
+    except ValueError:
+        logger.warning("已准备的流水线模型身份非法", exc_info=True)
+        return None
+
+
 def _active_task_graph_model_identity() -> Optional[ModelIdentity]:
     if not model_host.model_loaded or not model_manager.is_loaded:
-        return None
+        return _prepared_pipeline_model_identity()
     engine = backend_id_for(model_manager)
     model_path = str(getattr(model_manager, "_model_path", "") or "")
     model_id = str(getattr(model_manager, "active_model_id", "") or "")
@@ -2897,7 +2927,28 @@ def _execute_task_worker_stage(
                 provider_id=stage_request.provider_id,
                 same_provider_retryable=True,
             ) from exc
+    if stage_request.stage_type == "layer_forward":
+        # ★ 2026-10-03：本函数是 `EngineHost.execute_task_worker_stage` 的**同源副本**
+        #   （见 `inference_service/engine_host.py` 顶部注释），PC 侧在 api_server 进程里
+        #   走的是**这一份** ⇒ 只改 `engine_host.py` 不会让本机以层段 worker 身份工作
+        #   （实测：Surface 连上后每个 offer 都回
+        #   `TaskGraphError: 不支持的 Stage 类型: layer_forward`）。
+        #   委托同一份实现；但本函数是**模块级**（没有 `self`），所以用一个模块级缓存实例
+        #   承载 keep-head 上游（它本来就按 env 创建一次后复用，重载 500MB GGUF 代价高）。
+        global _LAYER_STAGE_HOST
+        if _LAYER_STAGE_HOST is None:
+            from inference_service.engine_host import EngineHost as _EngineHost
+
+            _LAYER_STAGE_HOST = _EngineHost()
+        return _LAYER_STAGE_HOST._execute_layer_forward_stage(
+            stage_request, provider_cancel_event,
+        )
     raise TaskGraphError(f"不支持的 Stage 类型: {stage_request.stage_type}")
+
+
+#: 模块级缓存：`_execute_task_worker_stage` 是模块级函数（无 `self`），层段 Stage 需要
+#: 一个持有 keep-head 上游的载体。上游按 env 创建一次后复用（重载 500MB GGUF 代价高）。
+_LAYER_STAGE_HOST = None
 
 
 def _execute_task_graph_chat_with_slot(
@@ -4686,8 +4737,14 @@ def _normalize_quant_for_engine(quant_type: str, engine: str) -> str:
         return "island"
 
     quant = raw.lower()
+    # ★ 2026-10-03：允许 fp32（`model_module` 内部的 `runtime_quant` 也用这个名字）。
+    #   跨框架 D→L 的对照基准（`relay_experiment` 的 d2l_mainrepo 路径）上游是
+    #   `torch.float32`，而端点此前只收 fp16/int8/int4 ⇒ 端点路径无法与基准同精度
+    #   对齐，对拍结果会掺进纯精度造成的分叉。
+    if quant in ("f32", "fp32", "float32"):
+        return "fp32"
     if quant not in ("fp16", "int8", "int4"):
-        raise HTTPException(400, f"不支持的量化类型: {quant}，可选: fp16, int8, int4")
+        raise HTTPException(400, f"不支持的量化类型: {quant}，可选: fp32, fp16, int8, int4")
     return quant
 
 
