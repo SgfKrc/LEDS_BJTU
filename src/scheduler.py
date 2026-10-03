@@ -3456,6 +3456,11 @@ class Scheduler(
                     self._push_layer_config_to_clients_locked(
                         require_distributed=require_distributed,
                     )
+                except Exception:
+                    logger.warning(
+                        "deferred layer config flush failed after model transition",
+                        exc_info=True,
+                    )
                 finally:
                     if authoritative:
                         with self._layer_config_lock:
