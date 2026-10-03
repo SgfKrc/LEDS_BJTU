@@ -1865,18 +1865,35 @@ class SchedulerPipelineMixin:
         #   `admitted`（实测：Surface 注册后 6 ms 就被释放，此后每轮重连重复一次）。
         #   判据必须落在 worker 自己身上：主节点在**节点注册那一刻**就推送 legacy 配置，
         #   早于 hello 往返 ⇒ master 侧按 capabilities 排除在时序上不可靠（已踩到）。
+        legacy_candidate = data
         if (
             isinstance(data, dict)
-            and not data.get("release")
+            and node_id in data
+            and isinstance(data.get(node_id), dict)
+        ):
+            legacy_candidate = data[node_id]
+        if isinstance(legacy_candidate, dict):
+            candidate_generation = legacy_candidate.get("generation")
+            if candidate_generation is not None:
+                ack_generation = candidate_generation
+        is_relay_assignment = (
+            isinstance(legacy_candidate, dict)
+            and str(legacy_candidate.get("engine", "") or "").lower()
+            == "relay_middle"
+        )
+        if (
+            isinstance(legacy_candidate, dict)
+            and not legacy_candidate.get("release")
+            and not is_relay_assignment
             and os.environ.get("QLH_LAYER_GGUF", "").strip()
         ):
             logger.info(
                 "本节点是 v3 层段 worker，拒绝 legacy 分层配置: config=%s",
-                data.get("config_id", ""),
+                legacy_candidate.get("config_id", ""),
             )
             self._send_layer_config_ack({
                 "node_id": node_id,
-                "config_id": str(data.get("config_id", "")),
+                "config_id": str(legacy_candidate.get("config_id", "")),
                 "generation": ack_generation,
                 "status": "error",
                 "error": "layer_stage_worker_rejects_legacy_config",

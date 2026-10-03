@@ -2202,6 +2202,69 @@ class TestPipelineMessageDispatch:
         assert sched._active_layer_config["engine"] == "relay_middle"
         assert sched._active_layer_config["relay_segment"] == relay_spec
 
+    def test_relay_middle_assignment_is_not_rejected_as_legacy_stage_config(
+            self, sched, monkeypatch):
+        """A stage-advertising relay still accepts its logical relay config."""
+        import scheduler_pipeline as pipeline_module
+
+        relay_spec = {
+            "role": "middle", "host": "127.0.0.1", "port": 50183,
+            "n_embd": 896, "timeout": 5.0, "layer_start": 8,
+            "layer_end": 16,
+        }
+        sent = []
+        fake_host = type("RelayHost", (), {
+            "is_loaded": False,
+            "model_loaded": False,
+            "layer_range": None,
+            "load_layer_range": lambda self, *args, **kwargs: (
+                (_ for _ in ()).throw(AssertionError("relay must not load local layers"))
+            ),
+        })()
+        sched._host = fake_host
+        sched._tcp_client = type("Client", (), {
+            "send_data": lambda self, payload, msg_type: sent.append(payload),
+        })()
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: "worker")
+        monkeypatch.setattr(pipeline_module, "PIPELINE_RELAY_ENABLED", True)
+        monkeypatch.setenv("QLH_LAYER_GGUF", "C:/models/layer.gguf")
+
+        sched._handle_layer_config("master", {
+            "node_id": "worker", "config_id": "cfg-relay-stage",
+            "generation": 7, "start_layer": 8, "end_layer": 16,
+            "model_id": "qwen-test", "model_sha256": "sha-relay",
+            "model_type": "qwen2", "total_layers": 24,
+            "engine": "relay_middle", "relay_segment": relay_spec,
+        })
+
+        assert sent[-1]["status"] == "ready"
+        assert sent[-1]["engine"] == "relay_middle"
+        assert sched._active_layer_config["config_id"] == "cfg-relay-stage"
+
+    def test_nested_legacy_rejection_ack_preserves_generation(
+            self, sched, monkeypatch):
+        """Wrapped legacy assignments must reject with their own generation."""
+        sent = []
+        sched._tcp_client = type("Client", (), {
+            "send_data": lambda self, payload, msg_type: sent.append(payload),
+        })()
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: "worker")
+        monkeypatch.setenv("QLH_LAYER_GGUF", "C:/models/layer.gguf")
+
+        sched._handle_layer_config("master", {
+            "worker": {
+                "node_id": "worker",
+                "config_id": "cfg-legacy-nested",
+                "generation": 19,
+                "start_layer": 8,
+                "end_layer": 16,
+            },
+        })
+
+        assert sent[-1]["status"] == "error"
+        assert sent[-1]["error"] == "layer_stage_worker_rejects_legacy_config"
+        assert sent[-1]["generation"] == 19
+
     def test_relay_middle_prepare_does_not_require_local_capacity(
             self, sched, monkeypatch):
         import scheduler_pipeline as pipeline_module
