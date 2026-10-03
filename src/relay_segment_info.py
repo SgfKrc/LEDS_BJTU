@@ -159,6 +159,69 @@ def read_gguf_layer_info(path: str | Path) -> dict[str, Any] | None:
     }
 
 
+#: GGML 张量类型 → `(每个 block 的元素数, 每个 block 的字节数)`。
+#: 与 `llama.cpp` 的 `ggml_blck_size()` / `ggml_type_size()` 同源。**刻意不 import
+#: `gguf` / `llama_cpp`** —— 同本模块其余部分：一旦进 `sys.modules` 就会改变 keep-head
+#: 的隔离判据（实测踩到）。
+_GGML_TYPE_SIZES: dict[int, tuple[int, int]] = {
+    0: (1, 4), 1: (1, 2), 2: (32, 18), 3: (32, 20),
+    6: (32, 22), 7: (32, 24), 8: (32, 34), 9: (32, 36),
+    10: (256, 84), 11: (256, 110), 12: (256, 144), 13: (256, 176),
+    14: (256, 210), 15: (256, 292), 16: (256, 66), 17: (256, 74),
+    18: (256, 98), 19: (256, 50), 20: (32, 18), 21: (256, 110),
+    22: (256, 82), 23: (256, 136), 24: (1, 1), 25: (1, 2),
+    26: (1, 4), 27: (1, 8), 28: (1, 8), 29: (256, 56),
+    30: (1, 2),
+}
+
+
+def read_gguf_tensor_bytes(path: str | Path) -> dict[str, int] | None:
+    """**零依赖**读 GGUF 张量表 ⇒ `{张量名: 字节数}`。
+
+    字节数按 **ggml 类型表精确算**（`元素数 / block_elems * block_bytes`），**不用**
+    「相邻 offset 之差」—— 后者含 GGUF 的 32 字节对齐填充，对不上 `pipeline_capacity`
+    要的 exact 账。
+
+    读不到 / 非 GGUF / 遇到未知张量类型一律返回 `None`（**不猜、不抛**）。
+    """
+    target = Path(path)
+    if not target.is_file():
+        return None
+    try:
+        with target.open("rb") as handle:
+            if handle.read(4) != _GGUF_MAGIC:
+                return None
+            (version,) = struct.unpack("<I", handle.read(4))
+            if version < 2:
+                return None
+            (n_tensors,) = struct.unpack("<Q", handle.read(8))
+            (n_kv,) = struct.unpack("<Q", handle.read(8))
+            for _ in range(int(n_kv)):
+                _gguf_read_string(handle)  # key
+                (value_type,) = struct.unpack("<I", handle.read(4))
+                _gguf_skip_value(handle, value_type)
+            sizes: dict[str, int] = {}
+            for _ in range(int(n_tensors)):
+                name = _gguf_read_string(handle)
+                (n_dims,) = struct.unpack("<I", handle.read(4))
+                dims = struct.unpack(f"<{int(n_dims)}Q", handle.read(8 * int(n_dims)))
+                (tensor_type,) = struct.unpack("<I", handle.read(4))
+                handle.read(8)  # offset（本函数不用）
+                entry = _GGML_TYPE_SIZES.get(tensor_type)
+                if entry is None:
+                    return None
+                block_elems, block_bytes = entry
+                elements = 1
+                for dim in dims:
+                    elements *= int(dim)
+                if elements % block_elems:
+                    return None
+                sizes[name] = (elements // block_elems) * block_bytes
+    except (OSError, ValueError, struct.error, UnicodeDecodeError):
+        return None
+    return sizes
+
+
 def read_artifact_manifest(path: str | Path) -> dict[str, Any] | None:
     """读**段工件旁的 manifest**（`<artifact>.gguf.manifest.json` 或显式路径）里的层范围。
 

@@ -1786,7 +1786,12 @@ class Scheduler(
         return TOTAL_MODEL_LAYERS
 
     def _get_active_pipeline_model_info(self) -> dict:
-        """Describe a PyTorch artifact without requiring a full model load."""
+        """Describe the master's pipeline artifact — PyTorch **or** llama.cpp.
+
+        不需要完整加载模型：两条引擎路径各自给出描述器，本方法只做形状归一与
+        `PIPELINE_RUNTIME_MODEL_TYPES` 判定。GGUF 侧由
+        `LlamaCppEngine.get_pipeline_descriptor()` 读文件头提供。
+        """
         manager = self._host
         if not manager or not runtime_supports(manager, Capability.FORWARD_LAYERS):
             return {}
@@ -1805,7 +1810,12 @@ class Scheduler(
             or getattr(manager, "_model_path", "")
             or ""
         )
-        if not model_path or not os.path.isdir(model_path):
+        # 目录（PyTorch artifact）或**单文件**（GGUF）都接受。llama.cpp 路径用「裁层
+        # GGUF」表达层段，不是一个装 safetensors 的目录 —— 只认目录会把去 torch 化的
+        # 边缘主节点挡在流水线之外。
+        if not model_path or not (
+            os.path.isdir(model_path) or os.path.isfile(model_path)
+        ):
             return {}
         model_type = str(descriptor.get("model_type", "") or "").lower()
         # ★ #31 M2：走单一事实来源（硬编码会让 hybrid 在这里返回 `{}` ⇒ master 静默不推层配置）

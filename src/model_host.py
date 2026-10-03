@@ -114,7 +114,18 @@ class _LazyModelManager:
         return instance
 
     def __getattr__(self, name):
-        return getattr(self._get_instance(), name)
+        try:
+            instance = self._get_instance()
+        except ImportError as exc:
+            # 无 torch 的边缘构建（免安装版）里 `model_module` 根本 import 不了
+            # （它顶部就 `import torch`）。调用方大多是**探测语义**的
+            # `getattr(host, "layer_range", None)` —— 它们要的是「没有这个值」，
+            # 不是异常。转成 `AttributeError` 让 `getattr` 的默认值生效；其他
+            # 异常照旧抛出，不掩盖真错误。
+            raise AttributeError(
+                f"{name!r} 需要 PyTorch 引擎，但当前节点没有 torch: {exc}"
+            ) from None
+        return getattr(instance, name)
 
     def __setattr__(self, name, value):
         if name in self.__slots__:

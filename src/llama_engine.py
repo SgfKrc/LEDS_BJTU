@@ -34,6 +34,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 import time
 from ctypes import byref
@@ -249,6 +250,219 @@ class LlamaCppEngine:
                 logger.debug("RPC session close failed", exc_info=True)
 
     # ================================================================
+    # 流水线模型描述器
+    # ================================================================
+
+    def _pipeline_file_sha256(self, path: str) -> str:
+        """整文件 sha256，按 `(path, mtime, size)` 记忆 —— 大 GGUF 只读一次。
+
+        与 PyTorch 侧 `model_sync.compute_model_sha256`（目录内 artifact 的稳定序
+        联合哈希）**语义不同**：那里是「一组文件」，这里是「单个 GGUF」。两者都只用于
+        「各节点是否握着同一份权重」的自证，由**主节点的描述器单独定口径**，因此
+        混合部署时以主节点为准，不需要跨引擎可比。
+        """
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return ""
+        key = (path, int(stat.st_mtime), int(stat.st_size))
+        cache = getattr(self, "_pipeline_sha_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._pipeline_sha_cache = cache
+        if cache.get("key") == key:
+            return str(cache.get("value", ""))
+        digest = hashlib.sha256()
+        try:
+            with open(path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            return ""
+        value = digest.hexdigest()
+        cache["key"] = key
+        cache["value"] = value
+        return value
+
+    def get_pipeline_descriptor(self) -> dict:
+        """流水线描述器：**零依赖**读 GGUF 头，不加载模型、不需要 torch。
+
+        与 `ModelManager.get_pipeline_descriptor()`（PyTorch 侧）同一契约。主节点的
+        层配置推送只认这个描述器（`scheduler._get_active_pipeline_model_info` ⇒
+        `scheduler_pipeline._get_master_model_sha256`），所以 llama.cpp 侧必须能给出
+        同样的 `model_type` / `total_layers` / `model_sha256`。
+
+        为什么需要它：上述两条路径此前硬要求主节点是 PyTorch 模型 —— 那是
+        「llama.cpp 不支持层拆分」时代的遗留判据，已被 `koakuma_engine` 的能力表推翻
+        （`BackendId.LLAMA_CPP` 自 2026-09-19 起声明 `FORWARD_LAYERS`，`llama_engine`
+        也有 `forward_layers_to_hidden` / `forward_layers_from_hidden`）。去 torch 化的
+        边缘设备只得一份裁层 GGUF，正是靠这个描述器才当得上流水线主节点。
+
+        `model_type` 取自 GGUF 的 `general.architecture`，与 `PIPELINE_RUNTIME_MODEL_TYPES`
+        同源判定 —— 判据只有一处，不在这里另立白名单。
+        """
+        cached = getattr(self, "_pipeline_descriptor", None)
+        if isinstance(cached, dict) and cached:
+            return dict(cached)
+        path = str(getattr(self, "_model_path", "") or "")
+        if not path or not os.path.isfile(path):
+            return {}
+        try:
+            from relay_segment_info import read_gguf_layer_info
+        except ImportError:  # 以包形式导入本模块时（src.llama_engine）
+            try:
+                from .relay_segment_info import read_gguf_layer_info
+            except ImportError:
+                return {}
+        info = read_gguf_layer_info(path)
+        if not info:
+            return {}
+        from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
+
+        model_type = str(info.get("architecture", "") or "").lower()
+        if model_type not in PIPELINE_RUNTIME_MODEL_TYPES:
+            return {}
+        total_layers = int(info.get("n_layer", 0) or 0)
+        if total_layers <= 0:
+            return {}
+        # `pipeline_capacity` 的容量账要**逐层字节**与**分量字节**，两者都必须 exact
+        # （它按此判定哪个 worker 装得下哪几层）。GGUF 里只有张量表，所以现场按
+        # ggml 类型算一遍 —— 这也是「不用 offset 差值」的原因，差值含 32 字节对齐填充。
+        from relay_segment_info import read_gguf_tensor_bytes
+
+        tensor_bytes = read_gguf_tensor_bytes(path)
+        if not tensor_bytes:
+            return {}
+        layer_weight_bytes = [0] * total_layers
+        component_weight_bytes = {
+            "embedding": 0, "final_norm": 0, "lm_head": 0, "other": 0,
+        }
+        block_prefix = re.compile(r"^blk\.(\d+)\.")
+        for tensor_name, size in tensor_bytes.items():
+            block = block_prefix.match(tensor_name)
+            if block:
+                index = int(block.group(1))
+                if index < total_layers:
+                    layer_weight_bytes[index] += size
+                    continue
+            if tensor_name.startswith("token_embd."):
+                component_weight_bytes["embedding"] += size
+            elif tensor_name.startswith("output_norm."):
+                component_weight_bytes["final_norm"] += size
+            elif tensor_name.startswith("output."):
+                component_weight_bytes["lm_head"] += size
+            else:
+                component_weight_bytes["other"] += size
+        if any(size <= 0 for size in layer_weight_bytes):
+            return {}
+        try:
+            weight_bytes = int(os.path.getsize(path))
+        except OSError:
+            weight_bytes = 0
+        descriptor = {
+            "model_id": (
+                str(getattr(self, "active_model_id", "") or "")
+                or os.path.splitext(os.path.basename(path))[0]
+            ),
+            "model_path": path,
+            "model_sha256": self._pipeline_file_sha256(path),
+            "model_type": model_type,
+            "total_layers": total_layers,
+            "layer_weight_bytes": layer_weight_bytes,
+            "component_weight_bytes": component_weight_bytes,
+            "quant_type": str(getattr(self, "_quant_type", "") or ""),
+            "inspection_mode": "gguf_header",
+            "weight_bytes": weight_bytes,
+            "pipeline_runtime_supported": True,
+        }
+        self._pipeline_descriptor = dict(descriptor)
+        return dict(descriptor)
+
+    def _find_layer_artifact(self, start: int, end: int) -> str:
+        """按 `[start, end)` 在工件目录里找裁层 GGUF —— **靠 manifest 自证，不猜文件名**。
+
+        工件由 `scripts/cut_layers.py` 产出，旁边必有 `<artifact>.gguf.manifest.json`，
+        里面的 `source_layer_range` 正是「这一段来自源模型的哪几层」。命名并不统一
+        （`cut-16` / `cut-16-20` / `head8` / `mid8-16` / `cut-k16` …），按文件名猜会
+        在下一个命名上翻车，所以只认 manifest。
+
+        搜索目录取 env `QLH_LAYER_ARTIFACT_DIR`；未设时用当前模型文件所在目录。
+        """
+        from pathlib import Path as _Path
+        from relay_segment_info import read_artifact_manifest
+
+        configured = os.environ.get("QLH_LAYER_ARTIFACT_DIR", "").strip()
+        directory = (
+            _Path(configured)
+            if configured
+            else _Path(str(getattr(self, "_model_path", "") or "")).parent
+        )
+        if not directory.is_dir():
+            return ""
+        wanted = [int(start), int(end)]
+        for manifest in sorted(directory.glob("*.manifest.json")):
+            info = read_artifact_manifest(manifest)
+            if not info:
+                continue
+            if list(info.get("source_layer_range") or []) != wanted:
+                continue
+            artifact = manifest.name[: -len(".manifest.json")] + ".gguf"
+            candidate = directory / artifact
+            if candidate.is_file():
+                return str(candidate)
+        return ""
+
+    def load_layer_range(
+        self,
+        start_layer: int,
+        end_layer: int,
+        has_embedding: bool = False,
+        has_lm_head: bool = False,
+        **kwargs: Any,
+    ) -> dict:
+        """llama.cpp 的「加载层段」= **换一份裁层 GGUF**。
+
+        PyTorch 侧按 key 物化层段（`LOAD_LAYER_RANGE` 语义）；llama.cpp 没有按层按需
+        加载的能力，同一意图由工件表达 —— `koakuma_engine` 的能力表刻意**不**给
+        `BackendId.LLAMA_CPP` 这个能力位，只给 `FORWARD_LAYERS`。
+
+        所以本方法做的是：按 `[start_layer, end_layer)` 定位工件并加载。找不到工件即
+        **失败**（`RuntimeError`），绝不静默退回整模 —— 那会让主节点跑着自己没被分配的
+        层，下游段收到的 hidden 就从错误的层深取来，而链路看上去"成功"。
+        """
+        path = self._find_layer_artifact(int(start_layer), int(end_layer))
+        if not path:
+            raise RuntimeError(
+                f"没有覆盖层区间[{int(start_layer)},{int(end_layer)})的裁层工件"
+                f"（查了 QLH_LAYER_ARTIFACT_DIR 与模型目录）；"
+                "llama.cpp 的层段由裁层 GGUF 表达，不是按 key 物化"
+            )
+        # 段视图 vs 整模视图：`pipeline_capacity` 与 worker 的层配置契约都按**整模**的
+        # 总层数与摘要算账（PyTorch 侧 `inspect_pipeline_model` 的 `partial_assignment`
+        # 就是这个语义）。换裁层 GGUF 之后 `_model_path` 指向段文件，若让描述器跟着变小，
+        # 主节点会被判「模型已变化，请等待层配置重新同步」——实测卡在这里。
+        # 所以：先留下整模描述器，加载段之后再装回去，只补层段标记。
+        whole = dict(getattr(self, "_pipeline_descriptor", None) or {})
+        self.load_model(path)
+        if whole:
+            whole["assignment_layer_range"] = [int(start_layer), int(end_layer)]
+            whole["partial_assignment"] = True
+            whole["loaded_artifact"] = path
+            self._pipeline_descriptor = whole
+        logger.info(
+            "llama.cpp 层段已加载: [%d,%d) embed=%s lm_head=%s -> %s",
+            int(start_layer), int(end_layer), has_embedding, has_lm_head, path,
+        )
+        return {
+            "success": True,
+            "engine": "llama_cpp",
+            "layer_range": f"{int(start_layer)}-{int(end_layer)}",
+            "layer_start": int(start_layer),
+            "layer_end": int(end_layer),
+            "artifact": path,
+        }
+
+    # ================================================================
     # 模型加载
     # ================================================================
 
@@ -334,6 +548,10 @@ class LlamaCppEngine:
         if self.is_loaded or self._mtmd_context is not None:
             self.unload()
         self._model_path = model_path
+        # 换模型即失效：描述器与文件摘要都跟着 `_model_path` 走。不重置会拿旧模型的
+        # 层数/摘要去推层配置（`get_pipeline_descriptor` 缓存的就是它们）。
+        self._pipeline_descriptor = None
+        self._pipeline_sha_cache = {}
         model_profile = model_profile if isinstance(model_profile, dict) else {}
         self._chat_template = str(model_profile.get("template") or "")
         self._thinking_mode = str(model_profile.get("thinking") or "unknown")
@@ -780,6 +998,15 @@ class LlamaCppEngine:
     @property
     def is_loaded(self) -> bool:
         return self._loaded and self._model is not None
+
+    def get_device(self) -> str:
+        """流水线/缓存路径要的 device —— llama.cpp 恒为 CPU。
+
+        PyTorch 侧返回 `torch.device`，调用方随后 `.to(...)` 搬运张量。llama.cpp 的权重
+        就在本进程内存里，没有设备搬运这回事，所以返回 `"cpu"`；配套地，hidden 与 token
+        id 一律用 numpy 表达（见 `_hidden_to_raw_f32` 与 `tokenizer` 适配器）。
+        """
+        return "cpu"
 
     # ================================================================
     # Native MTMD multimodal pipeline (G4.3.2B)
@@ -1485,6 +1712,50 @@ class LlamaCppEngine:
             info["memory"] = self.get_memory_usage()
         return info
 
+    def forward_layers(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        past_key_values=None,
+        use_cache: bool = True,
+        apply_lm_head: bool = False,
+        hidden_states=None,
+        **kwargs: Any,
+    ) -> dict:
+        """流水线执行循环要的层段 forward —— 按输入分派到两个既有入口。
+
+        PyTorch 侧一个 `forward_layers` 同时表达「吃 token」与「吃 hidden」两条输入；
+        llama.cpp 侧是 `forward_layers_to_hidden`（吃 token）与
+        `forward_layers_from_hidden`（吃 hidden）两个方法。这里按实参分派，并把返回
+        归一到调用方要的 `{"hidden_states": ..., "cache": ...}` 形状。
+
+        **KV 用 `n_past` 计数表达**（llama.cpp 的 KV 活在 context 内，没有可跨调用传递
+        的 cache 对象）：`past_key_values` 给整数就当作已有位置数，返回的 `cache` 是
+        推进后的位置数。调用方的 `_prefer_cache_state` 会把 `cache` 原样存下、下一轮再
+        当 `past_key_values` 传回来 —— 因此这个 int 必须能自洽往返。给不出整数（None /
+        torch 风格的层 tuple）时从 0 起算，这与接力首步的语义一致。
+        """
+        if hidden_states is not None:
+            return self.forward_layers_from_hidden(
+                hidden_states, n_past=_kv_position(past_key_values),
+            )
+        if input_ids is None:
+            raise ValueError("forward_layers 需要 input_ids 或 hidden_states")
+
+        import numpy as _np
+
+        ids = _np.asarray(input_ids, dtype=_np.int64).reshape(-1).tolist()
+        n_past = _kv_position(past_key_values)
+        hidden = self.forward_layers_to_hidden(
+            ids, n_past=n_past, all_positions=True,
+        )
+        if hidden is None:
+            raise RuntimeError("llama.cpp 层段 forward 未返回 hidden_states")
+        return {
+            "hidden_states": hidden,
+            "cache": n_past + len(ids),
+        }
+
     def forward_layers_to_hidden(self, input_ids, n_past: int = 0,
                                    all_positions: bool = False):
         """★ 层接力上游入口（2026-09-19）：只跑**本模型（裁层 GGUF = 前 k 层）**的层，
@@ -1673,6 +1944,75 @@ class LlamaCppEngine:
         if not self.is_loaded:
             raise RuntimeError("模型未加载")
         return self._model.detokenize(tokens).decode("utf-8", errors="replace")
+
+    @property
+    def tokenizer(self):
+        """流水线执行循环要的 HF 风格 `tokenizer`（懒建）。
+
+        Route A / relay 的执行循环按 HF 的用法取词：`tokenizer(text)` 拿 `input_ids`、
+        `.eos_token_id`、`.decode(ids)`。llama.cpp 只有 `tokenize` / `detokenize`，这里
+        做一层薄适配 —— 无 torch 的边缘主节点不必为了分词再装一份 transformers。
+        """
+        cached = getattr(self, "_tokenizer_adapter", None)
+        if cached is None:
+            cached = _LlamaCppTokenizerAdapter(self)
+            self._tokenizer_adapter = cached
+        return cached
+
+
+def _kv_position(past_key_values) -> int:
+    """把流水线传来的 KV 句柄折算成 `n_past`。
+
+    llama.cpp 的 KV 活在 context 内、没有可跨调用传递的 cache 对象，所以本引擎用
+    **整数位置数**当句柄（`forward_layers` 返回的 `cache` 就是它）。PyTorch 风格的层
+    tuple / cache 对象在这里没有对应物 ⇒ 一律从 0 起算（接力首步的语义）。
+    """
+    if isinstance(past_key_values, bool) or past_key_values is None:
+        return 0
+    if isinstance(past_key_values, (int, float)):
+        return max(0, int(past_key_values))
+    return 0
+
+
+class _LlamaCppTokenizerAdapter:
+    """把 `LlamaCppEngine` 的分词接口适配成流水线要的 HF 用法。
+
+    只实现执行循环真正用到的那几项（`__call__` / `eos_token_id` / `decode`）。刻意
+    **不假装**是完整 tokenizer：多出来的接口一旦被调用会立刻 `AttributeError`，而不是
+    给出一个语义不对的结果。
+    """
+
+    def __init__(self, engine: "LlamaCppEngine") -> None:
+        self._engine = engine
+
+    @property
+    def eos_token_id(self):
+        try:
+            return int(self._engine._model.token_eos())
+        except Exception:
+            return None
+
+    def __call__(self, text, return_tensors: str = None, **kwargs):
+        """`tokenizer(text)["input_ids"]` —— 形状为 `[1, tokens]` 的 numpy int64。"""
+        import numpy as _np
+
+        ids = _np.asarray([self._engine.tokenize(str(text))], dtype=_np.int64)
+        return {
+            "input_ids": ids,
+            "attention_mask": _np.ones_like(ids, dtype=_np.int64),
+        }
+
+    def decode(self, ids, skip_special_tokens: bool = False) -> str:
+        """接受 numpy 数组 / 张量 / 嵌套列表，一律拍平后交给 `detokenize`。"""
+        if hasattr(ids, "tolist"):
+            ids = ids.tolist()
+        flat: List[int] = []
+        for item in ids:
+            if isinstance(item, (list, tuple)):
+                flat.extend(int(value) for value in item)
+            else:
+                flat.append(int(item))
+        return self._engine.detokenize(flat)
 
 
 # ================================================================
