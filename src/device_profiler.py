@@ -34,6 +34,11 @@ from typing import Optional, Dict, Any, Tuple
 
 import psutil
 
+from task_worker_protocol import (
+    RUNTIME_PROFILES as TASK_WORKER_RUNTIME_PROFILES,
+    RUNTIME_PROFILE_UNSPECIFIED,
+)
+
 logger = logging.getLogger(__name__)
 
 _WINDOWS_NO_WINDOW = (
@@ -143,6 +148,31 @@ class PlatformInfo:
     python_version: str = ""
 
 
+# ============================================================
+# 发行 profile（运行时分档）环境变量读取
+# ============================================================
+
+#: 发行 profile 取值集合。**必须与 `packaging/packaging/runtime_guard.py` 的
+#: `RUNTIME_PROFILES` 一致**，由 `tests/test_runtime_profile_advertise.py` 校验。
+#: `llama_cpp_only` 是边缘/无 CUDA 发行的 profile：包体与外部 runtime venv 都不含 torch。
+RUNTIME_PROFILES: tuple = TASK_WORKER_RUNTIME_PROFILES
+
+#: 未声明 profile 时的取值：源码运行，或启动时既没给 `--runtime-profile`
+#: 也没设 `QLH_RUNTIME_PROFILE`。它表示"这个进程没有发行档"，不是硬件未知。
+def detect_runtime_profile() -> str:
+    """
+    读取本进程的发行 profile（环境变量 `QLH_RUNTIME_PROFILE`）。
+
+    该变量由 `qlh_launcher` 选定并写入环境，子进程继承。只认 `RUNTIME_PROFILES`
+    内的取值；未设置或不在此集合内一律返回 `unspecified`。
+
+    字段随注册 device_info 上报主节点，使调度能区分"无 torch 的边缘发行节点"
+    与"带 torch 的 PC 节点"，而不是靠目标机器碰巧装了什么反推。
+    """
+    raw = os.environ.get("QLH_RUNTIME_PROFILE", "").strip().lower()
+    return raw if raw in RUNTIME_PROFILES else RUNTIME_PROFILE_UNSPECIFIED
+
+
 @dataclass
 class DeviceProfile:
     """完整设备画像"""
@@ -161,6 +191,9 @@ class DeviceProfile:
     recommendations: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
     android_ready: bool = False
+    # 发行 profile（`llama_cpp_only` / `torch_cpu` / `torch_cuda`；
+    # `unspecified` = 源码运行或未声明）。随注册 device_info 上报主节点。
+    runtime_profile: str = RUNTIME_PROFILE_UNSPECIFIED
     # TP 孤岛聚合能力段（网关节点专用，随注册 device_info 上报主节点；
     # None = 非孤岛网关节点，旧版本节点无感）
     island: Optional[Dict[str, Any]] = None
@@ -433,6 +466,7 @@ class DeviceProfiler:
             recommendations=[],
             warnings=[],
             android_ready=self._check_android_ready(),
+            runtime_profile=detect_runtime_profile(),
             island=detect_island_profile(),
         )
 

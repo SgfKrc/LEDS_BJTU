@@ -20,6 +20,7 @@ from task_provider import (
 from task_worker_adapter import RemoteFullWorkerProvider, remote_provider_id
 from task_worker_protocol import (
     PROTOCOL_VERSION as TASK_WORKER_PROTOCOL_VERSION,
+    RUNTIME_PROFILE_UNSPECIFIED,
     WorkerMessage,
     WorkerProtocolError,
     build_message as build_task_worker_message,
@@ -125,6 +126,7 @@ class SchedulerTaskWorkerMixin:
             "engines": engines,
             "models": models,
             "max_concurrency": 1,
+            "runtime_profile": self._runtime_profile_for_capabilities(),
             # A distributed-only layer/relay worker is intentionally not a
             # Full Worker.  Its segment capability is negotiated by the
             # layer-config contract, so advertising no full-model identity
@@ -136,6 +138,18 @@ class SchedulerTaskWorkerMixin:
                 == "relay_middle"
             ),
         }
+
+    @staticmethod
+    def _runtime_profile_for_capabilities() -> str:
+        """Return the launcher-selected release profile without probing engines."""
+        try:
+            from device_profiler import detect_runtime_profile
+
+            return detect_runtime_profile()
+        except Exception:
+            # A malformed or partial slim installation must remain visible as
+            # unspecified; it must never claim a stronger release profile.
+            return RUNTIME_PROFILE_UNSPECIFIED
 
 
     def _send_task_worker_hello(

@@ -21,6 +21,11 @@ MAX_PROTOCOL_VERSION = 3
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 FULL_WORKER_KINDS = frozenset({"pc_full_worker", "android_full_worker"})
 
+# Runtime profiles are part of the release capability contract.  Keep this
+# dependency-free so protocol validation can run in the slim worker process.
+RUNTIME_PROFILES = ("llama_cpp_only", "torch_cpu", "torch_cuda")
+RUNTIME_PROFILE_UNSPECIFIED = "unspecified"
+
 MESSAGE_TYPES = frozenset({
     "hello",
     "hello_ack",
@@ -365,6 +370,8 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     # of a full-model identity.  This marker is optional for older workers.
     if "layer_worker" in capabilities:
         expected_fields.add("layer_worker")
+    if "runtime_profile" in capabilities:
+        expected_fields.add("runtime_profile")
     # ★ 2026-09-23：中间段通道能力（可选，向后兼容）—— 让调度侧知道该节点中间段
     #   实际能走哪条通道（值域同 `_LAYER_FORWARD_MIDDLE_CHANNELS`）；缺失 = 未声明。
     if "middle_channel" in capabilities:
@@ -400,6 +407,17 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
         _require_bool(
             capabilities["layer_worker"], "payload.capabilities.layer_worker",
         )
+    if "runtime_profile" in capabilities:
+        runtime_profile = _require_string(
+            capabilities["runtime_profile"],
+            "payload.capabilities.runtime_profile",
+            pattern=_SAFE_ID,
+        )
+        if runtime_profile != RUNTIME_PROFILE_UNSPECIFIED and runtime_profile not in RUNTIME_PROFILES:
+            raise _error(
+                "invalid_capabilities", "payload.capabilities.runtime_profile",
+                "runtime_profile is not a supported release profile",
+            )
     stage_types = capabilities["stage_types"]
     if not isinstance(stage_types, list) or not stage_types:
         raise _error(

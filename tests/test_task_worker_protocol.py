@@ -166,6 +166,18 @@ def test_hello_capabilities_may_advertise_middle_channel_and_n_pos_per_embd(gold
     assert npos_error.value.code == "invalid_capabilities"
 
 
+def test_hello_capabilities_may_advertise_runtime_profile(golden):
+    hello = copy.deepcopy(golden["messages"][0])
+    hello["payload"]["capabilities"]["runtime_profile"] = "llama_cpp_only"
+    decode_message(hello)
+
+    invalid = copy.deepcopy(golden["messages"][0])
+    invalid["payload"]["capabilities"]["runtime_profile"] = "torch_edge"
+    with pytest.raises(WorkerProtocolError) as captured:
+        decode_message(invalid)
+    assert captured.value.code == "invalid_capabilities"
+
+
 def test_hello_ack_fields_cannot_claim_an_invalid_negotiation(golden):
     accepted = copy.deepcopy(golden["messages"][1])
     accepted["payload"]["reason_code"] = "unsupported_protocol_version"
