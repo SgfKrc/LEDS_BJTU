@@ -89,6 +89,11 @@ class PeerClient:
         # resets the remote runner's KV state, so it must not happen per step.
         self._relay_sessions: Dict[str, Any] = {}
         self._pending_layer_config: Optional[tuple] = None
+        # Receiver callbacks are dispatched on independent threads. Keep a
+        # monotonic fence so a delayed release cannot erase a newer relay
+        # assignment after a master restart.
+        self._latest_layer_config_generation = 0
+        self._latest_layer_config_id = ""
         self._running = False
         self._client: Optional[Any] = None  # tcp_comm.TCPClient
         self._reconnect_delay = 5.0
@@ -203,6 +208,56 @@ class PeerClient:
 
     def _handle_layer_config_locked(self, data: dict) -> None:
         node_id = self._node_id
+
+        # Config callbacks run on independent receiver threads. Reject an
+        # older generation before it can clear a newer relay assignment.
+        candidate = data
+        if (
+            isinstance(data, dict)
+            and node_id in data
+            and isinstance(data.get(node_id), dict)
+        ):
+            candidate = data[node_id]
+        incoming_generation = None
+        if isinstance(candidate, dict) and "generation" in candidate:
+            try:
+                incoming_generation = int(candidate.get("generation"))
+            except (TypeError, ValueError):
+                incoming_generation = None
+        incoming_config_id = (
+            str(candidate.get("config_id", "") or "")
+            if isinstance(candidate, dict) else ""
+        )
+        if incoming_generation is not None:
+            with self._layer_config_lock:
+                latest_generation = int(
+                    getattr(self, "_latest_layer_config_generation", 0) or 0
+                )
+                latest_config_id = str(
+                    getattr(self, "_latest_layer_config_id", "") or ""
+                )
+                stale = (
+                    incoming_generation < latest_generation
+                    or (
+                        incoming_generation == latest_generation
+                        and incoming_config_id
+                        and latest_config_id
+                        and incoming_config_id != latest_config_id
+                    )
+                )
+                if stale:
+                    logger.info(
+                        "ignore stale layer config node=%s config=%s generation=%s latest=%s/%s",
+                        node_id,
+                        incoming_config_id or "legacy",
+                        incoming_generation,
+                        latest_generation,
+                        latest_config_id or "legacy",
+                    )
+                    return
+                if incoming_generation > latest_generation:
+                    self._latest_layer_config_generation = incoming_generation
+                    self._latest_layer_config_id = incoming_config_id
 
         # 兼容两种格式：新版直接是 assignment；旧版 {node_id: assignment}
         if isinstance(data, dict) and data.get("release"):

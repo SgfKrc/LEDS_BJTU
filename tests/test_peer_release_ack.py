@@ -94,3 +94,28 @@ def test_release_for_another_node_is_ignored():
 
     assert sent == []
     assert peer._active_layer_config == {"stale": True}
+
+
+def test_stale_release_cannot_clear_newer_relay_config():
+    """A delayed restart release must not erase the current relay assignment."""
+    peer, sent = _peer(node_id="client1")
+    peer._latest_layer_config_generation = 20
+    peer._latest_layer_config_id = "cfg-current"
+    peer._active_layer_config = {
+        "node_id": "client1",
+        "config_id": "cfg-current",
+        "generation": 20,
+        "engine": "relay_middle",
+    }
+    peer._local_pipeline_steps = {"task-current": 0}
+
+    peer._handle_layer_config({
+        "release": True,
+        "node_id": "client1",
+        "config_id": "cfg-old-release",
+        "generation": 19,
+    })
+
+    assert sent == []
+    assert peer._active_layer_config["config_id"] == "cfg-current"
+    assert peer._local_pipeline_steps == {"task-current": 0}
