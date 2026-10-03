@@ -430,6 +430,10 @@ class SchedulerPipelineMixin:
                         ),
                     }
                 for node_id in releasable_legacy_ids
+                # ★ 与下面的 `:537` releases 同理：relay 宿主**不**收本地层配置，
+                #   容量求解的否定结论不该顺带释放它的预留 —— 否则它每次 hello 后
+                #   都「确认退出分层 worker」，relay 链再也拿不到中间段（实测）。
+                if self._relay_segment_for_worker(node_id) is None
                 }
                 with self._layer_config_lock:
                     self._pipeline_load_transaction = {
@@ -543,6 +547,14 @@ class SchedulerPipelineMixin:
             }
             for node_id in (layer_releasable_worker_ids | full_worker_release_ids)
             if node_id not in assignments
+            # ★ relay 宿主**不**收本地层配置（它的层由远端 relay_mid_service 代跑），
+            #   因此它永远不在 `assignments` 里 —— 但那不等于该释放它的预留：它要的
+            #   恰恰是那份 legacy 层配置（`engine="relay_middle"`，由请求路径的
+            #   `_push_layer_config_to_clients_locked` 下发；hello 时还没有
+            #   capacity_plan，所以那时释放等于把它踢出链路）。此前没有这一条，
+            #   实测 Surface 每次 hello 后立刻「确认退出分层 worker」，
+            #   relay 链永远拿不到中间段。
+            and self._relay_segment_for_worker(node_id) is None
         }
         configs = {**assignments, **releases}
         if capacity_plan is not None:
