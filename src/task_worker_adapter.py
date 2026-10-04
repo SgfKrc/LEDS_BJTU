@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections
 import hashlib
+import json
 import logging
 import queue
 import threading
@@ -66,6 +67,19 @@ def _message_id(prefix: str) -> str:
 
 def _message_digest(message: WorkerMessage) -> str:
     return hashlib.sha256(canonical_message_bytes(message)).hexdigest()
+
+
+def _canonical_capabilities(value: Any) -> str:
+    """把 capabilities 折成可比字符串（dict 顺序无关）。
+
+    用于「幂等 hello」：判断 worker 这次上报的能力与上次是否**内容相同**。
+    不可 JSON 序列化的值退化为 `repr` —— 宁可判成"变了"（多重推一次层配置），
+    也不要漏判（漏了就永远不推）。
+    """
+    try:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, default=repr)
+    except (TypeError, ValueError):
+        return repr(value)
 
 
 class TaskWorkerControlPlane:
@@ -219,6 +233,19 @@ class TaskWorkerControlPlane:
                 version=ack_version,
             )
             now = time.time()
+            previous = self._workers.get(peer_id)
+            # ★ 幂等 hello（#28）：capabilities 的**内容**是否变化。协调方据它决定要不要
+            #   重推层配置 —— 此前每次 hello 后都无条件
+            #   `push_layer_config_to_clients()`（无内容比较），一旦层段路径也补
+            #   `refresh_task_worker_capabilities()`，就形成
+            #   `hello → push → load_layer_range → refresh → hello` 自激环：每次 push 都取
+            #   新 generation，worker 端永远判成"新配置"。
+            #   首次 hello（`previous is None`）等效"变化"，保证仍会推一次。
+            capabilities_changed = _canonical_capabilities(
+                payload.get("capabilities")
+            ) != _canonical_capabilities(
+                previous.get("capabilities") if isinstance(previous, dict) else None
+            )
             self._workers[peer_id] = {
                 "node_id": peer_id,
                 "worker_kind": payload["worker_kind"],
@@ -226,6 +253,7 @@ class TaskWorkerControlPlane:
                 "accepted": accepted,
                 "selected_version": selected_version,
                 "capabilities": payload["capabilities"],
+                "capabilities_changed": capabilities_changed,
                 "hello_received_at": now,
                 "last_transport_heartbeat": now,
                 "reason_code": reason_code,

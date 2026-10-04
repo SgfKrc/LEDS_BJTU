@@ -883,7 +883,14 @@ class SchedulerTaskWorkerMixin:
                     # no longer negotiating the task-worker path, so legacy
                     # scheduling can be recomputed for that connection.
                     self._task_worker_control.resolve_worker_connection_pending(client_id)
-                    self.push_layer_config_to_clients()
+                    # ★ 幂等 hello（#28）：**只有 capabilities 真的变了**才重推层配置。
+                    #   此前无条件 push，配合层段路径补 refresh 会形成
+                    #   `hello → push → load_layer_range → refresh → hello` 自激环（每次 push
+                    #   都取新 generation ⇒ worker 端永远判成"新配置"）。
+                    #   字段缺失时按"变了"处理（保守：多重推一次总好过永远不推）。
+                    worker_snapshot = self._task_worker_control.worker_snapshot(client_id)
+                    if worker_snapshot.get("capabilities_changed", True):
+                        self.push_layer_config_to_clients()
                     if ack.payload["accepted"]:
                         self._ensure_remote_task_worker_provider(client_id)
                         # A node that has just advertised a complete model is
