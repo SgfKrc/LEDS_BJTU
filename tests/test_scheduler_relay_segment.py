@@ -40,6 +40,20 @@ N_EMBD = 4
 N_TOKENS = 2
 
 
+@pytest.fixture(autouse=True)
+def _relay_probe_only_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """本文件整体验证的是 A1 relay 的**行为**（探针/实验语义）。
+
+    2026-10-04 产品裁定（分票规划 DIST-0）把 A1 从生产调度入口剔除后，
+    `PIPELINE_RELAY_PROBE_ONLY` 默认为 1 ⇒ `_relay_segment_for_worker` 在生产
+    路径直接不供给 relay 段。这些用例直接调用该方法，属探针语义，故在本文件
+    统一关掉闸门。**产品路径的剔除行为**由
+    `test_relay_segment_for_worker_respects_switch`（关掉 `RELAY_ENABLED`）与
+    启动期角色互斥检测（`api_server`）另行覆盖。
+    """
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_PROBE_ONLY", False)
+
+
 class _PlusOneRunner:
     def __init__(self) -> None:
         self.seen: list[tuple[int, bytes]] = []

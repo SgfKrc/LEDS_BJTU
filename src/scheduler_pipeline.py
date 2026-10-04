@@ -15,6 +15,7 @@ from koakuma_engine import Capability, backend_id_for, runtime_supports
 from config import (
     PIPELINE_MODEL_SYNC_TIMEOUT,
     PIPELINE_RELAY_ENABLED,
+    PIPELINE_RELAY_PROBE_ONLY,
     PIPELINE_RELAY_SEGMENTS,
     TASK_WORKER_EXPERIMENTAL_ENABLED,
 )
@@ -4401,6 +4402,22 @@ class SchedulerPipelineMixin:
         缓存用 `getattr` 惰性挂在实例上，**不**改 `__init__`（本方法是 mixin 方法，
         实例可能来自多种构造路径）。
         """
+        # ★ 2026-10-04 产品裁定（分票规划 DIST-0）：A1 relay 已从**产品调度入口
+        #   剔除** —— 它依赖 probe/SSH 隧道与 loopback 段服务，只保留为技术探针与
+        #   历史证据（产品主线是 A3 `stage_offer_v3`）。默认 `PROBE_ONLY=1` 时本方法
+        #   直接不供给 relay 段：生产请求即使配了 `QLH_RELAY_ENABLED` /
+        #   `QLH_RELAY_SEGMENTS`，也只记一份具名诊断并继续走 A3，**不做静默切换**。
+        #   探针/实验要恢复 A1 行为时显式设 `QLH_RELAY_PROBE_ONLY=0`。
+        if PIPELINE_RELAY_PROBE_ONLY:
+            if not getattr(self, "_relay_probe_only_warned", False):
+                self._relay_probe_only_warned = True
+                logger.warning(
+                    "A1 relay 已从产品调度入口剔除（QLH_RELAY_PROBE_ONLY=1，默认）："
+                    "QLH_RELAY_ENABLED/QLH_RELAY_SEGMENTS 不再作为生产能力，生产请求"
+                    "继续走 A3 stage_offer_v3。需要 A1 探针行为请显式设 "
+                    "QLH_RELAY_PROBE_ONLY=0。首个受影响 worker=%s", worker_id,
+                )
+            return None
         if not PIPELINE_RELAY_ENABLED:
             return None
         if str(routing_preference or "auto") == "local_only":
@@ -4677,6 +4694,23 @@ class SchedulerPipelineMixin:
 
         task_id = uuid.uuid4().hex[:12]
         worker_ids = [node["node_id"] for node in stage_nodes]
+        # ★ 产品裁定「分布式可用必须 fail-closed」：成功请求必须带非空
+        #   `claimed_layers`（与 A1 同口径：远端实际承了哪段层）。此前 A3 恒缺
+        #   该字段（它只在 `pipeline_capacity` 的 relay 零层条目里被填），按裁定
+        #   就不能计为分布式成功。这里由 `stage_nodes` 的每段 start/end 派生：
+        #   顶层给并集（判据只用非空 + 覆盖性），另给逐段明细供可观测性。
+        _stage_ranges: list[tuple[int, int]] = []
+        for _node in stage_nodes:
+            _start = _node.get("start_layer")
+            _end = _node.get("end_layer")
+            if _start is None or _end is None:
+                continue
+            _stage_ranges.append((int(_start), int(_end)))
+        _claimed_layers = (
+            [min(r[0] for r in _stage_ranges), max(r[1] for r in _stage_ranges)]
+            if _stage_ranges
+            else []
+        )
         pipeline_metrics = {
             "steps": [],
             "total_time_ms": 0,
@@ -4693,6 +4727,8 @@ class SchedulerPipelineMixin:
             "serving_node_id": self.get_effective_node_id(),
             "workers_used": worker_ids,
             "layer_assignments": stage_nodes,
+            "claimed_layers": _claimed_layers,
+            "layer_segments": [[s, e] for s, e in _stage_ranges],
         }
         generated_ids: list[int] = []
         full_input_ids = input_ids

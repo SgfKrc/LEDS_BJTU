@@ -458,6 +458,15 @@ PIPELINE_RELAY_ENABLED = _env_bool("QLH_RELAY_ENABLED", False)
 # 默认空 ⇒ 不下发任何 `relay_segment`，行为与接线前**完全一致**。不合法的条目整条丢弃。
 PIPELINE_RELAY_SEGMENTS = _env_first("QLH_RELAY_SEGMENTS", default="")
 
+# ★ 2026-10-04 产品裁定（分票规划 DIST-0）：**A1 relay 从产品调度入口剔除**。
+#   A1 依赖 probe/SSH 隧道与 loopback 段服务，只保留为技术探针与历史证据，
+#   不再是生产候选、容量来源或可用性证明（产品主线是 A3 `stage_offer_v3`）。
+#   本开关默认 **1（探针专用）**：置 1 时上面的 `QLH_RELAY_ENABLED` /
+#   `QLH_RELAY_SEGMENTS` 不再作为生产能力（`_relay_segment_for_worker` 直接
+#   不供给 relay 段），生产请求继续走 A3，只记一份具名诊断、不做静默切换。
+#   探针/实验需要恢复 A1 行为时显式设 `QLH_RELAY_PROBE_ONLY=0`。
+PIPELINE_RELAY_PROBE_ONLY = _env_bool("QLH_RELAY_PROBE_ONLY", True)
+
 # 图算法智能编排阈值：节点数超过此值（>5）时自动启用最大带宽生成树 + DFS，
 # 替代纯算力权重分配；节点数 ≤ 阈值时回退到简单排序（权重比例分配）
 GRAPH_ORCHESTRATOR_THRESHOLD = 5         # 节点数 > 5 启用图算法，≤ 5 使用简单排序
