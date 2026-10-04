@@ -170,6 +170,14 @@ class SchedulerTaskWorkerMixin:
         #   结果是 PC worker 永远不会被派到 `layer_forward`。
         stage_types = ["full_inference", "aggregate"]
         layer_ranges: list[list[int]] = []
+        # ★ #28：**工件身份**（「我手上有哪份权重」）与**就绪区间**（「我现在能跑哪几层」）
+        #   是两件事，此前共用一个 `if layer_worker / else` 分支 ⇒ 只要 `layer_range` 残留
+        #   或 `_active_layer_config` 还在，整个工件身份分支就被跳过，`models` 变空。
+        #   而主节点把这份 hello 快照当层分配与 Stage offer 的唯一身份来源 ⇒ 远端 Stage
+        #   以 `model_identity_mismatch` 被拒（worker 侧 `_handle_task_worker_stage_offer`
+        #   还会用**实时** capabilities 再比对一次，两侧都不一致时症状更隐蔽）。
+        #   ⇒ 身份**不再**依附于就绪状态：只要手上有工件就上报。
+        artifact = self._configured_layer_artifact()
         if layer_worker:
             layer_range = active_layer_config.get("layer_range")
             if (
@@ -181,27 +189,27 @@ class SchedulerTaskWorkerMixin:
                 )
             ):
                 layer_ranges.append([int(layer_range[0]), int(layer_range[1])])
-        else:
+        elif artifact is not None:
             # 首次 hello 时 master 还没下发 layer config —— 它只对**已声明**层段能力的
             # worker 下发。若这里只看 `_active_layer_config` 就形成死锁：声明为空 ⇒
             # 分配器没有区间约束 ⇒ 分到手上没有的区间 ⇒ `layer_range_not_advertised`
             # 被拒 ⇒ 永远拿不到配置。改为从**工件 manifest** 推导，使声明先于配置成立。
-            artifact = self._configured_layer_artifact()
-            if artifact is not None:
-                layer_worker = True
-                layer_ranges.append([artifact["start"], artifact["end"]])
-                # 层段 worker 不加载整模 ⇒ `models` 会是空的，而 Route A 的 offer 身份
-                # 正是从这里取（`_route_a_stage_model_identity`）⇒ 缺了它整条链会以
-                # `route_a_stage_model_identity_unavailable` 失败。用**工件身份**顶上：
-                # `task_worker_adapter._layer_model_matches` 比对的就是 engine/format/sha256。
-                if artifact.get("sha256"):
-                    models.append({
-                        "model_id": artifact["model_id"],
-                        "engine": "llama_cpp",
-                        "format": "gguf",
-                        "revision": artifact["revision"],
-                        "sha256": artifact["sha256"],
-                    })
+            layer_worker = True
+            layer_ranges.append([artifact["start"], artifact["end"]])
+        if artifact is not None and not models and artifact.get("sha256"):
+            # 层段 worker 不加载整模 ⇒ 只靠上面的整模分支时 `models` 会是空的，而 Route A
+            # 的 offer 身份正是从这里取（`_route_a_stage_model_identity`）⇒ 缺了它整条链
+            # 会以 `route_a_stage_model_identity_unavailable` 失败。用**工件身份**顶上：
+            # `task_worker_adapter._layer_model_matches` 比对的就是 engine/format/sha256。
+            # 整模身份优先（上面已填 `models` 时不覆盖）—— 两者冲突说明本机同时握着整模
+            # 与工件，此时以整模为准是保守选择。
+            models.append({
+                "model_id": artifact["model_id"],
+                "engine": "llama_cpp",
+                "format": "gguf",
+                "revision": artifact["revision"],
+                "sha256": artifact["sha256"],
+            })
         if layer_worker and "layer_forward" not in stage_types:
             stage_types.append("layer_forward")
         return {
