@@ -360,7 +360,14 @@ class SchedulerPipelineMixin:
                 node_id for node_id, node in self.nodes.items()
                 if node_id in connected_ids
                 and node_id != self.get_effective_node_id()
-                and getattr(node, "node_type", "pc") == "pc"
+                and (
+                    getattr(node, "node_type", "pc") == "pc"
+                    # Relay is an endpoint-backed role, not a local model
+                    # capability. Preserve it even when the host advertises
+                    # itself as Android so it can receive relay_middle rather
+                    # than being silently excluded before role resolution.
+                    or self._is_relay_host(node_id)
+                )
             }
         try:
             pending_worker_ids = self._task_worker_control.pending_worker_ids()
@@ -4410,7 +4417,30 @@ class SchedulerPipelineMixin:
         if cache is None:
             cache = self._parse_relay_segment_map(PIPELINE_RELAY_SEGMENTS)
             self._relay_segment_map_cache = cache
-        return cache.get(str(worker_id))
+        worker_key = str(worker_id or "").strip()
+        spec = cache.get(worker_key)
+        if spec is not None:
+            return spec
+
+        # Client workers conventionally register as ``client_<hostname>``
+        # while deployment profiles often use the stable hostname alone. Keep
+        # the exact key authoritative, then allow only the one unambiguous
+        # client-prefix alias so a profile typo cannot silently assign a relay
+        # segment to a different node.
+        alias = (
+            worker_key[7:]
+            if worker_key.startswith("client_")
+            else f"client_{worker_key}"
+        )
+        if alias and alias != worker_key:
+            aliased = cache.get(alias)
+            if aliased is not None:
+                logger.info(
+                    "relay 节点名按 client_ 别名匹配: worker=%s configured=%s",
+                    worker_key, alias,
+                )
+                return aliased
+        return None
 
     def _is_relay_host(self, node_id: str) -> bool:
         """该节点是否是 **relay 宿主** —— 「谁是 relay 宿主」的**唯一判据入口**。

@@ -412,6 +412,38 @@ def test_relay_segment_for_worker_returns_spec_and_caches(monkeypatch: pytest.Mo
     assert spec["layer_start"] == 8 and spec["layer_end"] == 16
     assert harness.obj._relay_segment_for_worker("worker-9") is None
 
+
+def test_relay_segment_for_worker_accepts_client_prefix_alias(monkeypatch: pytest.MonkeyPatch):
+    """Deployment names may omit the transport client's ``client_`` prefix."""
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_ENABLED", True)
+    monkeypatch.setattr(
+        scheduler_pipeline, "PIPELINE_RELAY_SEGMENTS",
+        "tablet=middle@127.0.0.1:50183#896#8-16",
+    )
+    harness = _Harness()
+
+    spec = harness.obj._relay_segment_for_worker("client_tablet")
+
+    assert spec is not None
+    assert spec["port"] == 50183
+
+
+def test_relay_segment_for_worker_exact_name_wins_over_alias(monkeypatch: pytest.MonkeyPatch):
+    """An explicit client_ key must remain authoritative when both names exist."""
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_ENABLED", True)
+    monkeypatch.setattr(
+        scheduler_pipeline, "PIPELINE_RELAY_SEGMENTS",
+        "tablet=middle@127.0.0.1:50183#896#8-16;"
+        "client_tablet=tail@127.0.0.1:50184#896#16-24",
+    )
+    harness = _Harness()
+
+    spec = harness.obj._relay_segment_for_worker("client_tablet")
+
+    assert spec is not None
+    assert spec["role"] == "tail"
+    assert spec["port"] == 50184
+
     # 缓存：解析一次后进程内稳定（改配置不影响已解析结果）
     monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_SEGMENTS",
                         "worker-9=middle@127.0.0.1:50199#896#8-16")

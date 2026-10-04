@@ -5662,6 +5662,46 @@ class TestPipelineOrchestrationIntegration:
         assert config["relay_segment"] == relay_segment
         assert config.get("release") is not True
 
+    def test_android_relay_host_is_not_excluded_from_legacy_rehydration(
+            self, sched_master, monkeypatch):
+        """Endpoint relay role survives candidate filtering regardless of platform."""
+        relay_id = "android-relay-host"
+        relay = NodeInfo(
+            node_id=relay_id, role="client", state=NodeState.ONLINE,
+            node_type="android", address="100.64.1.11:8888",
+            last_heartbeat=time.time(),
+        )
+        sched_master.nodes[relay_id] = relay
+        sched_master._tcp_server.clients = {relay_id: True}
+        relay_segment = {
+            "role": "middle",
+            "host": "127.0.0.1",
+            "port": 50283,
+            "n_embd": 4096,
+            "layer_start": 23,
+            "layer_end": 24,
+        }
+        monkeypatch.setattr(
+            sched_master, "_relay_segment_for_worker",
+            lambda node_id: relay_segment if node_id == relay_id else None,
+        )
+        monkeypatch.setattr(
+            sched_master, "_get_active_pipeline_model_info", lambda: {},
+        )
+        published = []
+        monkeypatch.setattr(
+            sched_master, "_publish_layer_configs",
+            lambda configs: published.append(configs),
+        )
+
+        sched_master._push_layer_config_to_clients_locked()
+
+        assert len(published) == 1
+        config = published[0][relay_id]
+        assert config["engine"] == "relay_middle"
+        assert config["relay_segment"] == relay_segment
+        assert config.get("release") is not True
+
     def test_model_transition_defers_release_and_flushes_one_push(
             self, sched_master, monkeypatch):
         """Transient model metadata must not publish release over a new config."""
