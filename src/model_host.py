@@ -349,7 +349,10 @@ class ModelHost:
         positional and keyword callers keep working.
         """
 
-        if str(engine or "").strip().lower() in ("llama_cpp", "llama.cpp", "llama-cpp", "gguf"):
+        requested_engine = str(engine or "").strip().lower()
+        if requested_engine in ("", "auto"):
+            requested_engine = str(self.select_engine(profile) or "").strip().lower()
+        if requested_engine in ("llama_cpp", "llama.cpp", "llama-cpp", "gguf"):
             self._load_gguf_model(model_path=model_path, model_id=model_id, profile=profile)
             return
         manager = self._materialize_manager()

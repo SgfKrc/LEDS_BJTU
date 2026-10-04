@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import pytest
 import threading
+import types
 
 from model_host import (
     InferenceHost,
@@ -224,6 +225,34 @@ class TestLazyModelManager:
         )
         with pytest.raises(RuntimeError, match="没有 PyTorch"):
             host.load_model(engine="pytorch")
+
+    def test_auto_load_uses_gguf_without_materializing_torch_manager(self, monkeypatch, tmp_path):
+        import model_host as model_host_module
+
+        model_path = tmp_path / "probe.gguf"
+        model_path.write_bytes(b"probe")
+
+        class FakeGguf:
+            engine_type = "llama_cpp"
+
+            def __init__(self):
+                self.is_loaded = False
+
+            def load_model(self, **kwargs):
+                self.is_loaded = True
+                self.model_path = kwargs["model_path"]
+
+        fake_module = types.ModuleType("llama_engine")
+        fake_module.LlamaCppEngine = FakeGguf
+        fake_module.get_gguf_model_path = lambda: str(model_path)
+        monkeypatch.setitem(sys.modules, "llama_engine", fake_module)
+
+        host = ModelHost()
+        monkeypatch.setattr(host, "select_engine", lambda profile=None: "llama_cpp")
+        host.load_model(model_path=str(model_path), engine=None)
+
+        assert host.is_loaded is True
+        assert host.engine_type == "llama_cpp"
 
     def test_torch_free_partial_gguf_is_rejected_as_full_model(self):
         class PartialGguf:
