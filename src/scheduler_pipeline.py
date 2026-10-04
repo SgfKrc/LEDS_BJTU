@@ -281,7 +281,17 @@ class SchedulerPipelineMixin:
             from local_store import set_local_setting
 
             set_local_setting(_PIPELINE_LIFECYCLE_STATE_KEY, state)
+            self._pipeline_lifecycle_persist_ok = True
+            if self._pipeline_recovery_pending and self._pipeline_recovery_failure in {
+                "pipeline_lifecycle_persist_failed",
+                "pipeline_recovery_state_unavailable",
+                "pipeline_recovery_state_invalid",
+            }:
+                self._pipeline_recovery_failure = "pipeline_recovery_pending"
         except Exception:
+            self._pipeline_lifecycle_persist_ok = False
+            self._pipeline_recovery_pending = True
+            self._pipeline_recovery_failure = "pipeline_lifecycle_persist_failed"
             logger.warning("failed to persist pipeline lifecycle state", exc_info=True)
 
     def _load_pipeline_recovery_state(self) -> None:
@@ -291,10 +301,12 @@ class SchedulerPipelineMixin:
 
             raw = get_local_setting(_PIPELINE_LIFECYCLE_STATE_KEY, None)
         except Exception:
+            self._pipeline_lifecycle_persist_ok = False
             self._pipeline_recovery_pending = True
             self._pipeline_recovery_failure = "pipeline_recovery_state_unavailable"
             logger.warning("failed to load pipeline lifecycle state", exc_info=True)
             return
+        self._pipeline_lifecycle_persist_ok = True
         if raw is None:
             return
         try:
@@ -302,6 +314,7 @@ class SchedulerPipelineMixin:
         except (AttributeError, TypeError, ValueError):
             schema_version = 0
         if not isinstance(raw, dict) or schema_version != 1:
+            self._pipeline_lifecycle_persist_ok = False
             self._pipeline_recovery_pending = True
             self._pipeline_recovery_failure = "pipeline_recovery_state_invalid"
             return
@@ -324,6 +337,8 @@ class SchedulerPipelineMixin:
         """Release the restart fence only after the fresh generation is ready."""
         if not self._pipeline_recovery_pending:
             return
+        if not self._pipeline_lifecycle_persist_ok:
+            return
         with self._layer_config_lock:
             transaction = self._pipeline_load_transaction
             if not transaction:
@@ -337,12 +352,32 @@ class SchedulerPipelineMixin:
                 return
             if phase != "ready":
                 return
+            config_id = str(transaction.get("config_id", "") or "")
+            plan = transaction.get("plan")
+            plan = dict(plan) if isinstance(plan, dict) else {}
             for node_id, expected in self._layer_config_expected.items():
                 if expected.get("release"):
                     return
                 if node_id not in self._layer_config_pushed:
                     return
-            self._clear_pipeline_recovery_fence()
+        for assignment in plan.get("assignments", []):
+            if not isinstance(assignment, dict):
+                continue
+            if assignment.get("execution") != "stage_offer_v3":
+                continue
+            ready, _reason = self._stage_offer_assignment_ready(
+                str(assignment.get("node_id", "") or ""), assignment,
+            )
+            if not ready:
+                return
+        with self._layer_config_lock:
+            transaction = self._pipeline_load_transaction
+            if (
+                transaction
+                and transaction.get("config_id") == config_id
+                and transaction.get("phase") == "ready"
+            ):
+                self._clear_pipeline_recovery_fence()
 
     @property
     def _active_layer_config(self):

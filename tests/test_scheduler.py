@@ -1885,6 +1885,78 @@ class TestPipelineReadiness:
         }]
         assert "model_path" not in snapshot
 
+    def test_restart_recovery_fence_requires_durable_ready_state(
+            self, sched, monkeypatch):
+        """A ready in-memory generation cannot clear a fence after a write failure."""
+        import local_store
+
+        monkeypatch.setattr(sched, "_running", True)
+        monkeypatch.setattr(sched, "_effective_role", lambda: "master")
+        sched._pipeline_recovery_pending = True
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-new",
+            "generation": 8,
+            "phase": "ready",
+            "worker_ids": set(),
+            "prepared_nodes": set(),
+            "ready_nodes": set(),
+            "plan": {"assignments": []},
+        }
+
+        def fail_write(_key, _value):
+            raise OSError("sqlite unavailable")
+
+        monkeypatch.setattr(local_store, "set_local_setting", fail_write)
+        sched._persist_pipeline_lifecycle_locked()
+        sched._maybe_finish_pipeline_recovery()
+
+        assert sched._pipeline_recovery_pending is True
+        assert sched._pipeline_lifecycle_persist_ok is False
+
+        saved = []
+        monkeypatch.setattr(
+            local_store, "set_local_setting",
+            lambda key, value: saved.append((key, value)),
+        )
+        sched._persist_pipeline_lifecycle_locked()
+        sched._maybe_finish_pipeline_recovery()
+
+        assert saved[0][0] == "pipeline_config_lifecycle_v1"
+        assert saved[0][1]["phase"] == "ready"
+        assert sched._pipeline_lifecycle_persist_ok is True
+        assert sched._pipeline_recovery_pending is False
+
+    def test_restart_recovery_fence_waits_for_route_a_stage_readiness(
+            self, sched, monkeypatch):
+        """A stage-offer assignment is not committed by legacy ACK state."""
+        stage_ready = False
+        monkeypatch.setattr(
+            sched, "_stage_offer_assignment_ready",
+            lambda _node_id, _assignment: (stage_ready, "not_ready"),
+        )
+        sched._pipeline_recovery_pending = True
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-new",
+            "generation": 8,
+            "phase": "ready",
+            "worker_ids": set(),
+            "prepared_nodes": set(),
+            "ready_nodes": set(),
+            "plan": {"assignments": [{
+                "node_id": "android-worker",
+                "execution": "stage_offer_v3",
+                "start_layer": 0,
+                "end_layer": 4,
+            }]},
+        }
+
+        sched._maybe_finish_pipeline_recovery()
+        assert sched._pipeline_recovery_pending is True
+
+        stage_ready = True
+        sched._maybe_finish_pipeline_recovery()
+        assert sched._pipeline_recovery_pending is False
+
     def test_forced_sync_does_not_accept_ready_single_node_plan(
             self, sched, monkeypatch):
         calls = []

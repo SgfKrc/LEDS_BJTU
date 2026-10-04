@@ -1040,6 +1040,7 @@ class Scheduler(
         self._pipeline_recovery_pending = False
         self._pipeline_recovery_failure = ""
         self._pipeline_recovery_state: Optional[dict] = None
+        self._pipeline_lifecycle_persist_ok = True
         # Qwen3 remains outside production runtime admission.  This isolated
         # state machine exercises the C2 lifecycle without network dispatch,
         # weight materialization, or full-model fallback.
