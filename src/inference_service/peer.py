@@ -156,7 +156,15 @@ class PeerClient:
         logger.warning("与主节点连接断开: %s:%s", self._master_host, self._master_port)
         with self._layer_config_lock:
             self._active_layer_config = None
+            self._pending_layer_config = None
             self._local_pipeline_steps.clear()
+            self._active_pipeline_task_ids.clear()
+            self._local_pipeline_cancelled.clear()
+        # A reconnect must not reuse KV state from a socket that has already
+        # lost its coordinator. Keep the generation fence intact so delayed
+        # messages from the old connection cannot overwrite a new assignment.
+        with self._kv_cache_lock:
+            self._kv_cache.clear()
 
     def run_forever(self) -> None:
         """阻塞运行：连接失败/断开后自动重连（简单退避）。"""

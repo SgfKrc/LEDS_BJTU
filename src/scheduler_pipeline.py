@@ -3970,7 +3970,13 @@ class SchedulerPipelineMixin:
         with self._layer_config_lock:
             plan = self._active_pipeline_capacity_plan
             transaction = self._pipeline_load_transaction
-            if not plan and transaction:
+            if (
+                not plan
+                and transaction
+                and transaction.get("phase") in {
+                    "preparing", "committing_local", "committing", "ready",
+                }
+            ):
                 plan = transaction.get("plan")
             assignments = plan.get("assignments", []) if isinstance(plan, dict) else []
             return len(assignments) >= 2
@@ -4037,7 +4043,7 @@ class SchedulerPipelineMixin:
                     transaction = self._pipeline_load_transaction or {}
                     phase = str(transaction.get("phase", "") or "")
                     plan = transaction.get("plan") or {}
-                if phase in {"rejected", "aborted"}:
+                if phase in {"rejected", "aborted", "invalidated"}:
                     return {
                         **readiness,
                         "ready": False,

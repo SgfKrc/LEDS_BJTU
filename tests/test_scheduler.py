@@ -753,6 +753,44 @@ class TestComputeLayerAssignment:
         )]
         assert reshard_attempts == ["worker-drop"]
 
+    def test_ready_capacity_plan_is_invalidated_when_worker_disconnects(
+            self, sched, monkeypatch):
+        plan = {
+            "admitted": True,
+            "plan_id": "plan-ready-drop",
+            "total_layers": 4,
+            "assignments": [
+                {"node_id": "worker-drop", "start_layer": 0, "end_layer": 2},
+                {"node_id": "master", "start_layer": 2, "end_layer": 4},
+            ],
+        }
+        sched._active_pipeline_capacity_plan = dict(plan)
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-ready-drop",
+            "phase": "ready",
+            "plan": dict(plan),
+            "worker_ids": {"worker-drop"},
+            "ready_nodes": {"worker-drop"},
+        }
+        monkeypatch.setattr(
+            sched, "_fail_pending_pipeline_results_for_node", lambda *_args: None,
+        )
+        monkeypatch.setattr(sched, "deregister_node", lambda _node_id: False)
+        monkeypatch.setattr(
+            sched, "_stage_pipeline_reshard_after_disconnect", lambda _node_id: None,
+        )
+        monkeypatch.setattr(sched, "push_layer_config_to_clients", lambda: None)
+
+        sched._on_tcp_disconnect("worker-drop")
+
+        assert sched._active_pipeline_capacity_plan is None
+        assert sched._pipeline_load_transaction["phase"] == "invalidated"
+        assert (
+            sched._pipeline_load_transaction["reason_code"]
+            == "pipeline_worker_disconnected"
+        )
+        assert sched.get_layer_assignments()["strategy"] != "capacity"
+
     def test_disconnect_reshard_uses_only_connected_survivors(
             self, sched, monkeypatch):
         captured = {}

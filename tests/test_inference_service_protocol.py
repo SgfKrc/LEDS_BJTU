@@ -2130,12 +2130,20 @@ def test_peer_layer_config_new_format(monkeypatch):
 def test_peer_disconnect_marks_client_for_reregistration():
     peer = make_peer()
     peer._running = True
+    peer._pending_layer_config = ("cfg-old", {})
+    peer._active_pipeline_task_ids.add("task-old")
+    peer._local_pipeline_cancelled.add("task-old")
+    peer._kv_cache["task-old"] = ("stale",)
     peer._close_all_relay_sessions = lambda: None
     peer._handle_disconnect()
 
     assert peer._running is False
     assert peer._active_layer_config is None
     assert peer._local_pipeline_steps == {}
+    assert peer._pending_layer_config is None
+    assert peer._active_pipeline_task_ids == set()
+    assert peer._local_pipeline_cancelled == set()
+    assert peer._kv_cache == {}
 
 
 def test_peer_layer_config_missing_contract(monkeypatch):

@@ -2504,11 +2504,20 @@ class Scheduler(
                 if self._active_pipeline_capacity_plan else None
             )
             if capacity_plan is None and self._pipeline_load_transaction:
+                transaction_phase = str(
+                    self._pipeline_load_transaction.get("phase", "") or ""
+                )
                 candidate = self._pipeline_load_transaction.get("plan")
-                if isinstance(candidate, dict) and candidate.get("admitted"):
+                if (
+                    transaction_phase in {
+                        "preparing", "committing_local", "committing", "ready",
+                    }
+                    and isinstance(candidate, dict)
+                    and candidate.get("admitted")
+                ):
                     capacity_plan = dict(candidate)
                     capacity_plan["transaction_phase"] = (
-                        self._pipeline_load_transaction.get("phase", "")
+                        transaction_phase
                     )
 
         if capacity_plan and capacity_plan.get("admitted"):
@@ -3030,6 +3039,12 @@ class Scheduler(
                 return self._attach_pipeline_node_contract(active)
             if transaction_snapshot and transaction_plan:
                 transaction_plan.update(transaction_snapshot)
+                if transaction_snapshot.get("transaction_phase") in {
+                    "rejected", "aborted", "invalidated",
+                }:
+                    # Retain terminal transaction diagnostics without
+                    # exposing the stale plan as executable capacity.
+                    transaction_plan["admitted"] = False
                 if transaction_plan.get("reason_code") == "pipeline_layer_range_coverage_insufficient":
                     transaction_plan["reason"] = (
                         "advertised layer_ranges cannot cover the requested contiguous layer interval"
@@ -4011,6 +4026,37 @@ class Scheduler(
                     "pipeline_worker_disconnected",
                     f"worker {client_id} disconnected during transaction",
                 )
+            active_plan = self._active_pipeline_capacity_plan
+            transaction_plan = (
+                transaction.get("plan") if isinstance(transaction, dict) else None
+            )
+
+            def _plan_uses_node(plan: object) -> bool:
+                if not isinstance(plan, dict):
+                    return False
+                return any(
+                    str(item.get("node_id", "")) == client_id
+                    for item in plan.get("assignments", [])
+                    if isinstance(item, dict)
+                )
+
+            uses_active_plan = _plan_uses_node(active_plan)
+            uses_transaction_plan = _plan_uses_node(transaction_plan)
+            if uses_active_plan or (
+                transaction
+                and transaction.get("phase") == "ready"
+                and (
+                    client_id in set(transaction.get("worker_ids", set()))
+                    or uses_transaction_plan
+                )
+            ):
+                self._active_pipeline_capacity_plan = None
+                if transaction and abort_details is None:
+                    transaction["phase"] = "invalidated"
+                    transaction["reason_code"] = "pipeline_worker_disconnected"
+                    transaction["reason"] = (
+                        f"worker {client_id} disconnected after plan activation"
+                    )
             qwen3_transaction = self._qwen3_pipeline_dry_run
             if qwen3_transaction is not None:
                 qwen3_disconnect = qwen3_transaction.disconnect(client_id)
