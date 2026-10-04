@@ -5604,9 +5604,26 @@ class SchedulerPipelineMixin:
                             raise RuntimeError(
                                 f"主节点 decode step {step} 缺少 KV cache"
                             )
-                    local_input_ids = input_ids if is_prefill else self._scheduler_facade_global('torch').tensor(
-                        [[new_token_id]], dtype=self._scheduler_facade_global('torch').long
-                    )
+                    if is_prefill:
+                        local_input_ids = input_ids
+                    else:
+                        # decode 步的输入载体随引擎而变：PyTorch 要张量，llama.cpp 要 numpy
+                        # （`LlamaCppEngine.forward_layers` 内部 `np.asarray`）。照 prefill 时
+                        # `input_ids` 的载体来造，别**无条件**造 torch —— 那会让无 torch 的
+                        # 主节点在**第二个 step** 就 `ModuleNotFoundError`（实测：relay 链的
+                        # 首段 prefill 已经过了、relay 段也回了前向结果，才炸在这里）。
+                        # 用 `loaded_torch()`（不触发 import）而不是调度门面的 `torch`。
+                        torch_mod = loaded_torch()
+                        if torch_mod is not None and hasattr(input_ids, "detach"):
+                            local_input_ids = torch_mod.tensor(
+                                [[new_token_id]], dtype=torch_mod.long
+                            )
+                        else:
+                            import numpy as _np
+
+                            local_input_ids = _np.asarray(
+                                [[new_token_id]], dtype=_np.int64
+                            )
                     local_attention_mask = attention_mask if is_prefill else None
 
                     t_master = time.time()
@@ -5860,9 +5877,22 @@ class SchedulerPipelineMixin:
                 else:
                     _stream_callback({"token": new_token_text})
 
-            # 更新完整序列仅用于最终解码（不再发送给首节点）
-            new_token_tensor = self._scheduler_facade_global('torch').tensor([[new_token_id]], dtype=self._scheduler_facade_global('torch').long)
-            full_input_ids = self._scheduler_facade_global('torch').cat([full_input_ids, new_token_tensor], dim=1)
+            # 更新完整序列仅用于最终解码（不再发送给首节点）。
+            # 用 numpy 而不是 torch：`full_input_ids` 起初来自 tokenizer（两条引擎路径现在
+            # 都给 numpy），这里只做**累积**，`_save_preempt_state` 也只做**暂存** ——
+            # 全程没有任何张量运算。此前无条件造 `torch.tensor` + `torch.cat` ⇒ 无 torch
+            # 的主节点在**第一个 decode 步**就 `ModuleNotFoundError`（实测：整条 relay 链
+            # 已走通、relay 段真回了前向结果，才在这里炸，此前一直被外层包装吞成一句
+            # `str(e)`）。
+            import numpy as _np
+
+            full_input_ids = _np.concatenate(
+                [
+                    _np.asarray(full_input_ids),
+                    _np.asarray([[new_token_id]], dtype=_np.int64),
+                ],
+                axis=1,
+            )
 
             step_ms = (time.time() - step_start) * 1000
             pipeline_metrics["steps"].append({
@@ -6356,8 +6386,15 @@ class SchedulerPipelineMixin:
                 return result
             except Exception as e:
                 if self._stream_output_started(kwargs):
+                    logger.warning("流水线推理失败（流式已开始）: %s", e, exc_info=True)
                     return {"response": "", "error": str(e)}
                 if require_distributed:
+                    # `distributed_required` 的 error 会**原样抛给客户端**，所以必须先把
+                    # 完整 traceback 落盘 —— 否则排障只剩一句 `str(e)`（实测踩过：只看到
+                    # `No module named 'torch'`，看不出是哪条路径在 import，只能靠猜）。
+                    logger.error(
+                        "distributed_required 流水线失败: %s", e, exc_info=True,
+                    )
                     return {
                         "response": "",
                         "error": f"distributed_required: {e}",

@@ -1799,6 +1799,12 @@ class LlamaCppEngine:
 
         ids = _np.asarray(input_ids, dtype=_np.int64).reshape(-1).tolist()
         n_past = _kv_position(past_key_values)
+        if n_past == 0:
+            # 从位置 0 起 ⇒ 先清掉 ctx 里的旧 KV。`llama_decode` 在 `[0, n)` 上重跑会直接
+            # `rc=-1`（`forward_layers_to_hidden` 的文档记过这个坑）。任务级的 `_kv_cache`
+            # 只是 KV **句柄**表，清它不清 ctx ⇒ 第二个请求的 prefill 必撞车，实测症状
+            # 正是 relay 链首段 `llama_decode 失败 rc=-1`。
+            self._clear_context_kv()
         hidden = self.forward_layers_to_hidden(
             ids, n_past=n_past, all_positions=True,
         )
@@ -1808,6 +1814,19 @@ class LlamaCppEngine:
             "hidden_states": hidden,
             "cache": n_past + len(ids),
         }
+
+    def _clear_context_kv(self) -> None:
+        """清掉原生 context 里的 KV（新序列从位置 0 起时必须做）。
+
+        `reset_kv_cache()` 是既有的 **stateless no-op**（注释写明 llama.cpp 绑定没暴露
+        等价 API），真正能用的是 `Llama._ctx.kv_cache_clear()`。顺带把自行跟踪的
+        `_kv_used` 归零，否则后续辅助 decode（如 LM Head）会续在已经不存在的 KV 之后。
+        """
+        try:
+            self._model._ctx.kv_cache_clear()
+        except Exception:
+            logger.debug("清 context KV 失败（忽略）", exc_info=True)
+        self._kv_used = 0
 
     def forward_layers_to_hidden(self, input_ids, n_past: int = 0,
                                    all_positions: bool = False):
