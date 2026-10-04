@@ -241,7 +241,8 @@ class TaskWorkerControlPlane:
             #   `hello → push → load_layer_range → refresh → hello` 自激环：每次 push 都取
             #   新 generation，worker 端永远判成"新配置"。
             #   首次 hello（`previous is None`）等效"变化"，保证仍会推一次。
-            capabilities_changed = _canonical_capabilities(
+            connection_rebound = peer_id in self._coordinator_pending_workers
+            capabilities_changed = connection_rebound or _canonical_capabilities(
                 payload.get("capabilities")
             ) != _canonical_capabilities(
                 previous.get("capabilities") if isinstance(previous, dict) else None
@@ -254,6 +255,7 @@ class TaskWorkerControlPlane:
                 "selected_version": selected_version,
                 "capabilities": payload["capabilities"],
                 "capabilities_changed": capabilities_changed,
+                "connection_rebound": connection_rebound,
                 "hello_received_at": now,
                 "last_transport_heartbeat": now,
                 "reason_code": reason_code,

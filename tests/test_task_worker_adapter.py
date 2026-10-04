@@ -592,6 +592,38 @@ def test_duplicate_hello_is_idempotent_but_message_id_conflict_is_rejected():
     assert captured.value.code == "message_id_conflict"
 
 
+def test_reconnected_hello_reopens_config_sync_even_when_capabilities_match():
+    coordinator = TaskWorkerControlPlane()
+    worker = TaskWorkerControlPlane()
+
+    first = worker.begin_worker_hello(
+        node_id="worker_01", capabilities=_capabilities(), sent_at_ms=1000,
+    )
+    assert first is not None
+    coordinator.mark_worker_connection_pending("worker_01")
+    coordinator.receive_on_coordinator(
+        "worker_01", first.snapshot(), coordinator_node_id="master",
+        sent_at_ms=1001,
+    )
+    coordinator.resolve_worker_connection_pending("worker_01")
+    coordinator.disconnect_worker("worker_01")
+
+    worker.disconnect_coordinator()
+    second = worker.begin_worker_hello(
+        node_id="worker_01", capabilities=_capabilities(), sent_at_ms=2000,
+    )
+    assert second is not None
+    coordinator.mark_worker_connection_pending("worker_01")
+    coordinator.receive_on_coordinator(
+        "worker_01", second.snapshot(), coordinator_node_id="master",
+        sent_at_ms=2001,
+    )
+
+    snapshot = coordinator.worker_snapshot("worker_01")
+    assert snapshot["capabilities_changed"] is True
+    assert snapshot["connection_rebound"] is True
+
+
 def test_disconnect_clears_health_and_pending_hello_fence():
     worker = TaskWorkerControlPlane()
     first = worker.begin_worker_hello(
