@@ -253,6 +253,28 @@ async def chat(req: ChatRequest, request: Request = None):
     # 路线 B：请求带外部 flag 但被数据作用域拒绝时记一条 INFO（每请求一次）
     _api_module._maybe_log_external_scope_denial(req, _api_module._external_route_decision(req))
 
+    # `#29`：`execution_mode=auto` + **显式**给了 `task_graph_template`，却没有任何 N2.1
+    #   字段 ⇒ 不推断、也不静默落回普通流水线，而是明确拒绝并给出 reason_code。
+    #   此前它静默走下面的非任务图分支，模板未生效且毫无提示（正是本条登记的现象）。
+    #   `task_graph_template` 的默认值就是 `dual_candidate`，所以「用户是否显式给了」
+    #   只能靠 pydantic 的 `model_fields_set` 判 —— 不能只看它有值。
+    if (
+        req.execution_mode == "auto"
+        and "task_graph_template" in req.model_fields_set
+        and not (
+            req.task_graph_auto_remote
+            or str(req.task_graph_remote_stage or "").strip()
+            or str(req.task_graph_remote_provider_id or "").strip()
+        )
+    ):
+        raise _api_module.coded_http_error(
+            400,
+            "TASK_GRAPH_REQUIRES_EXPLICIT_MODE",
+            "指定 task_graph_template 时必须同时给出 execution_mode='task_graph'，"
+            "或给出任一 N2.1 字段（task_graph_auto_remote / task_graph_remote_stage / "
+            "task_graph_remote_provider_id）以便推断执行模式。",
+        )
+
     def _run_chat_request():
         if req.execution_mode == "task_graph":
             if not _api_module.model_host.model_loaded or not _api_module.model_manager.is_loaded:

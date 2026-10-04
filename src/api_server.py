@@ -1180,6 +1180,13 @@ class ChatRequest(BaseModel):
         default=None,
         description="客户端预生成的 gen_ 执行 ID，用于所有聊天模式协作取消",
     )
+    task_graph_inferred: bool = Field(
+        default=False,
+        description=(
+            "`#29` 诊断位：`execution_mode` 是**由 N2.1 显式字段推断**而来，"
+            "不是用户直接指定的 `task_graph`。"
+        ),
+    )
     allow_external: bool = Field(
         default=False,
         description=(
@@ -1194,6 +1201,32 @@ class ChatRequest(BaseModel):
             "作用域门控约束；deny 档位下即使置 true 也不外发）。"
         ),
     )
+
+    @model_validator(mode="after")
+    def resolve_task_graph_mode(self):
+        """`#29`：`execution_mode=auto` 时按 **N2.1 显式字段**推断是否走任务图。
+
+        为什么要按「显式」判：`task_graph_template` 的默认值就是 `"dual_candidate"`
+        （`src/inference_service/protocol.py` 与这里同款），**光看它有值无法区分**用户
+        是否真的指定过 —— 得用 pydantic 的 `model_fields_set`。
+
+        这里只做**推断**（显式给了 N2.1 字段 ⇒ 意图明确是任务图，把 `auto` 升级为
+        `task_graph`）。这些字段此前只在 `execution_mode == "task_graph"` 分支内才被
+        读到，等于用户写了也不生效。
+
+        「只给模板、没有任何 N2.1 字段」那一档**不在这里**拒绝 —— 它需要带
+        `reason_code` 的 400 响应，而 validator 抛不出 `coded_http_error`；
+        该判定在路由层（`routes_chat`）做。
+        """
+        explicit_n21 = (
+            self.task_graph_auto_remote
+            or bool(str(self.task_graph_remote_stage or "").strip())
+            or bool(str(self.task_graph_remote_provider_id or "").strip())
+        )
+        if self.execution_mode == "auto" and explicit_n21:
+            self.execution_mode = "task_graph"
+            self.task_graph_inferred = True
+        return self
 
     @model_validator(mode="after")
     def validate_multimodal_route(self):
