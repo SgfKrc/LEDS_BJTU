@@ -415,6 +415,31 @@ def test_relay_segment_for_worker_respects_switch(monkeypatch: pytest.MonkeyPatc
     assert harness.obj._relay_segment_for_worker("worker-2") is None
 
 
+def test_relay_segment_for_worker_probe_only_excludes_from_production(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """★ 2026-10-04 产品裁定（分票规划 DIST-0）：A1 已从产品调度入口剔除。
+
+    `QLH_RELAY_PROBE_ONLY` 默认 1 ⇒ **即使 relay 全开也不供给 relay 段**，
+    生产请求继续走 A3，不做静默切换。本文件的 autouse fixture 为测 relay 行为
+    而关掉了该闸门，所以这里显式打开它。
+    """
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_PROBE_ONLY", True)
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_ENABLED", True)
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_SEGMENTS",
+                        "worker-2=middle@127.0.0.1:50183#896#8-16")
+    harness = _Harness()
+
+    # 配置齐全，但闸门开着 ⇒ 生产路径拿不到 relay 段。
+    assert harness.obj._relay_segment_for_worker("worker-2") is None
+    # 具名诊断只记一次（每进程一份），不刷屏。
+    assert getattr(harness.obj, "_relay_probe_only_warned", False) is True
+
+    # 显式关掉闸门（探针/实验语义）⇒ 恢复原有行为。
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_PROBE_ONLY", False)
+    assert harness.obj._relay_segment_for_worker("worker-2") is not None
+
+
 def test_relay_segment_for_worker_returns_spec_and_caches(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_ENABLED", True)
     monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_SEGMENTS",
