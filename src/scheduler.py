@@ -4025,6 +4025,12 @@ class Scheduler(
                     )
         if abort_details is not None:
             self._abort_pipeline_load_transaction(*abort_details)
+        # A disconnected socket can no longer satisfy the assignment that was
+        # registered for it.  Drop that per-node expectation before the
+        # reconnect callback publishes a fresh generation; otherwise an old
+        # ACK/retry entry can participate in readiness during the reconnect
+        # window and race the new configuration.
+        self._clear_layer_config_state(client_id)
         if qwen3_disconnect is not None:
             logger.warning(
                 "Qwen3 dry-run 因节点断线中止: node=%s contract=%s",

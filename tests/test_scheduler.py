@@ -4476,6 +4476,39 @@ class TestChainTopology:
         assert "client1" not in sched._layer_config_expected
         assert "client1" not in sched._layer_config_retry_state
 
+    def test_disconnect_drops_obsolete_layer_config_state(self, sched, monkeypatch):
+        """Reconnect must start from a fresh per-node config transaction."""
+        from scheduler import NodeInfo, NodeState
+
+        sched.nodes["client1"] = NodeInfo(
+            node_id="client1", role="client", state=NodeState.ONLINE,
+        )
+        sched._layer_config_expected["client1"] = {
+            "node_id": "client1", "config_id": "cfg-old", "generation": 7,
+        }
+        sched._layer_config_acks["client1"] = {
+            "node_id": "client1", "config_id": "cfg-old", "status": "ready",
+        }
+        sched._layer_config_pushed.add("client1")
+        sched._layer_config_retry_state["client1"] = {
+            "attempts": 2, "next_retry": 0.0,
+        }
+        sched._tcp_server = type("Server", (), {
+            "clients": {},
+            "_running": False,
+        })()
+        monkeypatch.setattr(sched, "_push_node_update_to_all_clients", lambda *args: None)
+        monkeypatch.setattr(sched, "deregister_node", lambda _node_id: None)
+        monkeypatch.setattr(sched, "push_layer_config_to_clients", lambda: None)
+        monkeypatch.setattr(sched, "_stage_pipeline_reshard_after_disconnect", lambda _node_id: None)
+
+        sched._on_tcp_disconnect("client1")
+
+        assert "client1" not in sched._layer_config_expected
+        assert "client1" not in sched._layer_config_acks
+        assert "client1" not in sched._layer_config_pushed
+        assert "client1" not in sched._layer_config_retry_state
+
     def test_failed_release_send_remains_retryable(self, sched):
         class FailingServer:
             _running = True
