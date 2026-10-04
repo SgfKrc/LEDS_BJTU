@@ -5789,7 +5789,9 @@ class SchedulerPipelineMixin:
                 logits_data = result["logits"]
                 if isinstance(logits_data, bytes):
                     logits = deserialize_tensor(logits_data).to(device=device)
-                elif self._scheduler_facade_global('torch') is not None and isinstance(logits_data, self._scheduler_facade_global('torch').Tensor):
+                elif (torch_mod := loaded_torch()) is not None and isinstance(
+                    logits_data, torch_mod.Tensor
+                ):
                     logits = logits_data.to(device=device)
                 else:
                     step_error = f"未知 logits 类型: {type(logits_data).__name__}"
@@ -5808,7 +5810,9 @@ class SchedulerPipelineMixin:
                             final_hidden = None
                     else:
                         final_hidden = deserialize_tensor(hidden_data)
-                elif self._scheduler_facade_global('torch') is not None and isinstance(hidden_data, self._scheduler_facade_global('torch').Tensor):
+                elif (torch_mod := loaded_torch()) is not None and isinstance(
+                    hidden_data, torch_mod.Tensor
+                ):
                     final_hidden = hidden_data
                 else:
                     step_error = (
@@ -5928,18 +5932,26 @@ class SchedulerPipelineMixin:
                 del self._kv_cache[task_id]
 
         # ---- Step 6: 解码结果 ----
+        # 拼接用 numpy：`input_ids` 来自 tokenizer（两条引擎路径现在都给 numpy），
+        # 而 `tokenizer.decode` 两侧都接受 numpy。此前无条件走 `torch.cat` ⇒ 无 torch 的
+        # 主节点在**生成结束后**这一步炸（整条链跑完才现形）。
+        import numpy as _np
+
         if generated_ids:
-            full_ids = self._scheduler_facade_global('torch').cat([
-                input_ids.squeeze(0),
-                self._scheduler_facade_global('torch').tensor(generated_ids, dtype=self._scheduler_facade_global('torch').long)
-            ], dim=0)
+            full_ids = _np.concatenate(
+                [
+                    _np.asarray(input_ids).squeeze(0),
+                    _np.asarray(generated_ids, dtype=_np.int64),
+                ],
+                axis=0,
+            )
             response_text = tokenizer.decode(full_ids, skip_special_tokens=True)
             raw_new_text = tokenizer.decode(
                 generated_ids, skip_special_tokens=True
             )
         else:
             response_text = tokenizer.decode(
-                input_ids.squeeze(0), skip_special_tokens=True
+                _np.asarray(input_ids).squeeze(0), skip_special_tokens=True
             )
             raw_new_text = ""
 

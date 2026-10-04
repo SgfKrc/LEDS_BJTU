@@ -1751,9 +1751,14 @@ class LlamaCppEngine:
         #    `generate`/`create_completion` 路径里维护，而本引擎的层段 forward 直接走
         #    原生 `llama_decode` ⇒ 它恒为 0，等于又从 0 开始。实测症状正是 `rc=-1`。
         n_past = self._kv_used_cells()
-        logits = self.forward_layers_from_hidden(
-            hidden_states, n_past=n_past, all_logits=False,
-        )
+        try:
+            logits = self.forward_layers_from_hidden(
+                hidden_states, n_past=n_past, all_logits=False,
+            )
+        finally:
+            # ★ C 案：LM Head 对主链路的 KV **完全透明**。`llama_decode` 必然占位置，
+            #   算完就把自己占的那一格退掉，否则流水线下一步 decode 的 `n_past` 会撞上它。
+            self._drop_kv_from(n_past)
         if logits is None:
             raise RuntimeError("llama.cpp LM Head 未返回 logits")
         import numpy as _np
@@ -1764,6 +1769,34 @@ class LlamaCppEngine:
         elif array.ndim == 2:
             array = array[None, :, :]
         return array
+
+    def _drop_kv_from(self, pos: int) -> None:
+        """把 KV 里位置 `>= pos` 的格退掉，并同步自行跟踪的 `_kv_used`。
+
+        `llama_decode` 只要调用就**必然占** KV 位置 —— 没有「只投影不占位」的 API ⇒
+        辅助 decode（如 LM Head）算完后必须把自己占的删掉，否则流水线下一步 decode 的
+        `n_past` 会撞上它（实测：relay 链首段 prefill + relay 段都正常，到 LM Head 之后
+        的 decode 步就 `llama_decode rc=-1`）。
+
+        走 `llama_memory_seq_rm(memory, seq_id, p0, p1)`：删掉序列 0 中位置落在
+        `[pos, ∞)` 的 token（其 docstring 明写 "Removes all tokens that belong to the
+        specified sequence and have positions in [p0, p1)"，`p1 = -1` 表示到末尾）。
+        失败只记 debug —— 这只是 KV 记账，不该让一次推理失败。
+        """
+        try:
+            import llama_cpp.llama_cpp as M
+
+            native_ctx = getattr(getattr(self._model, "_ctx", None), "ctx", None)
+            if native_ctx is None:
+                return
+            memory = M.llama_get_memory(native_ctx)
+            if not memory:
+                return
+            M.llama_memory_seq_rm(memory, 0, int(pos), -1)
+        except Exception:
+            logger.debug("退掉辅助 decode 的 KV 占用失败（忽略）", exc_info=True)
+        finally:
+            self._kv_used = max(0, int(pos))
 
     def forward_layers(
         self,
