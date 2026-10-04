@@ -891,17 +891,12 @@ class SchedulerTaskWorkerMixin:
                         # Layer/relay workers deliberately advertise no full
                         # model identity.  Do not turn their hello into an
                         # opt-out: the layer-config handshake is their role.
-                        # ★ relay 宿主是**例外的第三类**：它不能声明
-                        #   `forward_layers`（声明了就会拒绝 legacy 层配置，而 relay
-                        #   委派正是走那条通道 —— 实测 Surface 报「本节点是 v3 层段
-                        #   worker，拒绝 legacy 分层配置」），但它要的**恰恰**就是那份
-                        #   legacy 配置。所以按「是否持有有效 relay_segment」豁免，
-                        #   否则它会被当 Full Worker 释放预留，relay 链直接失去中间段。
-                        is_relay_host = (
-                            self._relay_segment_for_worker(client_id) is not None
-                        )
+                        # ★ relay 宿主是第三类角色，判据唯一的出处在 `_is_relay_host()`：
+                        #   它不能声明 `forward_layers`（声明了就会拒绝 legacy 层配置，而
+                        #   relay 委派正是走那条通道），但它要的恰恰就是那份 legacy 配置，
+                        #   因此不能被当 Full Worker 释放预留。
                         if (advertised_models
-                                and not is_relay_host
+                                and not self._is_relay_host(client_id)
                                 and not bool(
                                     message.payload.get("capabilities", {}).get(
                                         "layer_worker", False

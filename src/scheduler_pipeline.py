@@ -356,7 +356,7 @@ class SchedulerPipelineMixin:
         # remote relay service owns that segment's data path.
         relay_worker_ids = {
             node_id for node_id in releasable_legacy_ids
-            if self._relay_segment_for_worker(node_id) is not None
+            if self._is_relay_host(node_id)
         }
         releasable_legacy_ids -= self._task_worker_layer_stage_ids(set(connected_ids))
         # Route A Android workers use v3 stage_offer and must never receive a
@@ -493,7 +493,7 @@ class SchedulerPipelineMixin:
                 # ★ 与下面的 `:537` releases 同理：relay 宿主**不**收本地层配置，
                 #   容量求解的否定结论不该顺带释放它的预留 —— 否则它每次 hello 后
                 #   都「确认退出分层 worker」，relay 链再也拿不到中间段（实测）。
-                if self._relay_segment_for_worker(node_id) is None
+                if not self._is_relay_host(node_id)
                 }
                 with self._layer_config_lock:
                     self._pipeline_load_transaction = {
@@ -539,7 +539,7 @@ class SchedulerPipelineMixin:
                 #   `_run_pipeline` 就会按 v3 数据面去要它的层区间，而它手上根本没有
                 #   那段工件 ⇒ `layer_range_not_advertised`（实测：relay 链被误路由到
                 #   Route-A stage 路径后卡在这里）。
-                and self._relay_segment_for_worker(nid) is None
+                and not self._is_relay_host(nid)
             ):
                 # Keep the assignment in the active capacity plan for the
                 # execution/readiness contract, but do not materialize a
@@ -570,7 +570,7 @@ class SchedulerPipelineMixin:
                 "master_quant_type": model_info.get("quant_type", ""),
                 "engine": (
                     "relay_middle"
-                    if self._relay_segment_for_worker(nid) is not None
+                    if self._is_relay_host(nid)
                     else "pytorch"
                 ),
                 "sync_policy": (
@@ -614,7 +614,7 @@ class SchedulerPipelineMixin:
             #   capacity_plan，所以那时释放等于把它踢出链路）。此前没有这一条，
             #   实测 Surface 每次 hello 后立刻「确认退出分层 worker」，
             #   relay 链永远拿不到中间段。
-            and self._relay_segment_for_worker(node_id) is None
+            and not self._is_relay_host(node_id)
         }
         configs = {**assignments, **releases}
         if capacity_plan is not None:
@@ -2730,7 +2730,7 @@ class SchedulerPipelineMixin:
                 node_id,
             )
             return
-        if self._relay_segment_for_worker(client_id) is not None:
+        if self._is_relay_host(client_id):
             with self._layer_config_lock:
                 self._pipeline_worker_opt_out.discard(client_id)
             logger.info(
@@ -4374,6 +4374,32 @@ class SchedulerPipelineMixin:
             cache = self._parse_relay_segment_map(PIPELINE_RELAY_SEGMENTS)
             self._relay_segment_map_cache = cache
         return cache.get(str(worker_id))
+
+    def _is_relay_host(self, node_id: str) -> bool:
+        """该节点是否是 **relay 宿主** —— 「谁是 relay 宿主」的**唯一判据入口**。
+
+        relay 宿主是**第三种角色**，不是「v3 层段 worker 的例外」。它的能力声明与层段
+        worker **正好相反**：
+
+        * **不能**声明 `FORWARD_LAYERS` —— 声明了它就会拒绝 legacy 层配置，而 relay
+          委派恰恰走那条通道（实测：Surface 报「本节点是 v3 层段 worker，拒绝 legacy
+          分层配置」）；
+        * **要的**恰恰是那份 legacy 层配置（`engine="relay_middle"`），因此既不能被当
+          Full Worker 释放预留，也不能被排出层段名单。
+
+        这两条结论此前被复写在**五条**判定路径上（hello 的 opt-out、`_task_worker_full_
+        model_ids`、容量求解的两处 releases、`_task_worker_layer_stage_ids`），每处各写
+        一遍 `_relay_segment_for_worker(...) is not None`。少写一处就退化成「relay 链丢掉
+        中间段」，而症状（该节点被释放预留）离原因很远 —— 实测连追了五轮。
+
+        **刻意不接 `routing_preference`**：这是**节点角色**判定，不该随单次请求变化。
+        `_relay_segment_for_worker()` 里的 `local_only` 闸门是**请求级**的（「本次只要本地
+        算」），把它混进角色判定会让同一个节点在不同请求下被判成不同角色。需要请求级
+        取舍的调用点直接调 `_relay_segment_for_worker(id, routing_preference)` 取 spec。
+
+        ⚠️ 只传 `node_id` 一个位置参数：调用方（含测试与嵌入方）常注入单参 stub。
+        """
+        return self._relay_segment_for_worker(node_id) is not None
 
 
     def _wait_for_layer_result(self, task_id: str, node_ids,
