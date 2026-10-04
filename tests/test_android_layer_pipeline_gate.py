@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import pytest
 
-from api_server import _client_supports_forward_layers
+from api_server import (
+    _client_supports_forward_layers,
+    _validate_pipeline_role_switches,
+)
 from koakuma_engine import Capability
 from scheduler import NodeInfo, _node_supports_forward_layers
 
@@ -113,3 +116,20 @@ class TestClientSupportsForwardLayers:
     def test_non_dict_capabilities_are_safe(self):
         assert _client_supports_forward_layers("android", "nonsense") is False  # type: ignore[arg-type]
         assert _client_supports_forward_layers("pc", 123) is True  # type: ignore[arg-type]
+
+
+class TestPipelineRoleSwitches:
+    def test_probe_only_relay_does_not_block_route_a(self):
+        _validate_pipeline_role_switches(
+            relay_enabled=True,
+            relay_probe_only=True,
+            task_worker_enabled=True,
+        )
+
+    def test_active_relay_still_conflicts_with_route_a(self):
+        with pytest.raises(RuntimeError, match="不能同时开启"):
+            _validate_pipeline_role_switches(
+                relay_enabled=True,
+                relay_probe_only=False,
+                task_worker_enabled=True,
+            )

@@ -116,6 +116,7 @@ from config import (
     TASK_GRAPH_RETENTION_DAYS, TASK_GRAPH_RETENTION_MAX_RECORDS,
     TASK_WORKER_EXPERIMENTAL_ENABLED,
     PIPELINE_RELAY_ENABLED,
+    PIPELINE_RELAY_PROBE_ONLY,
 )
 
 # ★ 2026-10-04 裁定「一个节点只能是一种角色」：这两个开关此前从未出现在同一
@@ -124,12 +125,26 @@ from config import (
 #   拓扑整体拒绝（`stage_offer_nodes != pipeline_nodes`），而调度侧仍把 relay
 #   宿主的容量计为可用（`capacity_source="relay_exempt"`）⇒ 看得见、拿不到。
 #   启动期直接 fail-closed，而不是留到运行时由「谁先生效」决定行为。
-if PIPELINE_RELAY_ENABLED and TASK_WORKER_EXPERIMENTAL_ENABLED:
-    raise RuntimeError(
-        "QLH_RELAY_ENABLED 与 QLH_TASK_WORKER_EXPERIMENTAL_ENABLED 不能同时开启："
-        "一个节点只能是一种角色（relay 段宿主 或 v3 stage worker）。"
-        "两者并存会让混合拓扑被整体拒绝。请只保留其中一个。"
-    )
+def _validate_pipeline_role_switches(
+    *,
+    relay_enabled: bool,
+    relay_probe_only: bool,
+    task_worker_enabled: bool,
+) -> None:
+    """Reject only an active A1/data-plane collision with Route A."""
+    if relay_enabled and not relay_probe_only and task_worker_enabled:
+        raise RuntimeError(
+            "QLH_RELAY_ENABLED 与 QLH_TASK_WORKER_EXPERIMENTAL_ENABLED 不能同时开启："
+            "一个节点只能是一种角色（relay 段宿主 或 v3 stage worker）。"
+            "两者并存会让混合拓扑被整体拒绝。请只保留其中一个。"
+        )
+
+
+_validate_pipeline_role_switches(
+    relay_enabled=PIPELINE_RELAY_ENABLED,
+    relay_probe_only=PIPELINE_RELAY_PROBE_ONLY,
+    task_worker_enabled=TASK_WORKER_EXPERIMENTAL_ENABLED,
+)
 
 # 主节点用户自持 SQLite；生产运行时不再加载远端 PostgreSQL 驱动。
 import local_store as _local_store
