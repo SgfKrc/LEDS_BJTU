@@ -219,6 +219,36 @@ def _layer_stage_result_to_pipeline_value(
 
 
 class SchedulerPipelineMixin:
+    @property
+    def _active_layer_config(self):
+        """当前生效的层段配置（`None` = 本节点不是层段 worker）。
+
+        用 property 而不是裸属性：它的**每一次变化**都会改变本节点在 hello 里上报的
+        `layer_worker` / `layer_ranges` / `models` 语义，因此必须同步给主节点
+        （`refresh_task_worker_capabilities()`）。此前层段路径**全都不 refresh**
+        —— 整模路径都 refresh、层段路径一条都没有 —— 于是主节点一直拿 hello 旧快照
+        判身份，远端 Stage 被 `model_identity_mismatch` 拒（`#28`）。
+
+        收口成 setter 就不会再漏：那 7 个赋值点一行都不用改，将来新增的也会自动生效。
+        """
+        return getattr(self, "_active_layer_config_value", None)
+
+    @_active_layer_config.setter
+    def _active_layer_config(self, value):
+        previous = getattr(self, "_active_layer_config_value", None)
+        self._active_layer_config_value = value
+        if previous == value:
+            return
+        # `refresh_task_worker_capabilities()` 是异步的（只起线程，内部只碰
+        # `_task_worker_refresh_lock`），所以在层配置锁内调用是安全的。构造早期
+        # `_tcp_client` 还没就位时它自己会返回 False。
+        refresh = getattr(self, "refresh_task_worker_capabilities", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:
+                logger.debug("层段状态变化后刷新 hello 失败（忽略）", exc_info=True)
+
     def request_authoritative_layer_sync(
         self, *, require_distributed: bool = False,
     ) -> bool:
