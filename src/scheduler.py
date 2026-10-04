@@ -1035,6 +1035,11 @@ class Scheduler(
         self._pipeline_worker_opted_out = False
         self._pipeline_worker_opt_out: set[str] = set()
         self._pipeline_load_transaction: Optional[dict] = None
+        # A persisted active transaction must be republished after a master
+        # restart before distributed requests are admitted.
+        self._pipeline_recovery_pending = False
+        self._pipeline_recovery_failure = ""
+        self._pipeline_recovery_state: Optional[dict] = None
         # Qwen3 remains outside production runtime admission.  This isolated
         # state machine exercises the C2 lifecycle without network dispatch,
         # weight materialization, or full-model fallback.
@@ -1195,6 +1200,8 @@ class Scheduler(
         self._startup_cancel_event.clear()
         self.init_nodes()
         self._running = True
+        if self._effective_role() == "master":
+            self._load_pipeline_recovery_state()
 
         # Reconcile only the active model's assignment cache.  This is a
         # local, bounded cleanup and never touches the user's full model tree.

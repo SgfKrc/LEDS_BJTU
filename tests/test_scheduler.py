@@ -1804,6 +1804,87 @@ class TestPipelineReadiness:
         sched._tcp_server = None
         assert sched._all_pipeline_nodes_ready() is False
 
+    def test_restart_recovery_fence_blocks_readiness_until_fresh_commit(
+            self, sched, monkeypatch):
+        """重启后的旧事务只能作为闸门，不能直接充当活动配置。"""
+        import local_store
+
+        monkeypatch.setattr(
+            local_store,
+            "get_local_setting",
+            lambda key, default=None: {
+                "schema_version": 1,
+                "config_id": "cfg-old",
+                "generation": 7,
+                "phase": "ready",
+            } if key == "pipeline_config_lifecycle_v1" else default,
+        )
+        sched._tcp_server = type("Server", (), {"_running": True})()
+        sched._load_pipeline_recovery_state()
+
+        readiness = sched._get_pipeline_readiness()
+
+        assert readiness["ready"] is False
+        assert readiness["reason_code"] == "pipeline_recovery_pending"
+        assert sched._pipeline_recovery_state["config_id"] == "cfg-old"
+
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-new",
+            "generation": 8,
+            "phase": "ready",
+            "worker_ids": {"worker-a"},
+            "prepared_nodes": set(),
+            "ready_nodes": {"worker-a"},
+            "plan": {"assignments": []},
+        }
+        sched._layer_config_expected["worker-a"] = {
+            "config_id": "cfg-new",
+            "generation": 8,
+        }
+        sched._pipeline_recovery_pending = True
+        sched._maybe_finish_pipeline_recovery()
+        assert sched._pipeline_recovery_pending is True
+
+        sched._layer_config_pushed.add("worker-a")
+        sched._maybe_finish_pipeline_recovery()
+        assert sched._pipeline_recovery_pending is False
+
+    def test_pipeline_lifecycle_snapshot_is_bounded_and_json_safe(
+            self, sched):
+        """持久化记录不能携带 set、模型路径或执行器对象。"""
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-1",
+            "generation": 3,
+            "phase": "preparing",
+            "worker_ids": {"worker-b", "worker-a"},
+            "prepared_nodes": {"worker-a"},
+            "plan": {
+                "model_id": "model-1",
+                "model_type": "qwen2",
+                "plan_id": "plan-1",
+                "model_path": "C:/private/model.safetensors",
+                "assignments": [{
+                    "node_id": "worker-a",
+                    "start_layer": 0,
+                    "end_layer": 4,
+                    "execution": "legacy_layer_config",
+                    "runtime_object": object(),
+                }],
+            },
+        }
+
+        snapshot = sched._pipeline_lifecycle_snapshot_locked()
+
+        assert snapshot["worker_ids"] == ["worker-a", "worker-b"]
+        assert snapshot["prepared_nodes"] == ["worker-a"]
+        assert snapshot["assignments"] == [{
+            "node_id": "worker-a",
+            "start_layer": 0,
+            "end_layer": 4,
+            "execution": "legacy_layer_config",
+        }]
+        assert "model_path" not in snapshot
+
     def test_forced_sync_does_not_accept_ready_single_node_plan(
             self, sched, monkeypatch):
         calls = []
