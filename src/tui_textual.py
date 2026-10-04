@@ -3359,14 +3359,23 @@ class KoakumaApp(App):
 
 def run(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, *, interval: float = 5.0,
         routing_preference: str = "auto", show_thinking: bool = False,
-        supervisor: Any = None, log_token: str = "") -> int:
+        supervisor: Any = None, log_token: str = "",
+        enable_thinking: Optional[bool] = None) -> int:
     """启动 Textual 外壳（供 qlh.py 调用）。
 
     ``supervisor`` 非空时，本机后端冷启动在**启动屏内**完成（LOGO + 启动条同屏）。
+
+    ★ 2026-10-03：补 `enable_thinking` 形参。它是**改变模型行为**的开关（经 chat
+    template 传 `enable_thinking`），与只控制 UI 展示的 `show_thinking` 语义不同
+    （见 `KoakumaApp.__init__` 的说明）。`main()` 一直从 `--reasoning` 解析并把它
+    传进来，但 `run()` 没有这个形参 ⇒ `python -m tui_textual` 直接
+    `TypeError: run() got an unexpected keyword argument 'enable_thinking'`（实测），
+    而启动器正是这样调它的。
     """
     api = ApiClient(host=host, port=port, log_token=log_token)
     KoakumaApp(api, interval=interval, routing_preference=routing_preference,
-               show_thinking=show_thinking, supervisor=supervisor).run()
+               show_thinking=show_thinking, enable_thinking=enable_thinking,
+               supervisor=supervisor).run()
     return 0
 
 

@@ -150,40 +150,55 @@ __all__ = [
 ]
 
 def _sample_pipeline_token_id(logits, temperature: float, top_p: float) -> int:
-    """Sample one token with the same zero-temperature semantics as local inference."""
-    torch_module = require_torch()
-    if logits is None or logits.ndim != 3 or logits.shape[0] != 1:
+    """Sample one token with the same zero-temperature semantics as local inference.
+
+    logits 的载体随主节点引擎而变：PyTorch 给张量，llama.cpp 给 numpy `[1, 1, n_vocab]`。
+    这里统一折成 numpy 再走同一条数值路径，避免为两种载体写两套采样逻辑（口径分叉
+    比多一次转换危险得多）。
+    """
+    import numpy as np
+
+    if logits is None or getattr(logits, "ndim", None) != 3 or logits.shape[0] != 1:
         shape = getattr(logits, "shape", None)
         raise ValueError(f"流水线 logits 形状无效: {shape}")
 
+    if hasattr(logits, "detach"):
+        values = logits.detach().to(device="cpu", dtype=None).numpy()
+    else:
+        values = np.asarray(logits)
     # Local ModelManager uses do_sample=False when temperature <= 0. Keeping
     # that exact contract also avoids dividing fp16/bf16 logits by 1e-8,
     # which can create infinities and poison the CUDA context in multinomial.
-    next_logits = logits[:, -1, :].float()
+    next_logits = values[:, -1, :].astype(np.float32)
     if float(temperature) <= 0:
-        return int(torch_module.argmax(next_logits, dim=-1).item())
+        return int(np.argmax(next_logits, axis=-1)[0])
 
     scaled_logits = next_logits / max(float(temperature), 1e-5)
-    if not bool(torch_module.isfinite(scaled_logits).all().item()):
+    if not bool(np.isfinite(scaled_logits).all()):
         raise RuntimeError("流水线 logits 包含 NaN/Inf，拒绝执行采样")
-    probs = torch_module.softmax(scaled_logits, dim=-1)
-    if not bool(torch_module.isfinite(probs).all().item()):
+    shifted = scaled_logits - np.max(scaled_logits, axis=-1, keepdims=True)
+    exponentials = np.exp(shifted)
+    probs = exponentials / np.sum(exponentials, axis=-1, keepdims=True)
+    if not bool(np.isfinite(probs).all()):
         raise RuntimeError("流水线采样概率包含 NaN/Inf")
 
-    sorted_probs, sorted_indices = torch_module.sort(probs, descending=True, dim=-1)
+    order = np.argsort(-probs, axis=-1)
+    sorted_probs = np.take_along_axis(probs, order, axis=-1)
     nucleus = min(1.0, max(0.0, float(top_p)))
-    cumsum = torch_module.cumsum(sorted_probs, dim=-1)
+    cumsum = np.cumsum(sorted_probs, axis=-1)
     cutoff = cumsum > nucleus
-    cutoff[..., 1:] = cutoff[..., :-1].clone()
+    cutoff[..., 1:] = cutoff[..., :-1].copy()
     cutoff[..., 0] = False
-    filtered_probs = sorted_probs.masked_fill(cutoff, 0.0)
-    probability_sum = filtered_probs.sum(dim=-1, keepdim=True)
-    if (not bool(torch_module.isfinite(probability_sum).all().item())
-            or bool((probability_sum <= 0).any().item())):
+    filtered_probs = np.where(cutoff, 0.0, sorted_probs)
+    probability_sum = np.sum(filtered_probs, axis=-1, keepdims=True)
+    if not bool(np.isfinite(probability_sum).all()) or bool((probability_sum <= 0).any()):
         raise RuntimeError("流水线采样概率无有效候选 token")
     filtered_probs = filtered_probs / probability_sum
-    sampled_rank = torch_module.multinomial(filtered_probs, 1)
-    return int(sorted_indices.gather(-1, sampled_rank)[0, 0].item())
+    # numpy 没有 multinomial：用逆变换采样，与 torch.multinomial 同分布。
+    uniform = np.random.random(size=(filtered_probs.shape[0], 1))
+    cumulative = np.cumsum(filtered_probs, axis=-1)
+    picked = np.argmax(cumulative >= uniform, axis=-1)
+    return int(order[0, picked[0]])
 
 def _bootstrap_api_port(default: int = 8000) -> int:
     """Return the master API port used for first-connect bootstrap."""
@@ -1000,6 +1015,12 @@ class Scheduler(
         self._layer_config_retry_state: dict[str, dict] = {}
         self._layer_config_lock = threading.Lock()
         self._layer_config_push_lock = threading.Lock()
+        # Model transitions temporarily invalidate the local descriptor. Do
+        # not publish a transient release from concurrent status callbacks.
+        self._layer_config_model_change_depth = 0
+        self._layer_config_push_deferred = False
+        self._layer_config_push_deferred_authoritative = False
+        self._layer_config_push_deferred_require_distributed = False
         self._layer_execution_lock = threading.RLock()
         self._active_pipeline_task_ids: set[str] = set()
         self._pending_layer_config: Optional[tuple[str, dict]] = None
@@ -1786,7 +1807,12 @@ class Scheduler(
         return TOTAL_MODEL_LAYERS
 
     def _get_active_pipeline_model_info(self) -> dict:
-        """Describe a PyTorch artifact without requiring a full model load."""
+        """Describe the master's pipeline artifact — PyTorch **or** llama.cpp.
+
+        不需要完整加载模型：两条引擎路径各自给出描述器，本方法只做形状归一与
+        `PIPELINE_RUNTIME_MODEL_TYPES` 判定。GGUF 侧由
+        `LlamaCppEngine.get_pipeline_descriptor()` 读文件头提供。
+        """
         manager = self._host
         if not manager or not runtime_supports(manager, Capability.FORWARD_LAYERS):
             return {}
@@ -1805,7 +1831,12 @@ class Scheduler(
             or getattr(manager, "_model_path", "")
             or ""
         )
-        if not model_path or not os.path.isdir(model_path):
+        # 目录（PyTorch artifact）或**单文件**（GGUF）都接受。llama.cpp 路径用「裁层
+        # GGUF」表达层段，不是一个装 safetensors 的目录 —— 只认目录会把去 torch 化的
+        # 边缘主节点挡在流水线之外。
+        if not model_path or not (
+            os.path.isdir(model_path) or os.path.isfile(model_path)
+        ):
             return {}
         model_type = str(descriptor.get("model_type", "") or "").lower()
         # ★ #31 M2：走单一事实来源（硬编码会让 hybrid 在这里返回 `{}` ⇒ master 静默不推层配置）
@@ -3381,7 +3412,106 @@ class Scheduler(
 
     def push_layer_config_to_clients(self) -> None:
         with self._layer_config_push_lock:
-            self._push_layer_config_to_clients_locked()
+            # Keep the transition check under the same lock used by the
+            # publisher.  Otherwise a transition can begin after the check
+            # but before the publish and still leak a transient release.
+            with self._layer_config_lock:
+                if self._layer_config_model_change_depth:
+                    self._layer_config_push_deferred = True
+                    logger.info(
+                        "defer layer config push during model transition depth=%d",
+                        self._layer_config_model_change_depth,
+                    )
+                    return
+                retry_authoritative = bool(
+                    self._layer_config_push_deferred_authoritative
+                )
+                retry_require_distributed = bool(
+                    self._layer_config_push_deferred_require_distributed
+                )
+                if retry_authoritative:
+                    self._authoritative_layer_sync_requests += 1
+            try:
+                self._push_layer_config_to_clients_locked(
+                    require_distributed=retry_require_distributed,
+                )
+            except Exception:
+                # Keep the deferred request armed so a later status/hello
+                # callback can retry it after a transient publish failure.
+                raise
+            else:
+                with self._layer_config_lock:
+                    self._layer_config_push_deferred = False
+                    self._layer_config_push_deferred_authoritative = False
+                    self._layer_config_push_deferred_require_distributed = False
+            finally:
+                if retry_authoritative:
+                    with self._layer_config_lock:
+                        self._authoritative_layer_sync_requests = max(
+                            0,
+                            self._authoritative_layer_sync_requests - 1,
+                        )
+
+    def _begin_layer_config_model_change(self) -> None:
+        """Fence transient pushes while the local model is being replaced."""
+        # Serialize with an in-flight publish before marking the transition.
+        # This gives the fence a linearization point: either a push completes
+        # before the transition, or it is deferred after the transition starts.
+        with self._layer_config_push_lock:
+            with self._layer_config_lock:
+                self._layer_config_model_change_depth += 1
+
+    def _end_layer_config_model_change(self) -> None:
+        """End a model transition and flush one deferred push."""
+        with self._layer_config_push_lock:
+            with self._layer_config_lock:
+                self._layer_config_model_change_depth = max(
+                    0, self._layer_config_model_change_depth - 1,
+                )
+                flush = (
+                    self._layer_config_model_change_depth == 0
+                    and self._layer_config_push_deferred
+                )
+                authoritative = bool(
+                    self._layer_config_push_deferred_authoritative
+                )
+                require_distributed = bool(
+                    self._layer_config_push_deferred_require_distributed
+                )
+                if flush:
+                    self._layer_config_push_deferred = False
+                    self._layer_config_push_deferred_authoritative = False
+                    self._layer_config_push_deferred_require_distributed = False
+            if flush:
+                if authoritative:
+                    with self._layer_config_lock:
+                        self._authoritative_layer_sync_requests += 1
+                try:
+                    self._push_layer_config_to_clients_locked(
+                        require_distributed=require_distributed,
+                    )
+                except Exception:
+                    with self._layer_config_lock:
+                        self._layer_config_push_deferred = True
+                        self._layer_config_push_deferred_authoritative = (
+                            self._layer_config_push_deferred_authoritative
+                            or authoritative
+                        )
+                        self._layer_config_push_deferred_require_distributed = (
+                            self._layer_config_push_deferred_require_distributed
+                            or require_distributed
+                        )
+                    logger.warning(
+                        "deferred layer config flush failed after model transition",
+                        exc_info=True,
+                    )
+                finally:
+                    if authoritative:
+                        with self._layer_config_lock:
+                            self._authoritative_layer_sync_requests = max(
+                                0,
+                                self._authoritative_layer_sync_requests - 1,
+                            )
 
     def _task_worker_full_model_ids(self) -> set[str]:
         """Return healthy Task Worker peers that advertise a full model."""
@@ -3418,7 +3548,15 @@ class Scheduler(
             )
             if capabilities.get("models") and not has_layer_stage:
                 node_id = str(worker.get("node_id", "") or "")
-                if node_id:
+                # ★ relay 宿主不是 Full Worker：它**不能**声明 `forward_layers`
+                #   （声明了就会拒绝 legacy 层配置，而 relay 委派正是走那条通道 ——
+                #   实测 Surface 报「本节点是 v3 层段 worker，拒绝 legacy 分层配置」），
+                #   所以这里的 `has_layer_stage` 恒为假。但它要的**恰恰**是那份 legacy
+                #   层配置，不该被当 Full Worker 释放预留，否则 relay 链丢掉中间段。
+                is_relay_host = bool(
+                    node_id and self._relay_segment_for_worker(node_id) is not None
+                )
+                if node_id and not is_relay_host:
                     worker_ids.add(node_id)
         return worker_ids
 

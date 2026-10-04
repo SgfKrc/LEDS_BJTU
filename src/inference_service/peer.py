@@ -89,6 +89,11 @@ class PeerClient:
         # resets the remote runner's KV state, so it must not happen per step.
         self._relay_sessions: Dict[str, Any] = {}
         self._pending_layer_config: Optional[tuple] = None
+        # Receiver callbacks are dispatched on independent threads. Keep a
+        # monotonic fence so a delayed release cannot erase a newer relay
+        # assignment after a master restart.
+        self._latest_layer_config_generation = 0
+        self._latest_layer_config_id = ""
         self._running = False
         self._client: Optional[Any] = None  # tcp_comm.TCPClient
         self._reconnect_delay = 5.0
@@ -204,12 +209,93 @@ class PeerClient:
     def _handle_layer_config_locked(self, data: dict) -> None:
         node_id = self._node_id
 
-        # 兼容两种格式：新版直接是 assignment；旧版 {node_id: assignment}
+        # Validate an explicitly targeted message before touching the local
+        # generation watermark.  A release for another peer must not be able
+        # to advance this client's fence and reject a later valid config.
         if isinstance(data, dict) and data.get("release"):
             target_node_id = str(data.get("node_id", node_id))
             if target_node_id != node_id:
-                logger.warning("忽略目标不匹配的分层释放: target=%s local=%s", target_node_id, node_id)
+                logger.warning(
+                    "忽略目标不匹配的分层释放: target=%s local=%s",
+                    target_node_id, node_id,
+                )
                 return
+
+        # Config callbacks run on independent receiver threads. Reject an
+        # older generation before it can clear a newer relay assignment.
+        candidate = data
+        if (
+            isinstance(data, dict)
+            and node_id in data
+            and isinstance(data.get(node_id), dict)
+        ):
+            candidate = data[node_id]
+        if (
+            isinstance(candidate, dict)
+            and candidate.get("node_id") is not None
+            and str(candidate.get("node_id")) != node_id
+        ):
+            logger.warning(
+                "忽略目标不匹配的分层配置: target=%s local=%s",
+                candidate.get("node_id"), node_id,
+            )
+            return
+        incoming_generation = None
+        if isinstance(candidate, dict) and "generation" in candidate:
+            try:
+                incoming_generation = int(candidate.get("generation"))
+            except (TypeError, ValueError):
+                incoming_generation = None
+        incoming_config_id = (
+            str(candidate.get("config_id", "") or "")
+            if isinstance(candidate, dict) else ""
+        )
+        with self._layer_config_lock:
+            latest_generation = int(
+                getattr(self, "_latest_layer_config_generation", 0) or 0
+            )
+            latest_config_id = str(
+                getattr(self, "_latest_layer_config_id", "") or ""
+            )
+            # Once a versioned assignment has been accepted, an unversioned
+            # legacy message is necessarily older than the active lifecycle.
+            # Accepting it would let a delayed release clear a newer relay
+            # config during a master reconnect.
+            if incoming_generation is None and latest_generation > 0:
+                logger.info(
+                    "ignore unversioned stale layer config node=%s config=%s latest=%s/%s",
+                    node_id,
+                    incoming_config_id or "legacy",
+                    latest_generation,
+                    latest_config_id or "legacy",
+                )
+                return
+            if incoming_generation is not None:
+                stale = (
+                    incoming_generation < latest_generation
+                    or (
+                        incoming_generation == latest_generation
+                        and incoming_config_id
+                        and latest_config_id
+                        and incoming_config_id != latest_config_id
+                    )
+                )
+                if stale:
+                    logger.info(
+                        "ignore stale layer config node=%s config=%s generation=%s latest=%s/%s",
+                        node_id,
+                        incoming_config_id or "legacy",
+                        incoming_generation,
+                        latest_generation,
+                        latest_config_id or "legacy",
+                    )
+                    return
+                if incoming_generation > latest_generation:
+                    self._latest_layer_config_generation = incoming_generation
+                    self._latest_layer_config_id = incoming_config_id
+
+        # 兼容两种格式：新版直接是 assignment；旧版 {node_id: assignment}
+        if isinstance(data, dict) and data.get("release"):
             self._close_all_relay_sessions()
             with self._layer_config_lock:
                 self._active_layer_config = None

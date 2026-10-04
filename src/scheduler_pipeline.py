@@ -9,6 +9,7 @@ import time
 import uuid
 import base64
 import hashlib
+import math
 
 from koakuma_engine import Capability, backend_id_for, runtime_supports
 from config import (
@@ -25,7 +26,7 @@ from relay_segment_client import (
 )
 from relay_transport import is_loopback_host
 from scheduler_types import PreemptState
-from torch_runtime import require_torch
+from torch_runtime import loaded_torch
 
 logger = logging.getLogger("scheduler")
 
@@ -85,17 +86,69 @@ def _prefer_cache_state(result) -> object:
     return result["past_key_values"]
 
 
+def _hidden_to_raw_f32(hidden) -> tuple[bytes, int, int]:
+    """把 hidden 归一成 `(raw_le_f32_bytes, n_tokens, n_embd)` —— **不要求 torch**。
+
+    线格式本来就是 raw little-endian f32（见 `_encode_relay_hidden` 与
+    `transport_port.serialize_tensor`），所以这里要做的只有「二维 → CPU f32 连续 →
+    bytes」。给 torch tensor 就沿用它的 `.detach().to(...)`（语义最准）；没有 torch 的
+    边缘构建（免安装版）走 numpy —— 那种运行时里 hidden 本来就出自 `llama_cpp`/numpy，
+    不该为了转一次字节序而要求装 torch。
+    """
+    if hidden is None:
+        raise ValueError("layer stage requires a hidden tensor")
+    detach = getattr(hidden, "detach", None)
+    if callable(detach):
+        torch = loaded_torch()
+        if torch is None:
+            raise ValueError(
+                "收到 torch 张量但当前运行时没有 torch —— "
+                "边缘构建请直接传 numpy 数组"
+            )
+        cpu = detach().to(device="cpu", dtype=torch.float32).contiguous()
+        if cpu.ndim < 2:
+            raise ValueError(
+                "layer stage hidden tensor must have token and embedding dimensions"
+            )
+        shape = tuple(int(size) for size in cpu.shape)
+        return (
+            cpu.numpy().tobytes(),
+            int(math.prod(shape[:-1])),
+            int(shape[-1]),
+        )
+    import numpy as _np
+
+    array = _np.asarray(hidden)
+    if array.ndim < 2:
+        raise ValueError(
+            "layer stage hidden tensor must have token and embedding dimensions"
+        )
+    if array.dtype != _np.float32:
+        array = array.astype(_np.float32)
+    array = _np.ascontiguousarray(array)
+    shape = tuple(int(size) for size in array.shape)
+    return array.tobytes(), int(math.prod(shape[:-1])), int(shape[-1])
+
+
 def _encode_relay_hidden(tensor) -> tuple[str, list[int]]:
     """Encode relay input as the explicit raw-f32 wire contract."""
-    torch = require_torch()
-    cpu = tensor.detach().to(device="cpu", dtype=torch.float32).contiguous()
-    return base64.b64encode(cpu.numpy().tobytes()).decode("ascii"), [
-        int(size) for size in cpu.shape
-    ]
+    raw, n_tokens, n_embd = _hidden_to_raw_f32(tensor)
+    shape = getattr(tensor, "shape", None)
+    if shape is None:
+        import numpy as _np
+        shape = _np.asarray(tensor).shape
+    shape = [int(size) for size in shape]
+    if len(shape) < 2 or math.prod(shape[:-1]) != n_tokens or shape[-1] != n_embd:
+        raise ValueError("relay hidden shape is inconsistent with raw f32 payload")
+    return base64.b64encode(raw).decode("ascii"), shape
 
 
 def _decode_relay_hidden(raw: bytes, shape: object):
-    """Decode and validate a relay raw-f32 payload on the Torch side."""
+    """Decode and validate a relay raw-f32 payload.
+
+    返回 torch 张量（有 torch 时）或 numpy 数组（无 torch 的边缘构建）—— 两者在下游
+    都按 `[tokens, embedding]` f32 使用。
+    """
     if not isinstance(shape, list) or not shape or any(
         isinstance(size, bool) or not isinstance(size, int) or size <= 0
         for size in shape
@@ -108,7 +161,11 @@ def _decode_relay_hidden(raw: bytes, shape: object):
         raise ValueError(
             f"relay raw f32 length mismatch: bytes={len(raw)} expected={expected_items * 4}"
         )
-    torch = require_torch()
+    torch = loaded_torch()
+    if torch is None:
+        import numpy as _np
+
+        return _np.frombuffer(memoryview(raw), dtype=_np.float32).reshape(shape).copy()
     return torch.frombuffer(memoryview(raw), dtype=torch.float32).reshape(shape).clone()
 
 
@@ -173,20 +230,35 @@ class SchedulerPipelineMixin:
         """
         if self._effective_role() != "master":
             return False
-        with self._layer_config_lock:
-            self._authoritative_layer_sync_requests += 1
-        try:
-            # Explicit distributed requests bypass a single-node capacity plan;
-            # ordinary authoritative refreshes preserve the existing policy.
-            with self._layer_config_push_lock:
+        # Check the fence and publish under one lock order.  A check performed
+        # before acquiring `_layer_config_push_lock` can race with begin/end
+        # and publish a transient release during a model transition.
+        with self._layer_config_push_lock:
+            with self._layer_config_lock:
+                if self._layer_config_model_change_depth:
+                    self._layer_config_push_deferred = True
+                    self._layer_config_push_deferred_authoritative = True
+                    self._layer_config_push_deferred_require_distributed = (
+                        self._layer_config_push_deferred_require_distributed
+                        or bool(require_distributed)
+                    )
+                    logger.info(
+                        "defer authoritative layer sync during model transition depth=%d",
+                        self._layer_config_model_change_depth,
+                    )
+                    return True
+                self._authoritative_layer_sync_requests += 1
+            try:
+                # Explicit distributed requests bypass a single-node capacity plan;
+                # ordinary authoritative refreshes preserve the existing policy.
                 self._push_layer_config_to_clients_locked(
                     require_distributed=require_distributed,
                 )
-        finally:
-            with self._layer_config_lock:
-                self._authoritative_layer_sync_requests = max(
-                    0, self._authoritative_layer_sync_requests - 1,
-                )
+            finally:
+                with self._layer_config_lock:
+                    self._authoritative_layer_sync_requests = max(
+                        0, self._authoritative_layer_sync_requests - 1,
+                    )
         return True
 
 
@@ -277,6 +349,15 @@ class SchedulerPipelineMixin:
         #   「主节点已释放本设备的分层 worker 预留」⇒ 它直接掉出层段 worker 名单
         #   （实测：Surface 因此从 `admitted` 里消失）。
         #   它手上有工件，v3 stage offer 走的是 offer 里带的 hidden，不需要 master 推模型。
+        # Record endpoint-backed relay hosts before removing v3 stage workers
+        # from the legacy candidate set. A relay worker may advertise
+        # ``layer_forward`` from a local artifact, but it still needs the
+        # logical ``relay_middle`` assignment after a master restart; the
+        # remote relay service owns that segment's data path.
+        relay_worker_ids = {
+            node_id for node_id in releasable_legacy_ids
+            if self._relay_segment_for_worker(node_id) is not None
+        }
         releasable_legacy_ids -= self._task_worker_layer_stage_ids(set(connected_ids))
         # Route A Android workers use v3 stage_offer and must never receive a
         # legacy LAYER_CONFIG (which would make a layer worker look like a
@@ -293,10 +374,6 @@ class SchedulerPipelineMixin:
         )
         # A node explicitly assigned to an endpoint-backed relay segment is
         # still a pipeline participant even if it also advertises a full model.
-        relay_worker_ids = {
-            node_id for node_id in releasable_legacy_ids
-            if self._relay_segment_for_worker(node_id) is not None
-        }
         full_worker_release_ids.difference_update(relay_worker_ids)
         layer_releasable_worker_ids = releasable_legacy_ids - full_worker_release_ids
 
@@ -337,6 +414,31 @@ class SchedulerPipelineMixin:
         #   ⇒ hybrid 会被静默拦掉，master **不推层配置**）
         if (not master_sha256 or not model_id
                 or model_type not in PIPELINE_RUNTIME_MODEL_TYPES):
+            # Relay hosts can be rehydrated without local model metadata.
+            # During master restart, releasing them here races the next
+            # assignment/ACK and leaves the relay with no active config.
+            relay_assignments = {}
+            relay_total_layers = self._get_total_model_layers()
+            for node_id in relay_worker_ids:
+                relay_segment = self._relay_segment_for_worker(node_id)
+                if relay_segment is None:
+                    continue
+                relay_assignments[node_id] = {
+                    "node_id": node_id,
+                    "config_id": config_id,
+                    "generation": generation,
+                    "start_layer": relay_total_layers,
+                    "end_layer": relay_total_layers,
+                    "has_embedding": False,
+                    "has_lm_head": False,
+                    "model_id": model_id,
+                    "model_sha256": master_sha256,
+                    "model_type": model_type,
+                    "total_layers": relay_total_layers,
+                    "engine": "relay_middle",
+                    "phase": "commit",
+                    "relay_segment": relay_segment,
+                }
             releases = {
                 node_id: {
                     "node_id": node_id,
@@ -345,8 +447,9 @@ class SchedulerPipelineMixin:
                     "release": True,
                 }
                 for node_id in releasable_legacy_ids
+                if node_id not in relay_assignments
             }
-            self._publish_layer_configs(releases)
+            self._publish_layer_configs({**relay_assignments, **releases})
             logger.warning("主节点尚未加载可校验的 PyTorch 模型，暂不推送层配置")
             return
 
@@ -387,6 +490,10 @@ class SchedulerPipelineMixin:
                         ),
                     }
                 for node_id in releasable_legacy_ids
+                # ★ 与下面的 `:537` releases 同理：relay 宿主**不**收本地层配置，
+                #   容量求解的否定结论不该顺带释放它的预留 —— 否则它每次 hello 后
+                #   都「确认退出分层 worker」，relay 链再也拿不到中间段（实测）。
+                if self._relay_segment_for_worker(node_id) is None
                 }
                 with self._layer_config_lock:
                     self._pipeline_load_transaction = {
@@ -424,7 +531,16 @@ class SchedulerPipelineMixin:
             ):
                 continue
 
-            if nid in stage_releasable_worker_ids:
+            if (
+                nid in stage_releasable_worker_ids
+                # ★ relay 段不属于 v3 stage 名单：它的层由远端 relay_mid_service
+                #   代跑，本节点只转发（下面 `relay_segment` 分支会给它
+                #   `engine="relay_middle"`）。若这里把它标成 `stage_offer_v3`，
+                #   `_run_pipeline` 就会按 v3 数据面去要它的层区间，而它手上根本没有
+                #   那段工件 ⇒ `layer_range_not_advertised`（实测：relay 链被误路由到
+                #   Route-A stage 路径后卡在这里）。
+                and self._relay_segment_for_worker(nid) is None
+            ):
                 # Keep the assignment in the active capacity plan for the
                 # execution/readiness contract, but do not materialize a
                 # local model segment or publish LAYER_CONFIG to Android.
@@ -491,6 +607,14 @@ class SchedulerPipelineMixin:
             }
             for node_id in (layer_releasable_worker_ids | full_worker_release_ids)
             if node_id not in assignments
+            # ★ relay 宿主**不**收本地层配置（它的层由远端 relay_mid_service 代跑），
+            #   因此它永远不在 `assignments` 里 —— 但那不等于该释放它的预留：它要的
+            #   恰恰是那份 legacy 层配置（`engine="relay_middle"`，由请求路径的
+            #   `_push_layer_config_to_clients_locked` 下发；hello 时还没有
+            #   capacity_plan，所以那时释放等于把它踢出链路）。此前没有这一条，
+            #   实测 Surface 每次 hello 后立刻「确认退出分层 worker」，
+            #   relay 链永远拿不到中间段。
+            and self._relay_segment_for_worker(node_id) is None
         }
         configs = {**assignments, **releases}
         if capacity_plan is not None:
@@ -652,16 +776,7 @@ class SchedulerPipelineMixin:
         from task_provider import StageAttempt, StageRequest
         from task_worker_adapter import remote_provider_id
 
-        torch = require_torch()
-        if hidden_states is None or not hasattr(hidden_states, "detach"):
-            raise ValueError("layer stage requires a torch hidden tensor")
-        hidden = hidden_states.detach().to(
-            device="cpu", dtype=torch.float32,
-        ).contiguous()
-        if hidden.ndim != 2:
-            raise ValueError("layer stage hidden tensor must be [tokens, embedding]")
-        n_tokens, n_embd = (int(hidden.shape[0]), int(hidden.shape[1]))
-        raw = hidden.numpy().tobytes()
+        raw, n_tokens, n_embd = _hidden_to_raw_f32(hidden_states)
         hidden_spec = {
             "n_tokens": n_tokens,
             "n_embd": n_embd,
@@ -1019,8 +1134,13 @@ class SchedulerPipelineMixin:
         """
         获取主节点当前加载模型的 SHA256。
 
-        对当前已加载或已显式准备的 PyTorch Safetensors/BIN 模型计算摘要。
-        llama.cpp/GGUF 不支持层拆分，不得作为流水线模型基准。
+        口径由**主节点引擎自己的描述器**给出：PyTorch 侧是目录内 artifact 的联合哈希
+        （`model_sync.compute_model_sha256`），llama.cpp 侧是整份 GGUF 的文件摘要
+        （`LlamaCppEngine._pipeline_file_sha256`）。两者都只用于「各节点是否握着同一份
+        权重」的自证，混合部署时以主节点为准。
+
+        旧注释写的是「llama.cpp/GGUF 不支持层拆分，不得作为流水线模型基准」—— 那是
+        `BackendId.LLAMA_CPP` 声明 `FORWARD_LAYERS` 之前的判据，已不成立。
         """
         from model_sync import compute_model_sha256
 
@@ -1043,6 +1163,9 @@ class SchedulerPipelineMixin:
             or ''
         )
         if not model_path or not os.path.isdir(model_path):
+            # 单文件（GGUF）走不到这里：描述器已给出 `model_sha256` 并在上面返回。
+            # `compute_model_sha256` 的语义是「目录内 artifact 联合哈希」，对单文件
+            # 无意义，故不放宽 —— 缺描述器的 GGUF 引擎视为不可校验。
             return ""
 
         try:
@@ -1742,18 +1865,35 @@ class SchedulerPipelineMixin:
         #   `admitted`（实测：Surface 注册后 6 ms 就被释放，此后每轮重连重复一次）。
         #   判据必须落在 worker 自己身上：主节点在**节点注册那一刻**就推送 legacy 配置，
         #   早于 hello 往返 ⇒ master 侧按 capabilities 排除在时序上不可靠（已踩到）。
+        legacy_candidate = data
         if (
             isinstance(data, dict)
-            and not data.get("release")
+            and node_id in data
+            and isinstance(data.get(node_id), dict)
+        ):
+            legacy_candidate = data[node_id]
+        if isinstance(legacy_candidate, dict):
+            candidate_generation = legacy_candidate.get("generation")
+            if candidate_generation is not None:
+                ack_generation = candidate_generation
+        is_relay_assignment = (
+            isinstance(legacy_candidate, dict)
+            and str(legacy_candidate.get("engine", "") or "").lower()
+            == "relay_middle"
+        )
+        if (
+            isinstance(legacy_candidate, dict)
+            and not legacy_candidate.get("release")
+            and not is_relay_assignment
             and os.environ.get("QLH_LAYER_GGUF", "").strip()
         ):
             logger.info(
                 "本节点是 v3 层段 worker，拒绝 legacy 分层配置: config=%s",
-                data.get("config_id", ""),
+                legacy_candidate.get("config_id", ""),
             )
             self._send_layer_config_ack({
                 "node_id": node_id,
-                "config_id": str(data.get("config_id", "")),
+                "config_id": str(legacy_candidate.get("config_id", "")),
                 "generation": ack_generation,
                 "status": "error",
                 "error": "layer_stage_worker_rejects_legacy_config",
@@ -1883,21 +2023,27 @@ class SchedulerPipelineMixin:
             if target_node_id != node_id:
                 raise ValueError(f"层配置目标节点 {target_node_id} 与本节点 {node_id} 不一致")
             # ★ #31 M2：同上，走单一事实来源
-            if expected_model_type not in PIPELINE_RUNTIME_MODEL_TYPES:
+            relay_assignment = expected_engine == "relay_middle"
+            # Endpoint-backed relay workers own their model artifact remotely;
+            # allow a restart-time metadata gap to rehydrate their logical
+            # assignment using the relay segment contract alone.
+            if not relay_assignment and expected_model_type not in PIPELINE_RUNTIME_MODEL_TYPES:
                 raise ValueError(f"不支持的流水线模型架构: {expected_model_type or 'unknown'}")
             if expected_engine not in {"pytorch", "relay_middle"}:
                 raise ValueError(
                     f"分层配置引擎必须为 pytorch 或 relay_middle，实际为 {expected_engine}"
                 )
-            missing_contract = [
-                name for name, value in (
+            contract_fields = (
+                (("config_id", config_id),)
+                if relay_assignment
+                else (
                     ("config_id", config_id),
                     ("model_id", model_id),
                     ("model_sha256", expected_sha256),
                     ("total_layers", total_layers),
                 )
-                if not value
-            ]
+            )
+            missing_contract = [name for name, value in contract_fields if not value]
             if missing_contract:
                 raise ValueError(
                     "分层配置执行契约不完整: " + ", ".join(missing_contract)
@@ -2777,7 +2923,9 @@ class SchedulerPipelineMixin:
                     config_id=config_id, model_sha256=model_sha256,
                     model_type=model_type, received_chain_path=received_chain_path,
                 )
-            require_torch()
+            # 数据面经 `transport_port.serialize_tensor` ⇒ `serialize_tensor_fast`
+            # （`TNR0` magic + numpy frombuffer），**不经过 torch**。此前在这里前置
+            # `require_torch()`，会让无 torch 的边缘节点在走到这一段时直接失败。
             from transport_port import deserialize_tensor, serialize_tensor
             if actual_model_type != model_type:
                 layer_config_invalid = True
@@ -4960,7 +5108,10 @@ class SchedulerPipelineMixin:
         Returns:
             {"response": str, "thinking": str, "metrics": dict, ...}
         """
-        require_torch()
+        # 流水线数据面只经 `serialize_tensor_fast` / `deserialize_tensor_fast`
+        # （`TNR0` magic + numpy frombuffer），**不需要 torch**。此前这里前置
+        # `require_torch()`，与 `koakuma_engine` 里「llama.cpp 不需要 torch 也能做层
+        # 前向」的能力声明自相矛盾，也让无 torch 的边缘主节点在流水线入口就失败。
         import uuid
         from transport_port import MessageType, deserialize_tensor, serialize_tensor
         # ★ 与 worker 的 `deserialize_tensor_fast` 对称：fast 走 `TNR0` magic（numpy
@@ -5121,8 +5272,23 @@ class SchedulerPipelineMixin:
         pipeline_config_id = str(next(iter(config_ids)))
         pipeline_model_sha256 = str(next(iter(model_hashes)))
         pipeline_model_type = str(next(iter(model_types)))
+        # 主节点的模型类型一律取自**它自己的描述器**：PyTorch 侧能从 `mgr.model.config`
+        # 读，llama.cpp 侧根本没有 `model`/`config`（权重在 GGUF 里）——原实现只看后者
+        # ⇒ 去 torch 的主节点这里恒为空串，与 worker 契约永远对不上，每次请求都被判
+        # 「模型已变化」。描述器是两条引擎路径共同的单一事实来源。
+        master_descriptor = {}
+        get_master_descriptor = getattr(mgr, "get_pipeline_descriptor", None)
+        if callable(get_master_descriptor):
+            try:
+                master_descriptor = get_master_descriptor() or {}
+            except Exception:
+                master_descriptor = {}
         master_model_type = str(
-            getattr(getattr(getattr(mgr, "model", None), "config", None), "model_type", "")
+            master_descriptor.get("model_type", "")
+            or getattr(
+                getattr(getattr(mgr, "model", None), "config", None),
+                "model_type", "",
+            )
             or ""
         ).lower()
         if (master_model_type != pipeline_model_type
@@ -5319,8 +5485,18 @@ class SchedulerPipelineMixin:
 
             with self._pipeline_lock:
                 contract = self._pipeline_task_contracts.get(task_id)
-                if contract is None:
-                    return {"response": "", "error": "流水线任务执行契约已失效"}
+            if contract is None:
+                # ★ 这一处必须走与其它失败路径相同的**统一中止流程**：任务已经派发过
+                #   （worker 侧的 `_active_pipeline_task_ids` 已置位），只 `return` 会让
+                #   它在 worker 上**永远**留着 —— 此后每一次层配置都会被判「本节点仍有
+                #   流水线任务执行中」而延后，节点从此再也收不到新配置
+                #   （实测：Surface 卡在 `active=['bae88f27f26e']`，master 连发 6 次配置
+                #   都无人 ACK，链路整体失效）。
+                step_error = "流水线任务执行契约已失效"
+                self._broadcast_pipeline_abort(pipeline_nodes, task_id, step_error)
+                self._clear_pipeline_runtime_state(task_id)
+                return {"response": "", "error": step_error}
+            with self._pipeline_lock:
                 contract["current_step"] = step
                 prefix = f"{task_id}:"
                 for stale_key in list(self._pipeline_results):
@@ -5394,7 +5570,14 @@ class SchedulerPipelineMixin:
                             self._kv_cache[task_id] = _prefer_cache_state(local_result)
                     if "hidden_states" not in local_result:
                         raise RuntimeError("主节点首段未返回 hidden_states")
-                    hs_cpu = local_result["hidden_states"].detach().cpu()
+                    # hidden 的载体随引擎不同：PyTorch 给张量（要 `.detach().cpu()`），
+                    # llama.cpp 给 numpy `[tokens, n_embd]` f32。下游只把它当 payload 用。
+                    raw_hidden = local_result["hidden_states"]
+                    hs_cpu = (
+                        raw_hidden.detach().cpu()
+                        if hasattr(raw_hidden, "detach")
+                        else raw_hidden
+                    )
                     import base64 as _b64
                     relay_segment = (
                         self._relay_segment_for_worker(first_node_id, routing_preference)
@@ -5413,7 +5596,11 @@ class SchedulerPipelineMixin:
                         if hs_cpu.ndim < 2:
                             raise RuntimeError("relay hidden must have token and embedding dimensions")
                         hidden_seq = int(hs_cpu.shape[-2])
-                        hidden_batch = int(hs_cpu.numel() // (hidden_seq * int(hs_cpu.shape[-1])))
+                        # `numel()` 是 torch 的；llama.cpp 侧的 hidden 是 numpy，用 `.size`。
+                        hidden_items = (
+                            hs_cpu.numel() if hasattr(hs_cpu, "numel") else hs_cpu.size
+                        )
+                        hidden_batch = int(hidden_items // (hidden_seq * int(hs_cpu.shape[-1])))
                         prompt_tokens = int(input_ids.shape[-1])
                         if is_prefill:
                             positions_per_seq = list(range(hidden_seq))

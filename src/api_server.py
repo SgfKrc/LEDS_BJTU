@@ -864,6 +864,12 @@ def _run_exclusive_model_change(
     with model_host.full_chat_execution_lock:
         if prepare is not None:
             prepare()
+        begin_transition = getattr(
+            scheduler, "_begin_layer_config_model_change", None,
+        )
+        transition_started = callable(begin_transition)
+        if transition_started:
+            begin_transition()
         with scheduler._inference_lock:
             with scheduler._layer_execution_lock:
                 with scheduler._layer_config_lock:
@@ -887,6 +893,12 @@ def _run_exclusive_model_change(
                     return change()
                 finally:
                     _refresh_pipeline_layer_config()
+                    if transition_started:
+                        end_transition = getattr(
+                            scheduler, "_end_layer_config_model_change", None,
+                        )
+                        if callable(end_transition):
+                            end_transition()
 
 
 # ============================================================

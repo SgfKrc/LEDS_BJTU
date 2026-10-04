@@ -3160,7 +3160,14 @@ class EngineHost:
             if prepare is not None:
                 prepare()
             sched = self._scheduler
+            transition_started = False
             if sched is not None:
+                begin_transition = getattr(
+                    sched, "_begin_layer_config_model_change", None,
+                )
+                if callable(begin_transition):
+                    begin_transition()
+                    transition_started = True
                 with sched._inference_lock:
                     with sched._layer_execution_lock:
                         with sched._layer_config_lock:
@@ -3185,6 +3192,12 @@ class EngineHost:
             finally:
                 if sched is not None:
                     self._refresh_pipeline_layer_config(sched)
+                    if transition_started:
+                        end_transition = getattr(
+                            sched, "_end_layer_config_model_change", None,
+                        )
+                        if callable(end_transition):
+                            end_transition()
 
     def _refresh_pipeline_layer_config(self, sched) -> None:
         """主节点模型变化后重新下发层配置，并使旧 ACK 失效。"""

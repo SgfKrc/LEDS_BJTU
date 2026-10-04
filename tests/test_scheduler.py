@@ -2202,6 +2202,107 @@ class TestPipelineMessageDispatch:
         assert sched._active_layer_config["engine"] == "relay_middle"
         assert sched._active_layer_config["relay_segment"] == relay_spec
 
+    def test_relay_middle_assignment_is_not_rejected_as_legacy_stage_config(
+            self, sched, monkeypatch):
+        """A stage-advertising relay still accepts its logical relay config."""
+        import scheduler_pipeline as pipeline_module
+
+        relay_spec = {
+            "role": "middle", "host": "127.0.0.1", "port": 50183,
+            "n_embd": 896, "timeout": 5.0, "layer_start": 8,
+            "layer_end": 16,
+        }
+        sent = []
+        fake_host = type("RelayHost", (), {
+            "is_loaded": False,
+            "model_loaded": False,
+            "layer_range": None,
+            "load_layer_range": lambda self, *args, **kwargs: (
+                (_ for _ in ()).throw(AssertionError("relay must not load local layers"))
+            ),
+        })()
+        sched._host = fake_host
+        sched._tcp_client = type("Client", (), {
+            "send_data": lambda self, payload, msg_type: sent.append(payload),
+        })()
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: "worker")
+        monkeypatch.setattr(pipeline_module, "PIPELINE_RELAY_ENABLED", True)
+        monkeypatch.setenv("QLH_LAYER_GGUF", "C:/models/layer.gguf")
+
+        sched._handle_layer_config("master", {
+            "node_id": "worker", "config_id": "cfg-relay-stage",
+            "generation": 7, "start_layer": 8, "end_layer": 16,
+            "model_id": "qwen-test", "model_sha256": "sha-relay",
+            "model_type": "qwen2", "total_layers": 24,
+            "engine": "relay_middle", "relay_segment": relay_spec,
+        })
+
+        assert sent[-1]["status"] == "ready"
+        assert sent[-1]["engine"] == "relay_middle"
+        assert sched._active_layer_config["config_id"] == "cfg-relay-stage"
+
+    def test_relay_middle_rehydrates_without_master_model_identity(
+            self, sched, monkeypatch):
+        """Restart metadata gaps must still admit endpoint-backed relay config."""
+        import scheduler_pipeline as pipeline_module
+
+        relay_spec = {
+            "role": "middle", "host": "127.0.0.1", "port": 50183,
+            "n_embd": 896, "timeout": 5.0, "layer_start": 8,
+            "layer_end": 16,
+        }
+        sent = []
+        fake_host = type("RelayHost", (), {
+            "is_loaded": False,
+            "model_loaded": False,
+            "layer_range": None,
+            "load_layer_range": lambda self, *args, **kwargs: (
+                (_ for _ in ()).throw(AssertionError("relay must not load local layers"))
+            ),
+        })()
+        sched._host = fake_host
+        sched._tcp_client = type("Client", (), {
+            "send_data": lambda self, payload, msg_type: sent.append(payload),
+        })()
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: "worker")
+        monkeypatch.setattr(pipeline_module, "PIPELINE_RELAY_ENABLED", True)
+
+        sched._handle_layer_config("master", {
+            "node_id": "worker", "config_id": "cfg-relay-gap",
+            "generation": 8, "start_layer": 24, "end_layer": 24,
+            "total_layers": 24, "engine": "relay_middle",
+            "relay_segment": relay_spec,
+        })
+
+        assert sent[-1]["status"] == "ready"
+        assert sent[-1]["config_id"] == "cfg-relay-gap"
+        assert sent[-1]["model_type"] == ""
+        assert sched._active_layer_config["engine"] == "relay_middle"
+
+    def test_nested_legacy_rejection_ack_preserves_generation(
+            self, sched, monkeypatch):
+        """Wrapped legacy assignments must reject with their own generation."""
+        sent = []
+        sched._tcp_client = type("Client", (), {
+            "send_data": lambda self, payload, msg_type: sent.append(payload),
+        })()
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: "worker")
+        monkeypatch.setenv("QLH_LAYER_GGUF", "C:/models/layer.gguf")
+
+        sched._handle_layer_config("master", {
+            "worker": {
+                "node_id": "worker",
+                "config_id": "cfg-legacy-nested",
+                "generation": 19,
+                "start_layer": 8,
+                "end_layer": 16,
+            },
+        })
+
+        assert sent[-1]["status"] == "error"
+        assert sent[-1]["error"] == "layer_stage_worker_rejects_legacy_config"
+        assert sent[-1]["generation"] == 19
+
     def test_relay_middle_prepare_does_not_require_local_capacity(
             self, sched, monkeypatch):
         import scheduler_pipeline as pipeline_module
@@ -5476,6 +5577,148 @@ class TestPipelineOrchestrationIntegration:
         )
         sched_master._push_layer_config_to_clients_locked()
         assert node.node_id not in sched_master._layer_config_expected
+
+    def test_model_metadata_gap_preserves_relay_assignment(
+            self, sched_master, monkeypatch):
+        """Restart-time metadata gaps must not release an endpoint relay host."""
+        relay_id = "relay-host"
+        relay = NodeInfo(
+            node_id=relay_id, role="client", state=NodeState.ONLINE,
+            node_type="pc", address="100.64.1.9:8888",
+            last_heartbeat=time.time(),
+        )
+        sched_master.nodes[relay_id] = relay
+        sched_master._tcp_server.clients = {relay_id: True}
+        relay_segment = {
+            "role": "middle",
+            "host": "127.0.0.1",
+            "port": 50283,
+            "n_embd": 4096,
+            "layer_start": 23,
+            "layer_end": 24,
+        }
+        monkeypatch.setattr(
+            sched_master, "_relay_segment_for_worker",
+            lambda node_id: relay_segment if node_id == relay_id else None,
+        )
+        monkeypatch.setattr(
+            sched_master, "_get_active_pipeline_model_info", lambda: {},
+        )
+        published = []
+        monkeypatch.setattr(
+            sched_master, "_publish_layer_configs",
+            lambda configs: published.append(configs),
+        )
+
+        sched_master._push_layer_config_to_clients_locked()
+
+        assert len(published) == 1
+        config = published[0][relay_id]
+        assert config["engine"] == "relay_middle"
+        assert config["relay_segment"] == relay_segment
+        assert config.get("release") is not True
+
+    def test_model_metadata_gap_rehydrates_stage_advertised_relay(
+            self, sched_master, monkeypatch):
+        """A relay that advertises layer_forward still needs relay_middle."""
+        relay_id = "relay-stage-host"
+        relay = NodeInfo(
+            node_id=relay_id, role="client", state=NodeState.ONLINE,
+            node_type="pc", address="100.64.1.10:8888",
+            last_heartbeat=time.time(),
+        )
+        sched_master.nodes[relay_id] = relay
+        sched_master._tcp_server.clients = {relay_id: True}
+        relay_segment = {
+            "role": "middle",
+            "host": "127.0.0.1",
+            "port": 50283,
+            "n_embd": 4096,
+            "layer_start": 23,
+            "layer_end": 24,
+        }
+        monkeypatch.setattr(
+            sched_master, "_relay_segment_for_worker",
+            lambda node_id: relay_segment if node_id == relay_id else None,
+        )
+        monkeypatch.setattr(
+            sched_master, "_task_worker_layer_stage_ids",
+            lambda _connected: {relay_id},
+        )
+        monkeypatch.setattr(
+            sched_master, "_get_active_pipeline_model_info", lambda: {},
+        )
+        published = []
+        monkeypatch.setattr(
+            sched_master, "_publish_layer_configs",
+            lambda configs: published.append(configs),
+        )
+
+        sched_master._push_layer_config_to_clients_locked()
+
+        assert len(published) == 1
+        config = published[0][relay_id]
+        assert config["engine"] == "relay_middle"
+        assert config["relay_segment"] == relay_segment
+        assert config.get("release") is not True
+
+    def test_model_transition_defers_release_and_flushes_one_push(
+            self, sched_master, monkeypatch):
+        """Transient model metadata must not publish release over a new config."""
+        pushed = []
+        monkeypatch.setattr(
+            sched_master,
+            "_push_layer_config_to_clients_locked",
+            lambda **_kwargs: pushed.append(True),
+        )
+
+        sched_master._begin_layer_config_model_change()
+        sched_master.push_layer_config_to_clients()
+        # The authoritative refresh uses the internal push helper, so it must
+        # honor the same fence as ordinary status/hello-triggered pushes.
+        assert sched_master.request_authoritative_layer_sync() is True
+        assert pushed == []
+        assert sched_master._layer_config_push_deferred is True
+
+        sched_master._end_layer_config_model_change()
+        assert pushed == [True]
+        assert sched_master._layer_config_model_change_depth == 0
+        assert sched_master._layer_config_push_deferred is False
+
+    def test_failed_transition_flush_is_retried_with_authoritative_intent(
+            self, sched_master, monkeypatch):
+        """A transient publish failure must not lose the post-transition sync."""
+        calls = []
+
+        def fail_once(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise RuntimeError("temporary publish failure")
+
+        monkeypatch.setattr(
+            sched_master, "_push_layer_config_to_clients_locked", fail_once,
+        )
+
+        sched_master._begin_layer_config_model_change()
+        assert sched_master.request_authoritative_layer_sync(
+            require_distributed=True,
+        ) is True
+        sched_master._end_layer_config_model_change()
+
+        assert sched_master._layer_config_push_deferred is True
+        assert sched_master._layer_config_push_deferred_authoritative is True
+        assert sched_master._layer_config_push_deferred_require_distributed is True
+
+        sched_master.push_layer_config_to_clients()
+
+        assert calls == [
+            {"require_distributed": True},
+            {"require_distributed": True},
+        ]
+        assert sched_master._layer_config_push_deferred is False
+        assert sched_master._layer_config_push_deferred_authoritative is False
+        assert sched_master._layer_config_push_deferred_require_distributed is False
+        assert sched_master._authoritative_layer_sync_requests == 0
 
     # ----------------------------------------------------------
     # 场景 1：master 在线，所有 worker 离线 → fallback 本地推理
