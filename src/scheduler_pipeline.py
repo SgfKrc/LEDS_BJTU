@@ -1341,14 +1341,6 @@ class SchedulerPipelineMixin:
                 logger.warning("close relay session failed: task=%s", task_id, exc_info=True)
 
 
-    def _close_all_relay_segment_clients(self) -> None:
-        cache = getattr(self, "_relay_segment_clients", None)
-        if not cache:
-            return
-        for task_id in list(cache):
-            self._close_relay_segment_client(task_id)
-
-
     def _mark_local_pipeline_cancelled(self, task_id: str) -> None:
         if not task_id:
             return
