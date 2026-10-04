@@ -237,6 +237,23 @@ class ModelHost:
             return object.__getattribute__(manager, "_instance")
         return manager
 
+    def _materialize_manager(self) -> Any:
+        """Materialize the torch-backed manager for an explicit torch operation."""
+
+        manager = object.__getattribute__(self, "_manager")
+        # Tests and embedders may replace the lazy-factory symbol; use the
+        # stable proxy type name here instead of requiring that symbol remain a
+        # class object.
+        if type(manager).__name__ != "_LazyModelManager":
+            return manager
+        try:
+            return manager._get_instance()
+        except ImportError as exc:
+            raise RuntimeError(
+                "当前发行版没有 PyTorch，无法使用 torch ModelManager；"
+                "请选择 llama_cpp/GGUF 引擎"
+            ) from exc
+
     def has_loaded_model(self) -> bool:
         """Check LLM ownership without materializing the lazy manager."""
 
@@ -244,6 +261,62 @@ class ModelHost:
             return True
         manager = self.peek_manager()
         return bool(manager is not None and getattr(manager, "is_loaded", False))
+
+    @property
+    def is_loaded(self) -> bool:
+        """Expose a lazy-safe loaded flag for scheduler and API callers.
+
+        Reading this state must never instantiate ``model_module``.  In a torch-free
+        distribution the lazy manager is intentionally unavailable; that is an
+        unloaded host, not an AttributeError that callers might accidentally treat
+        as a successful fallback.
+        """
+
+        return self.has_loaded_model()
+
+    @property
+    def is_pipeline_prepared(self) -> bool:
+        """Expose distributed-only preparation without warming the lazy manager."""
+
+        manager = self.peek_manager()
+        return bool(manager is not None and getattr(manager, "is_pipeline_prepared", False))
+
+    def ensure_full_model(self, *args, **kwargs):
+        """Ensure a local full-model runtime, failing closed when it is unavailable.
+
+        ``ModelHost`` may be backed directly by ``LlamaCppEngine`` on the torch-free
+        path.  That engine does not need a separate ``ensure_full_model`` method when
+        it owns a whole GGUF, but a layer artifact (for example ``head8``) must never
+        be sent through the full-model chat fallback.
+        """
+
+        manager = self.peek_manager()
+        if manager is None:
+            raise RuntimeError(
+                "完整模型回退不可用：当前节点没有可用的 ModelManager（可能为无 torch 发行版）"
+            )
+
+        ensure = getattr(manager, "ensure_full_model", None)
+        if callable(ensure):
+            return ensure(*args, **kwargs)
+
+        # The torch-free GGUF engine is installed directly as the manager.  Inspect
+        # its pipeline descriptor before treating the loaded artifact as full-model.
+        describe = getattr(manager, "get_pipeline_descriptor", None)
+        if callable(describe):
+            descriptor = describe() or {}
+            if descriptor.get("partial_assignment") or descriptor.get("assignment_layer_range"):
+                layer_range = descriptor.get("assignment_layer_range")
+                raise RuntimeError(
+                    "当前 llama.cpp 引擎加载的是裁层工件"
+                    f"（layer_range={layer_range!r}），禁止整模回退；"
+                    "请等待流水线节点就绪或显式重新加载完整模型"
+                )
+        if backend_id_for(manager, default="") == "llama_cpp":
+            return None
+        raise RuntimeError(
+            "完整模型回退不可用：当前推理引擎未提供 ensure_full_model()"
+        )
 
     def runtime_status(self) -> dict:
         """Return the public, lazy-safe runtime state for diagnostics and tests."""
@@ -279,7 +352,8 @@ class ModelHost:
         if str(engine or "").strip().lower() in ("llama_cpp", "llama.cpp", "llama-cpp", "gguf"):
             self._load_gguf_model(model_path=model_path, model_id=model_id, profile=profile)
             return
-        self._manager.load_model(
+        manager = self._materialize_manager()
+        manager.load_model(
             model_path=model_path,
             quant_type=quant_type,
             profile=profile,
@@ -415,7 +489,7 @@ class ModelHost:
         # ★ 切回非 GGUF 引擎前，先确认 `_manager` 仍是模型管理器：`_load_gguf_model`
         #   会把 `LlamaCppEngine` 装成 `_manager`（它没有 `switch_model`），此时直接
         #   转发会抛 AttributeError。
-        manager = self._manager
+        manager = self._materialize_manager()
         if not hasattr(manager, "switch_model"):
             if hasattr(manager, "unload"):
                 manager.unload()

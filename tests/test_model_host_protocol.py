@@ -204,6 +204,55 @@ class TestLazyModelManager:
         # 未访问任何属性前不实例化 ModelManager（冷启动友好）
         assert ModelHost().runtime_status()["manager_loaded"] is False
 
+    def test_no_torch_proxy_reports_unloaded_and_fails_closed(self):
+        host = ModelHost()
+        assert host.is_loaded is False
+        assert host.is_pipeline_prepared is False
+        assert host.runtime_status()["manager_loaded"] is False
+        with pytest.raises(RuntimeError, match="没有可用的 ModelManager"):
+            host.ensure_full_model()
+        assert host.runtime_status()["manager_loaded"] is False
+
+    def test_explicit_torch_load_reports_missing_torch(self, monkeypatch):
+        import model_host as model_host_module
+
+        host = ModelHost()
+        monkeypatch.setattr(
+            model_host_module._LazyModelManager,
+            "_get_instance",
+            lambda self: (_ for _ in ()).throw(ImportError("torch is unavailable")),
+        )
+        with pytest.raises(RuntimeError, match="没有 PyTorch"):
+            host.load_model(engine="pytorch")
+
+    def test_torch_free_partial_gguf_is_rejected_as_full_model(self):
+        class PartialGguf:
+            engine_type = "llama_cpp"
+            is_loaded = True
+
+            def get_pipeline_descriptor(self):
+                return {
+                    "partial_assignment": True,
+                    "assignment_layer_range": [0, 8],
+                    "loaded_artifact": "head8.gguf",
+                }
+
+        host = ModelHost(manager=PartialGguf())
+        assert host.is_loaded is True
+        with pytest.raises(RuntimeError, match="裁层工件"):
+            host.ensure_full_model()
+
+    def test_torch_free_full_gguf_satisfies_full_model_check(self):
+        class FullGguf:
+            engine_type = "llama_cpp"
+            is_loaded = True
+
+            def get_pipeline_descriptor(self):
+                return {"model_path": "full.gguf"}
+
+        host = ModelHost(manager=FullGguf())
+        assert host.ensure_full_model() is None
+
 
 class TestApiServerIntegration:
     """api_server 经改造后的宿主接线（不加载模型）。"""
