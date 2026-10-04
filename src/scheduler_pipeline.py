@@ -4772,11 +4772,18 @@ class SchedulerPipelineMixin:
                             "response": "",
                             "error": f"route_a_decode_step_{step}_missing_kv",
                         }
-                local_input_ids = (
-                    input_ids
-                    if is_prefill
-                    else torch.tensor([[new_token_id]], dtype=torch.long)
-                )
+                if is_prefill:
+                    local_input_ids = input_ids
+                elif hasattr(input_ids, "detach"):
+                    # PyTorch 引擎：decode 步只喂新 token。
+                    local_input_ids = torch.tensor([[new_token_id]], dtype=torch.long)
+                else:
+                    # llama.cpp / 去 torch 节点：载体是 numpy。这里若不判载体，
+                    # `torch_runtime.require_torch()` 会抛 `ModuleNotFoundError`，
+                    # 表现为 `route_a_stage_execution_failed: No module named 'torch'`。
+                    import numpy as _np
+
+                    local_input_ids = _np.array([[new_token_id]], dtype=_np.int64)
                 local_result = mgr.forward_layers(
                     input_ids=local_input_ids,
                     attention_mask=attention_mask if is_prefill else None,
@@ -4882,8 +4889,22 @@ class SchedulerPipelineMixin:
                                 _stream_callback({"token": visible})
                     else:
                         _stream_callback({"token": token_text})
-                new_token_tensor = torch.tensor([[new_token_id]], dtype=torch.long)
-                full_input_ids = torch.cat([full_input_ids, new_token_tensor], dim=1)
+                # 载体随引擎不同：PyTorch 给张量，llama.cpp 给 numpy `[1, n_tokens]`。
+                # 必须跟 `full_input_ids` 同源拼接 —— 否则在去 torch 的节点上
+                # `torch_runtime.require_torch()` 会抛 `ModuleNotFoundError`，表现
+                # 为 `route_a_stage_execution_failed: No module named 'torch'`
+                # （legacy 首段的 decode 步早前已修同款，Route-A 这条漏了）。
+                if hasattr(full_input_ids, "detach"):
+                    new_token_tensor = torch.tensor([[new_token_id]], dtype=torch.long)
+                    full_input_ids = torch.cat([full_input_ids, new_token_tensor], dim=1)
+                else:
+                    import numpy as _np
+
+                    full_input_ids = _np.concatenate(
+                        [full_input_ids,
+                         _np.array([[new_token_id]], dtype=_np.int64)],
+                        axis=1,
+                    )
                 step_ms = (time.time() - step_start) * 1000
                 pipeline_metrics["steps"].append({
                     "step": step,
@@ -4902,10 +4923,20 @@ class SchedulerPipelineMixin:
                 pipeline_stack.pop()
 
         if generated_ids:
-            full_ids = torch.cat([
-                input_ids.squeeze(0),
-                torch.tensor(generated_ids, dtype=torch.long),
-            ], dim=0)
+            if hasattr(input_ids, "detach"):
+                full_ids = torch.cat([
+                    input_ids.squeeze(0),
+                    torch.tensor(generated_ids, dtype=torch.long),
+                ], dim=0)
+            else:
+                # 去 torch 节点：载体是 numpy，且 `tokenizer.decode` 也更适合收
+                # 普通序列 —— 这里不判载体同样会抛 `No module named 'torch'`。
+                import numpy as _np
+
+                full_ids = _np.concatenate([
+                    _np.asarray(input_ids).squeeze(0),
+                    _np.asarray(generated_ids, dtype=_np.int64),
+                ], axis=0).tolist()
             response_text = tokenizer.decode(full_ids, skip_special_tokens=True)
             raw_new_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
         else:
