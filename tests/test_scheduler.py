@@ -1957,6 +1957,33 @@ class TestPipelineReadiness:
         sched._maybe_finish_pipeline_recovery()
         assert sched._pipeline_recovery_pending is False
 
+    def test_restart_recovery_rejects_persisted_generation_as_active(
+            self, sched):
+        sched._pipeline_recovery_pending = True
+        sched._pipeline_recovery_state = {
+            "schema_version": 1,
+            "config_id": "cfg-old",
+            "generation": 7,
+            "phase": "ready",
+        }
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-old",
+            "generation": 7,
+            "phase": "ready",
+            "worker_ids": set(),
+            "prepared_nodes": set(),
+            "ready_nodes": set(),
+            "plan": {"assignments": []},
+        }
+
+        sched._maybe_finish_pipeline_recovery()
+        assert sched._pipeline_recovery_pending is True
+
+        sched._pipeline_load_transaction["config_id"] = "cfg-new"
+        sched._pipeline_load_transaction["generation"] = 8
+        sched._maybe_finish_pipeline_recovery()
+        assert sched._pipeline_recovery_pending is False
+
     def test_forced_sync_does_not_accept_ready_single_node_plan(
             self, sched, monkeypatch):
         calls = []

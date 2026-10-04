@@ -353,6 +353,27 @@ class SchedulerPipelineMixin:
             if phase != "ready":
                 return
             config_id = str(transaction.get("config_id", "") or "")
+            if not config_id:
+                return
+            try:
+                generation = int(transaction.get("generation", 0) or 0)
+            except (TypeError, ValueError):
+                return
+            persisted = self._pipeline_recovery_state
+            if isinstance(persisted, dict):
+                persisted_config_id = str(persisted.get("config_id", "") or "")
+                try:
+                    persisted_generation = int(
+                        persisted.get("generation", 0) or 0
+                    )
+                except (TypeError, ValueError):
+                    persisted_generation = 0
+                if (
+                    persisted_config_id
+                    and config_id == persisted_config_id
+                    and generation <= persisted_generation
+                ):
+                    return
             plan = transaction.get("plan")
             plan = dict(plan) if isinstance(plan, dict) else {}
             for node_id, expected in self._layer_config_expected.items():
