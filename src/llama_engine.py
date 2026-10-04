@@ -1832,6 +1832,13 @@ class LlamaCppEngine:
 
         ids = _np.asarray(input_ids, dtype=_np.int64).reshape(-1).tolist()
         n_past = _kv_position(past_key_values)
+        # 排障：relay 链的 decode 步若每步都拿到 `n_past == 0`，就会每步清 KV、每步从
+        # 位置 0 重算 ⇒ 输出恒定不变（实测症状：尾部段永远吐同样两个 token）。
+        # 这条日志一次就能区分「KV 句柄没传到」与「数值本身错」。
+        logger.info(
+            "层段 forward: n_past=%s past_kv=%r(%s) tokens=%d",
+            n_past, past_key_values, type(past_key_values).__name__, len(ids),
+        )
         if n_past == 0:
             # 从位置 0 起 ⇒ 先清掉 ctx 里的旧 KV。`llama_decode` 在 `[0, n)` 上重跑会直接
             # `rc=-1`（`forward_layers_to_hidden` 的文档记过这个坑）。任务级的 `_kv_cache`

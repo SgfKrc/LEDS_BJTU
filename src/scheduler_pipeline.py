@@ -1312,19 +1312,26 @@ class SchedulerPipelineMixin:
             role=str(spec.get("role", "middle")), timeout=float(spec["timeout"]),
         )
         cache[task_id] = (key, client)
+        logger.info("relay 段会话已建立并缓存: task=%s cache_id=%s size=%d",
+                    task_id, id(cache), len(cache))
         return client
 
 
     def _close_relay_segment_client(self, task_id: str) -> None:
         cache = getattr(self, "_relay_segment_clients", None)
         if not cache:
+            logger.info("关闭 relay 段会话: task=%s 无缓存（cache=%r cache_id=%s self_id=%s）",
+                        task_id, cache, id(cache) if cache is not None else None,
+                        id(getattr(self, "_relay_segment_clients", None)))
             return
         current = cache.pop(task_id, None)
+        logger.info("关闭 relay 段会话: task=%s found=%s cache_id=%s keys=%r",
+                    task_id, current is not None, id(cache), list(cache))
         if current is not None:
             try:
                 current[1].close()
             except Exception:
-                logger.debug("close relay session failed: task=%s", task_id, exc_info=True)
+                logger.warning("close relay session failed: task=%s", task_id, exc_info=True)
 
 
     def _close_all_relay_segment_clients(self) -> None:
