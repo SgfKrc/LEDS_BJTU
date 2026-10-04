@@ -1868,6 +1868,78 @@ class LlamaCppEngine:
             logger.debug("清 context KV 失败（忽略）", exc_info=True)
         self._kv_used = 0
 
+    def _keep_head_upstream(self):
+        """惰性构造 keep-head 上游（带补丁 shim）；不可用时返回 `None`。
+
+        为什么需要它：见 `docs/已知问题记录.md` #35 —— pip 绑定的
+        `llama_get_embeddings_ith` 返回的是 `output_norm(H)`，而层接力要求的是
+        **末层输出、`output_norm` 之前**的残差流。shim 的
+        `llama_set_embeddings_layer_inp(lid == n_layer)` 给出的正是后者。
+
+        按「工件路径 + 层数」缓存：`load_layer_range` 换了工件就自动重建。
+        """
+        import os
+        from pathlib import Path
+
+        desc = getattr(self, "_pipeline_descriptor", None) or {}
+        artifact = desc.get("loaded_artifact") or self._model_path
+        rng = desc.get("assignment_layer_range")
+        if not artifact or not rng or len(rng) != 2:
+            return None
+        cut_layer = int(rng[1]) - int(rng[0])
+        key = (str(artifact), cut_layer)
+        if getattr(self, "_keep_head_key", None) == key:
+            return getattr(self, "_keep_head", None)
+
+        old = getattr(self, "_keep_head", None)
+        if old is not None:
+            try:
+                old.close()
+            except Exception:  # noqa: BLE001 - 旧实例释放失败不影响新实例
+                logger.debug("keep-head 上游释放失败", exc_info=True)
+        self._keep_head = None
+        self._keep_head_key = key
+
+        shim = os.environ.get("QLH_KEEP_HEAD_SHIM", "").strip()
+        if not shim:
+            # shim 本体是 `qlh_keep_head.dll`（`qlh_kh_*` 入口在它里面）；同目录的
+            # `libllama.dll` 只是它依赖的**带补丁** llama.cpp，不是 shim。
+            candidate = (Path(__file__).resolve().parent.parent
+                         / "build" / "keephead" / "build-cpu" / "bin" / "qlh_keep_head.dll")
+            if candidate.is_file():
+                shim = str(candidate)
+        if not shim:
+            logger.warning(
+                "keep-head 上游不可用：未找到 shim（可设 QLH_KEEP_HEAD_SHIM）⇒ 退回 "
+                "embeddings 通道，其语义是 output_norm 之后，接力下游会错位"
+                "（docs/已知问题记录.md #35）")
+            return None
+        # 挂点判据：`nextn` 导出「末层输出」，但**各架构挂点不同** —— qwen2 在
+        # `output_norm` **之前**（正是接力要的），qwen35 在**之后**（多一次 RMSNorm，
+        # 实测会让接力首步分叉，见 `src/llama_keep_head.py` 的模块说明）。后者一律
+        # 不用 keep-head：宁可回退并告警，也不交付语义错的 hidden。
+        model_type = str(desc.get("model_type", "") or "")
+        if model_type.startswith("qwen3"):
+            logger.warning(
+                "keep-head 上游不可用：%s 的 nextn 挂点在 output_norm 之后，交付会"
+                "错位（docs/已知问题记录.md #35）", model_type)
+            return None
+        try:
+            from llama_keep_head import KeepHeadUpstream
+
+            # 不用 `layer_inp`：shim 把它限制为 `cut_layer < n_layer`
+            # （scripts/model_tools/keep_head_shim/qlh_keep_head.c:111），取不到
+            # `lid == n_layer`（= 末层输出）这个恰好需要的挂点。
+            self._keep_head = KeepHeadUpstream(
+                shim, str(artifact), mode="nextn",
+                n_ctx=int(getattr(self, "_n_ctx", 4096) or 4096))
+        except Exception:  # noqa: BLE001 - keep-head 是可选增强，失败即回退
+            logger.warning(
+                "keep-head 上游构造失败 ⇒ 退回 embeddings 通道（语义为 output_norm "
+                "之后，docs/已知问题记录.md #35）", exc_info=True)
+            self._keep_head = None
+        return self._keep_head
+
     def forward_layers_to_hidden(self, input_ids, n_past: int = 0,
                                    all_positions: bool = False):
         """★ 层接力上游入口（2026-09-19）：只跑**本模型（裁层 GGUF = 前 k 层）**的层，
@@ -1891,6 +1963,30 @@ class LlamaCppEngine:
         """
         if not self.is_loaded:
             return None
+
+        # ★ docs/已知问题记录.md #35：层接力要求「末层输出、`output_norm` 之前」，
+        #   而下面的 embeddings 通道返回的是 `output_norm(H)`。二者语义不同，直接
+        #   交付会让下游段在已 norm 的残差流上继续算 ⇒ 接力第一步即分叉。优先走
+        #   带补丁的 keep-head；它自己的 KV 由 shim 侧的 runner 维护，故这里不动
+        #   `self._kv_used`（那是本进程 pip ctx 的账）。
+        keep = self._keep_head_upstream()
+        if keep is not None:
+            import numpy as np
+
+            toks = [int(t) for t in np.asarray(input_ids).reshape(-1).tolist()]
+            if not toks:
+                raise ValueError("input_ids 不能为空")
+            if int(n_past) == 0:
+                # 新任务从位置 0 重来。keep-head worker 在同一进程里跨任务复用
+                # （`_keep_head_upstream` 按工件缓存），不清记忆就会撞上上一任务
+                # 的残留位置 —— llama.cpp 报 "tokens have inconsistent sequence
+                # positions"，表现为 `llama_decode rc=-1`。与 relay tail 段的
+                # `_pos` 泄漏同族，只是这次在 master 自己的首段里。
+                keep.reset()
+            out = np.asarray(keep.forward_tokens_to_hidden(toks, n_past=int(n_past)),
+                             dtype=np.float32)
+            return out if all_positions else out[-1].copy()
+
         import numpy as np
         import llama_cpp.llama_cpp as M
 
