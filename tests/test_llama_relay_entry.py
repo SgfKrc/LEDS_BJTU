@@ -53,6 +53,42 @@ class TestNotLoaded:
         with pytest.raises(TypeError):
             eng.is_loaded()  # type: ignore[operator]
 
+    def test_partial_upstream_fails_closed_without_keep_head(self, monkeypatch):
+        """A partial GGUF must never hand output_norm hidden to a relay tail."""
+        from llama_engine import LlamaCppEngine
+
+        eng = LlamaCppEngine()
+        eng._model = object()
+        eng._loaded = True
+        eng._pipeline_descriptor = {
+            "partial_assignment": True,
+            "assignment_layer_range": [0, 8],
+        }
+        monkeypatch.setattr(eng, "_keep_head_upstream", lambda: None)
+
+        with pytest.raises(RuntimeError, match="keep-head"):
+            eng.forward_layers_to_hidden([1, 2], n_past=0)
+
+    def test_layer_load_marks_partial_without_prior_descriptor(self, monkeypatch, tmp_path):
+        """A first direct stage load must still block full-model fallback."""
+        from llama_engine import LlamaCppEngine
+
+        artifact = tmp_path / "head8.gguf"
+        artifact.write_bytes(b"test")
+        eng = LlamaCppEngine()
+        monkeypatch.setattr(eng, "_find_layer_artifact", lambda _start, _end: str(artifact))
+        monkeypatch.setattr(
+            eng,
+            "load_model",
+            lambda path: setattr(eng, "_model_path", str(path)),
+        )
+
+        eng.load_layer_range(0, 8, has_embedding=True, has_lm_head=False)
+
+        descriptor = eng.get_pipeline_descriptor()
+        assert descriptor["partial_assignment"] is True
+        assert descriptor["assignment_layer_range"] == [0, 8]
+
 
 class TestWithRealModel:
     """需要裁层 GGUF 的用例（缺工件则整类跳过）。"""

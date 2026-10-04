@@ -444,11 +444,15 @@ class LlamaCppEngine:
         # 所以：先留下整模描述器，加载段之后再装回去，只补层段标记。
         whole = dict(getattr(self, "_pipeline_descriptor", None) or {})
         self.load_model(path)
-        if whole:
-            whole["assignment_layer_range"] = [int(start_layer), int(end_layer)]
-            whole["partial_assignment"] = True
-            whole["loaded_artifact"] = path
-            self._pipeline_descriptor = whole
+        # A stage worker may be created directly and load its first artifact
+        # without ever having cached a full-model descriptor.  The artifact
+        # itself is still partial; leaving the descriptor empty would let
+        # ModelHost.ensure_full_model() mistake head8/mid8 for a full model.
+        whole.setdefault("model_path", path)
+        whole["assignment_layer_range"] = [int(start_layer), int(end_layer)]
+        whole["partial_assignment"] = True
+        whole["loaded_artifact"] = path
+        self._pipeline_descriptor = whole
         logger.info(
             "llama.cpp 层段已加载: [%d,%d) embed=%s lm_head=%s -> %s",
             int(start_layer), int(end_layer), has_embedding, has_lm_head, path,
@@ -1909,10 +1913,9 @@ class LlamaCppEngine:
             if candidate.is_file():
                 shim = str(candidate)
         if not shim:
-            logger.warning(
-                "keep-head 上游不可用：未找到 shim（可设 QLH_KEEP_HEAD_SHIM）⇒ 退回 "
-                "embeddings 通道，其语义是 output_norm 之后，接力下游会错位"
-                "（docs/已知问题记录.md #35）")
+            logger.error(
+                "keep-head 上游不可用：未找到 shim（可设 QLH_KEEP_HEAD_SHIM）；"
+                "拒绝交付语义不兼容的 embeddings hidden（docs/已知问题记录.md #35）")
             return None
         # 挂点判据：`nextn` 导出「末层输出」，但**各架构挂点不同** —— qwen2 在
         # `output_norm` **之前**（正是接力要的），qwen35 在**之后**（多一次 RMSNorm，
@@ -1933,10 +1936,10 @@ class LlamaCppEngine:
             self._keep_head = KeepHeadUpstream(
                 shim, str(artifact), mode="nextn",
                 n_ctx=int(getattr(self, "_n_ctx", 4096) or 4096))
-        except Exception:  # noqa: BLE001 - keep-head 是可选增强，失败即回退
+        except Exception:  # noqa: BLE001 - 语义不兼容时由调用方 fail-closed
             logger.warning(
-                "keep-head 上游构造失败 ⇒ 退回 embeddings 通道（语义为 output_norm "
-                "之后，docs/已知问题记录.md #35）", exc_info=True)
+                "keep-head 上游构造失败；层接力将 fail-closed，不交付 embeddings hidden "
+                "（docs/已知问题记录.md #35）", exc_info=True)
             self._keep_head = None
         return self._keep_head
 
@@ -1986,6 +1989,12 @@ class LlamaCppEngine:
             out = np.asarray(keep.forward_tokens_to_hidden(toks, n_past=int(n_past)),
                              dtype=np.float32)
             return out if all_positions else out[-1].copy()
+
+        if self._pipeline_descriptor and self._pipeline_descriptor.get("partial_assignment"):
+            raise RuntimeError(
+                "llama.cpp 层接力需要 keep-head 上游（output_norm 之前的 hidden）；"
+                "当前 shim 不可用，拒绝使用语义不兼容的 embeddings 通道"
+            )
 
         import numpy as np
         import llama_cpp.llama_cpp as M
