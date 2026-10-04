@@ -984,6 +984,27 @@ class SchedulerPipelineMixin:
         )
 
 
+    def _invalidate_pipeline_load_transaction(
+        self, reason_code: str = "pipeline_model_changed", reason: str = "",
+    ) -> None:
+        """Fence a pipeline transaction before replacing the local model."""
+        with self._layer_config_lock:
+            transaction = self._pipeline_load_transaction
+            if transaction and transaction.get("phase") not in {
+                "aborted", "rejected", "invalidated",
+            }:
+                transaction["phase"] = "invalidated"
+                transaction["reason_code"] = reason_code
+                transaction["reason"] = reason
+                self._layer_config_generation = max(
+                    self._layer_config_generation + 1,
+                    time.time_ns(),
+                )
+            self._active_pipeline_capacity_plan = None
+            self._prepared_layer_configs.clear()
+            self._layer_config_inflight.clear()
+
+
     def _commit_pipeline_load_transaction(self, config_id: str) -> None:
         """Materialize the local segment, then publish commit to all workers."""
         with self._layer_config_lock:
@@ -1027,6 +1048,20 @@ class SchedulerPipelineMixin:
                 config_id, "pipeline_local_commit_failed", str(exc)
             )
             return
+
+        with self._layer_config_lock:
+            transaction = self._pipeline_load_transaction
+            if (
+                not transaction
+                or transaction.get("config_id") != config_id
+                or transaction.get("phase") != "committing_local"
+            ):
+                logger.info(
+                    "discarding superseded pipeline commit: config=%s phase=%s",
+                    config_id,
+                    transaction.get("phase", "") if transaction else "missing",
+                )
+                return
 
         commit_configs = {}
         for node_id, item in expected.items():

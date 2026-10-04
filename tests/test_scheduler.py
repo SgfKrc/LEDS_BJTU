@@ -681,6 +681,87 @@ class TestComputeLayerAssignment:
         assert sched._active_pipeline_capacity_plan["transaction_phase"] == "ready"
         assert sched.get_layer_assignments()["strategy"] == "capacity"
 
+    def test_model_change_invalidates_capacity_transaction(self, sched):
+        sched._layer_config_generation = 10
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-model-change",
+            "generation": 10,
+            "phase": "committing_local",
+            "plan": {"admitted": True, "plan_id": "plan-model-change"},
+            "worker_ids": {"worker"},
+        }
+        sched._active_pipeline_capacity_plan = {
+            "admitted": True, "plan_id": "plan-model-change",
+        }
+        sched._prepared_layer_configs["cfg-model-change"] = {
+            "plan_id": "plan-model-change",
+        }
+        sched._layer_config_inflight.add("worker")
+
+        sched._invalidate_pipeline_load_transaction(
+            reason_code="pipeline_model_changed",
+            reason="local model replacement started",
+        )
+
+        assert sched._pipeline_load_transaction["phase"] == "invalidated"
+        assert (
+            sched._pipeline_load_transaction["reason_code"]
+            == "pipeline_model_changed"
+        )
+        assert sched._active_pipeline_capacity_plan is None
+        assert sched._prepared_layer_configs == {}
+        assert sched._layer_config_inflight == set()
+        assert sched._layer_config_generation > 10
+
+    def test_superseded_local_commit_is_not_published(self, sched, monkeypatch):
+        sent = []
+        plan = {
+            "admitted": True,
+            "plan_id": "plan-superseded",
+            "model_id": "model",
+            "total_layers": 4,
+            "assignments": [
+                {"node_id": "master", "start_layer": 0, "end_layer": 2},
+                {"node_id": "worker", "start_layer": 2, "end_layer": 4},
+            ],
+        }
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-superseded",
+            "generation": 1,
+            "phase": "preparing",
+            "plan": plan,
+            "worker_ids": {"worker"},
+            "prepared_nodes": set(),
+        }
+        sched._layer_config_expected["worker"] = {
+            "node_id": "worker",
+            "config_id": "cfg-superseded",
+            "phase": "prepare",
+            "plan_id": "plan-superseded",
+            "start_layer": 2,
+            "end_layer": 4,
+        }
+        sched._host = type("Host", (), {
+            "prepare_pipeline_tokenizer": lambda self: None,
+            "load_layer_range": lambda self, *args, **kwargs: (
+                sched._invalidate_pipeline_load_transaction(
+                    reason_code="pipeline_model_changed",
+                    reason="local model replacement started",
+                )
+            ),
+        })()
+        sched._tcp_server = type("Server", (), {
+            "_running": True,
+            "send_layer_config": lambda self, node_id, payload: sent.append(
+                (node_id, dict(payload))
+            ),
+        })()
+
+        sched._commit_pipeline_load_transaction("cfg-superseded")
+
+        assert sent == []
+        assert sched._pipeline_load_transaction["phase"] == "invalidated"
+
     def test_late_prepare_ack_after_commit_is_not_logged_as_worker_error(
             self, sched, caplog):
         sched._pipeline_load_transaction = {

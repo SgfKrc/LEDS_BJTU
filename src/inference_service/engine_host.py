@@ -3194,6 +3194,14 @@ class EngineHost:
                 if callable(begin_transition):
                     begin_transition()
                     transition_started = True
+                invalidate_transaction = getattr(
+                    sched, "_invalidate_pipeline_load_transaction", None,
+                )
+                if callable(invalidate_transaction):
+                    invalidate_transaction(
+                        reason_code="pipeline_model_changed",
+                        reason="local model replacement started",
+                    )
                 with sched._inference_lock:
                     with sched._layer_execution_lock:
                         with sched._layer_config_lock:

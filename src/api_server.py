@@ -899,6 +899,14 @@ def _run_exclusive_model_change(
         transition_started = callable(begin_transition)
         if transition_started:
             begin_transition()
+        invalidate_transaction = getattr(
+            scheduler, "_invalidate_pipeline_load_transaction", None,
+        )
+        if callable(invalidate_transaction):
+            invalidate_transaction(
+                reason_code="pipeline_model_changed",
+                reason="local model replacement started",
+            )
         with scheduler._inference_lock:
             with scheduler._layer_execution_lock:
                 with scheduler._layer_config_lock:
