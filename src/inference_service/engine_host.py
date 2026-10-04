@@ -1094,7 +1094,6 @@ class EngineHost:
             HTTPException: 模型未加载、OOM、推理失败
         """
         import time as _time
-        import torch as _torch
         from fastapi import HTTPException
 
         # ---- task_graph 分支（1.2d：对齐 api_server._execute_requested_chat）----
@@ -1177,6 +1176,8 @@ class EngineHost:
 
         # ---- 分布式推理路由：从节点转发给主节点（local_only 强制本地）----
         sched = self._scheduler
+        pipeline_attempted = False
+        pipeline_failure_reason = ""
         distributed_enabled = bool(
             sched is not None and sched.get_distributed_inference_enabled()
         )
@@ -1276,6 +1277,7 @@ class EngineHost:
                 and self._run_mode == "distributed"
                 and sched._effective_role() == "master"
                 and runtime_supports(self._host, Capability.FORWARD_LAYERS)):
+            pipeline_attempted = True
             try:
                 pipeline_result = sched.run_pipeline_safe(
                     req.message,
@@ -1291,6 +1293,7 @@ class EngineHost:
                 )
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
                 if pipeline_result.get("error"):
+                    pipeline_failure_reason = str(pipeline_result["error"])
                     logger.warning(f"流水线推理失败: {pipeline_result['error']}，回退到本地推理")
                     self._enforce_distributed_required(
                         req, detail=str(pipeline_result["error"]),
@@ -1350,12 +1353,29 @@ class EngineHost:
                 raise
             except Exception as e:
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
+                pipeline_failure_reason = str(e)
                 logger.warning(f"流水线推理异常: {e}，回退到本地推理")
                 self._enforce_distributed_required(req, detail=str(e))
 
         model_manager = self._host
         # ---- llama.cpp / 孤岛引擎路径（整请求推理，不参与层拆分）----
         if backend_id_for(model_manager) in ("llama_cpp", "island"):
+            if pipeline_attempted:
+                # A1 relay + A3 Route-A mixed failures must not bypass the
+                # full-model guard and run a partial GGUF as a chat model.
+                ensure_full = getattr(model_manager, "ensure_full_model", None)
+                if not callable(ensure_full):
+                    raise HTTPException(
+                        503,
+                        "分布式流水线失败且当前引擎不提供整模回退校验",
+                    )
+                try:
+                    ensure_full()
+                except Exception as exc:
+                    raise HTTPException(
+                        503,
+                        f"分布式流水线失败，整模回退已拒绝: {exc}",
+                    ) from exc
             try:
                 engine_name = backend_id_for(model_manager)
                 request_history = [
@@ -1399,6 +1419,8 @@ class EngineHost:
                 fallback_reason = ""
                 if external_fallback_reason:
                     fallback_reason = external_fallback_reason
+                elif pipeline_failure_reason:
+                    fallback_reason = pipeline_failure_reason
                 elif distributed_enabled and self._run_mode == "distributed":
                     if engine_name == "island":
                         fallback_reason = "island engine delegates whole-request inference to the TP island"
@@ -1463,6 +1485,10 @@ class EngineHost:
                 raise HTTPException(500, f"推理失败: {str(e)}")
 
         # ---- PyTorch 引擎路径（CUDA/独显）----
+        # Torch is only needed after routing has selected the PyTorch backend;
+        # keep the GGUF path usable in the torch-free distribution.
+        import torch as _torch
+
         try:
             model_manager.ensure_full_model()
             tier_max = self._host.generation_config.get("tier_max_new_tokens", self._host.generation_config["max_new_tokens"])

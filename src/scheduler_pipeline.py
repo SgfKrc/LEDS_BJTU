@@ -6512,6 +6512,11 @@ class SchedulerPipelineMixin:
         #   缺 Embedding/LM Head 而报错（如 RuntimeError: 缺少 lm_head）。
         try:
             ensure_full = getattr(mgr, 'ensure_full_model', None)
+            logger.info(
+                "回退前完整模型检查: mgr=%s callable=%s is_pipeline_prepared=%s",
+                type(mgr).__name__, callable(ensure_full),
+                getattr(mgr, "is_pipeline_prepared", None),
+            )
             if callable(ensure_full):
                 ensure_full()
         except Exception as e:

@@ -1303,6 +1303,26 @@ def make_full_host(fake_model_cls=FakeModel):
     return host
 
 
+def test_chat_full_llama_cpp_does_not_import_torch(monkeypatch):
+    """The torch-free package must still serve the direct GGUF path."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def reject_torch(name, *args, **kwargs):
+        if name == "torch" or name.startswith("torch."):
+            raise ImportError("torch intentionally unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_torch)
+    host = make_full_host()
+
+    result = host.chat_full(ChatRequest(message="hello"))
+
+    assert result["content"] == "候选答案内容"
+    assert result["metrics"]["engine"] == "llama_cpp"
+
+
 # ----------------------------------------------------------------------
 # 14.5 1.2d task_graph 执行段（复制自 api_server._execute_task_graph_chat
 #      + _execute_task_graph_chat_with_slot + 5 个辅助函数）

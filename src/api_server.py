@@ -3688,11 +3688,14 @@ def _execute_chat_full(
         )
 
     # ---- 分布式流水线推理路径（主节点 + PyTorch 引擎 + 从节点可用；local_only 跳过）----
+    pipeline_attempted = False
+    pipeline_failure_reason = ""
     if (req.routing_preference != "local_only"
             and scheduler.get_distributed_inference_enabled()
             and RUN_MODE == "distributed"
             and scheduler._effective_role() == "master"
             and runtime_supports(model_manager, Capability.FORWARD_LAYERS)):
+        pipeline_attempted = True
         try:
             pipeline_result = scheduler.run_pipeline_safe(
                 req.message,
@@ -3713,6 +3716,7 @@ def _execute_chat_full(
             )
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
             if pipeline_result.get("error"):
+                pipeline_failure_reason = str(pipeline_result["error"])
                 logger.warning(f"流水线推理失败: {pipeline_result['error']}，回退到本地推理")
                 _enforce_distributed_required(
                     req,
@@ -3778,6 +3782,7 @@ def _execute_chat_full(
             raise
         except Exception as e:
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
+            pipeline_failure_reason = str(e)
             logger.warning(f"流水线推理异常: {e}，回退到本地推理")
             _enforce_distributed_required(req, detail=str(e))
 
@@ -3786,6 +3791,23 @@ def _execute_chat_full(
 
     # ---- llama.cpp / 孤岛引擎路径（整请求推理，不参与层拆分）----
     if backend_id_for(model_manager) in ("llama_cpp", "island"):
+        if pipeline_attempted:
+            # Mixed A1 relay + A3 Route-A failures must reuse the full-model
+            # guard before this direct chat fallback.  Otherwise a partial
+            # GGUF can bypass the scheduler check and return HTTP 200 garbage.
+            ensure_full = getattr(model_manager, "ensure_full_model", None)
+            if not callable(ensure_full):
+                raise HTTPException(
+                    503,
+                    "分布式流水线失败且当前引擎不提供整模回退校验",
+                )
+            try:
+                ensure_full()
+            except Exception as exc:
+                raise HTTPException(
+                    503,
+                    f"分布式流水线失败，整模回退已拒绝: {exc}",
+                ) from exc
         try:
             engine_name = backend_id_for(model_manager)
             request_history = [
@@ -3833,6 +3855,8 @@ def _execute_chat_full(
             if external_fallback_reason:
                 # 路线 B 外部路由失败后的本地回退（原因优先展示外部失败）
                 fallback_reason = external_fallback_reason
+            elif pipeline_failure_reason:
+                fallback_reason = pipeline_failure_reason
             elif scheduler.get_distributed_inference_enabled() and RUN_MODE == "distributed":
                 if engine_name == "island":
                     fallback_reason = "island engine delegates whole-request inference to the TP island"
