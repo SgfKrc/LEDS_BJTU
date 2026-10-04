@@ -4760,7 +4760,17 @@ class SchedulerPipelineMixin:
                 hidden = local_result.get("hidden_states")
                 if hidden is None:
                     return {"response": "", "error": "route_a_master_missing_hidden"}
-                hidden = hidden.detach().to(device="cpu", dtype=torch.float32).contiguous()
+                # hidden 的载体随引擎不同：PyTorch 给张量（要 `.detach().cpu()`），
+                # llama.cpp 给 numpy `[tokens, n_embd]` f32（legacy 首段路径同款判断）。
+                # 缺了这条分支，去 torch 的 master 会在这里抛
+                # `'numpy.ndarray' object has no attribute 'detach'`，被外层收敛成
+                # `route_a_stage_execution_failed` 后回退到全层主节点模式。
+                if hasattr(hidden, "detach"):
+                    hidden = hidden.detach().to(device="cpu", dtype=torch.float32).contiguous()
+                else:
+                    import numpy as _np
+
+                    hidden = _np.ascontiguousarray(hidden, dtype=_np.float32)
                 if hidden.ndim == 3 and int(hidden.shape[0]) == 1:
                     hidden = hidden.squeeze(0)
                 if hidden.ndim != 2:
