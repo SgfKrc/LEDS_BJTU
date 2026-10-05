@@ -4089,11 +4089,15 @@ class SchedulerPipelineMixin:
 
             # ★ 2026-10-03：v3 层段 worker 的 legacy ACK 故意是 error（见
             #   `_handle_layer_config_locked` 的同名分流）⇒ 它**不参与** legacy 就绪判据。
-            #   否则会先命中下面的 `not layer_ready and error` 分支，报成
-            #   「模型同步或层加载失败」并卡住整个请求 —— 而它其实是通过 v3 stage offer
-            #   就绪的，legacy 通道与它无关。
-            if is_stage_offer_worker:
-                continue
+            #   否则会先命中 `not layer_ready and error` 分支，报成「模型同步或层加载
+            #   失败」并卡住整个请求 —— 而它其实是通过 v3 stage offer 就绪的。
+            #
+            # ★ 2026-10-05（DIST-2）：但它**不能因此跳过整个 failure 判定**。此前这里
+            #   是裸 `continue`，于是下方 `worker_stage_offer_not_ready` 分支**永远
+            #   不可达** ⇒ stage worker 不健康时 readiness 仍可能报 `ready=True`。
+            #   现在改为：基础存活检查（未注册/离线/TCP 断/心跳过期）照常参与；
+            #   legacy 专属的 `worker_layer_load_failed` 只对非 stage worker 生效；
+            #   stage worker 自己的就绪判据用 `_stage_offer_assignment_ready` 的结果。
 
             failure = None
             if node_info is None:
@@ -4108,15 +4112,15 @@ class SchedulerPipelineMixin:
                     "worker_heartbeat_stale",
                     f"从节点 {node_id} 心跳已过期 ({age_text})",
                 )
+            elif not layer_ready and is_stage_offer_worker:
+                failure = (
+                    "worker_stage_offer_not_ready",
+                    f"从节点 {node_id} v3 layer_forward 未就绪: {stage_reason or error}",
+                )
             elif not layer_ready and error:
                 failure = (
                     "worker_layer_load_failed",
                     f"从节点 {node_id} 模型同步或层加载失败: {error}",
-                )
-            elif not layer_ready and is_stage_offer_worker:
-                failure = (
-                    "worker_stage_offer_not_ready",
-                    f"从节点 {node_id} v3 layer_forward 未就绪: {error}",
                 )
             elif not layer_ready and expected:
                 failure = (
