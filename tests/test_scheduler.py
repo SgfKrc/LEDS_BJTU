@@ -7924,6 +7924,29 @@ def test_tcp_bind_failure_keeps_master_local_pipeline_available(monkeypatch):
         sched.stop()
 
 
+def test_start_failure_releases_idempotency_guard_for_retry(monkeypatch):
+    import scheduler as scheduler_mod
+
+    monkeypatch.setattr(scheduler_mod, "RUN_MODE", "single", raising=False)
+    scheduler = Scheduler()
+    monkeypatch.setattr(
+        scheduler, "init_nodes", lambda: (_ for _ in ()).throw(
+            RuntimeError("init failed")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="init failed"):
+        scheduler.start()
+    assert scheduler._running is False
+
+    monkeypatch.setattr(scheduler, "init_nodes", lambda: None)
+    scheduler.start()
+    try:
+        assert scheduler._running is True
+    finally:
+        scheduler.stop()
+
+
 def test_distributed_start_defers_network_identity(monkeypatch):
     """A slow network probe must not block the local scheduler start."""
     import config as cfg

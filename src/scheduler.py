@@ -1195,6 +1195,23 @@ class Scheduler(
     # ================================================================
 
     def start(self, host: str = None, port: int = None) -> None:
+        """Start once and release the reservation if initialization fails."""
+        with self._start_lock:
+            if self._running:
+                logger.info("scheduler already running; ignoring duplicate start")
+                return
+            self._running = True
+        try:
+            self._start_impl(host=host, port=port)
+        except Exception:
+            try:
+                self.stop()
+            except Exception:
+                logger.warning("scheduler startup rollback failed", exc_info=True)
+                self._running = False
+            raise
+
+    def _start_impl(self, host: str = None, port: int = None) -> None:
         """
         启动调度器。
 
@@ -1225,11 +1242,6 @@ class Scheduler(
         #   已在运行时直接返回，避免重复 init_nodes / create_server。
         #   ★ 注意：两次 `start()` 是**并发**的（日志时间戳同毫秒），非原子的
         #     「检查后设置」两边都会通过 ⇒ 必须在 `_start_lock` 内占位。
-        with self._start_lock:
-            if self._running:
-                logger.info("调度器已在运行，忽略重复 start()（幂等守卫）")
-                return
-            self._running = True
         self._startup_cancel_event.clear()
         self.init_nodes()
         if self._effective_role() == "master":

@@ -334,6 +334,46 @@ class TaskWorkerControlPlane:
         with self._lock:
             return set(self._coordinator_pending_workers)
 
+    def connected_layer_stage_workers(
+        self, peer_ids: Optional[set[str]] = None,
+    ) -> list[dict[str, Any]]:
+        """Return accepted layer-capable workers without the health overlay.
+
+        Recovery must publish a fresh assignment before readiness is checked.
+        The normal status projection is heartbeat-gated, so using it as the
+        candidate source can deadlock recovery at ``not_configured``.  This
+        still requires an accepted hello and a live task-worker connection;
+        execution keeps the normal provider health gate.
+        """
+        allowed = {str(value) for value in peer_ids} if peer_ids is not None else None
+        with self._lock:
+            workers = []
+            for node_id, worker in self._workers.items():
+                if allowed is not None and node_id not in allowed:
+                    continue
+                if not worker.get("connected") or not worker.get("accepted"):
+                    continue
+                capabilities = worker.get("capabilities")
+                if not isinstance(capabilities, dict):
+                    continue
+                stage_types = capabilities.get("stage_types", [])
+                ranges = capabilities.get("layer_ranges")
+                if (
+                    worker.get("selected_version", 0) < 2
+                    or "layer_forward" not in stage_types
+                    or not ranges
+                ):
+                    continue
+                workers.append({
+                    "node_id": node_id,
+                    "worker_kind": worker.get("worker_kind", ""),
+                    "selected_version": worker.get("selected_version", 0),
+                    "capabilities": dict(capabilities),
+                    "connected": True,
+                    "accepted": True,
+                })
+            return workers
+
     def mark_coordinator_heartbeat(self) -> None:
         with self._lock:
             if self._coordinator.get("connected"):

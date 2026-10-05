@@ -889,7 +889,14 @@ class SchedulerTaskWorkerMixin:
                     #   都取新 generation ⇒ worker 端永远判成"新配置"）。
                     #   字段缺失时按"变了"处理（保守：多重推一次总好过永远不推）。
                     worker_snapshot = self._task_worker_control.worker_snapshot(client_id)
-                    if worker_snapshot.get("capabilities_changed", True):
+                    # Recovery must use one authoritative publish. A normal
+                    # capability push here would create a second generation.
+                    recovery_sync = bool(
+                        ack.payload["accepted"] and self._pipeline_recovery_pending
+                    )
+                    if not recovery_sync and worker_snapshot.get(
+                        "capabilities_changed", True
+                    ):
                         self.push_layer_config_to_clients()
                     # ★ 2026-10-05（DIST-1 三机重启实测）：权威重发此前**只在请求路径**
                     #   触发，而请求会被恢复闸门自身拒绝 ⇒ 没有任何路径去产生「新代际」
@@ -902,7 +909,7 @@ class SchedulerTaskWorkerMixin:
                     #   「按当前在线能力重算一份新计划」，而不是重放持久化的旧计划
                     #   （见 `push_layer_config_to_clients_locked` 里对
                     #   `_pipeline_recovery_pending` 的处理）。
-                    if ack.payload["accepted"] and self._pipeline_recovery_pending:
+                    if recovery_sync:
                         logger.info(
                             "重启恢复期收到 worker hello，触发权威重发: node=%s",
                             client_id,
@@ -920,6 +927,18 @@ class SchedulerTaskWorkerMixin:
                             if isinstance(message.payload, dict)
                             else []
                         )
+                        advertised_capabilities = (
+                            message.payload.get("capabilities", {})
+                            if isinstance(message.payload, dict)
+                            else {}
+                        )
+                        is_layer_stage_worker = bool(
+                            isinstance(advertised_capabilities, dict)
+                            and "layer_forward" in advertised_capabilities.get(
+                                "stage_types", []
+                            )
+                            and advertised_capabilities.get("layer_ranges")
+                        )
                         # Layer/relay workers deliberately advertise no full
                         # model identity.  Do not turn their hello into an
                         # opt-out: the layer-config handshake is their role.
@@ -929,8 +948,9 @@ class SchedulerTaskWorkerMixin:
                         #   因此不能被当 Full Worker 释放预留。
                         if (advertised_models
                                 and not self._is_relay_host(client_id)
+                                and not is_layer_stage_worker
                                 and not bool(
-                                    message.payload.get("capabilities", {}).get(
+                                    advertised_capabilities.get(
                                         "layer_worker", False
                                     )
                                 )):

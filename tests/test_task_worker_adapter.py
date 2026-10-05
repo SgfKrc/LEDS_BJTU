@@ -163,6 +163,27 @@ def test_android_layer_worker_is_admitted_without_full_model_dispatch_gate():
     assert snapshot["capabilities"]["models"]
 
 
+def test_recovery_candidate_uses_accepted_capabilities_without_health_overlay():
+    coordinator = TaskWorkerControlPlane()
+    worker = TaskWorkerControlPlane()
+    hello = worker.begin_worker_hello(
+        node_id="android_layer_01",
+        worker_kind="android_full_worker",
+        capabilities=_android_layer_capabilities(),
+    )
+    assert hello is not None
+    ack = coordinator.receive_on_coordinator(
+        "android_layer_01", hello.snapshot(), coordinator_node_id="master",
+    )
+    assert ack.payload["selected_version"] >= 2
+
+    candidates = coordinator.connected_layer_stage_workers({"android_layer_01"})
+    assert [item["node_id"] for item in candidates] == ["android_layer_01"]
+
+    coordinator.disconnect_worker("android_layer_01")
+    assert coordinator.connected_layer_stage_workers() == []
+
+
 def test_pending_worker_fence_is_resolved_by_hello_and_disconnect():
     control = TaskWorkerControlPlane()
     control.mark_worker_connection_pending("worker_pending")
@@ -1341,6 +1362,53 @@ def test_scheduler_binds_full_worker_hello_to_registered_pc_client(monkeypatch):
     assert scheduler.get_task_worker_protocol_status()[
         "connected_worker_count"
     ] == 1
+
+
+def test_recovery_hello_does_not_publish_two_layer_generations(monkeypatch):
+    from scheduler import NodeInfo, NodeRole, NodeState, Scheduler
+
+    scheduler = Scheduler()
+    scheduler._role_override = "master"
+    scheduler._pipeline_recovery_pending = True
+    scheduler.nodes["android_layer_01"] = NodeInfo(
+        node_id="android_layer_01",
+        role=NodeRole.CLIENT,
+        node_type="android",
+        state=NodeState.ONLINE,
+    )
+    sent = []
+    scheduler._tcp_server = type("Server", (), {
+        "send_to_client": lambda self, node_id, data, message_type: sent.append(
+            (node_id, data, message_type)
+        ),
+    })()
+    monkeypatch.setattr(scheduler, "get_effective_node_id", lambda: "master")
+    normal_pushes = []
+    authoritative_pushes = []
+    monkeypatch.setattr(
+        scheduler, "push_layer_config_to_clients",
+        lambda: normal_pushes.append(True),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "request_authoritative_layer_sync",
+        lambda **kwargs: authoritative_pushes.append(kwargs) or True,
+    )
+    worker = TaskWorkerControlPlane()
+    hello = worker.begin_worker_hello(
+        node_id="android_layer_01",
+        worker_kind="android_full_worker",
+        capabilities=_android_layer_capabilities(),
+    )
+    assert hello is not None
+
+    scheduler._handle_task_worker_message(
+        "android_layer_01", {"data": hello.snapshot()},
+    )
+
+    assert sent[0][1]["payload"]["accepted"] is True
+    assert normal_pushes == []
+    assert authoritative_pushes == [{"require_distributed": True}]
 
 
 def test_scheduler_full_worker_hello_releases_layer_reservation(monkeypatch):

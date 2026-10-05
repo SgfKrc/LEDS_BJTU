@@ -479,17 +479,31 @@ class SchedulerPipelineMixin:
         ):
             return set()
         try:
-            status = self._task_worker_control.status(role="master")
+            if self._pipeline_recovery_pending:
+                # Use accepted HELLO capabilities while rebuilding the first
+                # fresh assignment. The normal status projection is
+                # heartbeat-gated and can still report ``not_configured``.
+                raw_workers = self._task_worker_control.connected_layer_stage_workers(
+                    set(connected_ids),
+                )
+                admitted = {
+                    str(worker.get("node_id", ""))
+                    for worker in raw_workers
+                    if isinstance(worker, dict)
+                    and int(worker.get("selected_version", 0) or 0) >= 2
+                }
+            else:
+                status = self._task_worker_control.status(role="master")
+                admitted = {
+                    str(worker.get("node_id", ""))
+                    for worker in status.get("workers", [])
+                    if isinstance(worker, dict)
+                    and worker.get("healthy")
+                    and worker.get("layer_stage_dispatch_enabled")
+                    and str(worker.get("node_id", "")) in connected_ids
+                }
         except Exception:
             return set()
-        admitted = {
-            str(worker.get("node_id", ""))
-            for worker in status.get("workers", [])
-            if isinstance(worker, dict)
-            and worker.get("healthy")
-            and worker.get("layer_stage_dispatch_enabled")
-            and str(worker.get("node_id", "")) in connected_ids
-        }
         with self._nodes_lock:
             # ★ 2026-10-03：PC 也能承层段 —— v3 `layer_forward` 已在
             #   `EngineHost.execute_task_worker_stage` 实现，工件与 shim 经 env 配置。

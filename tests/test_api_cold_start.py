@@ -16,6 +16,57 @@ import model_host as model_host_module
 from model_host import model_host
 
 
+def test_shared_lifespans_reference_count_runtime(monkeypatch):
+    """Two uvicorn servers must share one runtime lifetime and readiness state."""
+    startup_calls = []
+    shutdown_calls = []
+    readiness_before = dict(api_server._runtime_readiness)
+    with api_server._runtime_lifecycle_lock:
+        api_server._runtime_lifecycle_users = 0
+
+    def fake_startup():
+        startup_calls.append(True)
+        api_server._runtime_startup_done.set()
+
+    async def fake_shutdown():
+        shutdown_calls.append(True)
+
+    monkeypatch.setattr(api_server, "_run_runtime_startup", fake_startup)
+    monkeypatch.setattr(api_server, "_shutdown_resources", fake_shutdown)
+
+    async def exercise():
+        first = api_server._lifespan(api_server.app)
+        await first.__aenter__()
+        await asyncio.sleep(0)
+        with api_server._runtime_readiness_lock:
+            api_server._runtime_readiness["ready"] = True
+
+        second = api_server._lifespan(api_server.app)
+        await second.__aenter__()
+        assert startup_calls == [True]
+        with api_server._runtime_readiness_lock:
+            assert api_server._runtime_readiness["ready"] is True
+
+        await first.__aexit__(None, None, None)
+        assert shutdown_calls == []
+        with api_server._runtime_lifecycle_lock:
+            assert api_server._runtime_lifecycle_users == 1
+
+        await second.__aexit__(None, None, None)
+        assert shutdown_calls == [True]
+        with api_server._runtime_lifecycle_lock:
+            assert api_server._runtime_lifecycle_users == 0
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        with api_server._runtime_lifecycle_lock:
+            api_server._runtime_lifecycle_users = 0
+        with api_server._runtime_readiness_lock:
+            api_server._runtime_readiness.clear()
+            api_server._runtime_readiness.update(readiness_before)
+
+
 def test_lazy_model_manager_defers_construction(monkeypatch):
     calls: list[str] = []
 
