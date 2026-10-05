@@ -49,7 +49,10 @@ from pipeline_node_contract import (
 )
 from pipeline_reshard import PipelineArtifactAvailability, PipelineReshardCoordinator
 import scheduler_layer_plan as _layer_plan
-from scheduler_types import InferenceTask, NodeInfo, NodeRole, NodeState, PreemptState, QueueTask
+from scheduler_types import (
+    InferenceTask, NodeInfo, NodeRole, NodeState, PreemptState, QueueTask,
+    WORKER_HEARTBEAT_MAX_AGE,
+)
 from scheduler_sidecars import SchedulerSidecarMixin
 from llama_rpc_contract import RpcShardLeaseBook
 from qwen3_pipeline_transaction import (
@@ -2670,6 +2673,7 @@ class Scheduler(
 
         records = []
         effective_id = self.get_effective_node_id()
+        now = time.time()
         for node_id, node in snapshot:
             # ★ 逐条件诊断：把「为什么某个在线 PC 没进容量候选」直接打出来。
             #   此前是一个 5 条件的 `or` 短路，出问题时只能靠猜 —— 排查 relay 跨机拓扑时
@@ -2694,6 +2698,17 @@ class Scheduler(
                 and not node.is_available()
             ):
                 skip_reason = "not_available"
+            elif (
+                node.role != NodeRole.MASTER
+                and node_id != effective_id
+                and not node.is_heartbeat_fresh(now, WORKER_HEARTBEAT_MAX_AGE)
+            ):
+                # ★ 2026-10-05（DIST-2）：容量候选此前只看 `NodeState`，而 TCP 半开
+                #   （对端进程已死、不发 FIN）要等巡检约 129s 才置 OFFLINE ⇒ 静默节点
+                #   在这段窗口里**一直占容量**，会分配出既非声明区间、层数也不对的
+                #   结果（实测：Y700 被带走后 master 仍把它算进规划）。
+                #   这里与 `_get_pipeline_readiness` 共用同一阈值 `WORKER_HEARTBEAT_MAX_AGE`。
+                skip_reason = "heartbeat_stale"
             if skip_reason:
                 logger.info(
                     "容量候选跳过 %s: reason=%s node_type=%s role=%s eligible=%s opted_out=%d",

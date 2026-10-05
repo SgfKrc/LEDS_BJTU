@@ -26,7 +26,7 @@ from relay_segment_client import (
     RelaySegmentError,
 )
 from relay_transport import is_loopback_host
-from scheduler_types import PreemptState
+from scheduler_types import PreemptState, WORKER_HEARTBEAT_MAX_AGE
 from torch_runtime import loaded_torch
 
 logger = logging.getLogger("scheduler")
@@ -34,12 +34,10 @@ logger = logging.getLogger("scheduler")
 
 RELAY_HIDDEN_WIRE_FORMAT = "qlh.relay_hidden.f32.v1"
 
-#: 从节点心跳的**容忍上限**（秒）。取 45s 的 2 倍余量：App 侧
-#: `AndroidPresenceStateMachine.heartbeatIntervalMs = 45_000`（可配 5–120s，见
-#: `heartbeatIntervalSeconds.coerceIn(5, 120)`），而这里原先写死 10s ⇒ 45s 的间隔
-#: 必然被判过期（实测 `11.4s > 10s`）。Route A 要求 Android 参与 readiness 后才暴露。
-#: 与 task worker 控制面的 `health_timeout_seconds=120` 同量级。
-_WORKER_HEARTBEAT_MAX_AGE = 120.0
+#: 从节点心跳的**容忍上限**（秒）。★ 2026-10-05（DIST-2）：定义上移到
+#: `scheduler_types.WORKER_HEARTBEAT_MAX_AGE`，让**容量规划**与 **readiness**
+#: 共用同一阈值；此处保留 `_WORKER_HEARTBEAT_MAX_AGE` 别名，避免改动既有读取点。
+_WORKER_HEARTBEAT_MAX_AGE = WORKER_HEARTBEAT_MAX_AGE
 
 _PIPELINE_LIFECYCLE_STATE_KEY = "pipeline_config_lifecycle_v1"
 _PIPELINE_RECOVERY_PHASES = frozenset({

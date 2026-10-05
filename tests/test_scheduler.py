@@ -320,6 +320,32 @@ class TestComputeLayerAssignment:
             for item in layout["nodes"]
         ) == 4
 
+    def test_stale_heartbeat_worker_leaves_capacity_candidates(self, sched):
+        """★ DIST-2：静默（TCP 半开）节点必须退出容量候选，不必等 TCP 巡检。
+
+        此前容量候选只看 `NodeInfo.is_available()`（`state == ONLINE`），而 TCP
+        半开（对端进程已死、不发 FIN）要等巡检约 129s 才置 OFFLINE ⇒ 这段窗口里
+        该节点**一直占容量**，容量求解器于是分配出既非它声明区间、层数也不对的
+        结果（实测：Y700 被带走后 master 仍把它算进规划，给出 `Layer 13-20` /
+        `Layer 15-24`）。现在候选与 readiness 共用 `WORKER_HEARTBEAT_MAX_AGE`。
+        """
+        now = time.time()
+        sched.nodes = {
+            "fresh": NodeInfo(
+                node_id="fresh", role="client", state=NodeState.ONLINE,
+                last_heartbeat=now - 5,
+            ),
+            "silent": NodeInfo(
+                node_id="silent", role="client", state=NodeState.ONLINE,
+                last_heartbeat=now - 200,  # 超过 WORKER_HEARTBEAT_MAX_AGE
+            ),
+        }
+
+        ids = {record["node_id"] for record in sched._get_pipeline_capacity_nodes()}
+
+        assert "fresh" in ids
+        assert "silent" not in ids
+
     def test_aggregate_resource_view_combines_online_nodes_without_addresses(self, sched):
         sched._role_override = "master"
         sched.nodes = {
