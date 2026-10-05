@@ -429,6 +429,14 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     #   `field_mismatch`。与其余可选键同样按「出现才允许」处理。
     if "relay_middle" in capabilities:
         expected_fields.add("relay_middle")
+    # ★ 2026-10-05（DIST-3 三机实测）：工件段类型（可选）—— `head`/`middle`/`tail`，
+    #   取值同主仓 `scripts/cut_layers.py` 的 `mode`。让调度侧能拒绝「中间段接末段」
+    #   （中间段工件没有 lm_head / final_norm）。
+    #   与其余可选键同样按「出现才允许」处理 —— 漏掉这一行，该 worker 的 hello 会以
+    #   `unknown=['segment_mode']` 被判 `invalid_fields` ⇒ **TCP 连上但握手中断**
+    #   （实测：Y700 每 30s 重连一次，master 侧只剩 `task_worker_handshake_pending`）。
+    if "segment_mode" in capabilities:
+        expected_fields.add("segment_mode")
     _require_exact_fields(
         capabilities,
         expected_fields,
