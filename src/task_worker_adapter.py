@@ -1208,6 +1208,19 @@ class RemoteFullWorkerProvider:
         self._queue_outbound_message(message, on_send_error)
 
     def notify_disconnect(self) -> None:
+        """对端断连：唤醒所有 pending，并**主动回收本 provider 的全部 reservation**。
+
+        ★ 2026-10-05（DIST-2 要求 2：「节点掉线…必须释放 lease」）：此前这里只把
+        pending 置 error 并 set 三个 event，**不释放 reservation** —— 释放完全依赖
+        上层 `task_graph._run_stage` 的 `finally`。一旦上层没走到那里（异常路径、
+        外层取消、进程卡住），条目就会留在 `_reservations` /
+        `_executed_reservations` / `_reservation_attempts` 里，而该 provider 在对端
+        重连前不会再有活动 ⇒ 「已预留未执行」的槽位被永久占用。
+
+        `release()` 是**纯本地 dict 操作**（不向 worker 发任何消息），在断连路径上
+        调用没有副作用；先唤醒 pending 再回收，顺序保证等待方先拿到
+        `remote_worker_disconnected` 错误。
+        """
         with self._lock:
             released = []
             for attempt_id, pending in self._pending.items():
@@ -1224,6 +1237,11 @@ class RemoteFullWorkerProvider:
                     released.append(attempt_id)
             for attempt_id in released:
                 self._pending.pop(attempt_id, None)
+            reservation_ids = list(self._reservations.keys())
+        # `release()` 内部自己取 `self._lock` ⇒ 必须在锁外调用（这里是普通 Lock，
+        # 锁内再取会自锁）。
+        for reservation_id in reservation_ids:
+            self.release(reservation_id)
 
     def release(self, reservation_id: str) -> None:
         with self._lock:

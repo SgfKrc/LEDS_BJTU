@@ -1033,7 +1033,11 @@ def test_remote_provider_disconnect_unblocks_pending_attempt():
 
     assert finished.wait(2)
     assert outcome["error"].code == "remote_worker_disconnected"
-    provider.release(reservation.reservation_id)
+    # ★ 2026-10-05（DIST-2）：断连现在会**主动回收** reservation，不再需要调用方
+    #   补一次 `release()`。此前这里必须显式 `provider.release(...)` 才能让
+    #   `active_reservations` 归零 —— 而真实路径上那次释放依赖上层
+    #   `task_graph._run_stage` 的 `finally`；上层一旦没走到（异常路径、外层取消、
+    #   进程卡住）就永久泄漏「已预留未执行」的槽位。
     assert provider.inspect().active_reservations == 0
 
 
