@@ -2214,6 +2214,42 @@ class TestPipelineReadiness:
         assert status["readiness_reason_code"] == "worker_layer_loading"
         assert status["workers"][0]["layer_status"] == "loading"
 
+    def test_pipeline_status_reports_tcp_connection_during_recovery_fence(
+        self, sched, monkeypatch,
+    ):
+        """Recovery readiness may be fenced without hiding a live TCP peer."""
+        from model_host import model_host as _host
+
+        sched._role_override = "master"
+        sched.nodes["client1"] = NodeInfo(
+            node_id="client1", role="client", state=NodeState.ONLINE,
+            address="100.64.1.2:8888", last_heartbeat=time.time(),
+        )
+        sched._tcp_server = type("FakeServer", (), {
+            "_running": True,
+            "clients": {"client1": object()},
+        })()
+        monkeypatch.setattr(_host, "_manager", type("Mgr", (), {
+            "is_loaded": True, "_engine_type": "pytorch",
+        })())
+        monkeypatch.setattr(sched, "get_layer_assignments", lambda: {
+            "total": 24,
+            "assignments": [
+                {"node_id": "master", "start_layer": 0, "end_layer": 8,
+                 "layers_count": 8},
+                {"node_id": "client1", "start_layer": 8, "end_layer": 24,
+                 "layers_count": 16},
+            ],
+        })
+        sched._pipeline_recovery_pending = True
+        sched._pipeline_recovery_failure = "pipeline_recovery_pending"
+
+        status = sched._get_pipeline_status()
+
+        assert status["readiness_reason_code"] == "pipeline_recovery_pending"
+        assert status["workers"][0]["tcp_connected"] is True
+        assert status["workers"][0]["layer_ready"] is False
+
 
 # ================================================================
 # 流水线结果等待 测试

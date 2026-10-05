@@ -7211,6 +7211,12 @@ class SchedulerPipelineMixin:
         readiness_by_node = {
             item["node_id"]: item for item in readiness.get("workers", [])
         }
+        # Read the connection state from the master-side TCPServer directly.
+        # Readiness intentionally returns no worker details while the restart
+        # recovery fence is active, so falling back to ``detail.get(...,
+        # False)`` would report every live peer as disconnected and obscure
+        # the actual recovery state.
+        connected_ids = self._connected_client_ids()
         worker_status = []
         online_count = 0
         with self._nodes_lock:
@@ -7225,7 +7231,7 @@ class SchedulerPipelineMixin:
             worker_status.append({
                 "node_id": nid,
                 "online": is_online,
-                "tcp_connected": detail.get("tcp_connected", False),
+                "tcp_connected": nid in connected_ids,
                 "heartbeat_age_seconds": detail.get("heartbeat_age_seconds"),
                 "layer_ready": detail.get("layer_ready", False),
                 "layer_status": detail.get("layer_status", "not_configured"),
