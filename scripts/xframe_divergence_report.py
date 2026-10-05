@@ -54,8 +54,46 @@ def hf_prompt_ids(hf_dir: str, prompt: str) -> tuple[list[int], int | None]:
     return list(tok(text, add_special_tokens=False)["input_ids"]), tok.eos_token_id
 
 
-def hf_greedy(hf_dir: str, input_ids: list[int], max_new_tokens: int) -> dict[str, Any]:
-    """HF transformers 贪心解码；返回生成的 token id 与每步的 top1−top2 margin。"""
+def _install_ggml_like_rmsnorm(model: Any) -> int:
+    """把模型里所有 RMSNorm 换成「复刻 ggml 语义」的版本，返回替换个数。
+
+    依据（见 `docs/跨框架接力数值差异机理-2026-10-05.md` §9 与 KT 文档的源码核对）：
+    ggml 的 `ggml_rms_norm` 用 **`double`（`ggml_float`）累加**，而 HF/torch 的
+    `Qwen2RMSNorm` 在输入 dtype（f32）上累加 —— 这是一个**精度类**差异，且位于放大链的
+    **种子**位置（embedding 2.7e-8 → attn_norm 2.0e-6，放大约 72×）。
+
+    本函数只做这一项对齐实验，用于判定「把归一化这一环钉死后，首分歧是否推迟」。
+    """
+    import torch
+
+    def make_forward(norm: Any):
+        eps = float(getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-6)))
+
+        def forward(hidden_states):
+            # ggml 语义：以 double 累加 Σx²，取 1/sqrt(mean+eps)，最后再乘 weight。
+            x = hidden_states.to(torch.float64)
+            var = (x * x).mean(-1, keepdim=True)
+            normalized = x * (1.0 / torch.sqrt(var + eps))
+            return (normalized.to(hidden_states.dtype) * norm.weight)
+
+        return forward
+
+    count = 0
+    for module in model.modules():
+        cls_name = type(module).__name__
+        if "RMSNorm" in cls_name and hasattr(module, "weight"):
+            module.forward = make_forward(module)
+            count += 1
+    return count
+
+
+def hf_greedy(hf_dir: str, input_ids: list[int], max_new_tokens: int,
+              rmsnorm: str = "hf") -> dict[str, Any]:
+    """HF transformers 贪心解码；返回生成的 token id 与每步的 top1−top2 margin。
+
+    `rmsnorm="ggml-like"` 时把模型内所有 RMSNorm 换成复刻 ggml 语义的版本
+    （double 累加 + `1/sqrt`），用于 XFRAME-2 的「钉死归一化这一环」实验。
+    """
     import torch
     from transformers import AutoModelForCausalLM
 
@@ -63,6 +101,10 @@ def hf_greedy(hf_dir: str, input_ids: list[int], max_new_tokens: int) -> dict[st
         hf_dir, dtype=torch.float32, attn_implementation="eager",
         trust_remote_code=False,
     ).eval()
+    if rmsnorm == "ggml-like":
+        replaced = _install_ggml_like_rmsnorm(model)
+        print(f"  [实验] 已把 {replaced} 个 RMSNorm 替换为 ggml 语义（double 累加 + 1/sqrt）")
+
     ids_t = torch.tensor([input_ids])
     with torch.no_grad():
         out = model.generate(
@@ -161,6 +203,11 @@ def main() -> int:
     ap.add_argument("--gguf", required=True, help="右引擎的整模 GGUF")
     ap.add_argument("--prompts", help="每行一个 prompt 的文件；缺省用内置 4 条")
     ap.add_argument("--max-new-tokens", type=int, default=16)
+    ap.add_argument(
+        "--hf-rmsnorm", choices=["hf", "ggml-like"], default="hf",
+        help="hf=原生 RMSNorm（默认）；ggml-like=复刻 ggml 语义（double 累加 + 1/sqrt），"
+             "用于 XFRAME-2 的「钉死归一化这一环」实验",
+    )
     ap.add_argument("--out", help="把画像写成 JSON")
     args = ap.parse_args()
 
@@ -174,7 +221,7 @@ def main() -> int:
     rows = []
     for prompt in prompts:
         pids, eos_id = hf_prompt_ids(args.hf_dir, prompt)
-        left = hf_greedy(args.hf_dir, pids, args.max_new_tokens)
+        left = hf_greedy(args.hf_dir, pids, args.max_new_tokens, rmsnorm=args.hf_rmsnorm)
         right = llama_greedy(args.gguf, pids, args.max_new_tokens)
 
         row = {
@@ -211,6 +258,7 @@ def main() -> int:
         "mode": "cross-engine",
         "left": "hf_transformers",
         "right": "llama_cpp",
+        "hf_rmsnorm": args.hf_rmsnorm,
         "prompts": total,
         "identical": identical,
         "length_only_divergence": length_only,
