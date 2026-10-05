@@ -968,6 +968,10 @@ class Scheduler(
         self._infer_tasks: dict[str, InferenceTask] = {}
         self._task_lock = threading.Lock()
         self._running = False
+        # ★ 2026-10-05：`start()` 的幂等守卫锁。双栈（`0.0.0.0` + `::`）下
+        #   `uvicorn.Server` 的 lifespan 会**并发**调两次 `start()`，非原子的
+        #   「检查后设置」两边都会通过 ⇒ 必须在锁内占位。
+        self._start_lock = threading.Lock()
         # 启动期后台发现线程必须能被 stop() 立即唤醒，避免停止后仍发起连接。
         self._startup_cancel_event = threading.Event()
         self._network_identity_thread: Optional[threading.Thread] = None
@@ -1198,9 +1202,29 @@ class Scheduler(
             host: TCP 监听地址（默认 0.0.0.0，接受所有接口连接）
             port: TCP 监听端口（默认 config.SERVER_PORT）
         """
+        # ★ 2026-10-05（两段实测根因）：`run_api_servers()` 在通配地址下会为
+        #   `0.0.0.0` 与 `::` **各起一个 `uvicorn.Server`**（共享同一 `app`），
+        #   于是 `_lifespan` 执行两次、本方法被调两次。此前没有任何幂等保护 ⇒
+        #   进程内出现**两个 `TCPServer` 实例**同时监听 8888：`_tcp_server_default`
+        #   被第二次覆盖（setter 见本文件 `_tcp_server` 属性），而 worker 的连接
+        #   只被其中一个实例 accept。请求线程读的是 `_tcp_server_default`，
+        #   因此 `clients` 为空 ⇒ 一连串下游症状：
+        #     `_get_pipeline_readiness` 的 `connected` 为空 ⇒
+        #     `worker_tcp_disconnected`；assignment 拿不到
+        #     `execution="stage_offer_v3"`；capacity 求解器从未被调用而退化成
+        #     `simple_weight` 分配（`Layer 13-20` / `15-24` 即由此而来）。
+        #   日志判据：10-05 每次启动都有**同毫秒两条** `TCP服务端启动`，
+        #   而 10-03 三机验收时只有一条。
+        #   已在运行时直接返回，避免重复 init_nodes / create_server。
+        #   ★ 注意：两次 `start()` 是**并发**的（日志时间戳同毫秒），非原子的
+        #     「检查后设置」两边都会通过 ⇒ 必须在 `_start_lock` 内占位。
+        with self._start_lock:
+            if self._running:
+                logger.info("调度器已在运行，忽略重复 start()（幂等守卫）")
+                return
+            self._running = True
         self._startup_cancel_event.clear()
         self.init_nodes()
-        self._running = True
         if self._effective_role() == "master":
             self._load_pipeline_recovery_state()
 
