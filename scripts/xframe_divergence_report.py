@@ -87,8 +87,46 @@ def _install_ggml_like_rmsnorm(model: Any) -> int:
     return count
 
 
+def _install_noise_injector(model: Any, layer_idx: int, rel_sigma: float,
+                            seed: int = 1234) -> int:
+    """在指定 transformer 层的输出上注入**确定性**相对噪声，返回挂载点数。
+
+    用途：量化「这套系统对数值差异有多敏感」——扫 `rel_sigma`，看多大的相对扰动足以
+    翻转 argmax。放大链（`docs/跨框架接力数值差异机理-2026-10-05.md` §3）预测系统在
+    1e-3 量级的跨引擎差异下必然翻转；本探针给出该预测的**直接测量**。
+
+    噪声按该张量自身的 `|x|` 均值缩放（相对幅度），并用固定 seed 保证可复现。
+    """
+    import torch
+
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+
+    def make_hook():
+        def hook(_module, _inputs, output):
+            def perturb(t):
+                if not torch.is_tensor(t) or not t.is_floating_point():
+                    return t
+                scale = t.detach().abs().mean() * rel_sigma
+                noise = torch.randn(t.shape, generator=generator,
+                                    dtype=torch.float32) * float(scale)
+                return (t.float() + noise).to(t.dtype)
+
+            if isinstance(output, tuple):
+                return (perturb(output[0]),) + tuple(output[1:])
+            return perturb(output)
+
+        return hook
+
+    layers = getattr(getattr(model, "model", None), "layers", None)
+    if layers is None or layer_idx >= len(layers):
+        raise SystemExit(f"模型没有 layers[{layer_idx}]")
+    layers[layer_idx].register_forward_hook(make_hook())
+    return 1
+
+
 def hf_greedy(hf_dir: str, input_ids: list[int], max_new_tokens: int,
-              rmsnorm: str = "hf") -> dict[str, Any]:
+              rmsnorm: str = "hf", noise_layer: int | None = None,
+              noise_sigma: float = 0.0) -> dict[str, Any]:
     """HF transformers 贪心解码；返回生成的 token id 与每步的 top1−top2 margin。
 
     `rmsnorm="ggml-like"` 时把模型内所有 RMSNorm 换成复刻 ggml 语义的版本
@@ -104,6 +142,9 @@ def hf_greedy(hf_dir: str, input_ids: list[int], max_new_tokens: int,
     if rmsnorm == "ggml-like":
         replaced = _install_ggml_like_rmsnorm(model)
         print(f"  [实验] 已把 {replaced} 个 RMSNorm 替换为 ggml 语义（double 累加 + 1/sqrt）")
+    if noise_layer is not None and noise_sigma > 0:
+        _install_noise_injector(model, noise_layer, noise_sigma)
+        print(f"  [实验] 已在 layers[{noise_layer}] 输出注入相对噪声 sigma={noise_sigma:g}")
 
     ids_t = torch.tensor([input_ids])
     with torch.no_grad():
@@ -209,6 +250,10 @@ def main() -> int:
              "用于 XFRAME-2 的「钉死归一化这一环」实验",
     )
     ap.add_argument("--out", help="把画像写成 JSON")
+    ap.add_argument("--noise-layer", type=int, default=None,
+                    help="敏感度探针：在 HF 的该层输出注入相对噪声（需配合 --noise-sigma）")
+    ap.add_argument("--noise-sigma", type=float, default=0.0,
+                    help="敏感度探针：相对噪声幅度（按该张量 |x| 均值缩放）")
     args = ap.parse_args()
 
     prompts = DEFAULT_PROMPTS
@@ -221,7 +266,8 @@ def main() -> int:
     rows = []
     for prompt in prompts:
         pids, eos_id = hf_prompt_ids(args.hf_dir, prompt)
-        left = hf_greedy(args.hf_dir, pids, args.max_new_tokens, rmsnorm=args.hf_rmsnorm)
+        left = hf_greedy(args.hf_dir, pids, args.max_new_tokens, rmsnorm=args.hf_rmsnorm,
+                         noise_layer=args.noise_layer, noise_sigma=args.noise_sigma)
         right = llama_greedy(args.gguf, pids, args.max_new_tokens)
 
         row = {
@@ -259,6 +305,8 @@ def main() -> int:
         "left": "hf_transformers",
         "right": "llama_cpp",
         "hf_rmsnorm": args.hf_rmsnorm,
+        "noise_layer": args.noise_layer,
+        "noise_sigma": args.noise_sigma,
         "prompts": total,
         "identical": identical,
         "length_only_divergence": length_only,
