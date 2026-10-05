@@ -1278,7 +1278,17 @@ class SchedulerPipelineMixin:
                     transaction = self._pipeline_load_transaction
                     if transaction and transaction.get("config_id") == config_id:
                         transaction["phase"] = "ready"
-                        self._active_pipeline_capacity_plan = dict(plan)
+                        # ★ 2026-10-05：与 legacy 提交路径对齐（见 `:2910-2913`）。
+                        #   legacy 提交成功时会把 active plan 的 `transaction_phase`
+                        #   提升为 `ready`，而 stage-only 此前只做 `dict(plan)` ⇒
+                        #   `/api/cluster/pipeline-capacity` 的投影**永远停在求解器
+                        #   初值 `planned`**（`scheduler.py` 里打的那个值），且该投影里
+                        #   本就没有 `config_id`/`generation` 键 ⇒ 看上去像"事务不存在"。
+                        #   实测中这个展示缺陷先把我误导过一次（去追一个不存在的事务）。
+                        active_plan = dict(plan)
+                        active_plan["computed_at"] = time.time()
+                        active_plan["transaction_phase"] = "ready"
+                        self._active_pipeline_capacity_plan = active_plan
                         self._persist_pipeline_lifecycle_locked()
                 self._maybe_finish_pipeline_recovery()
                 logger.info(
