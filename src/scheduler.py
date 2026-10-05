@@ -4344,11 +4344,12 @@ class Scheduler(
                 logger.info(f"推理任务已停止: {self._current_task.task_id}")
                 self._current_task = None
 
-        # 恢复所有节点为空闲
-        with self._nodes_lock:
-            for nid in self.nodes:
-                if self.nodes[nid].state == NodeState.BUSY:
-                    self.update_node_state(nid, NodeState.ONLINE)
+        # ★ 2026-10-05（DIST-2 收拢现状）：此处原有「恢复所有节点为空闲」——
+        #   `if self.nodes[nid].state == NodeState.BUSY: update_node_state(ONLINE)`。
+        #   但 `BUSY` **从未被任何代码置位** ⇒ 该分支恒假，整段是死逻辑，已移除
+        #   连同 `NodeState.BUSY` / `NodeState.ERROR` 两个枚举值。节点可用性现在由
+        #   「`NodeState`（ONLINE/OFFLINE）+ 心跳新鲜度」两维表达，
+        #   见 `scheduler_types.NodeState` 的说明。
 
         # TODO: 发送 TASK_STOP 指令给所有从节点
         # TODO: 清空所有节点 KV 缓存

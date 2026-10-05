@@ -9,11 +9,30 @@ from enum import Enum
 from typing import Optional
 
 class NodeState(str, Enum):
-    """节点状态枚举"""
-    ONLINE = "online"       # 在线空闲
-    BUSY = "busy"           # 推理中
+    """节点状态枚举。
+
+    ★ 2026-10-05（DIST-2 收拢现状）：本枚举**实际只有两个值在用** ——
+    `ONLINE` 与 `OFFLINE`；原先还有 `BUSY`（推理中）与 `ERROR`（异常），但
+    **从未有任何代码把节点置成它们**（全仓仅 `scheduler.py` 有一处
+    `state == NodeState.BUSY` 的比较，该分支恒假，连同"任务停止后恢复节点空闲"
+    那段一起移除）。保留死枚举会让「可用性判据」看起来比实际复杂。
+
+    **节点是否可用由两维系：**
+
+    1. **本枚举**：`ONLINE` ⇔ `is_available()` 为真。置位点集中在
+       `scheduler_cluster`（注册 / presence 心跳 / 远端节点表）与
+       `scheduler._on_tcp_disconnect`（断连置 `OFFLINE`）。
+    2. **心跳新鲜度**：`NodeInfo.is_heartbeat_fresh()`（阈值
+       `WORKER_HEARTBEAT_MAX_AGE`）。TCP 半开时第 1 维要等巡检约 129s 才翻转，
+       第 2 维才是在那段窗口里阻止"静默节点仍占容量"的判据。
+
+    规划文档里提到的 `registered / admitted / ready / leased / draining` 那套状态
+    **尚未进本枚举**，其语义目前分散在三个对象上：task-worker 的
+    `accepted` / `selected_version`（`task_worker_adapter`）、`Reservation` /
+    `lease_epoch`（`task_provider` / `task_graph`）。
+    """
+    ONLINE = "online"       # 在线（对端可达；是否真能派活另见心跳新鲜度）
     OFFLINE = "offline"     # 离线/断连
-    ERROR = "error"         # 异常
 
 
 class NodeRole(str, Enum):
