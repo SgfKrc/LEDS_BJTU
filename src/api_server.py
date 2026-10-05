@@ -346,25 +346,44 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """FastAPI lifespan 上下文管理器（替代废弃的 @app.on_event）"""
-    global _runtime_startup_thread
+    """FastAPI lifespan 上下文管理器（替代废弃的 @app.on_event）
+
+    ★ 2026-10-05：runtime 启动/关闭改为**进程级只执行一次**。
+    `run_api_servers()` 在通配地址下为 `0.0.0.0` 与 `::` 各起一个
+    `uvicorn.Server`（共享同一 `app`），uvicorn 会对每个 server 各跑一次
+    lifespan。此前每次都重启 `_run_runtime_startup` 线程、每次 shutdown 都调
+    `_shutdown_resources()`，导致进程内两套 TCPServer，且任一 server 关闭会
+    连带停掉整个 runtime。现在首个 lifespan 取得归属权并负责收尾，后续 lifespan
+    只做 readiness 标记后直接放行。
+    """
+    global _runtime_startup_thread, _runtime_lifecycle_owner
     _reset_runtime_readiness()
     _mark_process_ready()
-    _runtime_startup_done.clear()
-    _runtime_startup_thread = threading.Thread(
-        target=_run_runtime_startup,
-        name="runtime-startup",
-        daemon=True,
-    )
-    _runtime_startup_thread.start()
+    with _runtime_lifecycle_lock:
+        first = not _runtime_lifecycle_owner
+        if first:
+            _runtime_lifecycle_owner = True
+            _runtime_startup_done.clear()
+            _runtime_startup_thread = threading.Thread(
+                target=_run_runtime_startup,
+                name="runtime-startup",
+                daemon=True,
+            )
+            _runtime_startup_thread.start()
     try:
         # The HTTP process can serve liveness/readiness while the slower
         # runtime components finish initializing in the background.
         yield
     finally:
         # ---- shutdown ----
-        _runtime_startup_done.wait(timeout=30.0)
-        await _shutdown_resources()
+        # 只有取得归属权的那个 lifespan 负责收尾；先释放归属再执行关闭，
+        # 这样无论两个 server 谁先退出，收尾都只做一次。
+        with _runtime_lifecycle_lock:
+            owns_shutdown = _runtime_lifecycle_owner
+            _runtime_lifecycle_owner = False
+        if owns_shutdown:
+            _runtime_startup_done.wait(timeout=30.0)
+            await _shutdown_resources()
 
 
 app = FastAPI(
@@ -592,6 +611,15 @@ _runtime_readiness: dict[str, Any] = {
 }
 _runtime_startup_done = threading.Event()
 _runtime_startup_thread: Optional[threading.Thread] = None
+# ★ 2026-10-05：runtime 启动/关闭的**进程级**归属标志与锁。
+#   `run_api_servers()` 在通配地址下会为 `0.0.0.0` 与 `::` 各起一个
+#   `uvicorn.Server`（共享同一 `app`），uvicorn 因此对每个 server 各跑一次
+#   lifespan。此前 `_lifespan` 每次都重启 `_run_runtime_startup` 线程、且每次
+#   shutdown 都调 `_shutdown_resources()` ⇒ 进程内出现两套 TCPServer（已在
+#   `scheduler.start()` 侧止血），且任一 server 关闭会连带停掉整个 runtime。
+#   现在只让**首个** lifespan 负责启动与关闭，后续 lifespan 直接放行。
+_runtime_lifecycle_lock = threading.Lock()
+_runtime_lifecycle_owner = False
 
 
 def _reset_runtime_readiness() -> None:
