@@ -872,11 +872,23 @@ class SchedulerTaskWorkerMixin:
                             field="payload.worker_kind",
                         )
                 if message.message_type == "hello":
-                    ack = self._task_worker_control.receive_on_coordinator(
-                        client_id,
-                        raw,
-                        coordinator_node_id=self.get_effective_node_id(),
-                    )
+                    # ★ 2026-10-05（DIST-3）：把 hello 校验的异常面显式记下来。
+                    #   此前这里异常直接向上抛，而更外层（TCP 接收循环）会吞掉它
+                    #   ⇒ worker 侧只看到"连上又断开"，master 侧**一行日志都没有**，
+                    #   排查只能靠猜（实测：Y700 每 30s 重连一次、只知道
+                    #   `task_worker_handshake_pending`，定位花了好几轮）。
+                    try:
+                        ack = self._task_worker_control.receive_on_coordinator(
+                            client_id,
+                            raw,
+                            coordinator_node_id=self.get_effective_node_id(),
+                        )
+                    except Exception:
+                        logger.error(
+                            "task worker hello 校验失败: node=%s", client_id,
+                            exc_info=True,
+                        )
+                        raise
                     self._send_task_worker_to_node(client_id, ack)
                     # The registration fence must end for both an accepted
                     # hello and a definitive rejection.  A rejected hello is
