@@ -1587,8 +1587,22 @@ class EngineHost:
                 req,
                 serving_node_id=self._serving_node_id,
                 distributed_enabled=distributed_enabled,
-                fallback=bool(external_fallback_reason),
-                fallback_reason=external_fallback_reason,
+                # ★ 2026-10-05（DIST-4）：与 `api_server.py` 的同名路径对齐 ——
+                #   此前只用 `external_fallback_reason`，丢掉了 `:1296` / `:1356`
+                #   写入的 `pipeline_failure_reason` ⇒ 「pipeline 失败 ⇒ 本地整模回退」
+                #   会报成 `fallback=False` + 空 reason，与「从没请求分布式」无法区分。
+                #   注意 `:1422-1423` 那处本地回退的用法本来就是对的，只有这里漏了。
+                fallback=bool(
+                    external_fallback_reason or pipeline_failure_reason
+                ),
+                fallback_reason=(
+                    external_fallback_reason
+                    or (
+                        "pipeline_failed_then_local_pytorch: "
+                        f"{pipeline_failure_reason}"
+                        if pipeline_failure_reason else ""
+                    )
+                ),
             )
 
             db_session_id = target_session_id or "default"

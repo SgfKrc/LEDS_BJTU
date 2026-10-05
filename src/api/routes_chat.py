@@ -624,10 +624,22 @@ async def chat_stream(req: ChatRequest, request: Request):
             metrics["distributed_requested"] = req.routing_preference in (
                 "distributed_preferred", "distributed_required",
             )
-            metrics["distributed_used"] = distributed_used
+            # ★ 2026-10-05（DIST-4）：不再用局部标志**无条件覆盖**。
+            #   局部 `distributed_used` 在**进入流水线分支时**就置 `True`（`:526`），
+            #   而 pipeline 内部仍可能整模回退（事件 metrics 会是
+            #   `distributed_used=False` + `execution_mode=fallback_full_model_streaming`）
+            #   ⇒ 无条件覆盖会产出 `distributed_used=True` 与
+            #   `execution_mode=fallback_full_model_streaming` **并存**的自相矛盾字段，
+            #   把「回退成功」伪装成「分布式成功」。
+            #   改为：上游（事件 metrics / 响应 metrics）已给出判定时以它为准，
+            #   只有在完全没有判定时才回退到局部标志。
+            metrics["distributed_used"] = bool(
+                metrics.get("distributed_used", distributed_used)
+            )
+            effective_distributed_used = metrics["distributed_used"]
             if (req.routing_preference in ("distributed_preferred",
                                            "distributed_required")
-                    and not distributed_used):
+                    and not effective_distributed_used):
                 # 请求分布式但实际本地：必须展示回退原因（计划 §9.5）
                 metrics.setdefault("fallback", True)
                 metrics.setdefault(

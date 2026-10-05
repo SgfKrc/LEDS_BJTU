@@ -5034,6 +5034,12 @@ class SchedulerPipelineMixin:
             "layer_assignments": stage_nodes,
             "claimed_layers": _claimed_layers,
             "layer_segments": [[s, e] for s, e in _stage_ranges],
+            # ★ 2026-10-05（DIST-4）：把层配置代际写进**请求级** metrics。
+            #   此前 `config_id` 只存在于内存 contract（`_pipeline_task_contracts`）
+            #   与 `/api/cluster/pipeline-capacity`，响应与日志里都看不到 ⇒ 出问题时
+            #   无法从单条请求回溯它用的是哪一代层配置。取值与本链的 contract 一致
+            #   （`route_a:{task_id}`）。
+            "config_id": f"route_a:{task_id}",
         }
         generated_ids: list[int] = []
         full_input_ids = input_ids
@@ -5826,6 +5832,20 @@ class SchedulerPipelineMixin:
         suppress_native_thinking = native_thinking_prompt
         stream_buffer = ""
         workers_used = [n["node_id"] for n in pipeline_nodes]
+        # ★ 2026-10-05（DIST-4）：与 A3 链同口径派生层区间（见
+        #   `_run_route_a_stage_pipeline` 里 `_stage_ranges` 的算法）。
+        _legacy_stage_ranges: list[tuple[int, int]] = []
+        for _node in pipeline_nodes:
+            _start = _node.get("start_layer")
+            _end = _node.get("end_layer")
+            if _start is None or _end is None:
+                continue
+            _legacy_stage_ranges.append((int(_start), int(_end)))
+        _legacy_claimed_layers = (
+            [min(r[0] for r in _legacy_stage_ranges),
+             max(r[1] for r in _legacy_stage_ranges)]
+            if _legacy_stage_ranges else []
+        )
         pipeline_metrics = {
             "steps": [],
             "total_time_ms": 0,
@@ -5842,6 +5862,15 @@ class SchedulerPipelineMixin:
             "serving_node_id": self.get_effective_node_id(),
             "workers_used": workers_used,
             "layer_assignments": pipeline_nodes,
+            # ★ 2026-10-05（DIST-4）：与 A3 链对齐。
+            #   ① 补 `claimed_layers` / `layer_segments`：此前 legacy 链成功时这两个
+            #      字段完全缺失，而 DIST-4 的判据是「成功即 `claimed_layers` 非空」
+            #      —— 缺字段就等于无法证明它真的做了分层。
+            #   ② 补 `config_id`：使层配置代际在**请求级**可见（此前只存在于内存
+            #      contract 与 `/api/cluster/pipeline-capacity`）。
+            "claimed_layers": _legacy_claimed_layers,
+            "layer_segments": [[s, e] for s, e in _legacy_stage_ranges],
+            "config_id": pipeline_config_id,
         }
         t_pipeline_start = time.time()
 

@@ -2374,6 +2374,33 @@ def _augment_chat_metrics(metrics: dict | None, req: ChatRequest, **defaults) ->
     result.setdefault("layer_assignments", [])
     result.setdefault("request_id", _request_id_ctx.get("-"))
     result.setdefault("generation_id", req.generation_id or "")
+    # ★ 2026-10-05（DIST-4）：单条结构化摘要，让**一条日志**即可重建整条链路
+    #   （验收条文：「从单条请求日志可重建完整链路」）。此前**没有任何日志打印最终
+    #   metrics** —— 层区间（`scheduler_pipeline` 的「Route-A 分配原始」）与 worker
+    #   名单（「Route-A stage handoff」）分属两条**不含 request_id** 的日志，单请求
+    #   串行时可靠时间顺序人工拼，并发时会串。
+    #   字段与 DIST-4 的六项要求一一对应：route / assignment（workers_used +
+    #   layer_assignments）/ generation（generation_id + config_id）/ worker /
+    #   layer range（claimed_layers + layer_segments）/ fallback reason。
+    logger.info(
+        "event=chat_route_summary request_id=%s generation_id=%s "
+        "routing_preference=%s distributed_requested=%s distributed_used=%s "
+        "fallback=%s fallback_reason=%s execution_mode=%s route=%s "
+        "workers_used=%s claimed_layers=%s layer_segments=%s config_id=%s",
+        result.get("request_id", ""),
+        result.get("generation_id", ""),
+        result.get("routing_preference", ""),
+        result.get("distributed_requested", False),
+        result.get("distributed_used", False),
+        result.get("fallback", False),
+        result.get("fallback_reason", ""),
+        result.get("execution_mode", ""),
+        result.get("route", ""),
+        result.get("workers_used", []),
+        result.get("claimed_layers", []),
+        result.get("layer_segments", []),
+        result.get("config_id", ""),
+    )
     return result
 
 
@@ -4093,8 +4120,21 @@ def _execute_chat_full(
                 else 0,
             },
             req,
-            fallback=bool(external_fallback_reason),
-            fallback_reason=external_fallback_reason,
+            # ★ 2026-10-05（DIST-4）：此前这里**只用** `external_fallback_reason`，
+            #   把同函数内 `:3783` / `:3849` 写入的 `pipeline_failure_reason` 丢掉了
+            #   ⇒ master 为 PyTorch 引擎时，「pipeline 失败 ⇒ 本地整模回退」的 metrics
+            #   是 `distributed_used=False` + `fallback=False` + `fallback_reason=""`。
+            #   这与「请求从来没走分布式」完全无法区分 —— 正是 DIST-4 要打击的
+            #   「整模回退伪装成普通本地推理」。现在两者取或，并在来自 pipeline 失败
+            #   时保留来源标识，使单条响应即可回溯到真实失败原因。
+            fallback=bool(external_fallback_reason or pipeline_failure_reason),
+            fallback_reason=(
+                external_fallback_reason
+                or (
+                    f"pipeline_failed_then_local_pytorch: {pipeline_failure_reason}"
+                    if pipeline_failure_reason else ""
+                )
+            ),
         )
 
         db_session_id = target_session_id or "default"
