@@ -3226,6 +3226,57 @@ class TestPipelineFallback:
         assert result["ready"] is True
         assert sync_calls == [True]
 
+    @pytest.mark.parametrize(
+        "reason_code",
+        ["worker_offline", "worker_tcp_disconnected", "worker_heartbeat_stale"],
+    )
+    def test_force_distributed_fails_fast_on_unrecoverable_readiness(
+            self, sched, monkeypatch, reason_code):
+        """★ DIST-2：force 路径下不可恢复的就绪原因必须快速返回，不等满超时。
+
+        此前 `not force_distributed_assignment and reason not in recoverable`
+        的组合让 force 路径**连这三种原因也会等满 `PIPELINE_MODEL_SYNC_TIMEOUT`**。
+        它们等下去不会变好：对端要么已经没了，要么要等重连，而重连本身会触发一次
+        权威重发（`_handle_task_worker_message` 的 hello 分支）。DIST-2 要求
+        「禁止等待多个互相独立的超时后才 fallback」。
+        """
+        sched._role_override = "master"
+        sched.nodes["worker1"] = NodeInfo(
+            node_id="worker1", role=NodeRole.CLIENT, state=NodeState.ONLINE,
+            node_type="pc", device_info={"tier": "ultrabook"},
+            last_heartbeat=time.time(),
+        )
+        sched._tcp_server = type("Server", (), {
+            "_running": True,
+            "clients": {"worker1": object()},
+        })()
+        monkeypatch.setattr(
+            sched, "_get_pipeline_readiness",
+            lambda: {
+                "ready": False,
+                "reason_code": reason_code,
+                "reason": "不可恢复的就绪原因",
+                "workers": [],
+            },
+        )
+        sync_calls = []
+        monkeypatch.setattr(
+            sched,
+            "request_authoritative_layer_sync",
+            lambda **kwargs: sync_calls.append(kwargs) or True,
+        )
+
+        started = time.monotonic()
+        result = sched._synchronize_pipeline_workers_for_request(
+            timeout=60.0, force_distributed_assignment=True,
+        )
+        elapsed = time.monotonic() - started
+
+        assert result["reason_code"] == reason_code
+        assert result["ready"] is False
+        assert elapsed < 5.0, f"应快速失败，实际耗时 {elapsed:.1f}s"
+        assert sync_calls == [], "不可恢复状态下不应再触发权威重发"
+
     def test_request_sync_stops_when_worker_reopts_out(
             self, sched, monkeypatch):
         """旧从节点拒绝权威配置时不能等待完整同步超时。"""

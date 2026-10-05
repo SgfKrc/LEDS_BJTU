@@ -4274,10 +4274,34 @@ class SchedulerPipelineMixin:
             "worker_layer_load_failed",
             "pipeline_recovery_pending",
         }
-        if (
-            not force_distributed_assignment
-            and readiness.get("reason_code") not in recoverable
-        ):
+        # ★ 2026-10-05（DIST-2）：把「不可恢复的就绪原因」从 force 短路里剥离出来。
+        #
+        #   此前 `not force_distributed_assignment and reason not in recoverable`
+        #   的组合意味着：**force 路径下连不可恢复的原因也会等满
+        #   `PIPELINE_MODEL_SYNC_TIMEOUT`（60s）** —— 包括 `worker_offline` /
+        #   `worker_tcp_disconnected` / `worker_heartbeat_stale`。这些状态等下去不会
+        #   变好：对端要么已经没了，要么需要重新连上，而重连本身会触发一次权威重发
+        #   （见 `_handle_task_worker_message` 的 hello 分支）。在这里死等只是把
+        #   「确定的失败」延迟成「超时」。
+        #
+        #   DIST-2 明确要求「禁止等待多个互相独立的超时后才 fallback」，故这几种
+        #   原因在 force 路径下同样快速具名返回。
+        #
+        #   只收编最无歧义的三种：`worker_not_registered` 可能是「刚注册、hello
+        #   还没到位」，仍有等待价值，保持原行为。
+        unrecoverable = {
+            "worker_offline",
+            "worker_tcp_disconnected",
+            "worker_heartbeat_stale",
+        }
+        reason_code = str(readiness.get("reason_code", "") or "")
+        if reason_code in unrecoverable:
+            logger.info(
+                "分布式请求快速失败（不可恢复的就绪原因）: workers=%s reason_code=%s",
+                worker_ids, reason_code,
+            )
+            return readiness
+        if not force_distributed_assignment and reason_code not in recoverable:
             return readiness
 
         # An existing loading generation should finish without being superseded.
