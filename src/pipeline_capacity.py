@@ -235,6 +235,14 @@ def _normalize_nodes(
             normalized["layer_budget"] = _normalize_layer_budget(
                 raw.get("layer_budget"), f"node[{node_id}].layer_budget"
             )
+        # ★ 2026-10-05（DIST-3 三机实测）：工件段类型（`head`/`middle`/`tail`）。
+        #   只在取值为已知三种之一时透传；其它值（含缺失）视为未声明 ⇒ 不参与
+        #   求解器的段类型约束，保持旧行为。
+        raw_segment_mode = raw.get("segment_mode")
+        if isinstance(raw_segment_mode, str) and raw_segment_mode.lower() in (
+            "head", "middle", "tail",
+        ):
+            normalized["segment_mode"] = raw_segment_mode.lower()
         usable.append(normalized)
     usable.sort(
         key=lambda node: (
@@ -459,6 +467,26 @@ def solve_pipeline_capacity(
                     for start, allowed_end in allowed_ranges
                 ):
                     continue
+            # ★ 2026-10-05（DIST-3 三机实测）：**段类型约束**。
+            #
+            #   区间包含判据不够：`layer_ranges` 只说"本节点覆盖哪些层"，不区分工件
+            #   是首段 / 中间段 / 末段。Y700 广告 `[8,24]`（实为 `mid8-24`，
+            #   `mode=middle`）⇒ `[20,24)` 落在该区间内、被照分，而中间段工件
+            #   **没有 lm_head / final_norm** ⇒ 必然执行失败（实测报
+            #   `remote worker reported a Stage error`）。
+            #
+            #   段类型来自设备声明的 `segment_mode`（取工件 manifest 的 `mode`）；
+            #   未声明的设备不参与本约束，保持旧行为。
+            segment_mode = node.get("segment_mode")
+            if segment_mode == "tail" and end != layer_budget:
+                # 末段工件只含末尾层，接不了中间段。
+                continue
+            if segment_mode == "middle" and (cursor == 0 or end == layer_budget):
+                # 中间段工件既无 embedding 也无 lm_head。
+                continue
+            if segment_mode == "head" and cursor != 0:
+                # 首段工件只含开头层，接不了后续段。
+                continue
             raw_bytes = prefix[end] - prefix[cursor] + per_node_bytes
             has_embedding = not started
             has_lm_head = end == layer_budget

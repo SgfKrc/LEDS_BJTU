@@ -2660,6 +2660,11 @@ class Scheduler(
         #   "当前已就绪、马上能跑的区间"，budget 是"能自裁并承载的上限" ⇒ 有了它，
         #   求解器才能给该节点分配任意连续区间，而不是被它预置的那一段钉死。
         layer_budget_by_node: dict[str, dict] = {}
+        # ★ 2026-10-05（DIST-3 三机实测）：工件段类型（`head`/`middle`/`tail`）。
+        #   与 `layer_ranges` / `layer_budget` 同源（v3 hello capabilities），但要
+        #   单独透传给容量求解器：区间只说"覆盖哪些层"，不区分工件含不含
+        #   embedding / lm_head，于是中间段会被分到末段（实测失败原因）。
+        segment_mode_by_node: dict[str, str] = {}
         if self._effective_role() == "master" and TASK_WORKER_EXPERIMENTAL_ENABLED:
             try:
                 worker_status = self._task_worker_control.status(role="master")
@@ -2680,11 +2685,15 @@ class Scheduler(
                 budget = capabilities.get("layer_budget")
                 if isinstance(budget, dict):
                     layer_budget_by_node[node_id] = budget
-        if layer_ranges_by_node or layer_budget_by_node:
+                segment_mode = capabilities.get("segment_mode")
+                if isinstance(segment_mode, str) and segment_mode.strip():
+                    segment_mode_by_node[node_id] = segment_mode.strip().lower()
+        if layer_ranges_by_node or layer_budget_by_node or segment_mode_by_node:
             logger.info(
-                "容量节点层段投影: ranges=%s budget=%s",
+                "容量节点层段投影: ranges=%s budget=%s segment_mode=%s",
                 {k: v for k, v in layer_ranges_by_node.items()},
                 {k: v.get("max_layers") for k, v in layer_budget_by_node.items()},
+                segment_mode_by_node,
             )
 
         records = []
@@ -2818,6 +2827,10 @@ class Scheduler(
                 record["layer_ranges"] = layer_ranges_by_node[node_id]
             if node_id in layer_budget_by_node:
                 record["layer_budget"] = layer_budget_by_node[node_id]
+            # ★ 2026-10-05（DIST-3）：段类型透传给求解器，供其拒绝
+            #   「中间段接末段 / 末段接中间段」这类分配。
+            if node_id in segment_mode_by_node:
+                record["segment_mode"] = segment_mode_by_node[node_id]
             records.append(record)
         return records
 

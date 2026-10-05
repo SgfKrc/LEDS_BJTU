@@ -145,6 +145,67 @@ def test_layer_budget_without_local_cut_keeps_fixed_ranges():
     assert by_node["worker-a"]["end_layer"] == 2
 
 
+def test_middle_segment_artifact_cannot_take_the_tail_slot():
+    """★ DIST-3（2026-10-05 三机实测）：中间段工件不能接末段。
+
+    `layer_ranges` 只声明"本节点覆盖哪些层"，**不区分工件含不含
+    `embedding` / `lm_head`**。Y700 广告 `[0, 3]`（实为 `mid8-24`，
+    `mode=middle`）时，旧判据认为末段落在区间内就照分 —— 而中间段工件没有
+    `lm_head` / `final_norm`，请求必然失败（实测报
+    `remote worker reported a Stage error`）。声明的 `segment_mode` 必须让求解器
+    拒绝这种分配。
+    """
+    plan = solve_pipeline_capacity(
+        descriptor(),
+        [
+            {
+                **node("worker-a", 500),
+                "layer_ranges": [[0, 3]],
+                "segment_mode": "middle",
+            },
+        ],
+        safety_margin=1.0,
+    )
+
+    assert plan["admitted"] is False
+
+
+def test_absent_segment_declaration_keeps_legacy_behaviour():
+    """未声明 `segment_mode` 时**不得新增任何约束**（旧设备 / 旧 manifest 不变）。
+
+    取形沿用 `test_layer_budget_without_local_cut_keeps_fixed_ranges`：`worker-a`
+    只声明 `[0, 2]`，`worker-b` 不声明区间。这条同时是段类型约束的**反证** ——
+    若约束无条件生效（把缺失当 `middle` 处理），`worker-a` 拿首段就会被拒。
+    """
+    plan = solve_pipeline_capacity(
+        descriptor(),
+        [
+            {**node("worker-a", 500), "layer_ranges": [[0, 2]]},
+            node("worker-b", 400),
+        ],
+        safety_margin=1.0,
+    )
+
+    assert plan["admitted"] is True
+    by_node = {item["node_id"]: item for item in plan["assignments"]}
+    assert by_node["worker-a"]["start_layer"] == 0
+
+    # 同一拓扑、但显式声明 `middle` ⇒ 首段必须被拒：段类型约束确实生效。
+    rejected = solve_pipeline_capacity(
+        descriptor(),
+        [
+            {
+                **node("worker-a", 500),
+                "layer_ranges": [[0, 2]],
+                "segment_mode": "middle",
+            },
+            node("worker-b", 400),
+        ],
+        safety_margin=1.0,
+    )
+    assert rejected["admitted"] is False
+
+
 def test_aggregate_capacity_admits_when_no_single_node_fits():
     plan = solve_pipeline_capacity(
         descriptor(),
