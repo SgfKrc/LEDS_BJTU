@@ -3808,6 +3808,22 @@ def _execute_chat_full(
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
             if pipeline_result.get("error"):
                 pipeline_failure_reason = str(pipeline_result["error"])
+                # ★ 2026-10-05（DIST-4）：pipeline 失败时除了 `error` 字符串，还要
+                #   保住 `metrics.pipeline_readiness` —— 那里带**具名 reason_code**
+                #   （如 `route_a_mixed_legacy_execution_bridge_not_ready` /
+                #   `pipeline_recovery_pending` / `worker_stage_offer_not_ready`），
+                #   而 `error` 文案可能已被折叠成更通用的表述。此前整份 metrics 被
+                #   丢弃 ⇒ 「为什么失败」在请求级不可追溯。
+                _pipeline_readiness = None
+                _raw_metrics = pipeline_result.get("metrics")
+                if isinstance(_raw_metrics, dict):
+                    _pipeline_readiness = _raw_metrics.get("pipeline_readiness")
+                if isinstance(_pipeline_readiness, dict) and _pipeline_readiness:
+                    pipeline_failure_reason = (
+                        f"{pipeline_failure_reason} | readiness="
+                        f"{_pipeline_readiness.get('reason_code', '')}"
+                        f": {_pipeline_readiness.get('reason', '')}"
+                    )
                 logger.warning(f"流水线推理失败: {pipeline_result['error']}，回退到本地推理")
                 _enforce_distributed_required(
                     req,
