@@ -333,10 +333,37 @@ wall time 只作本机诊断，不作为准入结果：样本是单 GPU、单 pr
 
 ---
 
+## 8.7 实验票与产品准入的边界（2026-10-05 登记）
+
+§8.1–§8.6 与本文列的 torch 实验票、以及 `docs/分票规划-稳定分布式版本与架构泛用性后置-2026-10-04.md`
+中新增的 **`XFRAME-1/2/3`**（跨框架数值对齐实验），共同构成**同一批实验票**。纪律一致：
+**实验先行——未取得确定成果前，不接入产品实现，不写进稳定合同。**
+
+`XFRAME-1/2/3` 排在 `GEN-*`、`KT-1` 与本文 torch 票**之前**执行。依据：它直接决定「跨引擎
+混搭能否作为长期部署形态」，且 `XFRAME-1`（分歧自动检测与量化）是其余两票以及 `GEN-3` 的
+**判据前置**——没有它，「某项改动是否让分歧推迟」无法判定。
+
+**一处据此解释的观察**：§6.2 / §8 提到「KT 推的 AMX / AVX-512 MoE kernel **已经在主仓 vendor
+的 llama.cpp 里**（`ggml/src/ggml-cpu/amx/mmq.cpp`），但实际用的是 pip 预编译 wheel，其
+`ggml-config.cmake` 里 `GGML_AMX_BF16/INT8/TILE` 与 `GGML_AVX512*` 全为 `OFF`」。核实结论：
+
+- **源码在**（`android/app/src/main/cpp/llama.cpp/ggml/src/ggml-cpu/amx/mmq.cpp` 确实存在）；
+- **未启用的原因不是我们的构建脚本刻意关闭** —— `GGML_AMX_*=OFF` 出自 **pip wheel 自带的
+  `ggml-config.cmake`**（`.venv-*/Lib/site-packages/lib/cmake/ggml/`），即**预编译产物如此**；
+  QLH 自有的构建脚本（`build_keep_head_shim.ps1`、`edge_sim_setup.sh`）也**未显式启用**它。
+
+⇒ 因此这是一个**待评估的构建项**，归属 §8.6 的硬件准入实验票：需要先判定「目标机是否具备 AMX
+（Sapphire Rapids+）」以及启用后对**数值一致性**的影响，再决定是否进入发布构建。**实验先行，
+未取得确定成果前不改发布构建。**
+
 ## 9. 明确标注为「未核实」的条目
 
 1. KT 与 **vLLM** 是否另有官方整合（只找到它用 vLLM 项目的 `llmcompressor` 做 GPU 量化）。
-2. KT 的 **AMX kernel 是否已回流 llama.cpp**（旧文档只写"考虑贡献"，未查到对应 PR）。
+2. ~~KT 的 AMX kernel 是否已回流 llama.cpp（旧文档只写"考虑贡献"，未查到对应 PR）。~~
+   **已核实（2026-10-05）**：AMX / AVX-512 的 CPU MoE kernel **已在主仓 vendor 的 llama.cpp 源码树内**
+   （`android/app/src/main/cpp/llama.cpp/ggml/src/ggml-cpu/amx/mmq.cpp`），无需再从 KT 侧搬运。
+   但**实际运行用的是 pip 预编译 wheel**，其 `ggml-config.cmake` 把 `GGML_AMX_BF16/INT8/TILE`
+   与 `GGML_AVX512*` 全部置 `OFF` ⇒ **该 kernel 当前不参与计算**。是否启用归 §8.6 硬件准入票。
 3. KT 的 **ARM64(KML) / Windows** 后端成熟度与实际性能（README 只列为可选构建，roadmap 仍在探索）。
 4. §6 里所有**收益数字在 QLH 设备/模型上的外推**都属估计，**非实测**。
 5. §7 的方向冲突**未做新实测裁决**。
