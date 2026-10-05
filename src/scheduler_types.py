@@ -41,7 +41,8 @@ class NodeRole(str, Enum):
     CLIENT = "client"
 
 
-#: 从节点心跳的**容忍上限**（秒）。取 45s 的 2 倍余量：App 侧
+#: 从节点心跳的**容忍上限**（秒）：超过它，节点被视为「不可用，不该再参与流水线
+#: 就绪判定与容量规划」。取 45s 的 2 倍余量：App 侧
 #: `AndroidPresenceStateMachine.heartbeatIntervalMs = 45_000`（可配 5–120s，见
 #: `heartbeatIntervalSeconds.coerceIn(5, 120)`），而这里原先写死 10s ⇒ 45s 的间隔
 #: 必然被判过期（实测 `11.4s > 10s`）。Route A 要求 Android 参与 readiness 后才暴露。
@@ -52,6 +53,21 @@ class NodeRole(str, Enum):
 #: 规划只看 `NodeInfo.is_available()`（`state == ONLINE`），完全不看心跳新鲜度，而
 #: TCP 半开要等巡检约 129s 才置 OFFLINE ⇒ 静默节点在这段时间里一直占容量。
 WORKER_HEARTBEAT_MAX_AGE = 120.0
+
+
+#: task-worker **控制面** health 超时的**下界**（秒）。实际取值是
+#: `max(这个下界, HEARTBEAT_INTERVAL * 4)`（见 `scheduler` 里构造
+#: `TaskWorkerControlPlane` 处）—— 乘 4 是为了容忍若干次心跳抖动，下界则保证
+#: 即使把 `HEARTBEAT_INTERVAL` 调到很小也不会把健康判定收得过紧。
+#:
+#: 为什么不直接用 `WORKER_HEARTBEAT_MAX_AGE`（120s）：**两者语义不同、层次不同**。
+#: 控制面 health 决定「这个 provider 还要不要派 stage」（`healthy` /
+#: `layer_stage_dispatch_enabled` / stage offer 准入），流水线层的
+#: `WORKER_HEARTBEAT_MAX_AGE` 决定「这个节点还算不算数」（readiness 判定与容量
+#: 规划）。**有意让前者更短**：先停止派活，再让节点退出规划，两层不同时翻转；
+#: 若把两者并成同一个数，节点会在「仍被规划进层区间」的同时「已不再接受 stage」，
+#: 边界反而更难推理。
+TASK_WORKER_HEALTH_TIMEOUT_FLOOR_SECONDS = 30.0
 
 
 @dataclass

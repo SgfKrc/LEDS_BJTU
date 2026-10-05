@@ -51,6 +51,7 @@ from pipeline_reshard import PipelineArtifactAvailability, PipelineReshardCoordi
 import scheduler_layer_plan as _layer_plan
 from scheduler_types import (
     InferenceTask, NodeInfo, NodeRole, NodeState, PreemptState, QueueTask,
+    TASK_WORKER_HEALTH_TIMEOUT_FLOOR_SECONDS,
     WORKER_HEARTBEAT_MAX_AGE,
 )
 from scheduler_sidecars import SchedulerSidecarMixin
@@ -1132,7 +1133,10 @@ class Scheduler(
             "spare_master_logs": [],
         }
         self._task_worker_control = TaskWorkerControlPlane(
-            health_timeout_seconds=max(30.0, HEARTBEAT_INTERVAL * 4.0),
+            health_timeout_seconds=max(
+                TASK_WORKER_HEALTH_TIMEOUT_FLOOR_SECONDS,
+                HEARTBEAT_INTERVAL * 4.0,
+            ),
         )
         self._task_worker_refresh_lock = threading.Lock()
         self._task_worker_refresh_requested = False
