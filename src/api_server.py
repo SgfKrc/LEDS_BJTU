@@ -2382,11 +2382,26 @@ def _augment_chat_metrics(metrics: dict | None, req: ChatRequest, **defaults) ->
     #   字段与 DIST-4 的六项要求一一对应：route / assignment（workers_used +
     #   layer_assignments）/ generation（generation_id + config_id）/ worker /
     #   layer range（claimed_layers + layer_segments）/ fallback reason。
+    #
+    #   ★ 另加三个「线路/能力状态」字段（DIST-4 第二句要求的显式指标，按裁定走
+    #   可 grep 的日志字段而非新增 metrics，避免同一事实两处维护）。这三类是最容易
+    #   让「为什么没走分布式」被误读的来源：
+    #     - `a1_relay_probe_only` / `relay_enabled`：A1 是否已处于探针专用
+    #       （= 已从产品入口剔除）。全局环境级，打进摘要才能让单条日志自证环境。
+    #     - `legacy_bridge_rejected`：本次是否撞上 legacy/A3 混链拒绝。
+    #     - `capability_missing_reason`：失败链里带出的具名就绪原因（若有）。
+    _failure_text = str(result.get("fallback_reason", "") or "")
+    _capability_reason = ""
+    _marker = "readiness="
+    if _marker in _failure_text:
+        _capability_reason = _failure_text.split(_marker, 1)[1].strip()
     logger.info(
         "event=chat_route_summary request_id=%s generation_id=%s "
         "routing_preference=%s distributed_requested=%s distributed_used=%s "
         "fallback=%s fallback_reason=%s execution_mode=%s route=%s "
-        "workers_used=%s claimed_layers=%s layer_segments=%s config_id=%s",
+        "workers_used=%s claimed_layers=%s layer_segments=%s config_id=%s "
+        "a1_relay_probe_only=%s relay_enabled=%s legacy_bridge_rejected=%s "
+        "capability_missing_reason=%s",
         result.get("request_id", ""),
         result.get("generation_id", ""),
         result.get("routing_preference", ""),
@@ -2400,6 +2415,10 @@ def _augment_chat_metrics(metrics: dict | None, req: ChatRequest, **defaults) ->
         result.get("claimed_layers", []),
         result.get("layer_segments", []),
         result.get("config_id", ""),
+        PIPELINE_RELAY_PROBE_ONLY,
+        PIPELINE_RELAY_ENABLED,
+        "route_a_mixed_legacy_execution_bridge_not_ready" in _failure_text,
+        _capability_reason,
     )
     return result
 

@@ -17,6 +17,7 @@ from config import (
     PIPELINE_RELAY_ENABLED,
     PIPELINE_RELAY_PROBE_ONLY,
     PIPELINE_RELAY_SEGMENTS,
+    PIPELINE_ROUTE_A_STAGE_OFFER_ENABLED,
     TASK_WORKER_EXPERIMENTAL_ENABLED,
 )
 # ★ #31 M2：层流水线支持的架构**单一事实来源**（此前在 4 处各写了一份 `{"qwen","qwen2"}`）
@@ -777,6 +778,11 @@ class SchedulerPipelineMixin:
                 #   那段工件 ⇒ `layer_range_not_advertised`（实测：relay 链被误路由到
                 #   Route-A stage 路径后卡在这里）。
                 and not self._is_relay_host(nid)
+                # ★ 2026-10-05（DIST-4「发布闸门」）：A3 的独立开关。置 0 时不打
+                #   `stage_offer_v3` 标记 ⇒ `stage_offer_nodes` 为空，层段链整体不
+                #   参与，请求按既有路径处理。默认 1 = 保持现状行为（本开关是给
+                #   发布/部署侧显式关掉实验线路用的，不是改变已验收的行为）。
+                and PIPELINE_ROUTE_A_STAGE_OFFER_ENABLED
             ):
                 # Keep the assignment in the active capacity plan for the
                 # execution/readiness contract, but do not materialize a
