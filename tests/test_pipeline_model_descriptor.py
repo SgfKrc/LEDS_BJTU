@@ -13,6 +13,7 @@ sys.path.insert(0, "src")
 from pipeline_model_descriptor import (  # noqa: E402
     _ARCHITECTURE_LAYOUTS,
     PipelineModelDescriptorError,
+    canonical_pipeline_model_type,
     inspect_pipeline_model,
 )
 
@@ -62,6 +63,11 @@ def _write_gemma4_fixture(root):
         "model.embed_vision.proj.weight": torch.zeros(2, 2, dtype=torch.float16),
         "model.embed_audio.proj.weight": torch.zeros(2, 2, dtype=torch.float16),
     }, str(root / "model.safetensors"))
+
+
+def test_pipeline_model_type_canonicalizes_llama_cpp_qwen35_alias():
+    assert canonical_pipeline_model_type("qwen35") == "qwen3_5"
+    assert canonical_pipeline_model_type(" QWEN2 ") == "qwen2"
 
 
 def test_descriptor_reads_headers_without_materializing_weights(tmp_path):

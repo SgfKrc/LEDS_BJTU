@@ -254,6 +254,99 @@ class TestLazyModelManager:
         assert host.is_loaded is True
         assert host.engine_type == "llama_cpp"
 
+    def test_prepare_gguf_pipeline_does_not_materialize_torch_manager(
+            self, monkeypatch, tmp_path):
+        model_path = tmp_path / "probe.gguf"
+        model_path.write_bytes(b"probe")
+
+        class FakeGguf:
+            engine_type = "llama_cpp"
+
+            def prepare_pipeline_model(self, **kwargs):
+                self.kwargs = kwargs
+                self.is_pipeline_prepared = True
+                return {
+                    "model_id": kwargs["model_id"],
+                    "model_sha256": "a" * 64,
+                    "pipeline_runtime_supported": True,
+                }
+
+        fake_module = types.ModuleType("llama_engine")
+        fake_module.LlamaCppEngine = FakeGguf
+        monkeypatch.setitem(sys.modules, "llama_engine", fake_module)
+
+        host = ModelHost()
+        descriptor = host.prepare_pipeline_model(
+            model_id="probe-model",
+            model_path=str(model_path),
+            quant_type="Q4_K_M",
+        )
+
+        assert descriptor["model_id"] == "probe-model"
+        assert host.is_pipeline_prepared is True
+        assert host.is_loaded is False
+        assert host.engine_type == "llama_cpp"
+
+    def test_prepare_directory_switches_away_from_llama_manager(
+            self, monkeypatch, tmp_path):
+        model_dir = tmp_path / "safetensors-model"
+        model_dir.mkdir()
+        unloaded = []
+
+        class OldGguf:
+            engine_type = "llama_cpp"
+
+            def prepare_pipeline_model(self, **_kwargs):
+                raise AssertionError("directory must not use the GGUF preparer")
+
+            def unload(self):
+                unloaded.append(True)
+
+        class TorchManager:
+            def prepare_pipeline_model(self, **kwargs):
+                self.kwargs = kwargs
+                return {"model_id": kwargs["model_id"]}
+
+        torch_manager = TorchManager()
+        host = ModelHost(manager=OldGguf())
+        object.__setattr__(host, "_engine_type", "llama_cpp")
+        monkeypatch.setattr(
+            ModelHost, "_materialize_manager", lambda _self: torch_manager,
+        )
+
+        result = host.prepare_pipeline_model(
+            model_id="directory-model", model_path=str(model_dir),
+        )
+
+        assert result == {"model_id": "directory-model"}
+        assert unloaded == [True]
+        assert "_engine_type" not in host.__dict__
+
+    def test_unload_clears_direct_gguf_mirror_state(self):
+        class DirectGguf:
+            def unload(self):
+                self.unloaded = True
+
+        manager = DirectGguf()
+        host = ModelHost(manager=manager)
+        for name, value in {
+            "_engine_type": "llama_cpp",
+            "quant_type": "GGUF",
+            "model_path": "old.gguf",
+            "active_model_id": "old-model",
+            "_active_model_id": "old-model",
+        }.items():
+            object.__setattr__(host, name, value)
+
+        host.unload_model()
+
+        assert manager.unloaded is True
+        for name in (
+            "_engine_type", "quant_type", "model_path",
+            "active_model_id", "_active_model_id",
+        ):
+            assert name not in host.__dict__
+
     def test_torch_free_partial_gguf_is_rejected_as_full_model(self):
         class PartialGguf:
             engine_type = "llama_cpp"

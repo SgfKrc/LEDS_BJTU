@@ -1148,6 +1148,12 @@ class Scheduler(
         self._task_worker_active_attempts: dict[
             str, _TaskWorkerActiveAttempt
         ] = {}
+        # Short-lived terminal identities let a cancel that crossed a final
+        # result receive an idempotent acknowledgement instead of an
+        # unknown_attempt rejection.
+        self._task_worker_completed_attempts: dict[
+            str, tuple[_TaskWorkerActiveAttempt, float]
+        ] = {}
         self._task_worker_seen_messages: dict[
             str, tuple[str, list[dict]]
         ] = {}
@@ -1246,6 +1252,7 @@ class Scheduler(
         self.init_nodes()
         if self._effective_role() == "master":
             self._load_pipeline_recovery_state()
+            self._restore_pipeline_model_for_recovery()
 
         # Reconcile only the active model's assignment cache.  This is a
         # local, bounded cleanup and never touches the user's full model tree.
@@ -2655,6 +2662,7 @@ class Scheduler(
         # readiness hint. Feed admitted Android ranges into the capacity
         # solver so it cannot produce an assignment the worker must reject.
         layer_ranges_by_node: dict[str, list[list[int]]] = {}
+        layer_artifacts_by_node: dict[str, list[dict]] = {}
         # ★ 2026-10-03：设备自荐的层容量（本地裁层后可承载的层数上限）。与
         #   `layer_ranges` 同源（v3 hello capabilities）但语义不同：ranges 是
         #   "当前已就绪、马上能跑的区间"，budget 是"能自裁并承载的上限" ⇒ 有了它，
@@ -2682,13 +2690,21 @@ class Scheduler(
                 ranges = capabilities.get("layer_ranges")
                 if isinstance(ranges, list) and ranges:
                     layer_ranges_by_node[node_id] = ranges
+                artifacts = capabilities.get("layer_artifacts")
+                if isinstance(artifacts, list) and artifacts:
+                    layer_artifacts_by_node[node_id] = artifacts
                 budget = capabilities.get("layer_budget")
                 if isinstance(budget, dict):
                     layer_budget_by_node[node_id] = budget
                 segment_mode = capabilities.get("segment_mode")
                 if isinstance(segment_mode, str) and segment_mode.strip():
                     segment_mode_by_node[node_id] = segment_mode.strip().lower()
-        if layer_ranges_by_node or layer_budget_by_node or segment_mode_by_node:
+        if (
+            layer_ranges_by_node
+            or layer_artifacts_by_node
+            or layer_budget_by_node
+            or segment_mode_by_node
+        ):
             logger.info(
                 "容量节点层段投影: ranges=%s budget=%s segment_mode=%s",
                 {k: v for k, v in layer_ranges_by_node.items()},
@@ -2825,6 +2841,8 @@ class Scheduler(
             }
             if node_id in layer_ranges_by_node:
                 record["layer_ranges"] = layer_ranges_by_node[node_id]
+            if node_id in layer_artifacts_by_node:
+                record["layer_artifacts"] = layer_artifacts_by_node[node_id]
             if node_id in layer_budget_by_node:
                 record["layer_budget"] = layer_budget_by_node[node_id]
             # ★ 2026-10-05（DIST-3）：段类型透传给求解器，供其拒绝
@@ -2842,6 +2860,42 @@ class Scheduler(
         )
         with self._nodes_lock:
             snapshot = list(self.nodes.items())
+        worker_engines: dict[str, str] = {}
+        if self._effective_role() == "master" and TASK_WORKER_EXPERIMENTAL_ENABLED:
+            try:
+                worker_status = self._task_worker_control.status(role="master")
+            except Exception:
+                worker_status = {}
+            for worker in worker_status.get("workers", []):
+                if not isinstance(worker, dict):
+                    continue
+                capabilities = worker.get("capabilities")
+                if not isinstance(capabilities, dict):
+                    continue
+                models = capabilities.get("models")
+                model_engines = {
+                    str(item.get("engine", "")).strip()
+                    for item in models
+                    if isinstance(item, dict)
+                    and str(item.get("engine", "")).strip()
+                } if isinstance(models, list) else set()
+                # A PC can have both runtimes installed while its selected
+                # layer artifact is GGUF.  The executable model identity is
+                # more specific than the installation-wide engine list.
+                if len(model_engines) == 1:
+                    worker_engines[str(worker.get("node_id", ""))] = next(
+                        iter(model_engines)
+                    )
+                    continue
+                engines = capabilities.get("engines")
+                if not isinstance(engines, list):
+                    continue
+                normalized = [
+                    str(value).strip() for value in engines
+                    if str(value).strip()
+                ]
+                if len(normalized) == 1:
+                    worker_engines[str(worker.get("node_id", ""))] = normalized[0]
         return {
             node_id: {
                 "is_local": node_id == local_node_id,
@@ -2853,7 +2907,10 @@ class Scheduler(
                 "engine": (
                     "relay_middle"
                     if self._is_relay_host(node_id)
-                    else "pytorch"
+                    else worker_engines.get(
+                        node_id,
+                        str((_node.device_info or {}).get("backend_id") or "pytorch"),
+                    )
                 ),
             }
             for node_id, _node in snapshot
@@ -3250,10 +3307,18 @@ class Scheduler(
             for item in self._get_pipeline_capacity_nodes(node_ids)
         }
         planned = []
+        artifact_source_sha256 = ""
         for item in assignments:
             node_id = str(item.get("node_id", ""))
             start = int(item.get("start_layer", 0) or 0)
             end = int(item.get("end_layer", 0) or 0)
+            if start < 0 or end <= start or end > total_layers:
+                return {
+                    "status": "rejected", "admitted": False,
+                    "reason_code": "pipeline_capacity_manual_range_invalid",
+                    "reason": f"node {node_id} has invalid range [{start},{end})",
+                    "assignments": [],
+                }
             record = records.get(node_id)
             if record is None:
                 return {
@@ -3262,6 +3327,75 @@ class Scheduler(
                     "reason": f"node {node_id} has no usable capacity",
                     "assignments": [],
                 }
+            local_cut = bool(
+                isinstance(record.get("layer_budget"), dict)
+                and record["layer_budget"].get("local_cut")
+            )
+            selected_artifact = None
+            segment_mode = str(record.get("segment_mode", "") or "").lower()
+            if not local_cut:
+                artifacts = record.get("layer_artifacts")
+                if isinstance(artifacts, list) and artifacts:
+                    selected_artifact = next((
+                        dict(artifact) for artifact in artifacts
+                        if isinstance(artifact, dict)
+                        and list(artifact.get("layer_range") or []) == [start, end]
+                    ), None)
+                    if selected_artifact is None:
+                        return {
+                            "status": "rejected", "admitted": False,
+                            "reason_code": "pipeline_segment_contract_unsatisfied",
+                            "reason": (
+                                f"node {node_id} has no exact artifact for "
+                                f"[{start},{end})"
+                            ),
+                            "assignments": [],
+                        }
+                    segment_mode = str(
+                        selected_artifact.get("segment_mode", "") or ""
+                    ).lower()
+                    source_sha256 = str(
+                        selected_artifact.get("source_model_sha256", "") or ""
+                    ).lower()
+                    if (
+                        artifact_source_sha256 and source_sha256
+                        and artifact_source_sha256 != source_sha256
+                    ):
+                        return {
+                            "status": "rejected", "admitted": False,
+                            "reason_code": "pipeline_segment_contract_unsatisfied",
+                            "reason": "manual artifacts have different source identities",
+                            "assignments": [],
+                        }
+                    artifact_source_sha256 = artifact_source_sha256 or source_sha256
+                allowed_ranges = record.get("layer_ranges")
+                if isinstance(allowed_ranges, list) and allowed_ranges and not any(
+                    list(layer_range) == [start, end]
+                    for layer_range in allowed_ranges
+                    if isinstance(layer_range, (list, tuple))
+                ):
+                    return {
+                        "status": "rejected", "admitted": False,
+                        "reason_code": "pipeline_layer_range_coverage_insufficient",
+                        "reason": f"node {node_id} does not advertise [{start},{end})",
+                        "assignments": [],
+                    }
+                mode_valid = (
+                    (segment_mode == "head" and start == 0)
+                    or (segment_mode == "middle" and start > 0 and end < total_layers)
+                    or (segment_mode == "tail" and end == total_layers)
+                    or (not segment_mode and selected_artifact is None)
+                )
+                if not mode_valid:
+                    return {
+                        "status": "rejected", "admitted": False,
+                        "reason_code": "pipeline_segment_contract_unsatisfied",
+                        "reason": (
+                            f"node {node_id} artifact mode {segment_mode!r} "
+                            f"cannot execute [{start},{end})"
+                        ),
+                        "assignments": [],
+                    }
             raw_bytes = sum(layer_bytes[start:end]) + per_node_bytes
             if bool(item.get("has_embedding")):
                 raw_bytes += embedding_bytes
@@ -3280,7 +3414,7 @@ class Scheduler(
                     ),
                     "assignments": [],
                 }
-            planned.append({
+            planned_item = {
                 **dict(item),
                 "raw_weight_bytes": raw_bytes,
                 "required_bytes": required,
@@ -3290,7 +3424,10 @@ class Scheduler(
                 "runtime_multiplier": record["runtime_multiplier"],
                 "execution_device": record["execution_device"],
                 "capacity_source": record["capacity_source"],
-            })
+            }
+            if selected_artifact is not None:
+                planned_item["layer_artifact"] = selected_artifact
+            planned.append(planned_item)
 
         plan_identity = {
             "model_id": descriptor.get("model_id", ""),
@@ -3301,6 +3438,7 @@ class Scheduler(
                     for key in (
                         "node_id", "start_layer", "end_layer",
                         "required_bytes", "capacity_bytes",
+                        "layer_artifact",
                     )
                 }
                 for item in planned

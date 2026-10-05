@@ -205,6 +205,56 @@ def test_hello_capabilities_may_advertise_layer_budget(golden):
     assert layers_error.value.code == "invalid_integer"
 
 
+def test_hello_capabilities_validate_per_artifact_layer_contract(golden):
+    hello = copy.deepcopy(golden["messages"][0])
+    capabilities = hello["payload"]["capabilities"]
+    model = {
+        "model_id": "tail20.gguf",
+        "engine": "llama_cpp",
+        "format": "gguf",
+        "revision": "local",
+        "sha256": "a" * 64,
+    }
+    capabilities["engines"] = ["llama_cpp"]
+    capabilities["models"] = [model]
+    capabilities["layer_ranges"] = [[20, 24]]
+    capabilities["layer_artifacts"] = [{
+        "layer_range": [20, 24],
+        "segment_mode": "tail",
+        "model_id": "tail20.gguf",
+        "artifact_sha256": "a" * 64,
+        "source_model_sha256": "b" * 64,
+    }]
+
+    decode_message(hello)
+
+    bad_mode = copy.deepcopy(hello)
+    bad_mode["payload"]["capabilities"]["layer_artifacts"][0][
+        "segment_mode"
+    ] = "unknown"
+    with pytest.raises(WorkerProtocolError) as mode_error:
+        decode_message(bad_mode)
+    assert mode_error.value.code == "invalid_capabilities"
+
+    mismatched_identity = copy.deepcopy(hello)
+    mismatched_identity["payload"]["capabilities"]["layer_artifacts"][0][
+        "artifact_sha256"
+    ] = "c" * 64
+    with pytest.raises(WorkerProtocolError) as identity_error:
+        decode_message(mismatched_identity)
+    assert identity_error.value.code == "invalid_capabilities"
+
+
+def test_hello_capabilities_reject_invalid_node_segment_mode(golden):
+    hello = copy.deepcopy(golden["messages"][0])
+    hello["payload"]["capabilities"]["segment_mode"] = "middle-ish"
+
+    with pytest.raises(WorkerProtocolError) as captured:
+        decode_message(hello)
+
+    assert captured.value.code == "invalid_capabilities"
+
+
 def test_hello_capabilities_may_advertise_middle_channel_and_n_pos_per_embd(golden):
     """★ 2026-09-23：中间段通道与 M-RoPE 位置分量数是**可选**能力键（向后兼容）。"""
     hello = copy.deepcopy(golden["messages"][0])

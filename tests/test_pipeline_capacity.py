@@ -145,6 +145,32 @@ def test_layer_budget_without_local_cut_keeps_fixed_ranges():
     assert by_node["worker-a"]["end_layer"] == 2
 
 
+def test_fixed_artifact_range_cannot_be_sliced_by_prefer_all_workers():
+    """A ready GGUF artifact is executable only at its exact manifest range."""
+    plan = solve_pipeline_capacity(
+        descriptor(),
+        [
+            {**node("master", 180, role="master"), "layer_ranges": [[0, 1]]},
+            {
+                **node("middle", 500),
+                "layer_ranges": [[1, 4]],
+            },
+            {
+                **node("tail", 500),
+                "layer_ranges": [[3, 4]],
+            },
+        ],
+        safety_margin=1.0,
+        require_distributed=True,
+        prefer_all_workers=True,
+    )
+
+    assert plan["admitted"] is True
+    by_node = {item["node_id"]: item for item in plan["assignments"]}
+    assert (by_node["middle"]["start_layer"], by_node["middle"]["end_layer"]) == (1, 4)
+    assert "tail" in plan["control_only_nodes"]
+
+
 def test_middle_segment_artifact_cannot_take_the_tail_slot():
     """★ DIST-3（2026-10-05 三机实测）：中间段工件不能接末段。
 
@@ -160,7 +186,7 @@ def test_middle_segment_artifact_cannot_take_the_tail_slot():
         [
             {
                 **node("worker-a", 500),
-                "layer_ranges": [[0, 3]],
+                "layer_ranges": [[0, 4]],
                 "segment_mode": "middle",
             },
         ],
@@ -168,6 +194,93 @@ def test_middle_segment_artifact_cannot_take_the_tail_slot():
     )
 
     assert plan["admitted"] is False
+    assert plan["reason_code"] == "pipeline_segment_contract_unsatisfied"
+
+
+def test_per_artifact_modes_select_the_matching_range_and_identity():
+    plan = solve_pipeline_capacity(
+        descriptor(),
+        [
+            {**node("master", 180, role="master"), "layer_ranges": [[0, 1]]},
+            {
+                **node("edge", 500),
+                "layer_ranges": [[1, 3], [3, 4]],
+                "layer_artifacts": [
+                    {
+                        "layer_range": [1, 3],
+                        "segment_mode": "middle",
+                        "model_id": "middle.gguf",
+                        "artifact_sha256": "a" * 64,
+                        "source_model_sha256": "c" * 64,
+                    },
+                    {
+                        "layer_range": [3, 4],
+                        "segment_mode": "tail",
+                        "model_id": "tail.gguf",
+                        "artifact_sha256": "b" * 64,
+                        "source_model_sha256": "c" * 64,
+                    },
+                ],
+            },
+            {
+                **node("tail", 500),
+                "layer_ranges": [[3, 4]],
+                "segment_mode": "tail",
+            },
+        ],
+        safety_margin=1.0,
+        require_distributed=True,
+        prefer_all_workers=True,
+    )
+
+    assert plan["admitted"] is True
+    edge = next(item for item in plan["assignments"] if item["node_id"] == "edge")
+    assert edge["layer_artifact"]["model_id"] == "middle.gguf"
+    assert edge["layer_artifact"]["segment_mode"] == "middle"
+
+
+def test_per_artifact_source_digest_mismatch_is_rejected():
+    plan = solve_pipeline_capacity(
+        descriptor(),
+        [
+            {
+                **node("middle", 500),
+                "layer_ranges": [[0, 2]],
+                "layer_artifacts": [{
+                    "layer_range": [0, 2],
+                    "segment_mode": "head",
+                    "model_id": "head.gguf",
+                    "artifact_sha256": "a" * 64,
+                    "source_model_sha256": "c" * 64,
+                }],
+            },
+            {
+                **node("tail", 500),
+                "layer_ranges": [[2, 4]],
+                "layer_artifacts": [{
+                    "layer_range": [2, 4],
+                    "segment_mode": "tail",
+                    "model_id": "tail.gguf",
+                    "artifact_sha256": "b" * 64,
+                    "source_model_sha256": "d" * 64,
+                }],
+            },
+        ],
+        safety_margin=1.0,
+        require_distributed=True,
+    )
+
+    assert plan["admitted"] is False
+    assert plan["reason_code"] == "pipeline_segment_contract_unsatisfied"
+
+
+def test_invalid_segment_mode_fails_closed():
+    with pytest.raises(PipelineCapacityError):
+        solve_pipeline_capacity(
+            descriptor(),
+            [{**node("worker", 500), "segment_mode": "middle-ish"}],
+            safety_margin=1.0,
+        )
 
 
 def test_absent_segment_declaration_keeps_legacy_behaviour():

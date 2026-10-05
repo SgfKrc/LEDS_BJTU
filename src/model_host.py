@@ -365,6 +365,85 @@ class ModelHost:
             db_experimental_models=db_experimental_models,
         )
 
+    def prepare_pipeline_model(
+        self,
+        model_id: str,
+        model_path: str,
+        quant_type: str = None,
+        layer_range: tuple[int, int] | None = None,
+        model_sha256: str | None = None,
+    ) -> dict:
+        """Prepare directory or GGUF pipeline metadata without a full load.
+
+        GGUF is routed directly to the import-safe llama.cpp engine, so the
+        edge distribution does not import the torch-backed ``ModelManager``.
+        """
+        import os
+
+        resolved_path = os.path.abspath(model_path or "")
+        if os.path.isfile(resolved_path):
+            from llama_engine import LlamaCppEngine
+
+            current = self.peek_manager()
+            if current is not None:
+                unload = (
+                    getattr(current, "unload_model", None)
+                    or getattr(current, "unload", None)
+                )
+                if callable(unload):
+                    unload()
+            engine_obj = LlamaCppEngine()
+            descriptor = engine_obj.prepare_pipeline_model(
+                model_id=model_id,
+                model_path=resolved_path,
+                quant_type=quant_type,
+                layer_range=layer_range,
+                model_sha256=model_sha256,
+            )
+            object.__setattr__(self, "_manager", engine_obj)
+            object.__setattr__(self, "model_loaded", False)
+            object.__setattr__(self, "active_model_id", model_id)
+            object.__setattr__(self, "_active_model_id", model_id)
+            object.__setattr__(self, "_engine_type", "llama_cpp")
+            object.__setattr__(self, "quant_type", quant_type or "GGUF")
+            object.__setattr__(self, "model_path", resolved_path)
+            object.__setattr__(self, "current_quant", quant_type or "gguf")
+            return descriptor
+
+        manager = self.peek_manager()
+        prepare = (
+            getattr(manager, "prepare_pipeline_model", None)
+            if manager is not None else None
+        )
+        if manager is not None and (
+            not callable(prepare)
+            or backend_id_for(manager, default="") == "llama_cpp"
+        ):
+            unload = (
+                getattr(manager, "unload_model", None)
+                or getattr(manager, "unload", None)
+            )
+            if callable(unload):
+                unload()
+            object.__setattr__(self, "_manager", _LazyModelManager())
+            for name in (
+                "_engine_type", "quant_type", "model_path",
+                "active_model_id", "_active_model_id",
+            ):
+                object.__getattribute__(self, "__dict__").pop(name, None)
+        manager = self._materialize_manager()
+        descriptor = manager.prepare_pipeline_model(
+            model_id=model_id,
+            model_path=resolved_path,
+            quant_type=quant_type,
+            layer_range=layer_range,
+            model_sha256=model_sha256,
+        )
+        object.__setattr__(self, "model_loaded", False)
+        if quant_type:
+            object.__setattr__(self, "current_quant", quant_type)
+        return descriptor
+
     def _load_gguf_model(self, *, model_path: str = None, model_id: str = None, profile: dict = None) -> None:
         """Load a GGUF file via llama_engine and make it this host's manager."""
 
@@ -489,9 +568,6 @@ class ModelHost:
         # ★ 切回非 GGUF 引擎前，先确认 `_manager` 仍是模型管理器：`_load_gguf_model`
         #   会把 `LlamaCppEngine` 装成 `_manager`（它没有 `switch_model`），此时直接
         #   转发会抛 AttributeError。
-        # ★ 切回非 GGUF 引擎前，先确认 `_manager` 仍是模型管理器：`_load_gguf_model`
-        #   会把 `LlamaCppEngine` 装成 `_manager`（它没有 `switch_model`），此时直接
-        #   转发会抛 AttributeError。
         manager = self._materialize_manager()
         if not hasattr(manager, "switch_model"):
             if hasattr(manager, "unload"):
@@ -528,6 +604,11 @@ class ModelHost:
         elif hasattr(manager, "unload"):  # LlamaCppEngine
             manager.unload()
         object.__setattr__(self, "model_loaded", False)
+        for name in (
+            "_engine_type", "quant_type", "model_path",
+            "active_model_id", "_active_model_id",
+        ):
+            object.__getattribute__(self, "__dict__").pop(name, None)
 
     def __getattr__(self, name):
         # object.__getattribute__ 直接取 _manager，避免 _manager 被 del 后

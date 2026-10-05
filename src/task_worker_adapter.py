@@ -502,7 +502,9 @@ class _PendingRemoteAttempt:
     cancel_ack_event: threading.Event = field(default_factory=threading.Event)
     result: Optional[StageResult] = None
     error: Optional[BaseException] = None
+    offer_sent: bool = False
     cancel_requested: bool = False
+    cancel_enqueued: bool = False
     cancel_acknowledged: bool = False
     released: bool = False
     released_at: float = 0.0
@@ -555,6 +557,15 @@ class RemoteFullWorkerProvider:
                 continue
             try:
                 self._send_message(message)
+                if message.message_type == "stage_cancel":
+                    logger.info(
+                        "event=task_worker_stage_cancel_sent node_id=%s "
+                        "workflow_id=%s stage_id=%s attempt_id=%s",
+                        self.node_id,
+                        message.payload.get("workflow_id", ""),
+                        message.payload.get("stage_id", ""),
+                        message.payload.get("attempt_id", ""),
+                    )
             except Exception as exc:
                 try:
                     on_error(exc)
@@ -604,6 +615,47 @@ class RemoteFullWorkerProvider:
         while len(self._seen_order) > _MESSAGE_CACHE_LIMIT:
             expired = self._seen_order.popleft()
             self._seen_messages.pop(expired, None)
+
+    def _take_cancel_message_locked(
+        self, pending: _PendingRemoteAttempt,
+    ) -> Optional[WorkerMessage]:
+        """Build one cancellation only after its Stage offer is on the wire."""
+        if (
+            not pending.offer_sent
+            or not pending.cancel_requested
+            or pending.cancel_enqueued
+        ):
+            return None
+        pending.cancel_enqueued = True
+        attempt = pending.attempt
+        return build_message(
+            "stage_cancel",
+            {
+                "workflow_id": attempt.request.workflow_id,
+                "stage_id": attempt.request.stage_id,
+                "attempt_id": attempt.attempt_id,
+                "lease_id": attempt.lease_id,
+                "lease_epoch": attempt.lease_epoch,
+                "reason_code": "coordinator_cancelled",
+            },
+            message_id=_message_id("cancel_"),
+            sent_at_ms=int(time.time() * 1000),
+            version=PROTOCOL_VERSION,
+        )
+
+    def _queue_cancel_message(
+        self, attempt_id: str, message: WorkerMessage,
+    ) -> None:
+        def on_send_error(_exc: Exception) -> None:
+            with self._lock:
+                current = self._pending.get(attempt_id)
+                if current is not None:
+                    current.cancel_acknowledged = True
+                    current.cancel_ack_event.set()
+                    if current.released:
+                        self._pending.pop(attempt_id, None)
+
+        self._queue_outbound_message(message, on_send_error)
 
     def _prune_pending_locked(self) -> None:
         now = time.time()
@@ -965,12 +1017,28 @@ class RemoteFullWorkerProvider:
         try:
             self._send_message(offer)
         except Exception as exc:
+            # A cancellation that raced with a failed offer send has no
+            # remote work left to acknowledge. Mark it terminal so release()
+            # can reclaim the pending entry immediately.
+            with self._lock:
+                current = self._pending.get(attempt.attempt_id)
+                if current is pending and pending.cancel_requested:
+                    pending.cancel_acknowledged = True
+                    pending.cancel_ack_event.set()
             raise ProviderExecutionError(
                 "failed to send Stage offer to the remote worker",
                 code="remote_worker_disconnected",
                 provider_id=self.provider_id,
                 retryable=True,
             ) from exc
+        cancel_message = None
+        with self._lock:
+            current = self._pending.get(attempt.attempt_id)
+            if current is pending:
+                pending.offer_sent = True
+                cancel_message = self._take_cancel_message_locked(pending)
+        if cancel_message is not None:
+            self._queue_cancel_message(attempt.attempt_id, cancel_message)
         accept_deadline = min(
             attempt.lease_expires_at,
             time.time() + min(
@@ -1075,6 +1143,23 @@ class RemoteFullWorkerProvider:
                     code="attempt_identity_mismatch",
                     field="payload",
                 )
+            if (
+                pending.cancel_requested
+                and message.message_type in {
+                    "stage_accept", "stage_result", "stage_error",
+                }
+            ):
+                # A response already in flight can legally cross the local
+                # cancellation. Keep provider_cancelled authoritative and
+                # absorb the stale response idempotently instead of treating
+                # the peer as a protocol violator.
+                self._remember_message_locked(message)
+                logger.info(
+                    "event=task_worker_late_stage_response_ignored node_id=%s "
+                    "message_type=%s attempt_id=%s",
+                    self.node_id, message.message_type, attempt_id,
+                )
+                return message
             if message.message_type == "stage_accept":
                 if pending.accept_event.is_set():
                     raise WorkerProtocolError(
@@ -1147,6 +1232,14 @@ class RemoteFullWorkerProvider:
                     return message
                 pending.cancel_acknowledged = True
                 pending.cancel_ack_event.set()
+                logger.info(
+                    "event=task_worker_stage_cancel_acknowledged node_id=%s "
+                    "workflow_id=%s stage_id=%s attempt_id=%s",
+                    self.node_id,
+                    payload.get("workflow_id", ""),
+                    payload.get("stage_id", ""),
+                    attempt_id,
+                )
                 if pending.released:
                     self._pending.pop(attempt_id, None)
             self._remember_message_locked(message)
@@ -1219,6 +1312,7 @@ class RemoteFullWorkerProvider:
         return True
 
     def cancel(self, attempt_id: str) -> None:
+        message = None
         with self._lock:
             pending = self._pending.get(attempt_id)
             if pending is None or pending.cancel_requested:
@@ -1231,32 +1325,10 @@ class RemoteFullWorkerProvider:
             )
             pending.accept_event.set()
             pending.result_event.set()
-            attempt = pending.attempt
-            message = build_message(
-                "stage_cancel",
-                {
-                    "workflow_id": attempt.request.workflow_id,
-                    "stage_id": attempt.request.stage_id,
-                    "attempt_id": attempt.attempt_id,
-                    "lease_id": attempt.lease_id,
-                    "lease_epoch": attempt.lease_epoch,
-                    "reason_code": "coordinator_cancelled",
-                },
-                message_id=_message_id("cancel_"),
-                sent_at_ms=int(time.time() * 1000),
-                version=PROTOCOL_VERSION,
-            )
+            message = self._take_cancel_message_locked(pending)
 
-        def on_send_error(_exc: Exception) -> None:
-            with self._lock:
-                current = self._pending.get(attempt_id)
-                if current is not None:
-                    current.cancel_acknowledged = True
-                    current.cancel_ack_event.set()
-                    if current.released:
-                        self._pending.pop(attempt_id, None)
-
-        self._queue_outbound_message(message, on_send_error)
+        if message is not None:
+            self._queue_cancel_message(attempt_id, message)
 
     def notify_disconnect(self) -> None:
         """对端断连：唤醒所有 pending，并**主动回收本 provider 的全部 reservation**。

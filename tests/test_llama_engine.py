@@ -12,6 +12,99 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from llama_engine import LlamaCppEngine
 
 
+def test_gguf_qwen35_pipeline_descriptor_uses_canonical_model_type(
+    monkeypatch, tmp_path,
+):
+    model = tmp_path / "qwen35.gguf"
+    model.write_bytes(b"GGUF fixture")
+    monkeypatch.setattr(
+        "relay_segment_info.read_gguf_layer_info",
+        lambda _path: {"architecture": "qwen35", "n_layer": 2},
+    )
+    monkeypatch.setattr(
+        "relay_segment_info.read_gguf_tensor_bytes",
+        lambda _path: {
+            "token_embd.weight": 8,
+            "blk.0.attn_norm.weight": 4,
+            "blk.1.attn_norm.weight": 4,
+            "output_norm.weight": 4,
+        },
+    )
+
+    engine = LlamaCppEngine()
+    engine._model_path = str(model)
+
+    descriptor = engine.get_pipeline_descriptor()
+
+    assert descriptor["model_type"] == "qwen3_5"
+    assert descriptor["pipeline_runtime_supported"] is True
+    assert descriptor["layer_weight_bytes"] == [4, 4]
+
+
+def test_prepare_pipeline_model_is_metadata_only(monkeypatch, tmp_path):
+    path = tmp_path / "model.gguf"
+    path.write_bytes(b"GGUF metadata probe")
+    engine = LlamaCppEngine()
+    descriptor = {
+        "model_id": "probe",
+        "model_sha256": "a" * 64,
+        "model_type": "qwen2",
+        "total_layers": 24,
+        "pipeline_runtime_supported": True,
+    }
+    monkeypatch.setattr(
+        engine, "get_pipeline_descriptor", lambda: dict(descriptor),
+    )
+
+    result = engine.prepare_pipeline_model(
+        model_id="probe", model_path=str(path), quant_type="Q4_K_M",
+    )
+
+    assert result == descriptor
+    assert engine.is_loaded is False
+    assert engine.is_pipeline_prepared is True
+
+
+def test_abort_pipeline_materialization_restores_whole_descriptor():
+    engine = LlamaCppEngine()
+    closed = []
+
+    class LoadedSegment:
+        def close(self):
+            closed.append(True)
+
+    engine._model = LoadedSegment()
+    engine._loaded = True
+    engine._model_path = "segment.gguf"
+    engine._quant_type = "F16"
+    engine.active_model_id = "source-model"
+    engine._pipeline_distributed_only = True
+    engine._pipeline_descriptor = {
+        "model_id": "source-model",
+        "model_path": "whole.gguf",
+        "model_sha256": "a" * 64,
+        "model_type": "qwen2",
+        "total_layers": 24,
+        "quant_type": "F16",
+        "pipeline_runtime_supported": True,
+        "assignment_layer_range": [0, 16],
+        "partial_assignment": True,
+        "loaded_artifact": "segment.gguf",
+    }
+
+    engine.abort_pipeline_materialization()
+
+    assert closed == [True]
+    assert engine.is_loaded is False
+    assert engine.is_pipeline_prepared is True
+    assert engine._model_path == "whole.gguf"
+    descriptor = engine.get_pipeline_descriptor()
+    assert descriptor["model_path"] == "whole.gguf"
+    assert "assignment_layer_range" not in descriptor
+    assert "partial_assignment" not in descriptor
+    assert "loaded_artifact" not in descriptor
+
+
 def make_fake_mtmd():
     calls = {
         "free_context": 0,

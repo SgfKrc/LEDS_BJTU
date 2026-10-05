@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import importlib
 import logging
+import os
+import re
 import threading
 import time
 import uuid
@@ -32,6 +34,40 @@ from task_worker_protocol import (
 from torch_runtime import torch_available
 
 logger = logging.getLogger("scheduler")
+
+_LAYER_ARTIFACT_DIGEST_LOCK = threading.Lock()
+_LAYER_ARTIFACT_DIGEST_CACHE: dict[str, tuple[tuple[int, int, int], str]] = {}
+
+
+def _verified_layer_artifact_sha256(path) -> str:
+    """Hash one configured GGUF once per stable filesystem identity."""
+    try:
+        resolved = path.resolve(strict=True)
+        stat = resolved.stat()
+        if not resolved.is_file():
+            return ""
+        fingerprint = (
+            int(stat.st_size),
+            int(getattr(stat, "st_mtime_ns", 0)),
+            int(getattr(stat, "st_ctime_ns", 0)),
+        )
+    except OSError:
+        return ""
+    cache_key = str(resolved)
+    with _LAYER_ARTIFACT_DIGEST_LOCK:
+        cached = _LAYER_ARTIFACT_DIGEST_CACHE.get(cache_key)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+        digest = hashlib.sha256()
+        try:
+            with resolved.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            return ""
+        value = digest.hexdigest()
+        _LAYER_ARTIFACT_DIGEST_CACHE[cache_key] = (fingerprint, value)
+        return value
 
 
 @dataclass
@@ -63,13 +99,15 @@ class SchedulerTaskWorkerMixin:
         比对的正是这一项。
         """
         import json
-        import os
         from pathlib import Path
 
         model_path = os.environ.get("QLH_LAYER_GGUF", "").strip()
         if not model_path:
             return None
-        manifest_path = Path(model_path).with_suffix(".manifest.json")
+        artifact_path = Path(model_path)
+        if not artifact_path.is_file():
+            return None
+        manifest_path = artifact_path.with_suffix(".manifest.json")
         if not manifest_path.is_file():
             return None
         try:
@@ -83,6 +121,25 @@ class SchedulerTaskWorkerMixin:
             return None
         if value[0] < 0 or value[1] <= value[0]:
             return None
+        expected_sha256 = str(data.get("artifact_sha256", "") or "").lower()
+        if (
+            len(expected_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in expected_sha256)
+            or _verified_layer_artifact_sha256(artifact_path) != expected_sha256
+        ):
+            return None
+        segment_mode = str(data.get("mode", "") or "").lower()
+        if segment_mode not in {"head", "middle", "tail"}:
+            return None
+        source_sha256 = str(data.get("source_model_sha256", "") or "").lower()
+        if source_sha256 and (
+            len(source_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in source_sha256)
+        ):
+            return None
+        model_id = artifact_path.name
+        if re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", model_id) is None:
+            return None
         # `model_id` 取**文件名**，不用 manifest 的 `artifact` 字段：后者是相对路径
         # （含 `\`），而协议对它的要求是 `^[A-Za-z0-9_.:-]{1,128}$` —— 反斜杠不合法 ⇒
         # 整个 hello 会被判 `payload.capabilities.models[0].model_id is invalid`，worker
@@ -90,9 +147,11 @@ class SchedulerTaskWorkerMixin:
         return {
             "start": int(value[0]),
             "end": int(value[1]),
-            "model_id": Path(model_path).name,
-            "sha256": str(data.get("artifact_sha256", "") or ""),
+            "model_id": model_id,
+            "sha256": expected_sha256,
+            "source_model_sha256": source_sha256,
             "revision": str(data.get("generator_version", "") or ""),
+            "segment_mode": segment_mode,
         }
 
     def _task_worker_capabilities(self) -> dict:
@@ -178,7 +237,20 @@ class SchedulerTaskWorkerMixin:
         #   还会用**实时** capabilities 再比对一次，两侧都不一致时症状更隐蔽）。
         #   ⇒ 身份**不再**依附于就绪状态：只要手上有工件就上报。
         artifact = self._configured_layer_artifact()
-        if layer_worker:
+        artifact_required = bool(
+            os.environ.get("QLH_LAYER_GGUF", "").strip()
+        )
+        if artifact_required and artifact is None:
+            # An explicitly configured but missing/corrupt GGUF must not keep
+            # advertising a stale active range from the previous generation.
+            layer_worker = False
+        if artifact is not None:
+            # A fixed GGUF segment is executable only for the exact manifest
+            # range.  Never let a stale active config publish a second range
+            # beside the per-artifact contract.
+            layer_worker = True
+            layer_ranges.append([artifact["start"], artifact["end"]])
+        elif layer_worker:
             layer_range = active_layer_config.get("layer_range")
             if (
                 isinstance(layer_range, (list, tuple))
@@ -189,30 +261,31 @@ class SchedulerTaskWorkerMixin:
                 )
             ):
                 layer_ranges.append([int(layer_range[0]), int(layer_range[1])])
-        elif artifact is not None:
-            # 首次 hello 时 master 还没下发 layer config —— 它只对**已声明**层段能力的
-            # worker 下发。若这里只看 `_active_layer_config` 就形成死锁：声明为空 ⇒
-            # 分配器没有区间约束 ⇒ 分到手上没有的区间 ⇒ `layer_range_not_advertised`
-            # 被拒 ⇒ 永远拿不到配置。改为从**工件 manifest** 推导，使声明先于配置成立。
-            layer_worker = True
-            layer_ranges.append([artifact["start"], artifact["end"]])
-        if artifact is not None and not models and artifact.get("sha256"):
+        if artifact is not None and artifact.get("sha256"):
             # 层段 worker 不加载整模 ⇒ 只靠上面的整模分支时 `models` 会是空的，而 Route A
             # 的 offer 身份正是从这里取（`_route_a_stage_model_identity`）⇒ 缺了它整条链
             # 会以 `route_a_stage_model_identity_unavailable` 失败。用**工件身份**顶上：
             # `task_worker_adapter._layer_model_matches` 比对的就是 engine/format/sha256。
             # 整模身份优先（上面已填 `models` 时不覆盖）—— 两者冲突说明本机同时握着整模
             # 与工件，此时以整模为准是保守选择。
-            models.append({
+            artifact_model = {
                 "model_id": artifact["model_id"],
                 "engine": "llama_cpp",
                 "format": "gguf",
                 "revision": artifact["revision"],
                 "sha256": artifact["sha256"],
-            })
+            }
+            existing = next((
+                item for item in models
+                if item.get("model_id") == artifact_model["model_id"]
+            ), None)
+            if existing is None:
+                models.append(artifact_model)
+            elif existing != artifact_model:
+                raise RuntimeError("layer_artifact_model_identity_conflict")
         if layer_worker and "layer_forward" not in stage_types:
             stage_types.append("layer_forward")
-        return {
+        capabilities = {
             "stage_types": stage_types,
             "engines": engines,
             "models": models,
@@ -226,11 +299,26 @@ class SchedulerTaskWorkerMixin:
             # 当前**就绪、马上能跑**的层区间（与 `layer_budget` 的"承载上限"分工明确）。
             "layer_ranges": layer_ranges,
             "relay_middle": bool(
-                active_layer_config
+                layer_worker
+                and active_layer_config
                 and str(active_layer_config.get("engine", ""))
                 == "relay_middle"
             ),
         }
+        if artifact is not None and artifact.get("segment_mode") in {
+            "head", "middle", "tail",
+        }:
+            item = {
+                "layer_range": [artifact["start"], artifact["end"]],
+                "segment_mode": artifact["segment_mode"],
+                "model_id": artifact["model_id"],
+                "artifact_sha256": artifact["sha256"],
+            }
+            if artifact.get("source_model_sha256"):
+                item["source_model_sha256"] = artifact["source_model_sha256"]
+            capabilities["layer_artifacts"] = [item]
+            capabilities["segment_mode"] = artifact["segment_mode"]
+        return capabilities
 
     @staticmethod
     def _runtime_profile_for_capabilities() -> str:
@@ -501,11 +589,21 @@ class SchedulerTaskWorkerMixin:
         with self._task_worker_stage_lock:
             active = self._task_worker_active_attempts.get(attempt_id)
             if active is None:
-                raise WorkerProtocolError(
-                    "Stage cancellation has no active attempt",
-                    code="unknown_attempt",
-                    field="payload.attempt_id",
+                now = time.monotonic()
+                completed = getattr(
+                    self, "_task_worker_completed_attempts", {},
                 )
+                for completed_id, (_record, expires_at) in list(completed.items()):
+                    if expires_at <= now:
+                        completed.pop(completed_id, None)
+                tombstone = completed.get(attempt_id)
+                if tombstone is None:
+                    raise WorkerProtocolError(
+                        "Stage cancellation has no active attempt",
+                        code="unknown_attempt",
+                        field="payload.attempt_id",
+                    )
+                active = tombstone[0]
             if not self._task_worker_active_identity_matches(payload, active):
                 raise WorkerProtocolError(
                     "Stage cancellation identity does not match the active attempt",
@@ -813,6 +911,17 @@ class SchedulerTaskWorkerMixin:
                 )
                 if removed is not None:
                     removed.done_event.set()
+                    completed = getattr(
+                        self, "_task_worker_completed_attempts", None,
+                    )
+                    if completed is None:
+                        completed = {}
+                        self._task_worker_completed_attempts = completed
+                    now = time.monotonic()
+                    for completed_id, (_record, expires_at) in list(completed.items()):
+                        if expires_at <= now:
+                            completed.pop(completed_id, None)
+                    completed[attempt_id] = (removed, now + 5.0)
 
 
     def _handle_task_worker_message(self, client_id: str, msg: dict) -> None:

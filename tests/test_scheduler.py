@@ -185,6 +185,25 @@ class TestComputeLayerAssignment:
         assert result[0]["has_embedding"] is True
         assert result[0]["has_lm_head"] is True
 
+    def test_pipeline_node_metadata_uses_task_worker_engine(
+            self, sched, monkeypatch):
+        monkeypatch.setattr("scheduler.TASK_WORKER_EXPERIMENTAL_ENABLED", True)
+        sched._role_override = "master"
+        sched._task_worker_control.status = lambda role: {
+            "workers": [{
+                "node_id": "client1",
+                "capabilities": {
+                    "engines": ["pytorch", "llama_cpp"],
+                    "models": [{"engine": "llama_cpp"}],
+                },
+            }],
+        }
+
+        metadata = sched._pipeline_node_metadata()
+
+        assert metadata["master"]["engine"] == "pytorch"
+        assert metadata["client1"]["engine"] == "llama_cpp"
+
     def test_active_deepseek_layer_count_replaces_fixed_qwen_count(self, sched, monkeypatch):
         from model_host import model_host as _host
 
@@ -467,6 +486,44 @@ class TestComputeLayerAssignment:
 
         assert records[0]["layer_ranges"] == [[4, 16]]
 
+    def test_android_task_worker_artifacts_reach_capacity_solver(
+            self, sched, monkeypatch):
+        monkeypatch.setattr("scheduler.TASK_WORKER_EXPERIMENTAL_ENABLED", True)
+        sched._role_override = "master"
+        artifact = {
+            "layer_range": [4, 16],
+            "segment_mode": "middle",
+            "model_id": "middle4-16.gguf",
+            "artifact_sha256": "a" * 64,
+            "source_model_sha256": "b" * 64,
+        }
+        sched._task_worker_control.status = lambda role: {
+            "workers": [{
+                "node_id": "android-worker",
+                "healthy": True,
+                "layer_stage_dispatch_enabled": True,
+                "capabilities": {
+                    "layer_ranges": [[4, 16]],
+                    "layer_artifacts": [artifact],
+                },
+            }],
+        }
+        sched.nodes = {
+            "android-worker": NodeInfo(
+                node_id="android-worker", role=NodeRole.CLIENT,
+                state=NodeState.ONLINE, node_type="android",
+                device_info={
+                    "backend_id": "llama_cpp",
+                    "capabilities": [Capability.FORWARD_LAYERS],
+                    "memory": {"available_bytes": 3 * 1024 ** 3},
+                },
+            ),
+        }
+
+        records = sched._get_pipeline_capacity_nodes()
+
+        assert records[0]["layer_artifacts"] == [artifact]
+
     def test_android_task_worker_layer_budget_reaches_capacity_solver(self, sched, monkeypatch):
         """设备自荐的层容量必须随 `layer_ranges` 一起投影进求解器输入 ——
 
@@ -509,6 +566,65 @@ class TestComputeLayerAssignment:
         assert records[0]["layer_budget"]["max_layers"] == 12
         assert records[0]["layer_budget"]["local_cut"] is False
 
+    def test_manual_capacity_plan_enforces_exact_artifact_boundary_mode(
+            self, sched, monkeypatch):
+        descriptor = {
+            "model_id": "model", "model_type": "qwen2",
+            "model_sha256": "a" * 64, "total_layers": 4,
+            "layer_weight_bytes": [10, 10, 10, 10],
+            "component_weight_bytes": {
+                "embedding": 5, "final_norm": 2, "lm_head": 5,
+                "visual": 0, "mtp": 0, "multimodal": 0, "other": 0,
+            },
+        }
+        artifact = {
+            "layer_range": [2, 4], "segment_mode": "middle",
+            "model_id": "tail.gguf", "artifact_sha256": "b" * 64,
+            "source_model_sha256": "c" * 64,
+        }
+        records = [
+            {
+                "node_id": "master", "capacity_bytes": 10_000,
+                "reserve_bytes": 0, "runtime_multiplier": 1.0,
+                "execution_device": "cpu", "capacity_source": "test",
+            },
+            {
+                "node_id": "worker", "capacity_bytes": 10_000,
+                "reserve_bytes": 0, "runtime_multiplier": 1.0,
+                "execution_device": "cpu", "capacity_source": "test",
+                "layer_ranges": [[2, 4]], "layer_artifacts": [artifact],
+            },
+        ]
+        monkeypatch.setattr(
+            sched, "_get_pipeline_capacity_nodes", lambda _ids: records,
+        )
+        assignments = [
+            {
+                "node_id": "master", "role": "master",
+                "start_layer": 0, "end_layer": 2,
+                "has_embedding": True, "has_lm_head": False,
+            },
+            {
+                "node_id": "worker", "role": "client",
+                "start_layer": 2, "end_layer": 4,
+                "has_embedding": False, "has_lm_head": True,
+            },
+        ]
+
+        rejected = sched._build_manual_pipeline_capacity_plan(
+            assignments, descriptor=descriptor,
+        )
+        assert rejected["admitted"] is False
+        assert rejected["reason_code"] == "pipeline_segment_contract_unsatisfied"
+
+        artifact["segment_mode"] = "tail"
+        admitted = sched._build_manual_pipeline_capacity_plan(
+            assignments, descriptor=descriptor,
+        )
+        assert admitted["admitted"] is True
+        assert admitted["assignments"][1]["layer_artifact"] == artifact
+        assert admitted["pipeline_layout"]["nodes"][1]["engine"] == "llama_cpp"
+
     def test_route_a_stage_identity_comes_from_worker_artifact(self, sched):
         """Route A 的 offer 必须带 **worker 宣告的工件身份**（engine/format/sha256），
         而不是 master 自己那份模型的摘要 —— 层段在设备上执行、用的是设备的 GGUF，
@@ -537,6 +653,61 @@ class TestComputeLayerAssignment:
         assert identity.sha256.startswith("f6dab6b7")
         # 找不到该节点 / 没有可用的 models ⇒ None（调用方 fail-closed）
         assert sched._route_a_stage_model_identity("missing-node") is None
+
+    def test_route_a_stage_identity_matches_the_assigned_artifact(self, sched):
+        status = {
+            "workers": [{
+                "node_id": "android-worker",
+                "capabilities": {
+                    "models": [
+                        {
+                            "model_id": "middle.gguf", "engine": "llama_cpp",
+                            "format": "gguf", "revision": "local",
+                            "sha256": "a" * 64,
+                        },
+                        {
+                            "model_id": "tail.gguf", "engine": "llama_cpp",
+                            "format": "gguf", "revision": "local",
+                            "sha256": "b" * 64,
+                        },
+                    ],
+                    "layer_artifacts": [
+                        {
+                            "layer_range": [8, 20], "segment_mode": "middle",
+                            "model_id": "middle.gguf", "artifact_sha256": "a" * 64,
+                        },
+                        {
+                            "layer_range": [20, 24], "segment_mode": "tail",
+                            "model_id": "tail.gguf", "artifact_sha256": "b" * 64,
+                        },
+                    ],
+                },
+            }],
+        }
+        sched._task_worker_control.status = lambda role: status
+
+        assignment = {
+            "start_layer": 20,
+            "end_layer": 24,
+            "layer_artifact": {
+                "layer_range": [20, 24], "segment_mode": "tail",
+                "model_id": "tail.gguf", "artifact_sha256": "b" * 64,
+            },
+        }
+        identity = sched._route_a_stage_model_identity("android-worker", assignment)
+
+        assert identity is not None
+        assert identity.model_id == "tail.gguf"
+        assert identity.sha256 == "b" * 64
+
+        # A capability refresh must not silently substitute a different byte
+        # artifact under the already admitted plan identity.
+        status["workers"][0]["capabilities"]["layer_artifacts"][1][
+            "artifact_sha256"
+        ] = "c" * 64
+        assert sched._route_a_stage_model_identity(
+            "android-worker", assignment,
+        ) is None
 
     def test_capacity_prepare_acks_all_workers_before_commit(self, sched):
         sent = []
@@ -1843,6 +2014,7 @@ class TestPipelineReadiness:
                 "config_id": "cfg-old",
                 "generation": 7,
                 "phase": "ready",
+                "model_sha256": "a" * 64,
             } if key == "pipeline_config_lifecycle_v1" else default,
         )
         sched._tcp_server = type("Server", (), {"_running": True})()
@@ -1875,6 +2047,138 @@ class TestPipelineReadiness:
         sched._maybe_finish_pipeline_recovery()
         assert sched._pipeline_recovery_pending is False
 
+    def test_restart_recovery_restores_persisted_model_before_republish(
+            self, sched, monkeypatch, tmp_path):
+        import model_config
+        from types import SimpleNamespace
+
+        model_dir = tmp_path / "qwen2.5-0.5b-instruct"
+        model_dir.mkdir()
+        sched._pipeline_recovery_pending = True
+        sched._pipeline_recovery_state = {
+            "model_id": "qwen2.5-0.5b-instruct",
+            "model_type": "qwen2",
+            "model_sha256": "a" * 64,
+            "quant_type": "fp16",
+        }
+        prepared = []
+        sched._host = SimpleNamespace(
+            prepare_pipeline_model=lambda **kwargs: prepared.append(kwargs) or {
+                "model_type": "qwen2", "total_layers": 24,
+                "model_sha256": "a" * 64,
+            },
+        )
+        monkeypatch.setattr(sched, "_get_active_pipeline_model_info", lambda: {})
+        monkeypatch.setattr(
+            model_config, "get_model_config", lambda _model_id, _db_models=None: None,
+        )
+        monkeypatch.setattr(
+            model_config,
+            "get_builtin_models",
+            lambda: [SimpleNamespace(
+                model_id="qwen2.5-0.5b",
+                model_path=str(model_dir),
+            )],
+        )
+        monkeypatch.setattr(model_config, "resolve_model_path", lambda value: value)
+
+        assert sched._restore_pipeline_model_for_recovery() is True
+        assert prepared == [{
+            "model_id": "qwen2.5-0.5b-instruct",
+            "model_path": str(model_dir),
+            "quant_type": "fp16",
+            "model_sha256": None,
+        }]
+
+    def test_restart_recovery_rejects_changed_local_model_digest(
+            self, sched, monkeypatch, tmp_path):
+        import model_config
+        from types import SimpleNamespace
+
+        model_dir = tmp_path / "model-a"
+        model_dir.mkdir()
+        sched._pipeline_recovery_pending = True
+        sched._pipeline_recovery_state = {
+            "model_id": "model-a", "model_type": "qwen2",
+            "model_sha256": "a" * 64, "quant_type": "fp16",
+        }
+        unloaded = []
+        sched._host = SimpleNamespace(
+            prepare_pipeline_model=lambda **_kwargs: {
+                "model_type": "qwen2", "total_layers": 24,
+                "model_sha256": "b" * 64,
+            },
+            unload_model=lambda: unloaded.append(True),
+        )
+        monkeypatch.setattr(sched, "_get_active_pipeline_model_info", lambda: {})
+        monkeypatch.setattr(
+            model_config, "get_model_config", lambda _model_id, _db_models=None: None,
+        )
+        monkeypatch.setattr(
+            model_config, "get_builtin_models",
+            lambda: [SimpleNamespace(model_id="model-a", model_path=str(model_dir))],
+        )
+        monkeypatch.setattr(model_config, "resolve_model_path", lambda value: value)
+
+        assert sched._restore_pipeline_model_for_recovery() is False
+        assert sched._pipeline_recovery_failure == "pipeline_recovery_model_digest_mismatch"
+        assert unloaded == [True]
+
+    def test_restart_recovery_resolves_db_registered_gguf(
+            self, sched, monkeypatch, tmp_path):
+        import local_store
+        import model_config
+        from types import SimpleNamespace
+
+        gguf_path = tmp_path / "custom.gguf"
+        gguf_path.write_bytes(b"gguf-probe")
+        sched._pipeline_recovery_pending = True
+        sched._pipeline_recovery_state = {
+            "model_id": "custom-gguf", "model_type": "qwen2",
+            "model_sha256": "c" * 64, "quant_type": "Q4_K_M",
+        }
+        prepared = []
+        sched._host = SimpleNamespace(
+            prepare_pipeline_model=lambda **kwargs: prepared.append(kwargs) or {
+                "model_type": "qwen2", "total_layers": 24,
+                "model_sha256": "c" * 64,
+            },
+        )
+        db_models = [{
+            "model_id": "custom-gguf", "model_type": "gguf",
+            "model_path": "", "gguf_path": str(gguf_path),
+        }]
+        monkeypatch.setattr(local_store, "get_local_experimental_models", lambda: db_models)
+        monkeypatch.setattr(
+            model_config, "get_model_config",
+            lambda model_id, values=None: SimpleNamespace(**values[0])
+            if model_id == "custom-gguf" and values else None,
+        )
+        monkeypatch.setattr(model_config, "get_builtin_models", lambda: [])
+        monkeypatch.setattr(model_config, "resolve_model_path", lambda value: value)
+        monkeypatch.setattr(sched, "_get_active_pipeline_model_info", lambda: {})
+
+        assert sched._restore_pipeline_model_for_recovery() is True
+        assert prepared == [{
+            "model_id": "custom-gguf",
+            "model_path": str(gguf_path),
+            "quant_type": "Q4_K_M",
+            "model_sha256": None,
+        }]
+
+    def test_restart_recovery_rejects_different_default_model(self, sched):
+        sched._pipeline_recovery_pending = True
+        sched._pipeline_recovery_state = {
+            "model_id": "qwen2.5-0.5b-instruct",
+            "model_type": "qwen2",
+        }
+
+        assert sched._recovery_model_matches({
+            "model_id": "qwen3-5-2b",
+            "model_type": "qwen3_5",
+        }) is False
+        assert sched._pipeline_recovery_failure == "pipeline_recovery_model_mismatch"
+
     def test_pipeline_lifecycle_snapshot_is_bounded_and_json_safe(
             self, sched):
         """持久化记录不能携带 set、模型路径或执行器对象。"""
@@ -1901,6 +2205,7 @@ class TestPipelineReadiness:
 
         snapshot = sched._pipeline_lifecycle_snapshot_locked()
 
+        assert snapshot["schema_version"] == 2
         assert snapshot["worker_ids"] == ["worker-a", "worker-b"]
         assert snapshot["prepared_nodes"] == ["worker-a"]
         assert snapshot["assignments"] == [{
@@ -1910,6 +2215,27 @@ class TestPipelineReadiness:
             "execution": "legacy_layer_config",
         }]
         assert "model_path" not in snapshot
+
+    def test_schema_v1_recovery_without_model_digest_fails_closed(
+            self, sched, monkeypatch):
+        import local_store
+
+        monkeypatch.setattr(
+            local_store, "get_local_setting",
+            lambda _key, _default=None: {
+                "schema_version": 1,
+                "config_id": "cfg-old",
+                "generation": 7,
+                "phase": "ready",
+                "model_id": "ambiguous-model",
+            },
+        )
+
+        sched._load_pipeline_recovery_state()
+
+        assert sched._pipeline_recovery_pending is True
+        assert sched._pipeline_recovery_failure == "pipeline_recovery_state_invalid"
+        assert sched._pipeline_lifecycle_persist_ok is False
 
     def test_restart_recovery_fence_requires_durable_ready_state(
             self, sched, monkeypatch):
@@ -2117,6 +2443,11 @@ class TestPipelineReadiness:
             "model_type": "qwen",
             "total_layers": 24,
         })
+        # This test covers the legacy one-phase ACK path. Do not inherit a
+        # prepared-model flag left by another test in the process-wide host.
+        monkeypatch.setattr(
+            sched, "_host", type("Host", (), {"is_pipeline_prepared": False})(),
+        )
 
         sched.push_layer_config_to_clients()
 
@@ -5045,6 +5376,9 @@ class TestChainTopology:
             "total_layers": 24,
             "quant_type": "int4",
         })
+        monkeypatch.setattr(
+            sched, "_host", type("Host", (), {"is_pipeline_prepared": False})(),
+        )
 
         assert sched.request_authoritative_layer_sync() is True
 
@@ -5107,6 +5441,9 @@ class TestChainTopology:
         pushed = []
         monkeypatch.setattr(
             sched, "push_layer_config_to_clients", lambda: pushed.append(True),
+        )
+        monkeypatch.setattr(
+            sched, "_host", type("Host", (), {"is_pipeline_prepared": False})(),
         )
 
         sched._handle_layer_worker_opt_in("client1", {"data": {

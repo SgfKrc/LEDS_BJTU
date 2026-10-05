@@ -158,6 +158,9 @@ class LlamaCppEngine:
         self._n_ctx: int = 4096      # 上下文窗口大小
         self._n_threads: int = 4     # CPU 线程数
         self._loaded: bool = False
+        self._pipeline_descriptor: Dict[str, Any] | None = None
+        self._pipeline_sha_cache: Dict[str, Any] = {}
+        self._pipeline_distributed_only: bool = False
         # RAG embedding is opt-in. A normal text-generation load is never
         # silently reused as an embedding model.
         self._embedding_enabled: bool = False
@@ -298,8 +301,9 @@ class LlamaCppEngine:
         也有 `forward_layers_to_hidden` / `forward_layers_from_hidden`）。去 torch 化的
         边缘设备只得一份裁层 GGUF，正是靠这个描述器才当得上流水线主节点。
 
-        `model_type` 取自 GGUF 的 `general.architecture`，与 `PIPELINE_RUNTIME_MODEL_TYPES`
-        同源判定 —— 判据只有一处，不在这里另立白名单。
+        `model_type` 取自 GGUF 的 `general.architecture`，先在共享描述器边界归一化
+        llama.cpp 架构别名，再与 `PIPELINE_RUNTIME_MODEL_TYPES` 同源判定 —— 判据只有
+        一处，不在这里另立白名单。
         """
         cached = getattr(self, "_pipeline_descriptor", None)
         if isinstance(cached, dict) and cached:
@@ -317,9 +321,12 @@ class LlamaCppEngine:
         info = read_gguf_layer_info(path)
         if not info:
             return {}
-        from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
+        from pipeline_model_descriptor import (
+            PIPELINE_RUNTIME_MODEL_TYPES,
+            canonical_pipeline_model_type,
+        )
 
-        model_type = str(info.get("architecture", "") or "").lower()
+        model_type = canonical_pipeline_model_type(info.get("architecture", ""))
         if model_type not in PIPELINE_RUNTIME_MODEL_TYPES:
             return {}
         total_layers = int(info.get("n_layer", 0) or 0)
@@ -377,6 +384,62 @@ class LlamaCppEngine:
         }
         self._pipeline_descriptor = dict(descriptor)
         return dict(descriptor)
+
+    def prepare_pipeline_model(
+        self,
+        model_id: str,
+        model_path: str,
+        quant_type: str = None,
+        layer_range: tuple[int, int] | None = None,
+        model_sha256: str | None = None,
+    ) -> dict:
+        """Prepare GGUF pipeline metadata without constructing llama.cpp."""
+        resolved_path = os.path.abspath(model_path or "")
+        if not resolved_path or not os.path.isfile(resolved_path):
+            raise FileNotFoundError(f"GGUF 模型文件未找到: {resolved_path or '(未提供路径)'}")
+        if layer_range is not None:
+            raise ValueError("GGUF 整模恢复不接受 layer_range；裁层范围由工件 manifest 声明")
+        if self.is_loaded or self._mtmd_context is not None:
+            self.unload()
+        self._model_path = resolved_path
+        self.active_model_id = str(model_id or "")
+        self._quant_type = str(quant_type or "GGUF")
+        self._pipeline_descriptor = None
+        self._pipeline_sha_cache = {}
+        descriptor = self.get_pipeline_descriptor()
+        if not descriptor.get("pipeline_runtime_supported", False):
+            raise RuntimeError("GGUF 工件缺少可执行的流水线描述元数据")
+        actual_sha256 = str(descriptor.get("model_sha256", "") or "").lower()
+        expected_sha256 = str(model_sha256 or "").lower()
+        if expected_sha256 and actual_sha256 != expected_sha256:
+            self.unload()
+            raise RuntimeError("GGUF 流水线模型摘要与恢复记录不一致")
+        self._pipeline_descriptor = dict(descriptor)
+        self._pipeline_distributed_only = True
+        return dict(descriptor)
+
+    @property
+    def is_pipeline_prepared(self) -> bool:
+        return bool(self._pipeline_distributed_only and self._pipeline_descriptor)
+
+    def abort_pipeline_materialization(self) -> None:
+        """Release an aborted GGUF segment but keep whole-model metadata."""
+        descriptor = dict(self._pipeline_descriptor or {})
+        if not self._pipeline_distributed_only or not descriptor:
+            return
+        full_model_path = str(descriptor.get("model_path", "") or "")
+        model_id = str(descriptor.get("model_id", "") or "")
+        quant_type = str(descriptor.get("quant_type", "") or self._quant_type)
+        for key in (
+            "assignment_layer_range", "partial_assignment", "loaded_artifact",
+        ):
+            descriptor.pop(key, None)
+        self.unload()
+        self._model_path = full_model_path
+        self.active_model_id = model_id
+        self._quant_type = quant_type
+        self._pipeline_descriptor = descriptor
+        self._pipeline_distributed_only = True
 
     def _find_layer_artifact(self, start: int, end: int) -> str:
         """按 `[start, end)` 在工件目录里找裁层 GGUF —— **靠 manifest 自证，不猜文件名**。
@@ -443,6 +506,7 @@ class LlamaCppEngine:
         # 主节点会被判「模型已变化，请等待层配置重新同步」——实测卡在这里。
         # 所以：先留下整模描述器，加载段之后再装回去，只补层段标记。
         whole = dict(getattr(self, "_pipeline_descriptor", None) or {})
+        was_pipeline_prepared = self.is_pipeline_prepared
         self.load_model(path)
         # A stage worker may be created directly and load its first artifact
         # without ever having cached a full-model descriptor.  The artifact
@@ -453,6 +517,7 @@ class LlamaCppEngine:
         whole["partial_assignment"] = True
         whole["loaded_artifact"] = path
         self._pipeline_descriptor = whole
+        self._pipeline_distributed_only = was_pipeline_prepared
         logger.info(
             "llama.cpp 层段已加载: [%d,%d) embed=%s lm_head=%s -> %s",
             int(start_layer), int(end_layer), has_embedding, has_lm_head, path,
@@ -551,6 +616,7 @@ class LlamaCppEngine:
 
         if self.is_loaded or self._mtmd_context is not None:
             self.unload()
+        self._pipeline_distributed_only = False
         self._model_path = model_path
         # 换模型即失效：描述器与文件摘要都跟着 `_model_path` 走。不重置会拿旧模型的
         # 层数/摘要去推层配置（`get_pipeline_descriptor` 缓存的就是它们）。
@@ -999,6 +1065,10 @@ class LlamaCppEngine:
         self._thinking_enabled = None
         self._thinking_controlled = False
         self._chat_template_kwargs = {}
+        self._pipeline_descriptor = None
+        self._pipeline_sha_cache = {}
+        self._pipeline_distributed_only = False
+        self._model_path = ""
         logger.info("GGUF 模型已卸载")
 
     @property

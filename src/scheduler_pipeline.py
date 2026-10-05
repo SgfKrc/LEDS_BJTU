@@ -41,6 +41,7 @@ RELAY_HIDDEN_WIRE_FORMAT = "qlh.relay_hidden.f32.v1"
 _WORKER_HEARTBEAT_MAX_AGE = WORKER_HEARTBEAT_MAX_AGE
 
 _PIPELINE_LIFECYCLE_STATE_KEY = "pipeline_config_lifecycle_v1"
+_PIPELINE_LIFECYCLE_SCHEMA_VERSION = 2
 _PIPELINE_RECOVERY_PHASES = frozenset({
     "preparing", "committing_local", "committing", "ready",
 })
@@ -243,12 +244,14 @@ class SchedulerPipelineMixin:
                 if key in item
             })
         return {
-            "schema_version": 1,
+            "schema_version": _PIPELINE_LIFECYCLE_SCHEMA_VERSION,
             "config_id": str(transaction.get("config_id", "") or ""),
             "generation": int(transaction.get("generation", 0) or 0),
             "phase": str(transaction.get("phase", "") or ""),
             "model_id": str(plan.get("model_id", "") or ""),
             "model_type": str(plan.get("model_type", "") or ""),
+            "model_sha256": str(plan.get("model_sha256", "") or ""),
+            "quant_type": str(plan.get("quant_type", "") or ""),
             "plan_id": str(plan.get("plan_id", "") or ""),
             "worker_ids": sorted(
                 str(value) for value in transaction.get("worker_ids", set())
@@ -312,7 +315,7 @@ class SchedulerPipelineMixin:
             schema_version = int(raw.get("schema_version", 0) or 0)
         except (AttributeError, TypeError, ValueError):
             schema_version = 0
-        if not isinstance(raw, dict) or schema_version != 1:
+        if not isinstance(raw, dict) or schema_version not in {1, 2}:
             self._pipeline_lifecycle_persist_ok = False
             self._pipeline_recovery_pending = True
             self._pipeline_recovery_failure = "pipeline_recovery_state_invalid"
@@ -320,6 +323,22 @@ class SchedulerPipelineMixin:
         self._pipeline_recovery_state = dict(raw)
         phase = str(raw.get("phase", "") or "")
         if phase in _PIPELINE_RECOVERY_PHASES:
+            persisted_sha256 = str(raw.get("model_sha256", "") or "").lower()
+            if (
+                len(persisted_sha256) != 64
+                or any(char not in "0123456789abcdef" for char in persisted_sha256)
+            ):
+                # Schema v1 did not require artifact identity.  Guessing
+                # between a directory and a GGUF that share one model_id can
+                # silently restore different bytes, so old incomplete state
+                # is fenced for an explicit model reload instead.
+                self._pipeline_lifecycle_persist_ok = False
+                self._pipeline_recovery_pending = True
+                self._pipeline_recovery_failure = "pipeline_recovery_state_invalid"
+                logger.error(
+                    "pipeline recovery state lacks an authoritative model digest"
+                )
+                return
             self._pipeline_recovery_pending = True
             self._pipeline_recovery_failure = "pipeline_recovery_pending"
             logger.warning(
@@ -328,9 +347,176 @@ class SchedulerPipelineMixin:
                 raw.get("config_id", ""), raw.get("generation", ""), phase,
             )
 
+    def _restore_pipeline_model_for_recovery(self) -> bool:
+        """Restore distributed-only model metadata before workers reconnect.
+
+        The lifecycle record intentionally contains no absolute path. Resolve
+        the persisted model identity through the local model registry (also
+        accepting the historical directory-name identity), then prepare only
+        metadata. No full model is materialized here.
+        """
+        if not self._pipeline_recovery_pending:
+            return True
+        state = self._pipeline_recovery_state
+        if not isinstance(state, dict):
+            return False
+        model_id = str(state.get("model_id", "") or "").strip()
+        if not model_id:
+            self._pipeline_recovery_failure = "pipeline_recovery_model_identity_missing"
+            return False
+        if self._get_active_pipeline_model_info():
+            return True
+
+        model_paths: list[str] = []
+        try:
+            from model_config import (
+                get_builtin_models,
+                get_model_config,
+                resolve_model_path,
+            )
+            from local_store import get_local_experimental_models
+
+            try:
+                db_models = get_local_experimental_models()
+            except Exception:
+                db_models = []
+                logger.warning(
+                    "failed to read local model registry during pipeline recovery",
+                    exc_info=True,
+                )
+            configured = get_model_config(model_id, db_models)
+            candidates = [configured] if configured is not None else []
+            candidates.extend(
+                item for item in get_builtin_models()
+                if item is not configured
+            )
+            for candidate in candidates:
+                resolved_paths = [
+                    resolve_model_path(str(getattr(candidate, key, "") or ""))
+                    for key in ("model_path", "gguf_path")
+                ]
+                candidate_matches = (
+                    str(getattr(candidate, "model_id", "") or "") == model_id
+                    or any(
+                        path and (
+                            os.path.basename(os.path.normpath(path)) == model_id
+                            or os.path.splitext(os.path.basename(path))[0] == model_id
+                        )
+                        for path in resolved_paths
+                    )
+                )
+                if not candidate_matches:
+                    continue
+                for resolved in resolved_paths:
+                    if resolved and (os.path.isdir(resolved) or os.path.isfile(resolved)):
+                        normalized = os.path.abspath(resolved)
+                        if normalized not in model_paths:
+                            model_paths.append(normalized)
+        except Exception:
+            logger.warning(
+                "failed to resolve persisted pipeline model: model=%s",
+                model_id,
+                exc_info=True,
+            )
+
+        prepare = getattr(self._host, "prepare_pipeline_model", None)
+        if not model_paths or not callable(prepare):
+            self._pipeline_recovery_failure = "pipeline_recovery_model_unavailable"
+            logger.error(
+                "pipeline recovery model unavailable: model=%s paths=%s",
+                model_id, model_paths or "unresolved",
+            )
+            return False
+        expected_sha256 = str(state.get("model_sha256", "") or "").lower()
+        descriptor = None
+        selected_path = ""
+        restore_errors: list[tuple[str, str]] = []
+        for model_path in model_paths:
+            try:
+                candidate_descriptor = prepare(
+                    model_id=model_id,
+                    model_path=model_path,
+                    quant_type=(str(state.get("quant_type", "") or "") or None),
+                    # The persisted digest is an expectation, not evidence about
+                    # the bytes present after this restart. Recompute locally.
+                    model_sha256=None,
+                )
+                actual_sha256 = str(
+                    candidate_descriptor.get("model_sha256", "")
+                    if isinstance(candidate_descriptor, dict) else ""
+                ).lower()
+                if expected_sha256 and actual_sha256 != expected_sha256:
+                    restore_errors.append((model_path, "digest_mismatch"))
+                    continue
+                descriptor = candidate_descriptor
+                selected_path = model_path
+                break
+            except Exception as exc:
+                restore_errors.append((model_path, type(exc).__name__))
+                logger.warning(
+                    "pipeline recovery model candidate rejected: model=%s path=%s",
+                    model_id, model_path, exc_info=True,
+                )
+        if descriptor is None:
+            unload = getattr(self._host, "unload_model", None)
+            if callable(unload):
+                try:
+                    unload()
+                except Exception:
+                    logger.warning(
+                        "failed to clear mismatched recovery model metadata",
+                        exc_info=True,
+                    )
+            only_digest_mismatch = bool(restore_errors) and all(
+                reason == "digest_mismatch" for _path, reason in restore_errors
+            )
+            self._pipeline_recovery_failure = (
+                "pipeline_recovery_model_digest_mismatch"
+                if only_digest_mismatch else "pipeline_recovery_model_restore_failed"
+            )
+            logger.error(
+                "pipeline recovery model restore exhausted: model=%s expected=%s errors=%s",
+                model_id, expected_sha256 or "unspecified", restore_errors,
+            )
+            return False
+        logger.info(
+            "pipeline recovery model metadata restored: model=%s path=%s type=%s layers=%s",
+            model_id,
+            selected_path,
+            descriptor.get("model_type", "") if isinstance(descriptor, dict) else "",
+            descriptor.get("total_layers", "") if isinstance(descriptor, dict) else "",
+        )
+        return True
+
     def _clear_pipeline_recovery_fence(self) -> None:
         self._pipeline_recovery_pending = False
         self._pipeline_recovery_failure = ""
+
+    def _recovery_model_matches(self, model_info: dict) -> bool:
+        """Fence a fresh generation to the model persisted before restart."""
+        if not self._pipeline_recovery_pending:
+            return True
+        persisted = self._pipeline_recovery_state
+        if not isinstance(persisted, dict):
+            return True
+        expected_id = str(persisted.get("model_id", "") or "")
+        expected_type = str(persisted.get("model_type", "") or "").lower()
+        expected_sha256 = str(persisted.get("model_sha256", "") or "").lower()
+        actual_id = str(model_info.get("model_id", "") or "")
+        actual_type = str(model_info.get("model_type", "") or "").lower()
+        actual_sha256 = str(model_info.get("model_sha256", "") or "").lower()
+        if (
+            (expected_id and actual_id != expected_id)
+            or (expected_type and actual_type != expected_type)
+            or (expected_sha256 and actual_sha256 != expected_sha256)
+        ):
+            self._pipeline_recovery_failure = "pipeline_recovery_model_mismatch"
+            logger.error(
+                "pipeline recovery model mismatch: expected=%s/%s actual=%s/%s",
+                expected_id, expected_type, actual_id, actual_type,
+            )
+            return False
+        return True
 
     def _maybe_finish_pipeline_recovery(self) -> None:
         """Release the restart fence only after the fresh generation is ready."""
@@ -646,6 +832,8 @@ class SchedulerPipelineMixin:
         master_sha256 = model_info.get("model_sha256", "")
         model_id = model_info.get("model_id", "")
         model_type = model_info.get("model_type", "")
+        if model_info and not self._recovery_model_matches(model_info):
+            return
         # ★ #31 M2：走**单一事实来源**（此前这里硬编码 `{"qwen","qwen2"}`
         #   ⇒ hybrid 会被静默拦掉，master **不推层配置**）
         if (not master_sha256 or not model_id
@@ -712,6 +900,11 @@ class SchedulerPipelineMixin:
                 capacity_plan = self.get_pipeline_capacity_plan(
                     eligible_node_ids,
                     require_distributed=require_distributed,
+                )
+            if isinstance(capacity_plan, dict):
+                capacity_plan = dict(capacity_plan)
+                capacity_plan["quant_type"] = str(
+                    model_info.get("quant_type", "") or ""
                 )
             if not capacity_plan.get("admitted"):
                 releases = {
@@ -934,15 +1127,60 @@ class SchedulerPipelineMixin:
                 return False, "layer_stage_dispatch_not_admitted"
             raw_caps = snapshot.get("capabilities", {})
             ranges = raw_caps.get("layer_ranges", []) if isinstance(raw_caps, dict) else []
+            artifacts = (
+                raw_caps.get("layer_artifacts", [])
+                if isinstance(raw_caps, dict) else []
+            )
+            layer_budget = (
+                raw_caps.get("layer_budget", {})
+                if isinstance(raw_caps, dict) else {}
+            )
             requested = (
                 int(assignment.get("start_layer", -1)),
                 int(assignment.get("end_layer", -1)),
             )
-            if ranges:
+            if artifacts:
+                planned_artifact = assignment.get("layer_artifact")
+                expected_artifact = (
+                    planned_artifact
+                    if isinstance(planned_artifact, dict) else None
+                )
+
+                def artifact_matches(item):
+                    if not (
+                        isinstance(item, dict)
+                        and isinstance(item.get("layer_range"), (list, tuple))
+                        and len(item["layer_range"]) == 2
+                        and tuple(int(value) for value in item["layer_range"]) == requested
+                    ):
+                        return False
+                    if expected_artifact is None:
+                        return True
+                    return all(
+                        str(item.get(key, "") or "") == str(
+                            expected_artifact.get(key, "") or ""
+                        )
+                        for key in (
+                            "segment_mode", "model_id", "artifact_sha256",
+                            "source_model_sha256",
+                        )
+                    )
+
+                matches = any(
+                    artifact_matches(item)
+                    for item in artifacts
+                )
+                if not matches:
+                    return False, "layer_artifact_contract_changed"
+            elif isinstance(assignment.get("layer_artifact"), dict):
+                return False, "layer_artifact_contract_changed"
+            elif ranges and not (
+                isinstance(layer_budget, dict) and layer_budget.get("local_cut") is True
+            ):
                 matches = any(
                     isinstance(item, (list, tuple)) and len(item) == 2
-                    and int(item[0]) <= requested[0]
-                    and int(item[1]) >= requested[1]
+                    and int(item[0]) == requested[0]
+                    and int(item[1]) == requested[1]
                     for item in ranges
                 )
                 if not matches:
@@ -956,7 +1194,9 @@ class SchedulerPipelineMixin:
             return False, type(exc).__name__
 
 
-    def _route_a_stage_model_identity(self, node_id: str):
+    def _route_a_stage_model_identity(
+        self, node_id: str, assignment: dict | None = None,
+    ):
         """Return the physical artifact identity a Route-A stage worker advertised.
 
         Route A 的层段在**设备**上执行，用的是设备手上那份 GGUF 工件 ⇒ offer 必须
@@ -984,7 +1224,58 @@ class SchedulerPipelineMixin:
             )
             if not isinstance(models, list) or not models:
                 return None
-            model = models[0]
+            expected_model_id = ""
+            expected_sha256 = ""
+            artifacts = capabilities.get("layer_artifacts", [])
+            planned_artifact = (
+                assignment.get("layer_artifact")
+                if isinstance(assignment, dict) else None
+            )
+            if isinstance(planned_artifact, dict):
+                expected_model_id = str(planned_artifact.get("model_id", "") or "")
+                expected_sha256 = str(
+                    planned_artifact.get("artifact_sha256", "") or ""
+                )
+                current_artifact = next((
+                    item for item in artifacts
+                    if isinstance(item, dict)
+                    and item.get("layer_range") == planned_artifact.get("layer_range")
+                    and all(
+                        str(item.get(key, "") or "") == str(
+                            planned_artifact.get(key, "") or ""
+                        )
+                        for key in (
+                            "segment_mode", "model_id", "artifact_sha256",
+                            "source_model_sha256",
+                        )
+                    )
+                ), None) if isinstance(artifacts, list) else None
+                if current_artifact is None:
+                    return None
+            elif assignment is not None and isinstance(artifacts, list) and artifacts:
+                requested = (
+                    int(assignment.get("start_layer", -1)),
+                    int(assignment.get("end_layer", -1)),
+                )
+                artifact = next((
+                    item for item in artifacts
+                    if isinstance(item, dict)
+                    and isinstance(item.get("layer_range"), (list, tuple))
+                    and len(item["layer_range"]) == 2
+                    and tuple(int(value) for value in item["layer_range"]) == requested
+                ), None)
+                if artifact is None:
+                    return None
+                expected_model_id = str(artifact.get("model_id", "") or "")
+                expected_sha256 = str(
+                    artifact.get("artifact_sha256", "") or ""
+                )
+            model = next((
+                item for item in models
+                if isinstance(item, dict)
+                and (not expected_model_id or item.get("model_id") == expected_model_id)
+                and (not expected_sha256 or item.get("sha256") == expected_sha256)
+            ), None)
             if not isinstance(model, dict):
                 return None
             try:
@@ -4201,7 +4492,7 @@ class SchedulerPipelineMixin:
 
     def _connected_client_ids(self) -> set[str]:
         """Return node ids of the TCP clients currently connected to this master."""
-        server = self._tcp_server
+        server = getattr(self, "_tcp_server", None)
         if not server or not getattr(server, "_running", False):
             return set()
         get_client_ids = getattr(server, "get_client_ids", None)
@@ -4313,6 +4604,14 @@ class SchedulerPipelineMixin:
             "worker_offline",
             "worker_tcp_disconnected",
             "worker_heartbeat_stale",
+            "pipeline_lifecycle_persist_failed",
+            "pipeline_recovery_state_unavailable",
+            "pipeline_recovery_state_invalid",
+            "pipeline_recovery_model_identity_missing",
+            "pipeline_recovery_model_unavailable",
+            "pipeline_recovery_model_restore_failed",
+            "pipeline_recovery_model_mismatch",
+            "pipeline_recovery_model_digest_mismatch",
         }
         reason_code = str(readiness.get("reason_code", "") or "")
         if reason_code in unrecoverable:
@@ -5174,7 +5473,7 @@ class SchedulerPipelineMixin:
                     #   身份**：engine/format/sha256 必须与 worker 宣告的一致，否则
                     #   `_layer_model_matches` 会以 `model_identity_mismatch` 拒绝。
                     stage_model_identity = self._route_a_stage_model_identity(
-                        assignment["node_id"]
+                        assignment["node_id"], assignment,
                     )
                     if stage_model_identity is None:
                         return {
@@ -5258,6 +5557,19 @@ class SchedulerPipelineMixin:
                     "mode": "prefill" if is_prefill else "decode",
                 })
         except Exception as exc:
+            if (
+                getattr(exc, "code", "") == "provider_cancelled"
+                or (_cancel_event is not None and _cancel_event.is_set())
+            ):
+                logger.info(
+                    "event=route_a_stage_pipeline_cancelled task_id=%s",
+                    task_id,
+                )
+                return {
+                    "response": "",
+                    "error": "pipeline generation was cancelled",
+                    "cancelled": True,
+                }
             logger.error("Route-A stage pipeline failed", exc_info=True)
             return {"response": "", "error": f"route_a_stage_execution_failed: {exc}"}
         finally:
