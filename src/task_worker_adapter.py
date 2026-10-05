@@ -988,7 +988,10 @@ class RemoteFullWorkerProvider:
                 provider_id=self.provider_id,
             )
         except ProviderExecutionError as exc:
-            if exc.code == "remote_accept_timeout":
+            # ★ 2026-10-05（DIST-3「取消」场景，已知问题 #47）：本地取消必须
+            #   **向对端传播** `stage_cancel`。本类 `cancel()` 里早就有构造与发送
+            #   逻辑，但此前只在 `remote_accept_timeout` 这一条路径调用过。
+            if exc.code in ("remote_accept_timeout", "provider_cancelled"):
                 self.cancel(attempt.attempt_id)
             raise
         if not pending.accepted:
@@ -997,14 +1000,22 @@ class RemoteFullWorkerProvider:
                 code="remote_stage_not_accepted",
                 provider_id=self.provider_id,
             )
-        self._wait(
-            pending.result_event,
-            pending,
-            cancel_event,
-            lambda: pending.lease_expires_at,
-            timeout_code="lease_expired",
-            provider_id=self.provider_id,
-        )
+        try:
+            self._wait(
+                pending.result_event,
+                pending,
+                cancel_event,
+                lambda: pending.lease_expires_at,
+                timeout_code="lease_expired",
+                provider_id=self.provider_id,
+            )
+        except ProviderExecutionError as exc:
+            # ★ 2026-10-05（同上）：等结果阶段被取消（`provider_cancelled`）或租约
+            #   过期时，同样要让对端停手 —— 否则 worker 白跑完整个 Stage，回传结果
+            #   时本端已无对应 pending（`reason=unknown_attempt`）。
+            if exc.code in ("provider_cancelled", "lease_expired"):
+                self.cancel(attempt.attempt_id)
+            raise
         if pending.result is None:
             raise ProviderExecutionError(
                 "remote worker returned no Stage result",

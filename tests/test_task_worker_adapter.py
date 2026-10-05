@@ -1062,6 +1062,68 @@ def test_remote_provider_disconnect_unblocks_pending_attempt():
     assert provider.inspect().active_reservations == 0
 
 
+def test_cancel_event_propagates_stage_cancel_to_worker():
+    """★ #47（2026-10-05 三机实测）：本地取消必须**向 worker 传播** `stage_cancel`。
+
+    此前等结果阶段的 `_wait` 在 `cancel_event` 置位时直接抛 `provider_cancelled`，
+    **从不调用 `cancel()`**（本类里早已实现构造与发送 `stage_cancel` 的逻辑，却只在
+    `remote_accept_timeout` 那条路径被调过）⇒ worker 白跑完整个 Stage，回传结果时
+    本端已无对应 pending（实测 `event=task_worker_message_rejected
+    reason=unknown_attempt`）。
+    """
+    coordinator_control, _worker_control = _admitted_control_plane()
+    sent = []
+    provider = RemoteFullWorkerProvider(
+        node_id="worker_01",
+        peer_snapshot=lambda: coordinator_control.worker_snapshot("worker_01"),
+        send_message=sent.append,
+    )
+    request = _remote_request(provider.provider_id)
+    reservation = provider.reserve(request)
+    attempt = StageAttempt(
+        attempt_id="att_cancel01",
+        request=request,
+        provider_id=provider.provider_id,
+        lease_id="lease_cancel01",
+        lease_epoch=1,
+        lease_expires_at=time.time() + 30,
+    )
+    cancel_event = threading.Event()
+    outcome = {}
+    finished = threading.Event()
+
+    def execute():
+        try:
+            provider.execute(attempt, reservation, cancel_event)
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            finished.set()
+
+    threading.Thread(target=execute, daemon=True).start()
+    # 等 stage_offer 发出（说明 attempt 已登记在 `_pending`）。
+    assert _wait_until(lambda: bool(sent))
+    before = len(sent)
+
+    cancel_event.set()
+
+    assert finished.wait(3)
+    assert outcome["error"].code == "provider_cancelled"
+    # 关键断言：取消之后对端**应当收到** `stage_cancel`。
+    assert _wait_until(
+        lambda: any(
+            "stage_cancel" in _message_text(item) for item in sent[before:]
+        )
+    ), f"取消后未向 worker 发送 stage_cancel，实际发送: {sent[before:]}"
+
+
+def _message_text(raw) -> str:
+    """把 provider 发出的原始消息解成可搜索的文本（bytes/str 都兼容）。"""
+    if isinstance(raw, (bytes, bytearray)):
+        return bytes(raw).decode("utf-8", "replace")
+    return str(raw)
+
+
 def test_task_graph_commits_remote_result_through_existing_winner_gate():
     from task_graph import StageSpec, TaskGraphCoordinator
 
