@@ -891,6 +891,23 @@ class SchedulerTaskWorkerMixin:
                     worker_snapshot = self._task_worker_control.worker_snapshot(client_id)
                     if worker_snapshot.get("capabilities_changed", True):
                         self.push_layer_config_to_clients()
+                    # ★ 2026-10-05（DIST-1 三机重启实测）：权威重发此前**只在请求路径**
+                    #   触发，而请求会被恢复闸门自身拒绝 ⇒ 没有任何路径去产生「新代际」
+                    #   ⇒ 闸门永不解除（实测：三机全部在线、TCP 已重连、hello
+                    #   accepted=True，请求仍返回 `pipeline_recovery_pending`；
+                    #   readiness 停在 `layer_status=not_configured`，且准入名单在
+                    #   同一次会话内由非空变为空）。
+                    #   worker 重新 hello 是「这个节点回来了」的权威信号，恢复期就在
+                    #   此刻补一次**权威重发**：`require_distributed=True` 的语义是
+                    #   「按当前在线能力重算一份新计划」，而不是重放持久化的旧计划
+                    #   （见 `push_layer_config_to_clients_locked` 里对
+                    #   `_pipeline_recovery_pending` 的处理）。
+                    if ack.payload["accepted"] and self._pipeline_recovery_pending:
+                        logger.info(
+                            "重启恢复期收到 worker hello，触发权威重发: node=%s",
+                            client_id,
+                        )
+                        self.request_authoritative_layer_sync(require_distributed=True)
                     if ack.payload["accepted"]:
                         self._ensure_remote_task_worker_provider(client_id)
                         # A node that has just advertised a complete model is
