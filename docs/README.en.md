@@ -47,7 +47,7 @@ K-Llama is **two layers in one process**: a control plane aimed at people, and a
 │ ├ ggml RPC worker (borrowed GPU)    ├ inter-layer pipeline (qwen3_pipeline)│
 │ └ layer-segment forward (shim)      └ cross-framework upstream (model_mod) │
 └──────────────────────────────┬─────────────────────────────────────────────┘
-                               │ segment channel: Relay TCP (HIDDEN / HIDDEN_SEQ / TOKEN)
+                               │ segment channel: v3 stage (stage_offer_v3 / layer_forward)
 ┌──────────────────────────────┴─────────────────────────────────────────────┐
 │ Nodes and transport (cross-host, heterogeneous)                            │
 │ local loopback · SSH tunnel · Surface (x86_64, Windows) · y700 (ARM64)     │

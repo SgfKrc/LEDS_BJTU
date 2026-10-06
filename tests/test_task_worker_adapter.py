@@ -163,6 +163,27 @@ def test_android_layer_worker_is_admitted_without_full_model_dispatch_gate():
     assert snapshot["capabilities"]["models"]
 
 
+def test_recovery_candidate_uses_accepted_capabilities_without_health_overlay():
+    coordinator = TaskWorkerControlPlane()
+    worker = TaskWorkerControlPlane()
+    hello = worker.begin_worker_hello(
+        node_id="android_layer_01",
+        worker_kind="android_full_worker",
+        capabilities=_android_layer_capabilities(),
+    )
+    assert hello is not None
+    ack = coordinator.receive_on_coordinator(
+        "android_layer_01", hello.snapshot(), coordinator_node_id="master",
+    )
+    assert ack.payload["selected_version"] >= 2
+
+    candidates = coordinator.connected_layer_stage_workers({"android_layer_01"})
+    assert [item["node_id"] for item in candidates] == ["android_layer_01"]
+
+    coordinator.disconnect_worker("android_layer_01")
+    assert coordinator.connected_layer_stage_workers() == []
+
+
 def test_pending_worker_fence_is_resolved_by_hello_and_disconnect():
     control = TaskWorkerControlPlane()
     control.mark_worker_connection_pending("worker_pending")
@@ -592,6 +613,38 @@ def test_duplicate_hello_is_idempotent_but_message_id_conflict_is_rejected():
     assert captured.value.code == "message_id_conflict"
 
 
+def test_reconnected_hello_reopens_config_sync_even_when_capabilities_match():
+    coordinator = TaskWorkerControlPlane()
+    worker = TaskWorkerControlPlane()
+
+    first = worker.begin_worker_hello(
+        node_id="worker_01", capabilities=_capabilities(), sent_at_ms=1000,
+    )
+    assert first is not None
+    coordinator.mark_worker_connection_pending("worker_01")
+    coordinator.receive_on_coordinator(
+        "worker_01", first.snapshot(), coordinator_node_id="master",
+        sent_at_ms=1001,
+    )
+    coordinator.resolve_worker_connection_pending("worker_01")
+    coordinator.disconnect_worker("worker_01")
+
+    worker.disconnect_coordinator()
+    second = worker.begin_worker_hello(
+        node_id="worker_01", capabilities=_capabilities(), sent_at_ms=2000,
+    )
+    assert second is not None
+    coordinator.mark_worker_connection_pending("worker_01")
+    coordinator.receive_on_coordinator(
+        "worker_01", second.snapshot(), coordinator_node_id="master",
+        sent_at_ms=2001,
+    )
+
+    snapshot = coordinator.worker_snapshot("worker_01")
+    assert snapshot["capabilities_changed"] is True
+    assert snapshot["connection_rebound"] is True
+
+
 def test_disconnect_clears_health_and_pending_hello_fence():
     worker = TaskWorkerControlPlane()
     first = worker.begin_worker_hello(
@@ -1001,8 +1054,74 @@ def test_remote_provider_disconnect_unblocks_pending_attempt():
 
     assert finished.wait(2)
     assert outcome["error"].code == "remote_worker_disconnected"
-    provider.release(reservation.reservation_id)
+    # ★ 2026-10-05（DIST-2）：断连现在会**主动回收** reservation，不再需要调用方
+    #   补一次 `release()`。此前这里必须显式 `provider.release(...)` 才能让
+    #   `active_reservations` 归零 —— 而真实路径上那次释放依赖上层
+    #   `task_graph._run_stage` 的 `finally`；上层一旦没走到（异常路径、外层取消、
+    #   进程卡住）就永久泄漏「已预留未执行」的槽位。
     assert provider.inspect().active_reservations == 0
+
+
+def test_cancel_event_propagates_stage_cancel_to_worker():
+    """★ #47（2026-10-05 三机实测）：本地取消必须**向 worker 传播** `stage_cancel`。
+
+    此前等结果阶段的 `_wait` 在 `cancel_event` 置位时直接抛 `provider_cancelled`，
+    **从不调用 `cancel()`**（本类里早已实现构造与发送 `stage_cancel` 的逻辑，却只在
+    `remote_accept_timeout` 那条路径被调过）⇒ worker 白跑完整个 Stage，回传结果时
+    本端已无对应 pending（实测 `event=task_worker_message_rejected
+    reason=unknown_attempt`）。
+    """
+    coordinator_control, _worker_control = _admitted_control_plane()
+    sent = []
+    provider = RemoteFullWorkerProvider(
+        node_id="worker_01",
+        peer_snapshot=lambda: coordinator_control.worker_snapshot("worker_01"),
+        send_message=sent.append,
+    )
+    request = _remote_request(provider.provider_id)
+    reservation = provider.reserve(request)
+    attempt = StageAttempt(
+        attempt_id="att_cancel01",
+        request=request,
+        provider_id=provider.provider_id,
+        lease_id="lease_cancel01",
+        lease_epoch=1,
+        lease_expires_at=time.time() + 30,
+    )
+    cancel_event = threading.Event()
+    outcome = {}
+    finished = threading.Event()
+
+    def execute():
+        try:
+            provider.execute(attempt, reservation, cancel_event)
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            finished.set()
+
+    threading.Thread(target=execute, daemon=True).start()
+    # 等 stage_offer 发出（说明 attempt 已登记在 `_pending`）。
+    assert _wait_until(lambda: bool(sent))
+    before = len(sent)
+
+    cancel_event.set()
+
+    assert finished.wait(3)
+    assert outcome["error"].code == "provider_cancelled"
+    # 关键断言：取消之后对端**应当收到** `stage_cancel`。
+    assert _wait_until(
+        lambda: any(
+            "stage_cancel" in _message_text(item) for item in sent[before:]
+        )
+    ), f"取消后未向 worker 发送 stage_cancel，实际发送: {sent[before:]}"
+
+
+def _message_text(raw) -> str:
+    """把 provider 发出的原始消息解成可搜索的文本（bytes/str 都兼容）。"""
+    if isinstance(raw, (bytes, bytearray)):
+        return bytes(raw).decode("utf-8", "replace")
+    return str(raw)
 
 
 def test_task_graph_commits_remote_result_through_existing_winner_gate():
@@ -1307,6 +1426,53 @@ def test_scheduler_binds_full_worker_hello_to_registered_pc_client(monkeypatch):
     ] == 1
 
 
+def test_recovery_hello_does_not_publish_two_layer_generations(monkeypatch):
+    from scheduler import NodeInfo, NodeRole, NodeState, Scheduler
+
+    scheduler = Scheduler()
+    scheduler._role_override = "master"
+    scheduler._pipeline_recovery_pending = True
+    scheduler.nodes["android_layer_01"] = NodeInfo(
+        node_id="android_layer_01",
+        role=NodeRole.CLIENT,
+        node_type="android",
+        state=NodeState.ONLINE,
+    )
+    sent = []
+    scheduler._tcp_server = type("Server", (), {
+        "send_to_client": lambda self, node_id, data, message_type: sent.append(
+            (node_id, data, message_type)
+        ),
+    })()
+    monkeypatch.setattr(scheduler, "get_effective_node_id", lambda: "master")
+    normal_pushes = []
+    authoritative_pushes = []
+    monkeypatch.setattr(
+        scheduler, "push_layer_config_to_clients",
+        lambda: normal_pushes.append(True),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "request_authoritative_layer_sync",
+        lambda **kwargs: authoritative_pushes.append(kwargs) or True,
+    )
+    worker = TaskWorkerControlPlane()
+    hello = worker.begin_worker_hello(
+        node_id="android_layer_01",
+        worker_kind="android_full_worker",
+        capabilities=_android_layer_capabilities(),
+    )
+    assert hello is not None
+
+    scheduler._handle_task_worker_message(
+        "android_layer_01", {"data": hello.snapshot()},
+    )
+
+    assert sent[0][1]["payload"]["accepted"] is True
+    assert normal_pushes == []
+    assert authoritative_pushes == [{"require_distributed": True}]
+
+
 def test_scheduler_full_worker_hello_releases_layer_reservation(monkeypatch):
     from scheduler import NodeInfo, NodeRole, NodeState, Scheduler
 
@@ -1463,6 +1629,11 @@ def test_configured_relay_worker_precedes_full_task_worker_opt_out(
 
     scheduler = Scheduler()
     scheduler._role_override = "master"
+    # This covers the configured legacy relay path; do not inherit a
+    # metadata-only pipeline preparation from the process-wide ModelHost.
+    monkeypatch.setattr(
+        scheduler, "_host", type("Host", (), {"is_pipeline_prepared": False})(),
+    )
     scheduler.nodes["worker_01"] = NodeInfo(
         node_id="worker_01",
         role=NodeRole.CLIENT,
@@ -2080,6 +2251,194 @@ def test_remote_provider_sends_cancel_and_accepts_cancel_ack():
     assert provider.inspect().active_reservations == 0
 
 
+def test_remote_provider_absorbs_stage_responses_crossing_cancel():
+    coordinator_control, _worker_control = _admitted_control_plane()
+    sent = []
+    provider = RemoteFullWorkerProvider(
+        node_id="worker_01",
+        peer_snapshot=lambda: coordinator_control.worker_snapshot("worker_01"),
+        send_message=sent.append,
+    )
+    request = _remote_request(provider.provider_id)
+    reservation = provider.reserve(request)
+    attempt = StageAttempt(
+        attempt_id="att_cancellate01",
+        request=request,
+        provider_id=provider.provider_id,
+        lease_id="lease_cancellate01",
+        lease_epoch=1,
+        lease_expires_at=time.time() + 5,
+    )
+    outcome = {}
+
+    def execute():
+        try:
+            provider.execute(attempt, reservation, threading.Event())
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=execute, daemon=True)
+    thread.start()
+    assert _wait_until(lambda: bool(sent))
+    identity = _response_identity(sent[0].payload)
+
+    provider.cancel(attempt.attempt_id)
+    provider.handle_message(build_message(
+        "stage_accept",
+        {**identity, "accepted": True, "reason_code": "", "retryable": False},
+        message_id="msg_cancellateaccept01",
+        sent_at_ms=int(time.time() * 1000),
+        version=2,
+    ).snapshot())
+    output = {"content": "finished while cancel crossed the wire"}
+    provider.handle_message(build_message(
+        "stage_result",
+        {
+            **identity,
+            "output": output,
+            "output_sha256": canonical_sha256(output),
+            "metadata": {},
+        },
+        message_id="msg_cancellateresult01",
+        sent_at_ms=int(time.time() * 1000),
+        version=2,
+    ).snapshot())
+    provider.handle_message(build_message(
+        "stage_cancelled",
+        {**identity, "reason_code": "coordinator_cancelled"},
+        message_id="msg_cancellateack01",
+        sent_at_ms=int(time.time() * 1000),
+        version=2,
+    ).snapshot())
+
+    thread.join(2)
+    assert not thread.is_alive()
+    assert outcome["error"].code == "provider_cancelled"
+    provider.release(reservation.reservation_id)
+    provider.close()
+
+
+def test_remote_cancel_is_deferred_until_blocked_offer_send_completes():
+    coordinator_control, _worker_control = _admitted_control_plane()
+    offer_send_started = threading.Event()
+    finish_offer_send = threading.Event()
+    cancel_sent = threading.Event()
+    send_order = []
+    queued_types = []
+
+    def send(message):
+        if message.message_type == "stage_offer":
+            send_order.append("stage_offer_started")
+            offer_send_started.set()
+            assert finish_offer_send.wait(2)
+            send_order.append("stage_offer_finished")
+            return
+        send_order.append(message.message_type)
+        if message.message_type == "stage_cancel":
+            cancel_sent.set()
+
+    provider = RemoteFullWorkerProvider(
+        node_id="worker_01",
+        peer_snapshot=lambda: coordinator_control.worker_snapshot("worker_01"),
+        send_message=send,
+    )
+    original_queue = provider._queue_outbound_message
+
+    def record_queue(message, on_error):
+        queued_types.append(message.message_type)
+        return original_queue(message, on_error)
+
+    provider._queue_outbound_message = record_queue
+    request = _remote_request(provider.provider_id)
+    reservation = provider.reserve(request)
+    attempt = StageAttempt(
+        attempt_id="att_cancelorder01",
+        request=request,
+        provider_id=provider.provider_id,
+        lease_id="lease_cancelorder01",
+        lease_epoch=1,
+        lease_expires_at=time.time() + 5,
+    )
+    outcome = {}
+    finished = threading.Event()
+
+    def execute():
+        try:
+            provider.execute(attempt, reservation, threading.Event())
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            finished.set()
+
+    threading.Thread(target=execute, daemon=True).start()
+    assert offer_send_started.wait(2)
+
+    provider.cancel(attempt.attempt_id)
+
+    # Cancellation wakes local waiters immediately, but its wire message must
+    # not be queued while the synchronous offer transport call is in flight.
+    assert queued_types == []
+    assert send_order == ["stage_offer_started"]
+
+    finish_offer_send.set()
+    assert cancel_sent.wait(2)
+    assert finished.wait(2)
+    assert queued_types == ["stage_cancel"]
+    assert send_order == [
+        "stage_offer_started", "stage_offer_finished", "stage_cancel",
+    ]
+    assert outcome["error"].code == "provider_cancelled"
+    provider.release(reservation.reservation_id)
+    provider.close()
+
+
+def test_remote_cancel_racing_failed_offer_does_not_leave_pending_attempt():
+    coordinator_control, _worker_control = _admitted_control_plane()
+    offer_send_started = threading.Event()
+    finish_offer_send = threading.Event()
+
+    def send(message):
+        if message.message_type == "stage_offer":
+            offer_send_started.set()
+            assert finish_offer_send.wait(2)
+            raise ConnectionError("disconnected before offer was sent")
+
+    provider = RemoteFullWorkerProvider(
+        node_id="worker_01",
+        peer_snapshot=lambda: coordinator_control.worker_snapshot("worker_01"),
+        send_message=send,
+    )
+    request = _remote_request(provider.provider_id)
+    reservation = provider.reserve(request)
+    attempt = StageAttempt(
+        attempt_id="att_cancelfail01",
+        request=request,
+        provider_id=provider.provider_id,
+        lease_id="lease_cancelfail01",
+        lease_epoch=1,
+        lease_expires_at=time.time() + 5,
+    )
+    outcome = {}
+
+    def execute():
+        try:
+            provider.execute(attempt, reservation, threading.Event())
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=execute, daemon=True)
+    thread.start()
+    assert offer_send_started.wait(2)
+    provider.cancel(attempt.attempt_id)
+    finish_offer_send.set()
+    thread.join(2)
+
+    assert outcome["error"].code == "remote_worker_disconnected"
+    provider.release(reservation.reservation_id)
+    assert attempt.attempt_id not in provider._pending
+    provider.close()
+
+
 def test_remote_cancel_and_renew_do_not_block_on_network_send():
     coordinator_control, _worker_control = _admitted_control_plane()
     provider_holder = {}
@@ -2607,6 +2966,89 @@ def test_scheduler_worker_cancel_ack_is_replayed_without_stage_error(
     ]
     assert "stage_error" not in message_types
     assert sent[1][0] == sent[2][0]
+
+
+def test_scheduler_worker_acknowledges_cancel_after_stage_completed(monkeypatch):
+    from scheduler import Scheduler
+
+    scheduler = Scheduler()
+    scheduler._role_override = "client"
+    monkeypatch.setattr(scheduler, "get_effective_node_id", lambda: "worker_01")
+    monkeypatch.setattr(scheduler, "_task_worker_capabilities", _capabilities)
+    coordinator = TaskWorkerControlPlane()
+    hello = scheduler._task_worker_control.begin_worker_hello(
+        node_id="worker_01", capabilities=_capabilities(),
+    )
+    assert hello is not None
+    ack = coordinator.receive_on_coordinator(
+        "worker_01", hello.snapshot(), coordinator_node_id="master",
+    )
+    scheduler._task_worker_control.receive_on_worker(ack.snapshot())
+    sent = []
+    completed = threading.Event()
+
+    class Client:
+        is_registered = True
+
+        def send_data(self, data, message_type):
+            sent.append((data, message_type))
+            if data["message_type"] == "stage_result":
+                completed.set()
+
+    scheduler._tcp_client = Client()
+    monkeypatch.setattr(scheduler, "_host", SimpleNamespace(
+        full_chat_execution_lock=threading.RLock(),
+    ))
+    scheduler.configure_callbacks(_scheduler_callbacks(
+        execute=lambda _request, _cancel_event: {"content": "already complete"},
+    ))
+    now_ms = int(time.time() * 1000)
+    root_input = {"message": "hello"}
+    offer_payload = {
+        "workflow_id": "wf_workercancellate01",
+        "request_id": "request-worker-cancel-late",
+        "stage_id": "candidate_a",
+        "stage_type": "full_inference",
+        "attempt_id": "att_workercancellate01",
+        "lease_id": "lease_workercancellate01",
+        "lease_epoch": 1,
+        "lease_expires_at_ms": now_ms + 5000,
+        "provider_id": remote_provider_id("worker_01"),
+        "root_input": root_input,
+        "dependencies": {},
+        "input_sha256": stage_input_sha256(root_input, {}),
+        "model_identity": _model_identity().snapshot(),
+    }
+    offer = build_message(
+        "stage_offer", offer_payload,
+        message_id="msg_workercancellateoffer01",
+        sent_at_ms=now_ms,
+        version=2,
+    )
+    scheduler._handle_task_worker_message("master", {"data": offer.snapshot()})
+    assert completed.wait(2)
+    assert _wait_until(lambda: not scheduler._task_worker_active_attempts)
+
+    cancel = build_message(
+        "stage_cancel",
+        {
+            key: offer_payload[key]
+            for key in (
+                "workflow_id", "stage_id", "attempt_id", "lease_id", "lease_epoch",
+            )
+        } | {"reason_code": "coordinator_cancelled"},
+        message_id="msg_workercancellate01",
+        sent_at_ms=int(time.time() * 1000),
+        version=2,
+    )
+    scheduler._handle_task_worker_message("master", {"data": cancel.snapshot()})
+
+    assert _wait_until(
+        lambda: sent and sent[-1][0]["message_type"] == "stage_cancelled",
+    )
+    assert [item[0]["message_type"] for item in sent] == [
+        "stage_accept", "stage_result", "stage_cancelled",
+    ]
 
 
 def test_scheduler_worker_replays_cached_result_after_send_failure(monkeypatch):

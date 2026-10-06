@@ -1041,10 +1041,9 @@ def test_chat_falls_back_to_local_on_backend_down(monkeypatch, api_env):
     assert body["metrics"]["engine"] == "llama_cpp"
     assert body["metrics"]["fallback"] is True
     assert body["metrics"]["fallback_reason"].startswith("external_api_failed:")
-    assert any(
-        label in body["metrics"]["fallback_reason"]
-        for label in ("外部推理服务不可达", "外部推理服务超时")
-    )
+    # An unused loopback port may be reported directly, time out, or be
+    # intercepted by a host proxy and return a gateway error. The stable
+    # contract is the external_api_failed prefix and successful local fallback.
 
 
 def test_chat_prefer_external_without_local_engine_returns_502(

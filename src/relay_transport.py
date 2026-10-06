@@ -720,6 +720,7 @@ def serve_relay_connection(
                 # 要跨连接复用，`close()` 会把底层 handle 置空 ⇒ 该服务此后**每个连接**都失败
                 # （实测：帧完全正确却报 `rc=-5 参数非法`，现象与"模型算错"难以区分，只能靠重启恢复）。
                 # 引擎的真正释放发生在进程退出时（见 `run_service` 的 finally）。
+                logger.info("relay 段收到 CLOSE 帧 ⇒ runner.reset()（会话结束）")
                 try:
                     runner.reset()
                 except Exception as exc:  # noqa: BLE001
@@ -872,6 +873,7 @@ def serve_relay_middle_connection(
                 if frame.n_tokens != 0 or frame.payload:
                     raise RelayProtocolError("invalid_close_frame")
                 # ★ 同 `serve_relay_connection`：只 reset，不 close（见那里的详细说明）。
+                logger.info("relay middle 段收到 CLOSE 帧 ⇒ runner.reset()（会话结束）")
                 try:
                     runner.reset()
                 except Exception as exc:  # noqa: BLE001

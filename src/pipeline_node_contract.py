@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Iterable, Mapping, Sequence
 
 
@@ -458,10 +458,23 @@ def pipeline_layout_from_capacity_plan(
         is_local = bool(meta.get(
             "is_local", assignment.get("role") == "master",
         ))
+        selected_artifact = assignment.get("layer_artifact")
+        if not isinstance(selected_artifact, Mapping):
+            selected_artifact = {}
+        artifact_kind = str(
+            meta.get("artifact_kind")
+            or ("gguf_segment" if selected_artifact else "safetensors_assignment")
+        )
         artifact_value = meta.get("artifact") or PipelineArtifactRef(
+            # The layout-wide identity remains the logical source model.  A
+            # Route-A worker can execute a format-specific GGUF segment whose
+            # byte digest is intentionally different from the master's model.
             model_sha256=model_sha256,
-            artifact_kind=str(meta.get("artifact_kind") or "safetensors_assignment"),
-            artifact_sha256=str(meta.get("artifact_sha256") or ""),
+            artifact_kind=artifact_kind,
+            artifact_sha256=str(
+                meta.get("artifact_sha256")
+                or selected_artifact.get("artifact_sha256", "")
+            ),
             manifest_sha256=str(meta.get("manifest_sha256") or ""),
             architecture=str(meta.get("architecture") or architecture),
             source_layer_range=(start, end),
@@ -470,7 +483,13 @@ def pipeline_layout_from_capacity_plan(
             node_id=node_id,
             kind=str(meta.get("kind") or ("local" if is_local else "remote_pipeline")),
             layer_range=(start, end),
-            engine=str(meta.get("engine") or default_engine),
+            # A selected layer_artifact is the exact GGUF segment executed by
+            # Route A.  Node-level metadata may describe a co-located PyTorch
+            # full model, which must not overwrite this assignment identity.
+            engine=(
+                "llama_cpp" if artifact_kind == "gguf_segment"
+                else str(meta.get("engine") or default_engine)
+            ),
             location=str(meta.get("location") or ("local" if is_local else f"node:{node_id}")),
             capacity=PipelineNodeCapacity(
                 capacity_bytes=assignment.get("capacity_bytes", 0),
@@ -488,7 +507,19 @@ def pipeline_layout_from_capacity_plan(
             cross_engine=bool(meta.get("cross_engine", False)),
             handoff_at=meta.get("handoff_at"),
         ))
-    return validate_pipeline_nodes(nodes, total_layers=total_layers)
+    annotated: list[PipelineNode] = []
+    previous_engine = ""
+    for node in sorted(nodes, key=lambda item: item.layer_range):
+        crosses_engine = bool(previous_engine and previous_engine != node.engine)
+        if crosses_engine:
+            node = replace(
+                node,
+                cross_engine=True,
+                handoff_at=node.layer_range[0],
+            )
+        annotated.append(node)
+        previous_engine = node.engine
+    return validate_pipeline_nodes(annotated, total_layers=total_layers)
 
 
 def pipeline_layout_from_relay_handoff(

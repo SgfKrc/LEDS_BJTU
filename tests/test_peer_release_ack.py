@@ -164,3 +164,50 @@ def test_unversioned_release_cannot_clear_newer_relay_config():
     assert sent == []
     assert peer._active_layer_config["config_id"] == "cfg-current"
     assert peer._local_pipeline_steps == {"task-current": 0}
+
+
+def test_same_generation_release_without_config_id_is_fenced():
+    """A versioned release without its identity must not clear active state."""
+    peer, sent = _peer(node_id="client1")
+    peer._latest_layer_config_generation = 20
+    peer._latest_layer_config_id = "cfg-current"
+    peer._active_layer_config = {
+        "node_id": "client1",
+        "config_id": "cfg-current",
+        "generation": 20,
+    }
+    peer._local_pipeline_steps = {"task-current": 0}
+
+    peer._handle_layer_config({
+        "release": True,
+        "node_id": "client1",
+        "generation": 20,
+    })
+
+    assert sent == []
+    assert peer._active_layer_config["config_id"] == "cfg-current"
+    assert peer._local_pipeline_steps == {"task-current": 0}
+
+
+def test_same_generation_release_with_other_config_id_is_fenced():
+    """A same-generation release for another config is not a duplicate."""
+    peer, sent = _peer(node_id="client1")
+    peer._latest_layer_config_generation = 20
+    peer._latest_layer_config_id = "cfg-current"
+    peer._active_layer_config = {
+        "node_id": "client1",
+        "config_id": "cfg-current",
+        "generation": 20,
+    }
+    peer._local_pipeline_steps = {"task-current": 0}
+
+    peer._handle_layer_config({
+        "release": True,
+        "node_id": "client1",
+        "config_id": "cfg-old",
+        "generation": 20,
+    })
+
+    assert sent == []
+    assert peer._active_layer_config["config_id"] == "cfg-current"
+    assert peer._local_pipeline_steps == {"task-current": 0}

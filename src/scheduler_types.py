@@ -9,17 +9,65 @@ from enum import Enum
 from typing import Optional
 
 class NodeState(str, Enum):
-    """节点状态枚举"""
-    ONLINE = "online"       # 在线空闲
-    BUSY = "busy"           # 推理中
+    """节点状态枚举。
+
+    ★ 2026-10-05（DIST-2 收拢现状）：本枚举**实际只有两个值在用** ——
+    `ONLINE` 与 `OFFLINE`；原先还有 `BUSY`（推理中）与 `ERROR`（异常），但
+    **从未有任何代码把节点置成它们**（全仓仅 `scheduler.py` 有一处
+    `state == NodeState.BUSY` 的比较，该分支恒假，连同"任务停止后恢复节点空闲"
+    那段一起移除）。保留死枚举会让「可用性判据」看起来比实际复杂。
+
+    **节点是否可用由两维系：**
+
+    1. **本枚举**：`ONLINE` ⇔ `is_available()` 为真。置位点集中在
+       `scheduler_cluster`（注册 / presence 心跳 / 远端节点表）与
+       `scheduler._on_tcp_disconnect`（断连置 `OFFLINE`）。
+    2. **心跳新鲜度**：`NodeInfo.is_heartbeat_fresh()`（阈值
+       `WORKER_HEARTBEAT_MAX_AGE`）。TCP 半开时第 1 维要等巡检约 129s 才翻转，
+       第 2 维才是在那段窗口里阻止"静默节点仍占容量"的判据。
+
+    规划文档里提到的 `registered / admitted / ready / leased / draining` 那套状态
+    **尚未进本枚举**，其语义目前分散在三个对象上：task-worker 的
+    `accepted` / `selected_version`（`task_worker_adapter`）、`Reservation` /
+    `lease_epoch`（`task_provider` / `task_graph`）。
+    """
+    ONLINE = "online"       # 在线（对端可达；是否真能派活另见心跳新鲜度）
     OFFLINE = "offline"     # 离线/断连
-    ERROR = "error"         # 异常
 
 
 class NodeRole(str, Enum):
     """节点角色（字符串枚举，便于比较）"""
     MASTER = "master"
     CLIENT = "client"
+
+
+#: 从节点心跳的**容忍上限**（秒）：超过它，节点被视为「不可用，不该再参与流水线
+#: 就绪判定与容量规划」。取 45s 的 2 倍余量：App 侧
+#: `AndroidPresenceStateMachine.heartbeatIntervalMs = 45_000`（可配 5–120s，见
+#: `heartbeatIntervalSeconds.coerceIn(5, 120)`），而这里原先写死 10s ⇒ 45s 的间隔
+#: 必然被判过期（实测 `11.4s > 10s`）。Route A 要求 Android 参与 readiness 后才暴露。
+#:
+#: ★ 2026-10-05（DIST-2「唯一超时来源」）：本常量由 `scheduler_pipeline` 上移到此处，
+#: 因为**容量规划**（`scheduler._get_pipeline_capacity_nodes`）与 **readiness**
+#: （`scheduler_pipeline._get_pipeline_readiness`）现在共用同一个阈值 —— 此前容量
+#: 规划只看 `NodeInfo.is_available()`（`state == ONLINE`），完全不看心跳新鲜度，而
+#: TCP 半开要等巡检约 129s 才置 OFFLINE ⇒ 静默节点在这段时间里一直占容量。
+WORKER_HEARTBEAT_MAX_AGE = 120.0
+
+
+#: task-worker **控制面** health 超时的**下界**（秒）。实际取值是
+#: `max(这个下界, HEARTBEAT_INTERVAL * 4)`（见 `scheduler` 里构造
+#: `TaskWorkerControlPlane` 处）—— 乘 4 是为了容忍若干次心跳抖动，下界则保证
+#: 即使把 `HEARTBEAT_INTERVAL` 调到很小也不会把健康判定收得过紧。
+#:
+#: 为什么不直接用 `WORKER_HEARTBEAT_MAX_AGE`（120s）：**两者语义不同、层次不同**。
+#: 控制面 health 决定「这个 provider 还要不要派 stage」（`healthy` /
+#: `layer_stage_dispatch_enabled` / stage offer 准入），流水线层的
+#: `WORKER_HEARTBEAT_MAX_AGE` 决定「这个节点还算不算数」（readiness 判定与容量
+#: 规划）。**有意让前者更短**：先停止派活，再让节点退出规划，两层不同时翻转；
+#: 若把两者并成同一个数，节点会在「仍被规划进层区间」的同时「已不再接受 stage」，
+#: 边界反而更难推理。
+TASK_WORKER_HEALTH_TIMEOUT_FLOOR_SECONDS = 30.0
 
 
 @dataclass
@@ -46,6 +94,36 @@ class NodeInfo:
 
     def is_available(self) -> bool:
         return self.state == NodeState.ONLINE
+
+    def heartbeat_age(self, now: Optional[float] = None) -> Optional[float]:
+        """距上次心跳的秒数；从未有过任何时间基准时返回 `None`。
+
+        基准优先取 `last_heartbeat`，未收到过心跳时回退到 `connected_at`。
+        """
+        base = self.last_heartbeat or self.connected_at
+        if not base:
+            return None
+        return max(0.0, (time.time() if now is None else now) - base)
+
+    def is_heartbeat_fresh(self, now: float, max_age: float) -> bool:
+        """心跳是否仍在容忍窗口内。
+
+        ★ 2026-10-05（DIST-2）：把「节点可用」从单一的 `NodeState` 扩到
+        「状态 + 心跳新鲜度」。此前容量规划只看 `is_available()`
+        （`state == ONLINE`），而 TCP 半开（对端进程已死、不发 FIN）要等巡检约
+        129s 才置 `OFFLINE` ⇒ 静默节点在这段时间里**一直占容量**，会分配出错的
+        层区间（实测：Y700 被带走后 master 仍把它算进规划，给出既非声明区间、
+        层数也不对的结果）。
+
+        `max_age` 由调用方注入（复用既有常量，不另造一套数字）。
+
+        **时间基准完全未知时视为新鲜**：那是「未知」而不是「已过期」。真实路径
+        不会出现这种情况（`register_node` 与 Android 注册都会立即写入
+        `connected_at` 与 `last_heartbeat`），但测试与嵌入场景构造的节点可能两个
+        字段都没填，不应因此被误判掉线。
+        """
+        age = self.heartbeat_age(now)
+        return age is None or age <= max_age
 
     def to_dict(self) -> dict:
         """转为可序列化的字典"""

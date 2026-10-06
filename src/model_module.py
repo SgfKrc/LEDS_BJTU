@@ -2348,6 +2348,28 @@ class ModelManager:
             model_id=model_id,
         )
 
+    def _llama_cpp_trimmed_range(self) -> str:
+        """返回 llama.cpp 引擎的裁层描述；**空串表示未裁层**（可安全当整模用）。
+
+        ★ 判据必须问 engine：裁层状态记在 `LlamaCppEngine._pipeline_descriptor` 上，
+        而 ModelManager 自己的 `_pipeline_descriptor` / `_pipeline_distributed_only`
+        只覆盖 PyTorch 的 `load_layer_range`（从 safetensors 物化层段）那条路径。
+        这也是旧代码「llama.cpp 不存在层裁剪」假设失效的地方。
+        """
+        engine = getattr(self, "model", None)
+        describe = getattr(engine, "get_pipeline_descriptor", None)
+        if not callable(describe):
+            return ""
+        try:
+            info = describe() or {}
+        except Exception:  # noqa: BLE001 - 描述失败一律按「不可确认」处理
+            return "descriptor_unavailable"
+        rng = info.get("assignment_layer_range")
+        if not info.get("partial_assignment") and not rng:
+            return ""
+        artifact = info.get("loaded_artifact") or info.get("model_path") or ""
+        return f"range={rng} artifact={os.path.basename(str(artifact))}"
+
     @_serialized_model_access
     def ensure_full_model(self, quant_type: str = None,
                           profile: dict = None, engine: str = None) -> None:
@@ -2359,8 +2381,22 @@ class ModelManager:
             )
         if not self.is_loaded:
             raise RuntimeError("模型未加载")
-        # llama.cpp / 孤岛引擎始终是"完整模型"语义，不存在层裁剪
-        if self._engine_type in ("llama_cpp", "island"):
+        # ★ 2026-10-04：`llama_cpp` **不再等于**「完整模型」语义 ——
+        #   `LlamaCppEngine.load_layer_range()`（`src/llama_engine.py`）能加载裁层 GGUF。
+        #   旧假设「llama.cpp 不存在层裁剪」让本方法对裁层状态**静默 return** ⇒ 回退路径
+        #   把 head8（`[0,8)`、`lm_head=False`）当整模继续推理 ⇒ 产出垃圾却仍返回 HTTP 200。
+        #   现在裁层一律 fail-closed（与 `_pipeline_distributed_only` 同口径，不自动重载
+        #   整模）；`island` 仍按旧语义直接返回。
+        if self._engine_type == "llama_cpp":
+            trimmed = self._llama_cpp_trimmed_range()
+            if trimmed:
+                raise RuntimeError(
+                    "当前 llama.cpp 引擎加载的是裁层工件（"
+                    f"{trimmed}），禁止整模回退；"
+                    "请等待流水线节点就绪或显式重新加载完整模型"
+                )
+            return
+        if self._engine_type == "island":
             return
         if (
             self._engine_type == "pytorch"

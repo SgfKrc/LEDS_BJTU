@@ -40,6 +40,20 @@ N_EMBD = 4
 N_TOKENS = 2
 
 
+@pytest.fixture(autouse=True)
+def _relay_probe_only_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """本文件整体验证的是 A1 relay 的**行为**（探针/实验语义）。
+
+    2026-10-04 产品裁定（分票规划 DIST-0）把 A1 从生产调度入口剔除后，
+    `PIPELINE_RELAY_PROBE_ONLY` 默认为 1 ⇒ `_relay_segment_for_worker` 在生产
+    路径直接不供给 relay 段。这些用例直接调用该方法，属探针语义，故在本文件
+    统一关掉闸门。**产品路径的剔除行为**由
+    `test_relay_segment_for_worker_respects_switch`（关掉 `RELAY_ENABLED`）与
+    启动期角色互斥检测（`api_server`）另行覆盖。
+    """
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_PROBE_ONLY", False)
+
+
 class _PlusOneRunner:
     def __init__(self) -> None:
         self.seen: list[tuple[int, bytes]] = []
@@ -401,6 +415,31 @@ def test_relay_segment_for_worker_respects_switch(monkeypatch: pytest.MonkeyPatc
     assert harness.obj._relay_segment_for_worker("worker-2") is None
 
 
+def test_relay_segment_for_worker_probe_only_excludes_from_production(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """★ 2026-10-04 产品裁定（分票规划 DIST-0）：A1 已从产品调度入口剔除。
+
+    `QLH_RELAY_PROBE_ONLY` 默认 1 ⇒ **即使 relay 全开也不供给 relay 段**，
+    生产请求继续走 A3，不做静默切换。本文件的 autouse fixture 为测 relay 行为
+    而关掉了该闸门，所以这里显式打开它。
+    """
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_PROBE_ONLY", True)
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_ENABLED", True)
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_SEGMENTS",
+                        "worker-2=middle@127.0.0.1:50183#896#8-16")
+    harness = _Harness()
+
+    # 配置齐全，但闸门开着 ⇒ 生产路径拿不到 relay 段。
+    assert harness.obj._relay_segment_for_worker("worker-2") is None
+    # 具名诊断只记一次（每进程一份），不刷屏。
+    assert getattr(harness.obj, "_relay_probe_only_warned", False) is True
+
+    # 显式关掉闸门（探针/实验语义）⇒ 恢复原有行为。
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_PROBE_ONLY", False)
+    assert harness.obj._relay_segment_for_worker("worker-2") is not None
+
+
 def test_relay_segment_for_worker_returns_spec_and_caches(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_ENABLED", True)
     monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_SEGMENTS",
@@ -411,6 +450,38 @@ def test_relay_segment_for_worker_returns_spec_and_caches(monkeypatch: pytest.Mo
     assert spec is not None and spec["port"] == 50183
     assert spec["layer_start"] == 8 and spec["layer_end"] == 16
     assert harness.obj._relay_segment_for_worker("worker-9") is None
+
+
+def test_relay_segment_for_worker_accepts_client_prefix_alias(monkeypatch: pytest.MonkeyPatch):
+    """Deployment names may omit the transport client's ``client_`` prefix."""
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_ENABLED", True)
+    monkeypatch.setattr(
+        scheduler_pipeline, "PIPELINE_RELAY_SEGMENTS",
+        "tablet=middle@127.0.0.1:50183#896#8-16",
+    )
+    harness = _Harness()
+
+    spec = harness.obj._relay_segment_for_worker("client_tablet")
+
+    assert spec is not None
+    assert spec["port"] == 50183
+
+
+def test_relay_segment_for_worker_exact_name_wins_over_alias(monkeypatch: pytest.MonkeyPatch):
+    """An explicit client_ key must remain authoritative when both names exist."""
+    monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_ENABLED", True)
+    monkeypatch.setattr(
+        scheduler_pipeline, "PIPELINE_RELAY_SEGMENTS",
+        "tablet=middle@127.0.0.1:50183#896#8-16;"
+        "client_tablet=tail@127.0.0.1:50184#896#16-24",
+    )
+    harness = _Harness()
+
+    spec = harness.obj._relay_segment_for_worker("client_tablet")
+
+    assert spec is not None
+    assert spec["role"] == "tail"
+    assert spec["port"] == 50184
 
     # 缓存：解析一次后进程内稳定（改配置不影响已解析结果）
     monkeypatch.setattr(scheduler_pipeline, "PIPELINE_RELAY_SEGMENTS",

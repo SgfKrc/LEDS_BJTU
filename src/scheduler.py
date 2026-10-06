@@ -49,7 +49,11 @@ from pipeline_node_contract import (
 )
 from pipeline_reshard import PipelineArtifactAvailability, PipelineReshardCoordinator
 import scheduler_layer_plan as _layer_plan
-from scheduler_types import InferenceTask, NodeInfo, NodeRole, NodeState, PreemptState, QueueTask
+from scheduler_types import (
+    InferenceTask, NodeInfo, NodeRole, NodeState, PreemptState, QueueTask,
+    TASK_WORKER_HEALTH_TIMEOUT_FLOOR_SECONDS,
+    WORKER_HEARTBEAT_MAX_AGE,
+)
 from scheduler_sidecars import SchedulerSidecarMixin
 from llama_rpc_contract import RpcShardLeaseBook
 from qwen3_pipeline_transaction import (
@@ -968,6 +972,10 @@ class Scheduler(
         self._infer_tasks: dict[str, InferenceTask] = {}
         self._task_lock = threading.Lock()
         self._running = False
+        # ★ 2026-10-05：`start()` 的幂等守卫锁。双栈（`0.0.0.0` + `::`）下
+        #   `uvicorn.Server` 的 lifespan 会**并发**调两次 `start()`，非原子的
+        #   「检查后设置」两边都会通过 ⇒ 必须在锁内占位。
+        self._start_lock = threading.Lock()
         # 启动期后台发现线程必须能被 stop() 立即唤醒，避免停止后仍发起连接。
         self._startup_cancel_event = threading.Event()
         self._network_identity_thread: Optional[threading.Thread] = None
@@ -1035,6 +1043,12 @@ class Scheduler(
         self._pipeline_worker_opted_out = False
         self._pipeline_worker_opt_out: set[str] = set()
         self._pipeline_load_transaction: Optional[dict] = None
+        # A persisted active transaction must be republished after a master
+        # restart before distributed requests are admitted.
+        self._pipeline_recovery_pending = False
+        self._pipeline_recovery_failure = ""
+        self._pipeline_recovery_state: Optional[dict] = None
+        self._pipeline_lifecycle_persist_ok = True
         # Qwen3 remains outside production runtime admission.  This isolated
         # state machine exercises the C2 lifecycle without network dispatch,
         # weight materialization, or full-model fallback.
@@ -1119,7 +1133,10 @@ class Scheduler(
             "spare_master_logs": [],
         }
         self._task_worker_control = TaskWorkerControlPlane(
-            health_timeout_seconds=max(30.0, HEARTBEAT_INTERVAL * 4.0),
+            health_timeout_seconds=max(
+                TASK_WORKER_HEALTH_TIMEOUT_FLOOR_SECONDS,
+                HEARTBEAT_INTERVAL * 4.0,
+            ),
         )
         self._task_worker_refresh_lock = threading.Lock()
         self._task_worker_refresh_requested = False
@@ -1130,6 +1147,12 @@ class Scheduler(
         self._task_worker_stage_lock = threading.RLock()
         self._task_worker_active_attempts: dict[
             str, _TaskWorkerActiveAttempt
+        ] = {}
+        # Short-lived terminal identities let a cancel that crossed a final
+        # result receive an idempotent acknowledgement instead of an
+        # unknown_attempt rejection.
+        self._task_worker_completed_attempts: dict[
+            str, tuple[_TaskWorkerActiveAttempt, float]
         ] = {}
         self._task_worker_seen_messages: dict[
             str, tuple[str, list[dict]]
@@ -1178,6 +1201,23 @@ class Scheduler(
     # ================================================================
 
     def start(self, host: str = None, port: int = None) -> None:
+        """Start once and release the reservation if initialization fails."""
+        with self._start_lock:
+            if self._running:
+                logger.info("scheduler already running; ignoring duplicate start")
+                return
+            self._running = True
+        try:
+            self._start_impl(host=host, port=port)
+        except Exception:
+            try:
+                self.stop()
+            except Exception:
+                logger.warning("scheduler startup rollback failed", exc_info=True)
+                self._running = False
+            raise
+
+    def _start_impl(self, host: str = None, port: int = None) -> None:
         """
         启动调度器。
 
@@ -1192,9 +1232,27 @@ class Scheduler(
             host: TCP 监听地址（默认 0.0.0.0，接受所有接口连接）
             port: TCP 监听端口（默认 config.SERVER_PORT）
         """
+        # ★ 2026-10-05（两段实测根因）：`run_api_servers()` 在通配地址下会为
+        #   `0.0.0.0` 与 `::` **各起一个 `uvicorn.Server`**（共享同一 `app`），
+        #   于是 `_lifespan` 执行两次、本方法被调两次。此前没有任何幂等保护 ⇒
+        #   进程内出现**两个 `TCPServer` 实例**同时监听 8888：`_tcp_server_default`
+        #   被第二次覆盖（setter 见本文件 `_tcp_server` 属性），而 worker 的连接
+        #   只被其中一个实例 accept。请求线程读的是 `_tcp_server_default`，
+        #   因此 `clients` 为空 ⇒ 一连串下游症状：
+        #     `_get_pipeline_readiness` 的 `connected` 为空 ⇒
+        #     `worker_tcp_disconnected`；assignment 拿不到
+        #     `execution="stage_offer_v3"`；capacity 求解器从未被调用而退化成
+        #     `simple_weight` 分配（`Layer 13-20` / `15-24` 即由此而来）。
+        #   日志判据：10-05 每次启动都有**同毫秒两条** `TCP服务端启动`，
+        #   而 10-03 三机验收时只有一条。
+        #   已在运行时直接返回，避免重复 init_nodes / create_server。
+        #   ★ 注意：两次 `start()` 是**并发**的（日志时间戳同毫秒），非原子的
+        #     「检查后设置」两边都会通过 ⇒ 必须在 `_start_lock` 内占位。
         self._startup_cancel_event.clear()
         self.init_nodes()
-        self._running = True
+        if self._effective_role() == "master":
+            self._load_pipeline_recovery_state()
+            self._restore_pipeline_model_for_recovery()
 
         # Reconcile only the active model's assignment cache.  This is a
         # local, bounded cleanup and never touches the user's full model tree.
@@ -2504,11 +2562,20 @@ class Scheduler(
                 if self._active_pipeline_capacity_plan else None
             )
             if capacity_plan is None and self._pipeline_load_transaction:
+                transaction_phase = str(
+                    self._pipeline_load_transaction.get("phase", "") or ""
+                )
                 candidate = self._pipeline_load_transaction.get("plan")
-                if isinstance(candidate, dict) and candidate.get("admitted"):
+                if (
+                    transaction_phase in {
+                        "preparing", "committing_local", "committing", "ready",
+                    }
+                    and isinstance(candidate, dict)
+                    and candidate.get("admitted")
+                ):
                     capacity_plan = dict(candidate)
                     capacity_plan["transaction_phase"] = (
-                        self._pipeline_load_transaction.get("phase", "")
+                        transaction_phase
                     )
 
         if capacity_plan and capacity_plan.get("admitted"):
@@ -2595,11 +2662,17 @@ class Scheduler(
         # readiness hint. Feed admitted Android ranges into the capacity
         # solver so it cannot produce an assignment the worker must reject.
         layer_ranges_by_node: dict[str, list[list[int]]] = {}
+        layer_artifacts_by_node: dict[str, list[dict]] = {}
         # ★ 2026-10-03：设备自荐的层容量（本地裁层后可承载的层数上限）。与
         #   `layer_ranges` 同源（v3 hello capabilities）但语义不同：ranges 是
         #   "当前已就绪、马上能跑的区间"，budget 是"能自裁并承载的上限" ⇒ 有了它，
         #   求解器才能给该节点分配任意连续区间，而不是被它预置的那一段钉死。
         layer_budget_by_node: dict[str, dict] = {}
+        # ★ 2026-10-05（DIST-3 三机实测）：工件段类型（`head`/`middle`/`tail`）。
+        #   与 `layer_ranges` / `layer_budget` 同源（v3 hello capabilities），但要
+        #   单独透传给容量求解器：区间只说"覆盖哪些层"，不区分工件含不含
+        #   embedding / lm_head，于是中间段会被分到末段（实测失败原因）。
+        segment_mode_by_node: dict[str, str] = {}
         if self._effective_role() == "master" and TASK_WORKER_EXPERIMENTAL_ENABLED:
             try:
                 worker_status = self._task_worker_control.status(role="master")
@@ -2617,18 +2690,31 @@ class Scheduler(
                 ranges = capabilities.get("layer_ranges")
                 if isinstance(ranges, list) and ranges:
                     layer_ranges_by_node[node_id] = ranges
+                artifacts = capabilities.get("layer_artifacts")
+                if isinstance(artifacts, list) and artifacts:
+                    layer_artifacts_by_node[node_id] = artifacts
                 budget = capabilities.get("layer_budget")
                 if isinstance(budget, dict):
                     layer_budget_by_node[node_id] = budget
-        if layer_ranges_by_node or layer_budget_by_node:
+                segment_mode = capabilities.get("segment_mode")
+                if isinstance(segment_mode, str) and segment_mode.strip():
+                    segment_mode_by_node[node_id] = segment_mode.strip().lower()
+        if (
+            layer_ranges_by_node
+            or layer_artifacts_by_node
+            or layer_budget_by_node
+            or segment_mode_by_node
+        ):
             logger.info(
-                "容量节点层段投影: ranges=%s budget=%s",
+                "容量节点层段投影: ranges=%s budget=%s segment_mode=%s",
                 {k: v for k, v in layer_ranges_by_node.items()},
                 {k: v.get("max_layers") for k, v in layer_budget_by_node.items()},
+                segment_mode_by_node,
             )
 
         records = []
         effective_id = self.get_effective_node_id()
+        now = time.time()
         for node_id, node in snapshot:
             # ★ 逐条件诊断：把「为什么某个在线 PC 没进容量候选」直接打出来。
             #   此前是一个 5 条件的 `or` 短路，出问题时只能靠猜 —— 排查 relay 跨机拓扑时
@@ -2653,6 +2739,17 @@ class Scheduler(
                 and not node.is_available()
             ):
                 skip_reason = "not_available"
+            elif (
+                node.role != NodeRole.MASTER
+                and node_id != effective_id
+                and not node.is_heartbeat_fresh(now, WORKER_HEARTBEAT_MAX_AGE)
+            ):
+                # ★ 2026-10-05（DIST-2）：容量候选此前只看 `NodeState`，而 TCP 半开
+                #   （对端进程已死、不发 FIN）要等巡检约 129s 才置 OFFLINE ⇒ 静默节点
+                #   在这段窗口里**一直占容量**，会分配出既非声明区间、层数也不对的
+                #   结果（实测：Y700 被带走后 master 仍把它算进规划）。
+                #   这里与 `_get_pipeline_readiness` 共用同一阈值 `WORKER_HEARTBEAT_MAX_AGE`。
+                skip_reason = "heartbeat_stale"
             if skip_reason:
                 logger.info(
                     "容量候选跳过 %s: reason=%s node_type=%s role=%s eligible=%s opted_out=%d",
@@ -2744,8 +2841,14 @@ class Scheduler(
             }
             if node_id in layer_ranges_by_node:
                 record["layer_ranges"] = layer_ranges_by_node[node_id]
+            if node_id in layer_artifacts_by_node:
+                record["layer_artifacts"] = layer_artifacts_by_node[node_id]
             if node_id in layer_budget_by_node:
                 record["layer_budget"] = layer_budget_by_node[node_id]
+            # ★ 2026-10-05（DIST-3）：段类型透传给求解器，供其拒绝
+            #   「中间段接末段 / 末段接中间段」这类分配。
+            if node_id in segment_mode_by_node:
+                record["segment_mode"] = segment_mode_by_node[node_id]
             records.append(record)
         return records
 
@@ -2757,6 +2860,42 @@ class Scheduler(
         )
         with self._nodes_lock:
             snapshot = list(self.nodes.items())
+        worker_engines: dict[str, str] = {}
+        if self._effective_role() == "master" and TASK_WORKER_EXPERIMENTAL_ENABLED:
+            try:
+                worker_status = self._task_worker_control.status(role="master")
+            except Exception:
+                worker_status = {}
+            for worker in worker_status.get("workers", []):
+                if not isinstance(worker, dict):
+                    continue
+                capabilities = worker.get("capabilities")
+                if not isinstance(capabilities, dict):
+                    continue
+                models = capabilities.get("models")
+                model_engines = {
+                    str(item.get("engine", "")).strip()
+                    for item in models
+                    if isinstance(item, dict)
+                    and str(item.get("engine", "")).strip()
+                } if isinstance(models, list) else set()
+                # A PC can have both runtimes installed while its selected
+                # layer artifact is GGUF.  The executable model identity is
+                # more specific than the installation-wide engine list.
+                if len(model_engines) == 1:
+                    worker_engines[str(worker.get("node_id", ""))] = next(
+                        iter(model_engines)
+                    )
+                    continue
+                engines = capabilities.get("engines")
+                if not isinstance(engines, list):
+                    continue
+                normalized = [
+                    str(value).strip() for value in engines
+                    if str(value).strip()
+                ]
+                if len(normalized) == 1:
+                    worker_engines[str(worker.get("node_id", ""))] = normalized[0]
         return {
             node_id: {
                 "is_local": node_id == local_node_id,
@@ -2767,9 +2906,11 @@ class Scheduler(
                 "federated": node_id != local_node_id,
                 "engine": (
                     "relay_middle"
-                    if callable(getattr(self, "_relay_segment_for_worker", None))
-                    and self._relay_segment_for_worker(node_id) is not None
-                    else "pytorch"
+                    if self._is_relay_host(node_id)
+                    else worker_engines.get(
+                        node_id,
+                        str((_node.device_info or {}).get("backend_id") or "pytorch"),
+                    )
                 ),
             }
             for node_id, _node in snapshot
@@ -3031,6 +3172,12 @@ class Scheduler(
                 return self._attach_pipeline_node_contract(active)
             if transaction_snapshot and transaction_plan:
                 transaction_plan.update(transaction_snapshot)
+                if transaction_snapshot.get("transaction_phase") in {
+                    "rejected", "aborted", "invalidated",
+                }:
+                    # Retain terminal transaction diagnostics without
+                    # exposing the stale plan as executable capacity.
+                    transaction_plan["admitted"] = False
                 if transaction_plan.get("reason_code") == "pipeline_layer_range_coverage_insufficient":
                     transaction_plan["reason"] = (
                         "advertised layer_ranges cannot cover the requested contiguous layer interval"
@@ -3160,10 +3307,18 @@ class Scheduler(
             for item in self._get_pipeline_capacity_nodes(node_ids)
         }
         planned = []
+        artifact_source_sha256 = ""
         for item in assignments:
             node_id = str(item.get("node_id", ""))
             start = int(item.get("start_layer", 0) or 0)
             end = int(item.get("end_layer", 0) or 0)
+            if start < 0 or end <= start or end > total_layers:
+                return {
+                    "status": "rejected", "admitted": False,
+                    "reason_code": "pipeline_capacity_manual_range_invalid",
+                    "reason": f"node {node_id} has invalid range [{start},{end})",
+                    "assignments": [],
+                }
             record = records.get(node_id)
             if record is None:
                 return {
@@ -3172,6 +3327,75 @@ class Scheduler(
                     "reason": f"node {node_id} has no usable capacity",
                     "assignments": [],
                 }
+            local_cut = bool(
+                isinstance(record.get("layer_budget"), dict)
+                and record["layer_budget"].get("local_cut")
+            )
+            selected_artifact = None
+            segment_mode = str(record.get("segment_mode", "") or "").lower()
+            if not local_cut:
+                artifacts = record.get("layer_artifacts")
+                if isinstance(artifacts, list) and artifacts:
+                    selected_artifact = next((
+                        dict(artifact) for artifact in artifacts
+                        if isinstance(artifact, dict)
+                        and list(artifact.get("layer_range") or []) == [start, end]
+                    ), None)
+                    if selected_artifact is None:
+                        return {
+                            "status": "rejected", "admitted": False,
+                            "reason_code": "pipeline_segment_contract_unsatisfied",
+                            "reason": (
+                                f"node {node_id} has no exact artifact for "
+                                f"[{start},{end})"
+                            ),
+                            "assignments": [],
+                        }
+                    segment_mode = str(
+                        selected_artifact.get("segment_mode", "") or ""
+                    ).lower()
+                    source_sha256 = str(
+                        selected_artifact.get("source_model_sha256", "") or ""
+                    ).lower()
+                    if (
+                        artifact_source_sha256 and source_sha256
+                        and artifact_source_sha256 != source_sha256
+                    ):
+                        return {
+                            "status": "rejected", "admitted": False,
+                            "reason_code": "pipeline_segment_contract_unsatisfied",
+                            "reason": "manual artifacts have different source identities",
+                            "assignments": [],
+                        }
+                    artifact_source_sha256 = artifact_source_sha256 or source_sha256
+                allowed_ranges = record.get("layer_ranges")
+                if isinstance(allowed_ranges, list) and allowed_ranges and not any(
+                    list(layer_range) == [start, end]
+                    for layer_range in allowed_ranges
+                    if isinstance(layer_range, (list, tuple))
+                ):
+                    return {
+                        "status": "rejected", "admitted": False,
+                        "reason_code": "pipeline_layer_range_coverage_insufficient",
+                        "reason": f"node {node_id} does not advertise [{start},{end})",
+                        "assignments": [],
+                    }
+                mode_valid = (
+                    (segment_mode == "head" and start == 0)
+                    or (segment_mode == "middle" and start > 0 and end < total_layers)
+                    or (segment_mode == "tail" and end == total_layers)
+                    or (not segment_mode and selected_artifact is None)
+                )
+                if not mode_valid:
+                    return {
+                        "status": "rejected", "admitted": False,
+                        "reason_code": "pipeline_segment_contract_unsatisfied",
+                        "reason": (
+                            f"node {node_id} artifact mode {segment_mode!r} "
+                            f"cannot execute [{start},{end})"
+                        ),
+                        "assignments": [],
+                    }
             raw_bytes = sum(layer_bytes[start:end]) + per_node_bytes
             if bool(item.get("has_embedding")):
                 raw_bytes += embedding_bytes
@@ -3190,7 +3414,7 @@ class Scheduler(
                     ),
                     "assignments": [],
                 }
-            planned.append({
+            planned_item = {
                 **dict(item),
                 "raw_weight_bytes": raw_bytes,
                 "required_bytes": required,
@@ -3200,7 +3424,10 @@ class Scheduler(
                 "runtime_multiplier": record["runtime_multiplier"],
                 "execution_device": record["execution_device"],
                 "capacity_source": record["capacity_source"],
-            })
+            }
+            if selected_artifact is not None:
+                planned_item["layer_artifact"] = selected_artifact
+            planned.append(planned_item)
 
         plan_identity = {
             "model_id": descriptor.get("model_id", ""),
@@ -3211,6 +3438,7 @@ class Scheduler(
                     for key in (
                         "node_id", "start_layer", "end_layer",
                         "required_bytes", "capacity_bytes",
+                        "layer_artifact",
                     )
                 }
                 for item in planned
@@ -3548,15 +3776,11 @@ class Scheduler(
             )
             if capabilities.get("models") and not has_layer_stage:
                 node_id = str(worker.get("node_id", "") or "")
-                # ★ relay 宿主不是 Full Worker：它**不能**声明 `forward_layers`
-                #   （声明了就会拒绝 legacy 层配置，而 relay 委派正是走那条通道 ——
-                #   实测 Surface 报「本节点是 v3 层段 worker，拒绝 legacy 分层配置」），
-                #   所以这里的 `has_layer_stage` 恒为假。但它要的**恰恰**是那份 legacy
-                #   层配置，不该被当 Full Worker 释放预留，否则 relay 链丢掉中间段。
-                is_relay_host = bool(
-                    node_id and self._relay_segment_for_worker(node_id) is not None
-                )
-                if node_id and not is_relay_host:
+                # ★ relay 宿主不是 Full Worker（判据唯一的出处在 `_is_relay_host()`）：
+                #   它不能声明 `forward_layers`（声明了就会拒绝 legacy 层配置，而 relay
+                #   委派正是走那条通道），所以这里的 `has_layer_stage` 恒为假；但它要的
+                #   恰恰是那份 legacy 层配置，不该被当 Full Worker 释放预留。
+                if node_id and not self._is_relay_host(node_id):
                     worker_ids.add(node_id)
         return worker_ids
 
@@ -4016,6 +4240,37 @@ class Scheduler(
                     "pipeline_worker_disconnected",
                     f"worker {client_id} disconnected during transaction",
                 )
+            active_plan = self._active_pipeline_capacity_plan
+            transaction_plan = (
+                transaction.get("plan") if isinstance(transaction, dict) else None
+            )
+
+            def _plan_uses_node(plan: object) -> bool:
+                if not isinstance(plan, dict):
+                    return False
+                return any(
+                    str(item.get("node_id", "")) == client_id
+                    for item in plan.get("assignments", [])
+                    if isinstance(item, dict)
+                )
+
+            uses_active_plan = _plan_uses_node(active_plan)
+            uses_transaction_plan = _plan_uses_node(transaction_plan)
+            if uses_active_plan or (
+                transaction
+                and transaction.get("phase") == "ready"
+                and (
+                    client_id in set(transaction.get("worker_ids", set()))
+                    or uses_transaction_plan
+                )
+            ):
+                self._active_pipeline_capacity_plan = None
+                if transaction and abort_details is None:
+                    transaction["phase"] = "invalidated"
+                    transaction["reason_code"] = "pipeline_worker_disconnected"
+                    transaction["reason"] = (
+                        f"worker {client_id} disconnected after plan activation"
+                    )
             qwen3_transaction = self._qwen3_pipeline_dry_run
             if qwen3_transaction is not None:
                 qwen3_disconnect = qwen3_transaction.disconnect(client_id)
@@ -4030,6 +4285,12 @@ class Scheduler(
                     )
         if abort_details is not None:
             self._abort_pipeline_load_transaction(*abort_details)
+        # A disconnected socket can no longer satisfy the assignment that was
+        # registered for it.  Drop that per-node expectation before the
+        # reconnect callback publishes a fresh generation; otherwise an old
+        # ACK/retry entry can participate in readiness during the reconnect
+        # window and race the new configuration.
+        self._clear_layer_config_state(client_id)
         if qwen3_disconnect is not None:
             logger.warning(
                 "Qwen3 dry-run 因节点断线中止: node=%s contract=%s",
@@ -4250,11 +4511,12 @@ class Scheduler(
                 logger.info(f"推理任务已停止: {self._current_task.task_id}")
                 self._current_task = None
 
-        # 恢复所有节点为空闲
-        with self._nodes_lock:
-            for nid in self.nodes:
-                if self.nodes[nid].state == NodeState.BUSY:
-                    self.update_node_state(nid, NodeState.ONLINE)
+        # ★ 2026-10-05（DIST-2 收拢现状）：此处原有「恢复所有节点为空闲」——
+        #   `if self.nodes[nid].state == NodeState.BUSY: update_node_state(ONLINE)`。
+        #   但 `BUSY` **从未被任何代码置位** ⇒ 该分支恒假，整段是死逻辑，已移除
+        #   连同 `NodeState.BUSY` / `NodeState.ERROR` 两个枚举值。节点可用性现在由
+        #   「`NodeState`（ONLINE/OFFLINE）+ 心跳新鲜度」两维表达，
+        #   见 `scheduler_types.NodeState` 的说明。
 
         # TODO: 发送 TASK_STOP 指令给所有从节点
         # TODO: 清空所有节点 KV 缓存

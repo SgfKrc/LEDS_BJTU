@@ -193,6 +193,46 @@ def test_capacity_plan_adapter_preserves_solver_assignment():
     assert layout.nodes[-1].federated is True
 
 
+def test_capacity_plan_adapter_preserves_selected_segment_artifact():
+    plan = {
+        "admitted": True,
+        "total_layers": 2,
+        "model_sha256": MODEL_SHA,
+        "model_type": "qwen2",
+        "assignments": [
+            {
+                "node_id": "local", "role": "master",
+                "start_layer": 0, "end_layer": 1,
+                "has_embedding": True, "has_lm_head": False,
+                "capacity_bytes": 100, "required_bytes": 10,
+            },
+            {
+                "node_id": "edge", "role": "client",
+                "start_layer": 1, "end_layer": 2,
+                "has_embedding": False, "has_lm_head": True,
+                "capacity_bytes": 100, "required_bytes": 10,
+                "layer_artifact": {
+                    "layer_range": [1, 2],
+                    "segment_mode": "tail",
+                    "model_id": "tail1-2.gguf",
+                    "artifact_sha256": "b" * 64,
+                    "source_model_sha256": "c" * 64,
+                },
+            },
+        ],
+    }
+
+    layout = pipeline_layout_from_capacity_plan(plan)
+
+    assert layout.nodes[-1].artifact.model_sha256 == MODEL_SHA
+    assert layout.nodes[-1].artifact.artifact_kind == "gguf_segment"
+    assert layout.nodes[-1].artifact.artifact_sha256 == "b" * 64
+    assert layout.nodes[-1].artifact.source_layer_range == (1, 2)
+    assert layout.nodes[-1].engine == "llama_cpp"
+    assert layout.nodes[-1].cross_engine is True
+    assert layout.nodes[-1].handoff_at == 1
+
+
 def test_relay_and_rpc_contracts_map_without_control_plane_imports():
     upstream = RelayModelIdentity(
         model_sha256=MODEL_SHA, architecture="qwen35", block_count=5,

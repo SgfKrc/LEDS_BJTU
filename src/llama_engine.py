@@ -158,6 +158,9 @@ class LlamaCppEngine:
         self._n_ctx: int = 4096      # 上下文窗口大小
         self._n_threads: int = 4     # CPU 线程数
         self._loaded: bool = False
+        self._pipeline_descriptor: Dict[str, Any] | None = None
+        self._pipeline_sha_cache: Dict[str, Any] = {}
+        self._pipeline_distributed_only: bool = False
         # RAG embedding is opt-in. A normal text-generation load is never
         # silently reused as an embedding model.
         self._embedding_enabled: bool = False
@@ -298,8 +301,9 @@ class LlamaCppEngine:
         也有 `forward_layers_to_hidden` / `forward_layers_from_hidden`）。去 torch 化的
         边缘设备只得一份裁层 GGUF，正是靠这个描述器才当得上流水线主节点。
 
-        `model_type` 取自 GGUF 的 `general.architecture`，与 `PIPELINE_RUNTIME_MODEL_TYPES`
-        同源判定 —— 判据只有一处，不在这里另立白名单。
+        `model_type` 取自 GGUF 的 `general.architecture`，先在共享描述器边界归一化
+        llama.cpp 架构别名，再与 `PIPELINE_RUNTIME_MODEL_TYPES` 同源判定 —— 判据只有
+        一处，不在这里另立白名单。
         """
         cached = getattr(self, "_pipeline_descriptor", None)
         if isinstance(cached, dict) and cached:
@@ -317,9 +321,12 @@ class LlamaCppEngine:
         info = read_gguf_layer_info(path)
         if not info:
             return {}
-        from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
+        from pipeline_model_descriptor import (
+            PIPELINE_RUNTIME_MODEL_TYPES,
+            canonical_pipeline_model_type,
+        )
 
-        model_type = str(info.get("architecture", "") or "").lower()
+        model_type = canonical_pipeline_model_type(info.get("architecture", ""))
         if model_type not in PIPELINE_RUNTIME_MODEL_TYPES:
             return {}
         total_layers = int(info.get("n_layer", 0) or 0)
@@ -377,6 +384,62 @@ class LlamaCppEngine:
         }
         self._pipeline_descriptor = dict(descriptor)
         return dict(descriptor)
+
+    def prepare_pipeline_model(
+        self,
+        model_id: str,
+        model_path: str,
+        quant_type: str = None,
+        layer_range: tuple[int, int] | None = None,
+        model_sha256: str | None = None,
+    ) -> dict:
+        """Prepare GGUF pipeline metadata without constructing llama.cpp."""
+        resolved_path = os.path.abspath(model_path or "")
+        if not resolved_path or not os.path.isfile(resolved_path):
+            raise FileNotFoundError(f"GGUF 模型文件未找到: {resolved_path or '(未提供路径)'}")
+        if layer_range is not None:
+            raise ValueError("GGUF 整模恢复不接受 layer_range；裁层范围由工件 manifest 声明")
+        if self.is_loaded or self._mtmd_context is not None:
+            self.unload()
+        self._model_path = resolved_path
+        self.active_model_id = str(model_id or "")
+        self._quant_type = str(quant_type or "GGUF")
+        self._pipeline_descriptor = None
+        self._pipeline_sha_cache = {}
+        descriptor = self.get_pipeline_descriptor()
+        if not descriptor.get("pipeline_runtime_supported", False):
+            raise RuntimeError("GGUF 工件缺少可执行的流水线描述元数据")
+        actual_sha256 = str(descriptor.get("model_sha256", "") or "").lower()
+        expected_sha256 = str(model_sha256 or "").lower()
+        if expected_sha256 and actual_sha256 != expected_sha256:
+            self.unload()
+            raise RuntimeError("GGUF 流水线模型摘要与恢复记录不一致")
+        self._pipeline_descriptor = dict(descriptor)
+        self._pipeline_distributed_only = True
+        return dict(descriptor)
+
+    @property
+    def is_pipeline_prepared(self) -> bool:
+        return bool(self._pipeline_distributed_only and self._pipeline_descriptor)
+
+    def abort_pipeline_materialization(self) -> None:
+        """Release an aborted GGUF segment but keep whole-model metadata."""
+        descriptor = dict(self._pipeline_descriptor or {})
+        if not self._pipeline_distributed_only or not descriptor:
+            return
+        full_model_path = str(descriptor.get("model_path", "") or "")
+        model_id = str(descriptor.get("model_id", "") or "")
+        quant_type = str(descriptor.get("quant_type", "") or self._quant_type)
+        for key in (
+            "assignment_layer_range", "partial_assignment", "loaded_artifact",
+        ):
+            descriptor.pop(key, None)
+        self.unload()
+        self._model_path = full_model_path
+        self.active_model_id = model_id
+        self._quant_type = quant_type
+        self._pipeline_descriptor = descriptor
+        self._pipeline_distributed_only = True
 
     def _find_layer_artifact(self, start: int, end: int) -> str:
         """按 `[start, end)` 在工件目录里找裁层 GGUF —— **靠 manifest 自证，不猜文件名**。
@@ -443,12 +506,18 @@ class LlamaCppEngine:
         # 主节点会被判「模型已变化，请等待层配置重新同步」——实测卡在这里。
         # 所以：先留下整模描述器，加载段之后再装回去，只补层段标记。
         whole = dict(getattr(self, "_pipeline_descriptor", None) or {})
+        was_pipeline_prepared = self.is_pipeline_prepared
         self.load_model(path)
-        if whole:
-            whole["assignment_layer_range"] = [int(start_layer), int(end_layer)]
-            whole["partial_assignment"] = True
-            whole["loaded_artifact"] = path
-            self._pipeline_descriptor = whole
+        # A stage worker may be created directly and load its first artifact
+        # without ever having cached a full-model descriptor.  The artifact
+        # itself is still partial; leaving the descriptor empty would let
+        # ModelHost.ensure_full_model() mistake head8/mid8 for a full model.
+        whole.setdefault("model_path", path)
+        whole["assignment_layer_range"] = [int(start_layer), int(end_layer)]
+        whole["partial_assignment"] = True
+        whole["loaded_artifact"] = path
+        self._pipeline_descriptor = whole
+        self._pipeline_distributed_only = was_pipeline_prepared
         logger.info(
             "llama.cpp 层段已加载: [%d,%d) embed=%s lm_head=%s -> %s",
             int(start_layer), int(end_layer), has_embedding, has_lm_head, path,
@@ -547,6 +616,7 @@ class LlamaCppEngine:
 
         if self.is_loaded or self._mtmd_context is not None:
             self.unload()
+        self._pipeline_distributed_only = False
         self._model_path = model_path
         # 换模型即失效：描述器与文件摘要都跟着 `_model_path` 走。不重置会拿旧模型的
         # 层数/摘要去推层配置（`get_pipeline_descriptor` 缓存的就是它们）。
@@ -995,6 +1065,10 @@ class LlamaCppEngine:
         self._thinking_enabled = None
         self._thinking_controlled = False
         self._chat_template_kwargs = {}
+        self._pipeline_descriptor = None
+        self._pipeline_sha_cache = {}
+        self._pipeline_distributed_only = False
+        self._model_path = ""
         logger.info("GGUF 模型已卸载")
 
     @property
@@ -1751,9 +1825,14 @@ class LlamaCppEngine:
         #    `generate`/`create_completion` 路径里维护，而本引擎的层段 forward 直接走
         #    原生 `llama_decode` ⇒ 它恒为 0，等于又从 0 开始。实测症状正是 `rc=-1`。
         n_past = self._kv_used_cells()
-        logits = self.forward_layers_from_hidden(
-            hidden_states, n_past=n_past, all_logits=False,
-        )
+        try:
+            logits = self.forward_layers_from_hidden(
+                hidden_states, n_past=n_past, all_logits=False,
+            )
+        finally:
+            # ★ C 案：LM Head 对主链路的 KV **完全透明**。`llama_decode` 必然占位置，
+            #   算完就把自己占的那一格退掉，否则流水线下一步 decode 的 `n_past` 会撞上它。
+            self._drop_kv_from(n_past)
         if logits is None:
             raise RuntimeError("llama.cpp LM Head 未返回 logits")
         import numpy as _np
@@ -1764,6 +1843,34 @@ class LlamaCppEngine:
         elif array.ndim == 2:
             array = array[None, :, :]
         return array
+
+    def _drop_kv_from(self, pos: int) -> None:
+        """把 KV 里位置 `>= pos` 的格退掉，并同步自行跟踪的 `_kv_used`。
+
+        `llama_decode` 只要调用就**必然占** KV 位置 —— 没有「只投影不占位」的 API ⇒
+        辅助 decode（如 LM Head）算完后必须把自己占的删掉，否则流水线下一步 decode 的
+        `n_past` 会撞上它（实测：relay 链首段 prefill + relay 段都正常，到 LM Head 之后
+        的 decode 步就 `llama_decode rc=-1`）。
+
+        走 `llama_memory_seq_rm(memory, seq_id, p0, p1)`：删掉序列 0 中位置落在
+        `[pos, ∞)` 的 token（其 docstring 明写 "Removes all tokens that belong to the
+        specified sequence and have positions in [p0, p1)"，`p1 = -1` 表示到末尾）。
+        失败只记 debug —— 这只是 KV 记账，不该让一次推理失败。
+        """
+        try:
+            import llama_cpp.llama_cpp as M
+
+            native_ctx = getattr(getattr(self._model, "_ctx", None), "ctx", None)
+            if native_ctx is None:
+                return
+            memory = M.llama_get_memory(native_ctx)
+            if not memory:
+                return
+            M.llama_memory_seq_rm(memory, 0, int(pos), -1)
+        except Exception:
+            logger.debug("退掉辅助 decode 的 KV 占用失败（忽略）", exc_info=True)
+        finally:
+            self._kv_used = max(0, int(pos))
 
     def forward_layers(
         self,
@@ -1799,6 +1906,19 @@ class LlamaCppEngine:
 
         ids = _np.asarray(input_ids, dtype=_np.int64).reshape(-1).tolist()
         n_past = _kv_position(past_key_values)
+        # 排障：relay 链的 decode 步若每步都拿到 `n_past == 0`，就会每步清 KV、每步从
+        # 位置 0 重算 ⇒ 输出恒定不变（实测症状：尾部段永远吐同样两个 token）。
+        # 这条日志一次就能区分「KV 句柄没传到」与「数值本身错」。
+        logger.info(
+            "层段 forward: n_past=%s past_kv=%r(%s) tokens=%d",
+            n_past, past_key_values, type(past_key_values).__name__, len(ids),
+        )
+        if n_past == 0:
+            # 从位置 0 起 ⇒ 先清掉 ctx 里的旧 KV。`llama_decode` 在 `[0, n)` 上重跑会直接
+            # `rc=-1`（`forward_layers_to_hidden` 的文档记过这个坑）。任务级的 `_kv_cache`
+            # 只是 KV **句柄**表，清它不清 ctx ⇒ 第二个请求的 prefill 必撞车，实测症状
+            # 正是 relay 链首段 `llama_decode 失败 rc=-1`。
+            self._clear_context_kv()
         hidden = self.forward_layers_to_hidden(
             ids, n_past=n_past, all_positions=True,
         )
@@ -1808,6 +1928,90 @@ class LlamaCppEngine:
             "hidden_states": hidden,
             "cache": n_past + len(ids),
         }
+
+    def _clear_context_kv(self) -> None:
+        """清掉原生 context 里的 KV（新序列从位置 0 起时必须做）。
+
+        `reset_kv_cache()` 是既有的 **stateless no-op**（注释写明 llama.cpp 绑定没暴露
+        等价 API），真正能用的是 `Llama._ctx.kv_cache_clear()`。顺带把自行跟踪的
+        `_kv_used` 归零，否则后续辅助 decode（如 LM Head）会续在已经不存在的 KV 之后。
+        """
+        try:
+            self._model._ctx.kv_cache_clear()
+        except Exception:
+            logger.debug("清 context KV 失败（忽略）", exc_info=True)
+        self._kv_used = 0
+
+    def _keep_head_upstream(self):
+        """惰性构造 keep-head 上游（带补丁 shim）；不可用时返回 `None`。
+
+        为什么需要它：见 `docs/已知问题记录.md` #35 —— pip 绑定的
+        `llama_get_embeddings_ith` 返回的是 `output_norm(H)`，而层接力要求的是
+        **末层输出、`output_norm` 之前**的残差流。shim 的
+        `llama_set_embeddings_layer_inp(lid == n_layer)` 给出的正是后者。
+
+        按「工件路径 + 层数」缓存：`load_layer_range` 换了工件就自动重建。
+        """
+        import os
+        from pathlib import Path
+
+        desc = getattr(self, "_pipeline_descriptor", None) or {}
+        artifact = desc.get("loaded_artifact") or self._model_path
+        rng = desc.get("assignment_layer_range")
+        if not artifact or not rng or len(rng) != 2:
+            return None
+        cut_layer = int(rng[1]) - int(rng[0])
+        key = (str(artifact), cut_layer)
+        if getattr(self, "_keep_head_key", None) == key:
+            return getattr(self, "_keep_head", None)
+
+        old = getattr(self, "_keep_head", None)
+        if old is not None:
+            try:
+                old.close()
+            except Exception:  # noqa: BLE001 - 旧实例释放失败不影响新实例
+                logger.debug("keep-head 上游释放失败", exc_info=True)
+        self._keep_head = None
+        self._keep_head_key = key
+
+        shim = os.environ.get("QLH_KEEP_HEAD_SHIM", "").strip()
+        if not shim:
+            # shim 本体是 `qlh_keep_head.dll`（`qlh_kh_*` 入口在它里面）；同目录的
+            # `libllama.dll` 只是它依赖的**带补丁** llama.cpp，不是 shim。
+            candidate = (Path(__file__).resolve().parent.parent
+                         / "build" / "keephead" / "build-cpu" / "bin" / "qlh_keep_head.dll")
+            if candidate.is_file():
+                shim = str(candidate)
+        if not shim:
+            logger.error(
+                "keep-head 上游不可用：未找到 shim（可设 QLH_KEEP_HEAD_SHIM）；"
+                "拒绝交付语义不兼容的 embeddings hidden（docs/已知问题记录.md #35）")
+            return None
+        # 挂点判据：`nextn` 导出「末层输出」，但**各架构挂点不同** —— qwen2 在
+        # `output_norm` **之前**（正是接力要的），qwen35 在**之后**（多一次 RMSNorm，
+        # 实测会让接力首步分叉，见 `src/llama_keep_head.py` 的模块说明）。后者一律
+        # 不用 keep-head：宁可回退并告警，也不交付语义错的 hidden。
+        model_type = str(desc.get("model_type", "") or "")
+        if model_type.startswith("qwen3"):
+            logger.warning(
+                "keep-head 上游不可用：%s 的 nextn 挂点在 output_norm 之后，交付会"
+                "错位（docs/已知问题记录.md #35）", model_type)
+            return None
+        try:
+            from llama_keep_head import KeepHeadUpstream
+
+            # 不用 `layer_inp`：shim 把它限制为 `cut_layer < n_layer`
+            # （scripts/model_tools/keep_head_shim/qlh_keep_head.c:111），取不到
+            # `lid == n_layer`（= 末层输出）这个恰好需要的挂点。
+            self._keep_head = KeepHeadUpstream(
+                shim, str(artifact), mode="nextn",
+                n_ctx=int(getattr(self, "_n_ctx", 4096) or 4096))
+        except Exception:  # noqa: BLE001 - 语义不兼容时由调用方 fail-closed
+            logger.warning(
+                "keep-head 上游构造失败；层接力将 fail-closed，不交付 embeddings hidden "
+                "（docs/已知问题记录.md #35）", exc_info=True)
+            self._keep_head = None
+        return self._keep_head
 
     def forward_layers_to_hidden(self, input_ids, n_past: int = 0,
                                    all_positions: bool = False):
@@ -1832,6 +2036,51 @@ class LlamaCppEngine:
         """
         if not self.is_loaded:
             return None
+
+        # ★ docs/已知问题记录.md #35：层接力要求「末层输出、`output_norm` 之前」，
+        #   而下面的 embeddings 通道返回的是 `output_norm(H)`。二者语义不同，直接
+        #   交付会让下游段在已 norm 的残差流上继续算 ⇒ 接力第一步即分叉。优先走
+        #   带补丁的 keep-head；它自己的 KV 由 shim 侧的 runner 维护，故这里不动
+        #   `self._kv_used`（那是本进程 pip ctx 的账）。
+        keep = self._keep_head_upstream()
+        if keep is not None:
+            import numpy as np
+
+            toks = [int(t) for t in np.asarray(input_ids).reshape(-1).tolist()]
+            if not toks:
+                raise ValueError("input_ids 不能为空")
+            if int(n_past) == 0:
+                # 新任务从位置 0 重来。keep-head worker 在同一进程里跨任务复用
+                # （`_keep_head_upstream` 按工件缓存），不清记忆就会撞上上一任务
+                # 的残留位置 —— llama.cpp 报 "tokens have inconsistent sequence
+                # positions"，表现为 `llama_decode rc=-1`。与 relay tail 段的
+                # `_pos` 泄漏同族，只是这次在 master 自己的首段里。
+                keep.reset()
+            out = np.asarray(keep.forward_tokens_to_hidden(toks, n_past=int(n_past)),
+                             dtype=np.float32)
+            return out if all_positions else out[-1].copy()
+
+        # ★ 2026-10-06 加固（docs/已知问题记录.md #35）：
+        #   本函数末尾的 pip-embeddings 通道返回的是 `output_norm(H)`，而层接力要求
+        #   「末层输出、`output_norm` **之前**」—— 二者语义不同。直接交付会让下游段在
+        #   已归一化的残差流上继续算，**首步即分叉且不报错**（症状：token 与 prompt
+        #   无关地交替，见 #35 原文）。
+        #   此前只在 `partial_assignment` 时才 fail-closed ⇒ 「纯整模 GGUF +
+        #   直接 forward_layers」这条形态（legacy 首段 `scheduler_pipeline.py:3596/6388`、
+        #   peer 侧 `inference_service/peer.py:919`、relay 探针
+        #   `scripts/relay_experiment.py:948`）会**静默**走进 embeddings 分支。
+        #   现改为**默认一律 fail-closed**；确需旧行为者用 `QLH_ALLOW_NORMED_UPSTREAM=1`
+        #   显式放行（与 handoff 的 `upstream_applies_output_norm` 口径一致）。
+        _allow_normed = os.environ.get(
+            "QLH_ALLOW_NORMED_UPSTREAM", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if not _allow_normed:
+            raise RuntimeError(
+                "llama.cpp 层接力需要 keep-head 上游（output_norm 之前的 hidden）；"
+                "当前 shim 不可用，拒绝使用语义不兼容的 embeddings 通道"
+                "（确需旧行为请设 QLH_ALLOW_NORMED_UPSTREAM=1）"
+            )
+
         import numpy as np
         import llama_cpp.llama_cpp as M
 

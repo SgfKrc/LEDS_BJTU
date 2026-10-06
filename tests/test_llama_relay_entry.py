@@ -53,9 +53,63 @@ class TestNotLoaded:
         with pytest.raises(TypeError):
             eng.is_loaded()  # type: ignore[operator]
 
+    def test_partial_upstream_fails_closed_without_keep_head(self, monkeypatch):
+        """A partial GGUF must never hand output_norm hidden to a relay tail."""
+        from llama_engine import LlamaCppEngine
+
+        eng = LlamaCppEngine()
+        eng._model = object()
+        eng._loaded = True
+        eng._pipeline_descriptor = {
+            "partial_assignment": True,
+            "assignment_layer_range": [0, 8],
+        }
+        monkeypatch.setattr(eng, "_keep_head_upstream", lambda: None)
+
+        with pytest.raises(RuntimeError, match="keep-head"):
+            eng.forward_layers_to_hidden([1, 2], n_past=0)
+
+    def test_layer_load_marks_partial_without_prior_descriptor(self, monkeypatch, tmp_path):
+        """A first direct stage load must still block full-model fallback."""
+        from llama_engine import LlamaCppEngine
+
+        artifact = tmp_path / "head8.gguf"
+        artifact.write_bytes(b"test")
+        eng = LlamaCppEngine()
+        monkeypatch.setattr(eng, "_find_layer_artifact", lambda _start, _end: str(artifact))
+        monkeypatch.setattr(
+            eng,
+            "load_model",
+            lambda path: setattr(eng, "_model_path", str(path)),
+        )
+
+        eng.load_layer_range(0, 8, has_embedding=True, has_lm_head=False)
+
+        descriptor = eng.get_pipeline_descriptor()
+        assert descriptor["partial_assignment"] is True
+        assert descriptor["assignment_layer_range"] == [0, 8]
+
 
 class TestWithRealModel:
     """需要裁层 GGUF 的用例（缺工件则整类跳过）。"""
+
+    @pytest.fixture(autouse=True)
+    def _allow_normed_upstream(self, monkeypatch):
+        """★ 2026-10-06：本类有意覆盖 `forward_layers_to_hidden` 的 pip-embeddings 通道
+        （它返回 `output_norm(H)`）。该通道自 #35 加固起**默认 fail-closed**（因为对层接力
+        而言语义不兼容），所以这里显式放行，让函数级覆盖继续有效。
+        「默认拒绝」本身另由 `test_default_rejects_normed_upstream` 覆盖。"""
+        monkeypatch.setenv("QLH_ALLOW_NORMED_UPSTREAM", "1")
+
+    def test_default_rejects_normed_upstream(self, monkeypatch):
+        """★ #35 加固（2026-10-06）：**默认**（不设 `QLH_ALLOW_NORMED_UPSTREAM`）必须
+        fail-closed，不得静默交付 `output_norm(H)`。本类有 autouse fixture 放行 ⇒
+        这里显式清除以验证默认行为；keep-head 也 mock 成不可用以走到该分支。"""
+        monkeypatch.delenv("QLH_ALLOW_NORMED_UPSTREAM", raising=False)
+        eng = _engine_or_skip()
+        monkeypatch.setattr(eng, "_keep_head_upstream", lambda: None)
+        with pytest.raises(RuntimeError, match="output_norm"):
+            eng.forward_layers_to_hidden([1, 2], n_past=0)
 
     def test_logits_shape_and_determinism(self):
         import numpy as np
@@ -135,6 +189,12 @@ class TestMultiSequence:
     `llama_decode rc=-1`**。主仓现经模块级 `llama_context_default_params()` 在建 context 前注入
     （`llama_engine._new_llama_with_seq_max`）。
     """
+
+    @pytest.fixture(autouse=True)
+    def _allow_normed_upstream(self, monkeypatch):
+        """同 `TestWithRealModel`：本类直接覆盖 `forward_layers_to_hidden`，需显式放行
+        （该函数的 embeddings 通道自 #35 加固起默认 fail-closed）。"""
+        monkeypatch.setenv("QLH_ALLOW_NORMED_UPSTREAM", "1")
 
     def test_default_path_unchanged(self, monkeypatch):
         """`n_seq_max=None`（默认）时不得改动 llama.cpp 的全局默认 params 函数。"""

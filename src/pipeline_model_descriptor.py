@@ -26,6 +26,12 @@ DESCRIPTOR_SCHEMA_VERSION = 1
 #   （实测 `RuntimeError: 模型架构 qwen3_5_text 缺少最终 Norm`）。两者共用
 #   `model.language_model.*` 前缀（实测真工件 318 个层 key 全部匹配）。
 PIPELINE_RUNTIME_MODEL_TYPES = frozenset({"qwen", "qwen2", "qwen3_5", "qwen3_5_text"})
+_PIPELINE_MODEL_TYPE_ALIASES = {
+    # llama.cpp's GGUF architecture name for the Transformers ``qwen3_5``
+    # model family.  Pipeline descriptors use the Transformers spelling so
+    # descriptors from both engines share one model-type contract.
+    "qwen35": "qwen3_5",
+}
 _MAX_JSON_BYTES = 64 * 1024 * 1024
 _DTYPE_BYTES = {
     "BOOL": 1,
@@ -48,6 +54,13 @@ _DTYPE_BYTES = {
 
 class PipelineModelDescriptorError(ValueError):
     """The local artifact cannot produce a safe pipeline descriptor."""
+
+
+def canonical_pipeline_model_type(value: Any) -> str:
+    """Return the canonical model type used by pipeline descriptors."""
+
+    normalized = str(value or "").strip().lower()
+    return _PIPELINE_MODEL_TYPE_ALIASES.get(normalized, normalized)
 
 
 _ARCHITECTURE_LAYOUTS = {

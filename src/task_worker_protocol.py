@@ -45,6 +45,7 @@ _LEASE_ID = re.compile(r"^lease_[A-Za-z0-9_-]{8,96}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _SAFE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_LAYER_SEGMENT_MODES = frozenset({"head", "middle", "tail"})
 
 # 受支持的推理引擎标识（与 task_provider.ModelIdentity 的校验集保持一致）:
 #   pytorch / llama_cpp   本地引擎
@@ -429,6 +430,19 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     #   `field_mismatch`。与其余可选键同样按「出现才允许」处理。
     if "relay_middle" in capabilities:
         expected_fields.add("relay_middle")
+    # ★ 2026-10-05（DIST-3 三机实测）：工件段类型（可选）—— `head`/`middle`/`tail`，
+    #   取值同主仓 `scripts/cut_layers.py` 的 `mode`。让调度侧能拒绝「中间段接末段」
+    #   （中间段工件没有 lm_head / final_norm）。
+    #   与其余可选键同样按「出现才允许」处理 —— 漏掉这一行，该 worker 的 hello 会以
+    #   `unknown=['segment_mode']` 被判 `invalid_fields` ⇒ **TCP 连上但握手中断**
+    #   （实测：Y700 每 30s 重连一次，master 侧只剩 `task_worker_handshake_pending`）。
+    if "segment_mode" in capabilities:
+        expected_fields.add("segment_mode")
+    # Per-artifact metadata is required when one worker owns heterogeneous
+    # ranges (for example a middle segment and a tail segment).  A single
+    # node-level ``segment_mode`` cannot describe that safely.
+    if "layer_artifacts" in capabilities:
+        expected_fields.add("layer_artifacts")
     _require_exact_fields(
         capabilities,
         expected_fields,
@@ -503,6 +517,94 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
                 "invalid_capabilities", "payload.capabilities.layer_ranges",
                 "layer_ranges must not contain duplicates",
             )
+    if "segment_mode" in capabilities:
+        segment_mode = _require_string(
+            capabilities["segment_mode"],
+            "payload.capabilities.segment_mode",
+        )
+        if segment_mode not in _LAYER_SEGMENT_MODES:
+            raise _error(
+                "invalid_capabilities", "payload.capabilities.segment_mode",
+                "segment_mode must be head, middle, or tail",
+            )
+    if "layer_artifacts" in capabilities:
+        artifacts = capabilities["layer_artifacts"]
+        field = "payload.capabilities.layer_artifacts"
+        if not isinstance(artifacts, list) or not artifacts or len(artifacts) > 64:
+            raise _error(
+                "invalid_capabilities", field,
+                "layer_artifacts must be a non-empty list with at most 64 entries",
+            )
+        artifact_ranges: list[tuple[int, int]] = []
+        artifact_modes: set[str] = set()
+        for index, artifact in enumerate(artifacts):
+            item_field = f"{field}[{index}]"
+            artifact = _require_object(artifact, item_field)
+            expected_artifact_fields = {
+                "layer_range", "segment_mode", "model_id", "artifact_sha256",
+            }
+            if "source_model_sha256" in artifact:
+                expected_artifact_fields.add("source_model_sha256")
+            _require_exact_fields(artifact, expected_artifact_fields, item_field)
+            layer_range = artifact["layer_range"]
+            if (
+                not isinstance(layer_range, list)
+                or len(layer_range) != 2
+                or any(
+                    isinstance(bound, bool) or not isinstance(bound, int)
+                    for bound in layer_range
+                )
+                or layer_range[0] < 0
+                or layer_range[1] <= layer_range[0]
+            ):
+                raise _error(
+                    "invalid_capabilities", f"{item_field}.layer_range",
+                    "layer_range must be a non-empty [start, end) integer range",
+                )
+            mode = _require_string(
+                artifact["segment_mode"], f"{item_field}.segment_mode",
+            )
+            if mode not in _LAYER_SEGMENT_MODES:
+                raise _error(
+                    "invalid_capabilities", f"{item_field}.segment_mode",
+                    "segment_mode must be head, middle, or tail",
+                )
+            _require_string(
+                artifact["model_id"], f"{item_field}.model_id", pattern=_SAFE_ID,
+            )
+            _require_string(
+                artifact["artifact_sha256"],
+                f"{item_field}.artifact_sha256",
+                pattern=_SHA256,
+            )
+            if "source_model_sha256" in artifact:
+                _require_string(
+                    artifact["source_model_sha256"],
+                    f"{item_field}.source_model_sha256",
+                    pattern=_SHA256,
+                )
+            artifact_ranges.append((layer_range[0], layer_range[1]))
+            artifact_modes.add(mode)
+        if len(artifact_ranges) != len(set(artifact_ranges)):
+            raise _error(
+                "invalid_capabilities", field,
+                "layer_artifacts must not contain duplicate layer_range values",
+            )
+        if "layer_ranges" not in capabilities or set(artifact_ranges) != {
+            tuple(item) for item in capabilities.get("layer_ranges", [])
+        }:
+            raise _error(
+                "invalid_capabilities", field,
+                "layer_artifacts and layer_ranges must advertise the same ranges",
+            )
+        if (
+            "segment_mode" in capabilities
+            and artifact_modes != {capabilities["segment_mode"]}
+        ):
+            raise _error(
+                "invalid_capabilities", "payload.capabilities.segment_mode",
+                "node-level segment_mode must agree with every layer_artifact",
+            )
     engines = capabilities["engines"]
     if not isinstance(engines, list) or not engines or any(
         value not in _SUPPORTED_ENGINES
@@ -538,6 +640,26 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
             "invalid_capabilities", "payload.capabilities.models",
             "model_id values must be unique",
         )
+    if "layer_artifacts" in capabilities:
+        models_by_id = {
+            str(model.get("model_id", "")): model
+            for model in models if isinstance(model, dict)
+        }
+        for index, artifact in enumerate(capabilities["layer_artifacts"]):
+            artifact_model_id = str(artifact.get("model_id", ""))
+            advertised_model = models_by_id.get(artifact_model_id)
+            if advertised_model is None:
+                raise _error(
+                    "invalid_capabilities",
+                    f"payload.capabilities.layer_artifacts[{index}].model_id",
+                    "layer artifact model_id must reference capabilities.models",
+                )
+            if advertised_model.get("sha256") != artifact.get("artifact_sha256"):
+                raise _error(
+                    "invalid_capabilities",
+                    f"payload.capabilities.layer_artifacts[{index}].artifact_sha256",
+                    "layer artifact digest must match its advertised model identity",
+                )
     max_concurrency = _require_int(
         capabilities["max_concurrency"],
         "payload.capabilities.max_concurrency",

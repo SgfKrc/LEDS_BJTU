@@ -458,6 +458,32 @@ PIPELINE_RELAY_ENABLED = _env_bool("QLH_RELAY_ENABLED", False)
 # 默认空 ⇒ 不下发任何 `relay_segment`，行为与接线前**完全一致**。不合法的条目整条丢弃。
 PIPELINE_RELAY_SEGMENTS = _env_first("QLH_RELAY_SEGMENTS", default="")
 
+# ★ 2026-10-04 产品裁定（分票规划 DIST-0）：**A1 relay 从产品调度入口剔除**。
+#   A1 依赖 probe/SSH 隧道与 loopback 段服务，只保留为技术探针与历史证据，
+#   不再是生产候选、容量来源或可用性证明（产品主线是 A3 `stage_offer_v3`）。
+#   本开关默认 **1（探针专用）**：置 1 时上面的 `QLH_RELAY_ENABLED` /
+#   `QLH_RELAY_SEGMENTS` 不再作为生产能力（`_relay_segment_for_worker` 直接
+#   不供给 relay 段），生产请求继续走 A3，只记一份具名诊断、不做静默切换。
+#   探针/实验需要恢复 A1 行为时显式设 `QLH_RELAY_PROBE_ONLY=0`。
+PIPELINE_RELAY_PROBE_ONLY = _env_bool("QLH_RELAY_PROBE_ONLY", True)
+
+# ★ 2026-10-05（DIST-4「发布闸门」）：**A3（Route A / `stage_offer_v3`）的独立开关**。
+#
+# 此前 A3 **没有开关** —— 路径由 assignment 是否被打上 `execution="stage_offer_v3"`
+# 自动决定（打标见 `scheduler_pipeline._push_layer_config_to_clients_locked`），
+# 而总闸 `DISTRIBUTED_INFERENCE_ENABLED` 默认开 ⇒ 现状是「实验线路默认关，但生产
+# 主线默认开且发布脚本无法区分」。
+#
+#   - `1`（默认）：A3 可用 —— **保持现状行为不变**；
+#   - `0`：不给任何 assignment 打 `stage_offer_v3` 标记 ⇒ 层段链整体不参与
+#     （`stage_offer_nodes` 为空，请求按既有 legacy/回退路径处理）。
+#
+# 默认取 `1` 是**刻意的**：本开关的用途是让**发布脚本/部署侧可以显式关掉实验
+# 线路**（`DIST-4` 的「只允许显式开启 A3」），而不是改变当前已验收通过的行为。
+PIPELINE_ROUTE_A_STAGE_OFFER_ENABLED = _env_bool(
+    "QLH_ROUTE_A_STAGE_OFFER", True,
+)
+
 # 图算法智能编排阈值：节点数超过此值（>5）时自动启用最大带宽生成树 + DFS，
 # 替代纯算力权重分配；节点数 ≤ 阈值时回退到简单排序（权重比例分配）
 GRAPH_ORCHESTRATOR_THRESHOLD = 5         # 节点数 > 5 启用图算法，≤ 5 使用简单排序

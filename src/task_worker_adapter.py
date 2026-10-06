@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections
 import hashlib
+import json
 import logging
 import queue
 import threading
@@ -66,6 +67,19 @@ def _message_id(prefix: str) -> str:
 
 def _message_digest(message: WorkerMessage) -> str:
     return hashlib.sha256(canonical_message_bytes(message)).hexdigest()
+
+
+def _canonical_capabilities(value: Any) -> str:
+    """把 capabilities 折成可比字符串（dict 顺序无关）。
+
+    用于「幂等 hello」：判断 worker 这次上报的能力与上次是否**内容相同**。
+    不可 JSON 序列化的值退化为 `repr` —— 宁可判成"变了"（多重推一次层配置），
+    也不要漏判（漏了就永远不推）。
+    """
+    try:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, default=repr)
+    except (TypeError, ValueError):
+        return repr(value)
 
 
 class TaskWorkerControlPlane:
@@ -219,6 +233,20 @@ class TaskWorkerControlPlane:
                 version=ack_version,
             )
             now = time.time()
+            previous = self._workers.get(peer_id)
+            # ★ 幂等 hello（#28）：capabilities 的**内容**是否变化。协调方据它决定要不要
+            #   重推层配置 —— 此前每次 hello 后都无条件
+            #   `push_layer_config_to_clients()`（无内容比较），一旦层段路径也补
+            #   `refresh_task_worker_capabilities()`，就形成
+            #   `hello → push → load_layer_range → refresh → hello` 自激环：每次 push 都取
+            #   新 generation，worker 端永远判成"新配置"。
+            #   首次 hello（`previous is None`）等效"变化"，保证仍会推一次。
+            connection_rebound = peer_id in self._coordinator_pending_workers
+            capabilities_changed = connection_rebound or _canonical_capabilities(
+                payload.get("capabilities")
+            ) != _canonical_capabilities(
+                previous.get("capabilities") if isinstance(previous, dict) else None
+            )
             self._workers[peer_id] = {
                 "node_id": peer_id,
                 "worker_kind": payload["worker_kind"],
@@ -226,6 +254,8 @@ class TaskWorkerControlPlane:
                 "accepted": accepted,
                 "selected_version": selected_version,
                 "capabilities": payload["capabilities"],
+                "capabilities_changed": capabilities_changed,
+                "connection_rebound": connection_rebound,
                 "hello_received_at": now,
                 "last_transport_heartbeat": now,
                 "reason_code": reason_code,
@@ -303,6 +333,46 @@ class TaskWorkerControlPlane:
     def pending_worker_ids(self) -> set[str]:
         with self._lock:
             return set(self._coordinator_pending_workers)
+
+    def connected_layer_stage_workers(
+        self, peer_ids: Optional[set[str]] = None,
+    ) -> list[dict[str, Any]]:
+        """Return accepted layer-capable workers without the health overlay.
+
+        Recovery must publish a fresh assignment before readiness is checked.
+        The normal status projection is heartbeat-gated, so using it as the
+        candidate source can deadlock recovery at ``not_configured``.  This
+        still requires an accepted hello and a live task-worker connection;
+        execution keeps the normal provider health gate.
+        """
+        allowed = {str(value) for value in peer_ids} if peer_ids is not None else None
+        with self._lock:
+            workers = []
+            for node_id, worker in self._workers.items():
+                if allowed is not None and node_id not in allowed:
+                    continue
+                if not worker.get("connected") or not worker.get("accepted"):
+                    continue
+                capabilities = worker.get("capabilities")
+                if not isinstance(capabilities, dict):
+                    continue
+                stage_types = capabilities.get("stage_types", [])
+                ranges = capabilities.get("layer_ranges")
+                if (
+                    worker.get("selected_version", 0) < 2
+                    or "layer_forward" not in stage_types
+                    or not ranges
+                ):
+                    continue
+                workers.append({
+                    "node_id": node_id,
+                    "worker_kind": worker.get("worker_kind", ""),
+                    "selected_version": worker.get("selected_version", 0),
+                    "capabilities": dict(capabilities),
+                    "connected": True,
+                    "accepted": True,
+                })
+            return workers
 
     def mark_coordinator_heartbeat(self) -> None:
         with self._lock:
@@ -432,7 +502,9 @@ class _PendingRemoteAttempt:
     cancel_ack_event: threading.Event = field(default_factory=threading.Event)
     result: Optional[StageResult] = None
     error: Optional[BaseException] = None
+    offer_sent: bool = False
     cancel_requested: bool = False
+    cancel_enqueued: bool = False
     cancel_acknowledged: bool = False
     released: bool = False
     released_at: float = 0.0
@@ -485,6 +557,15 @@ class RemoteFullWorkerProvider:
                 continue
             try:
                 self._send_message(message)
+                if message.message_type == "stage_cancel":
+                    logger.info(
+                        "event=task_worker_stage_cancel_sent node_id=%s "
+                        "workflow_id=%s stage_id=%s attempt_id=%s",
+                        self.node_id,
+                        message.payload.get("workflow_id", ""),
+                        message.payload.get("stage_id", ""),
+                        message.payload.get("attempt_id", ""),
+                    )
             except Exception as exc:
                 try:
                     on_error(exc)
@@ -534,6 +615,47 @@ class RemoteFullWorkerProvider:
         while len(self._seen_order) > _MESSAGE_CACHE_LIMIT:
             expired = self._seen_order.popleft()
             self._seen_messages.pop(expired, None)
+
+    def _take_cancel_message_locked(
+        self, pending: _PendingRemoteAttempt,
+    ) -> Optional[WorkerMessage]:
+        """Build one cancellation only after its Stage offer is on the wire."""
+        if (
+            not pending.offer_sent
+            or not pending.cancel_requested
+            or pending.cancel_enqueued
+        ):
+            return None
+        pending.cancel_enqueued = True
+        attempt = pending.attempt
+        return build_message(
+            "stage_cancel",
+            {
+                "workflow_id": attempt.request.workflow_id,
+                "stage_id": attempt.request.stage_id,
+                "attempt_id": attempt.attempt_id,
+                "lease_id": attempt.lease_id,
+                "lease_epoch": attempt.lease_epoch,
+                "reason_code": "coordinator_cancelled",
+            },
+            message_id=_message_id("cancel_"),
+            sent_at_ms=int(time.time() * 1000),
+            version=PROTOCOL_VERSION,
+        )
+
+    def _queue_cancel_message(
+        self, attempt_id: str, message: WorkerMessage,
+    ) -> None:
+        def on_send_error(_exc: Exception) -> None:
+            with self._lock:
+                current = self._pending.get(attempt_id)
+                if current is not None:
+                    current.cancel_acknowledged = True
+                    current.cancel_ack_event.set()
+                    if current.released:
+                        self._pending.pop(attempt_id, None)
+
+        self._queue_outbound_message(message, on_send_error)
 
     def _prune_pending_locked(self) -> None:
         now = time.time()
@@ -895,12 +1017,28 @@ class RemoteFullWorkerProvider:
         try:
             self._send_message(offer)
         except Exception as exc:
+            # A cancellation that raced with a failed offer send has no
+            # remote work left to acknowledge. Mark it terminal so release()
+            # can reclaim the pending entry immediately.
+            with self._lock:
+                current = self._pending.get(attempt.attempt_id)
+                if current is pending and pending.cancel_requested:
+                    pending.cancel_acknowledged = True
+                    pending.cancel_ack_event.set()
             raise ProviderExecutionError(
                 "failed to send Stage offer to the remote worker",
                 code="remote_worker_disconnected",
                 provider_id=self.provider_id,
                 retryable=True,
             ) from exc
+        cancel_message = None
+        with self._lock:
+            current = self._pending.get(attempt.attempt_id)
+            if current is pending:
+                pending.offer_sent = True
+                cancel_message = self._take_cancel_message_locked(pending)
+        if cancel_message is not None:
+            self._queue_cancel_message(attempt.attempt_id, cancel_message)
         accept_deadline = min(
             attempt.lease_expires_at,
             time.time() + min(
@@ -918,7 +1056,10 @@ class RemoteFullWorkerProvider:
                 provider_id=self.provider_id,
             )
         except ProviderExecutionError as exc:
-            if exc.code == "remote_accept_timeout":
+            # ★ 2026-10-05（DIST-3「取消」场景，已知问题 #47）：本地取消必须
+            #   **向对端传播** `stage_cancel`。本类 `cancel()` 里早就有构造与发送
+            #   逻辑，但此前只在 `remote_accept_timeout` 这一条路径调用过。
+            if exc.code in ("remote_accept_timeout", "provider_cancelled"):
                 self.cancel(attempt.attempt_id)
             raise
         if not pending.accepted:
@@ -927,14 +1068,22 @@ class RemoteFullWorkerProvider:
                 code="remote_stage_not_accepted",
                 provider_id=self.provider_id,
             )
-        self._wait(
-            pending.result_event,
-            pending,
-            cancel_event,
-            lambda: pending.lease_expires_at,
-            timeout_code="lease_expired",
-            provider_id=self.provider_id,
-        )
+        try:
+            self._wait(
+                pending.result_event,
+                pending,
+                cancel_event,
+                lambda: pending.lease_expires_at,
+                timeout_code="lease_expired",
+                provider_id=self.provider_id,
+            )
+        except ProviderExecutionError as exc:
+            # ★ 2026-10-05（同上）：等结果阶段被取消（`provider_cancelled`）或租约
+            #   过期时，同样要让对端停手 —— 否则 worker 白跑完整个 Stage，回传结果
+            #   时本端已无对应 pending（`reason=unknown_attempt`）。
+            if exc.code in ("provider_cancelled", "lease_expired"):
+                self.cancel(attempt.attempt_id)
+            raise
         if pending.result is None:
             raise ProviderExecutionError(
                 "remote worker returned no Stage result",
@@ -994,6 +1143,23 @@ class RemoteFullWorkerProvider:
                     code="attempt_identity_mismatch",
                     field="payload",
                 )
+            if (
+                pending.cancel_requested
+                and message.message_type in {
+                    "stage_accept", "stage_result", "stage_error",
+                }
+            ):
+                # A response already in flight can legally cross the local
+                # cancellation. Keep provider_cancelled authoritative and
+                # absorb the stale response idempotently instead of treating
+                # the peer as a protocol violator.
+                self._remember_message_locked(message)
+                logger.info(
+                    "event=task_worker_late_stage_response_ignored node_id=%s "
+                    "message_type=%s attempt_id=%s",
+                    self.node_id, message.message_type, attempt_id,
+                )
+                return message
             if message.message_type == "stage_accept":
                 if pending.accept_event.is_set():
                     raise WorkerProtocolError(
@@ -1066,6 +1232,14 @@ class RemoteFullWorkerProvider:
                     return message
                 pending.cancel_acknowledged = True
                 pending.cancel_ack_event.set()
+                logger.info(
+                    "event=task_worker_stage_cancel_acknowledged node_id=%s "
+                    "workflow_id=%s stage_id=%s attempt_id=%s",
+                    self.node_id,
+                    payload.get("workflow_id", ""),
+                    payload.get("stage_id", ""),
+                    attempt_id,
+                )
                 if pending.released:
                     self._pending.pop(attempt_id, None)
             self._remember_message_locked(message)
@@ -1138,6 +1312,7 @@ class RemoteFullWorkerProvider:
         return True
 
     def cancel(self, attempt_id: str) -> None:
+        message = None
         with self._lock:
             pending = self._pending.get(attempt_id)
             if pending is None or pending.cancel_requested:
@@ -1150,34 +1325,25 @@ class RemoteFullWorkerProvider:
             )
             pending.accept_event.set()
             pending.result_event.set()
-            attempt = pending.attempt
-            message = build_message(
-                "stage_cancel",
-                {
-                    "workflow_id": attempt.request.workflow_id,
-                    "stage_id": attempt.request.stage_id,
-                    "attempt_id": attempt.attempt_id,
-                    "lease_id": attempt.lease_id,
-                    "lease_epoch": attempt.lease_epoch,
-                    "reason_code": "coordinator_cancelled",
-                },
-                message_id=_message_id("cancel_"),
-                sent_at_ms=int(time.time() * 1000),
-                version=PROTOCOL_VERSION,
-            )
+            message = self._take_cancel_message_locked(pending)
 
-        def on_send_error(_exc: Exception) -> None:
-            with self._lock:
-                current = self._pending.get(attempt_id)
-                if current is not None:
-                    current.cancel_acknowledged = True
-                    current.cancel_ack_event.set()
-                    if current.released:
-                        self._pending.pop(attempt_id, None)
-
-        self._queue_outbound_message(message, on_send_error)
+        if message is not None:
+            self._queue_cancel_message(attempt_id, message)
 
     def notify_disconnect(self) -> None:
+        """对端断连：唤醒所有 pending，并**主动回收本 provider 的全部 reservation**。
+
+        ★ 2026-10-05（DIST-2 要求 2：「节点掉线…必须释放 lease」）：此前这里只把
+        pending 置 error 并 set 三个 event，**不释放 reservation** —— 释放完全依赖
+        上层 `task_graph._run_stage` 的 `finally`。一旦上层没走到那里（异常路径、
+        外层取消、进程卡住），条目就会留在 `_reservations` /
+        `_executed_reservations` / `_reservation_attempts` 里，而该 provider 在对端
+        重连前不会再有活动 ⇒ 「已预留未执行」的槽位被永久占用。
+
+        `release()` 是**纯本地 dict 操作**（不向 worker 发任何消息），在断连路径上
+        调用没有副作用；先唤醒 pending 再回收，顺序保证等待方先拿到
+        `remote_worker_disconnected` 错误。
+        """
         with self._lock:
             released = []
             for attempt_id, pending in self._pending.items():
@@ -1194,6 +1360,11 @@ class RemoteFullWorkerProvider:
                     released.append(attempt_id)
             for attempt_id in released:
                 self._pending.pop(attempt_id, None)
+            reservation_ids = list(self._reservations.keys())
+        # `release()` 内部自己取 `self._lock` ⇒ 必须在锁外调用（这里是普通 Lock，
+        # 锁内再取会自锁）。
+        for reservation_id in reservation_ids:
+            self.release(reservation_id)
 
     def release(self, reservation_id: str) -> None:
         with self._lock:

@@ -15,7 +15,9 @@ from koakuma_engine import Capability, backend_id_for, runtime_supports
 from config import (
     PIPELINE_MODEL_SYNC_TIMEOUT,
     PIPELINE_RELAY_ENABLED,
+    PIPELINE_RELAY_PROBE_ONLY,
     PIPELINE_RELAY_SEGMENTS,
+    PIPELINE_ROUTE_A_STAGE_OFFER_ENABLED,
     TASK_WORKER_EXPERIMENTAL_ENABLED,
 )
 # ★ #31 M2：层流水线支持的架构**单一事实来源**（此前在 4 处各写了一份 `{"qwen","qwen2"}`）
@@ -25,7 +27,7 @@ from relay_segment_client import (
     RelaySegmentError,
 )
 from relay_transport import is_loopback_host
-from scheduler_types import PreemptState
+from scheduler_types import PreemptState, WORKER_HEARTBEAT_MAX_AGE
 from torch_runtime import loaded_torch
 
 logger = logging.getLogger("scheduler")
@@ -33,12 +35,16 @@ logger = logging.getLogger("scheduler")
 
 RELAY_HIDDEN_WIRE_FORMAT = "qlh.relay_hidden.f32.v1"
 
-#: 从节点心跳的**容忍上限**（秒）。取 45s 的 2 倍余量：App 侧
-#: `AndroidPresenceStateMachine.heartbeatIntervalMs = 45_000`（可配 5–120s，见
-#: `heartbeatIntervalSeconds.coerceIn(5, 120)`），而这里原先写死 10s ⇒ 45s 的间隔
-#: 必然被判过期（实测 `11.4s > 10s`）。Route A 要求 Android 参与 readiness 后才暴露。
-#: 与 task worker 控制面的 `health_timeout_seconds=120` 同量级。
-_WORKER_HEARTBEAT_MAX_AGE = 120.0
+#: 从节点心跳的**容忍上限**（秒）。★ 2026-10-05（DIST-2）：定义上移到
+#: `scheduler_types.WORKER_HEARTBEAT_MAX_AGE`，让**容量规划**与 **readiness**
+#: 共用同一阈值；此处保留 `_WORKER_HEARTBEAT_MAX_AGE` 别名，避免改动既有读取点。
+_WORKER_HEARTBEAT_MAX_AGE = WORKER_HEARTBEAT_MAX_AGE
+
+_PIPELINE_LIFECYCLE_STATE_KEY = "pipeline_config_lifecycle_v1"
+_PIPELINE_LIFECYCLE_SCHEMA_VERSION = 2
+_PIPELINE_RECOVERY_PHASES = frozenset({
+    "preparing", "committing_local", "committing", "ready",
+})
 
 
 def _kv_state_seq_len(past, model_type: str) -> tuple[int, int]:
@@ -219,6 +225,396 @@ def _layer_stage_result_to_pipeline_value(
 
 
 class SchedulerPipelineMixin:
+    def _pipeline_lifecycle_snapshot_locked(self) -> dict | None:
+        """Return a bounded JSON-safe transaction record for restart recovery."""
+        transaction = self._pipeline_load_transaction
+        if not isinstance(transaction, dict):
+            return None
+        plan = transaction.get("plan") if isinstance(transaction.get("plan"), dict) else {}
+        assignments = []
+        for item in plan.get("assignments", []):
+            if not isinstance(item, dict):
+                continue
+            assignments.append({
+                key: item[key]
+                for key in (
+                    "node_id", "start_layer", "end_layer", "layers_count",
+                    "execution", "stage_type", "has_embedding", "has_lm_head",
+                )
+                if key in item
+            })
+        return {
+            "schema_version": _PIPELINE_LIFECYCLE_SCHEMA_VERSION,
+            "config_id": str(transaction.get("config_id", "") or ""),
+            "generation": int(transaction.get("generation", 0) or 0),
+            "phase": str(transaction.get("phase", "") or ""),
+            "model_id": str(plan.get("model_id", "") or ""),
+            "model_type": str(plan.get("model_type", "") or ""),
+            "model_sha256": str(plan.get("model_sha256", "") or ""),
+            "quant_type": str(plan.get("quant_type", "") or ""),
+            "plan_id": str(plan.get("plan_id", "") or ""),
+            "worker_ids": sorted(
+                str(value) for value in transaction.get("worker_ids", set())
+                if str(value)
+            ),
+            "prepared_nodes": sorted(
+                str(value) for value in transaction.get("prepared_nodes", set())
+                if str(value)
+            ),
+            "ready_nodes": sorted(
+                str(value) for value in transaction.get("ready_nodes", set())
+                if str(value)
+            ),
+            "assignments": assignments,
+            "updated_at": time.time(),
+        }
+
+    def _persist_pipeline_lifecycle_locked(self) -> None:
+        """Persist lifecycle state while the transaction lock is held."""
+        if (
+            not getattr(self, "_running", False)
+            or self._effective_role() != "master"
+        ):
+            return
+        state = self._pipeline_lifecycle_snapshot_locked()
+        if state is None:
+            return
+        try:
+            from local_store import set_local_setting
+
+            set_local_setting(_PIPELINE_LIFECYCLE_STATE_KEY, state)
+            self._pipeline_lifecycle_persist_ok = True
+            if self._pipeline_recovery_pending and self._pipeline_recovery_failure in {
+                "pipeline_lifecycle_persist_failed",
+                "pipeline_recovery_state_unavailable",
+                "pipeline_recovery_state_invalid",
+            }:
+                self._pipeline_recovery_failure = "pipeline_recovery_pending"
+        except Exception:
+            self._pipeline_lifecycle_persist_ok = False
+            self._pipeline_recovery_pending = True
+            self._pipeline_recovery_failure = "pipeline_lifecycle_persist_failed"
+            logger.warning("failed to persist pipeline lifecycle state", exc_info=True)
+
+    def _load_pipeline_recovery_state(self) -> None:
+        """Arm a restart fence from the last active transaction."""
+        try:
+            from local_store import get_local_setting
+
+            raw = get_local_setting(_PIPELINE_LIFECYCLE_STATE_KEY, None)
+        except Exception:
+            self._pipeline_lifecycle_persist_ok = False
+            self._pipeline_recovery_pending = True
+            self._pipeline_recovery_failure = "pipeline_recovery_state_unavailable"
+            logger.warning("failed to load pipeline lifecycle state", exc_info=True)
+            return
+        self._pipeline_lifecycle_persist_ok = True
+        if raw is None:
+            return
+        try:
+            schema_version = int(raw.get("schema_version", 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            schema_version = 0
+        if not isinstance(raw, dict) or schema_version not in {1, 2}:
+            self._pipeline_lifecycle_persist_ok = False
+            self._pipeline_recovery_pending = True
+            self._pipeline_recovery_failure = "pipeline_recovery_state_invalid"
+            return
+        self._pipeline_recovery_state = dict(raw)
+        phase = str(raw.get("phase", "") or "")
+        if phase in _PIPELINE_RECOVERY_PHASES:
+            persisted_sha256 = str(raw.get("model_sha256", "") or "").lower()
+            if (
+                len(persisted_sha256) != 64
+                or any(char not in "0123456789abcdef" for char in persisted_sha256)
+            ):
+                # Schema v1 did not require artifact identity.  Guessing
+                # between a directory and a GGUF that share one model_id can
+                # silently restore different bytes, so old incomplete state
+                # is fenced for an explicit model reload instead.
+                self._pipeline_lifecycle_persist_ok = False
+                self._pipeline_recovery_pending = True
+                self._pipeline_recovery_failure = "pipeline_recovery_state_invalid"
+                logger.error(
+                    "pipeline recovery state lacks an authoritative model digest"
+                )
+                return
+            self._pipeline_recovery_pending = True
+            self._pipeline_recovery_failure = "pipeline_recovery_pending"
+            logger.warning(
+                "pipeline restart recovery fenced until authoritative republish: "
+                "config=%s generation=%s phase=%s",
+                raw.get("config_id", ""), raw.get("generation", ""), phase,
+            )
+
+    def _restore_pipeline_model_for_recovery(self) -> bool:
+        """Restore distributed-only model metadata before workers reconnect.
+
+        The lifecycle record intentionally contains no absolute path. Resolve
+        the persisted model identity through the local model registry (also
+        accepting the historical directory-name identity), then prepare only
+        metadata. No full model is materialized here.
+        """
+        if not self._pipeline_recovery_pending:
+            return True
+        state = self._pipeline_recovery_state
+        if not isinstance(state, dict):
+            return False
+        model_id = str(state.get("model_id", "") or "").strip()
+        if not model_id:
+            self._pipeline_recovery_failure = "pipeline_recovery_model_identity_missing"
+            return False
+        if self._get_active_pipeline_model_info():
+            return True
+
+        model_paths: list[str] = []
+        try:
+            from model_config import (
+                get_builtin_models,
+                get_model_config,
+                resolve_model_path,
+            )
+            from local_store import get_local_experimental_models
+
+            try:
+                db_models = get_local_experimental_models()
+            except Exception:
+                db_models = []
+                logger.warning(
+                    "failed to read local model registry during pipeline recovery",
+                    exc_info=True,
+                )
+            configured = get_model_config(model_id, db_models)
+            candidates = [configured] if configured is not None else []
+            candidates.extend(
+                item for item in get_builtin_models()
+                if item is not configured
+            )
+            for candidate in candidates:
+                resolved_paths = [
+                    resolve_model_path(str(getattr(candidate, key, "") or ""))
+                    for key in ("model_path", "gguf_path")
+                ]
+                candidate_matches = (
+                    str(getattr(candidate, "model_id", "") or "") == model_id
+                    or any(
+                        path and (
+                            os.path.basename(os.path.normpath(path)) == model_id
+                            or os.path.splitext(os.path.basename(path))[0] == model_id
+                        )
+                        for path in resolved_paths
+                    )
+                )
+                if not candidate_matches:
+                    continue
+                for resolved in resolved_paths:
+                    if resolved and (os.path.isdir(resolved) or os.path.isfile(resolved)):
+                        normalized = os.path.abspath(resolved)
+                        if normalized not in model_paths:
+                            model_paths.append(normalized)
+        except Exception:
+            logger.warning(
+                "failed to resolve persisted pipeline model: model=%s",
+                model_id,
+                exc_info=True,
+            )
+
+        prepare = getattr(self._host, "prepare_pipeline_model", None)
+        if not model_paths or not callable(prepare):
+            self._pipeline_recovery_failure = "pipeline_recovery_model_unavailable"
+            logger.error(
+                "pipeline recovery model unavailable: model=%s paths=%s",
+                model_id, model_paths or "unresolved",
+            )
+            return False
+        expected_sha256 = str(state.get("model_sha256", "") or "").lower()
+        descriptor = None
+        selected_path = ""
+        restore_errors: list[tuple[str, str]] = []
+        for model_path in model_paths:
+            try:
+                candidate_descriptor = prepare(
+                    model_id=model_id,
+                    model_path=model_path,
+                    quant_type=(str(state.get("quant_type", "") or "") or None),
+                    # The persisted digest is an expectation, not evidence about
+                    # the bytes present after this restart. Recompute locally.
+                    model_sha256=None,
+                )
+                actual_sha256 = str(
+                    candidate_descriptor.get("model_sha256", "")
+                    if isinstance(candidate_descriptor, dict) else ""
+                ).lower()
+                if expected_sha256 and actual_sha256 != expected_sha256:
+                    restore_errors.append((model_path, "digest_mismatch"))
+                    continue
+                descriptor = candidate_descriptor
+                selected_path = model_path
+                break
+            except Exception as exc:
+                restore_errors.append((model_path, type(exc).__name__))
+                logger.warning(
+                    "pipeline recovery model candidate rejected: model=%s path=%s",
+                    model_id, model_path, exc_info=True,
+                )
+        if descriptor is None:
+            unload = getattr(self._host, "unload_model", None)
+            if callable(unload):
+                try:
+                    unload()
+                except Exception:
+                    logger.warning(
+                        "failed to clear mismatched recovery model metadata",
+                        exc_info=True,
+                    )
+            only_digest_mismatch = bool(restore_errors) and all(
+                reason == "digest_mismatch" for _path, reason in restore_errors
+            )
+            self._pipeline_recovery_failure = (
+                "pipeline_recovery_model_digest_mismatch"
+                if only_digest_mismatch else "pipeline_recovery_model_restore_failed"
+            )
+            logger.error(
+                "pipeline recovery model restore exhausted: model=%s expected=%s errors=%s",
+                model_id, expected_sha256 or "unspecified", restore_errors,
+            )
+            return False
+        logger.info(
+            "pipeline recovery model metadata restored: model=%s path=%s type=%s layers=%s",
+            model_id,
+            selected_path,
+            descriptor.get("model_type", "") if isinstance(descriptor, dict) else "",
+            descriptor.get("total_layers", "") if isinstance(descriptor, dict) else "",
+        )
+        return True
+
+    def _clear_pipeline_recovery_fence(self) -> None:
+        self._pipeline_recovery_pending = False
+        self._pipeline_recovery_failure = ""
+
+    def _recovery_model_matches(self, model_info: dict) -> bool:
+        """Fence a fresh generation to the model persisted before restart."""
+        if not self._pipeline_recovery_pending:
+            return True
+        persisted = self._pipeline_recovery_state
+        if not isinstance(persisted, dict):
+            return True
+        expected_id = str(persisted.get("model_id", "") or "")
+        expected_type = str(persisted.get("model_type", "") or "").lower()
+        expected_sha256 = str(persisted.get("model_sha256", "") or "").lower()
+        actual_id = str(model_info.get("model_id", "") or "")
+        actual_type = str(model_info.get("model_type", "") or "").lower()
+        actual_sha256 = str(model_info.get("model_sha256", "") or "").lower()
+        if (
+            (expected_id and actual_id != expected_id)
+            or (expected_type and actual_type != expected_type)
+            or (expected_sha256 and actual_sha256 != expected_sha256)
+        ):
+            self._pipeline_recovery_failure = "pipeline_recovery_model_mismatch"
+            logger.error(
+                "pipeline recovery model mismatch: expected=%s/%s actual=%s/%s",
+                expected_id, expected_type, actual_id, actual_type,
+            )
+            return False
+        return True
+
+    def _maybe_finish_pipeline_recovery(self) -> None:
+        """Release the restart fence only after the fresh generation is ready."""
+        if not self._pipeline_recovery_pending:
+            return
+        if not self._pipeline_lifecycle_persist_ok:
+            return
+        with self._layer_config_lock:
+            transaction = self._pipeline_load_transaction
+            if not transaction:
+                return
+            phase = str(transaction.get("phase", "") or "")
+            if phase in {"rejected", "aborted", "invalidated"}:
+                self._pipeline_recovery_failure = (
+                    str(transaction.get("reason_code", "") or "")
+                    or "pipeline_recovery_failed"
+                )
+                return
+            if phase != "ready":
+                return
+            config_id = str(transaction.get("config_id", "") or "")
+            if not config_id:
+                return
+            try:
+                generation = int(transaction.get("generation", 0) or 0)
+            except (TypeError, ValueError):
+                return
+            persisted = self._pipeline_recovery_state
+            if isinstance(persisted, dict):
+                persisted_config_id = str(persisted.get("config_id", "") or "")
+                try:
+                    persisted_generation = int(
+                        persisted.get("generation", 0) or 0
+                    )
+                except (TypeError, ValueError):
+                    persisted_generation = 0
+                if (
+                    persisted_config_id
+                    and config_id == persisted_config_id
+                    and generation <= persisted_generation
+                ):
+                    return
+            plan = transaction.get("plan")
+            plan = dict(plan) if isinstance(plan, dict) else {}
+            for node_id, expected in self._layer_config_expected.items():
+                if expected.get("release"):
+                    return
+                if node_id not in self._layer_config_pushed:
+                    return
+        for assignment in plan.get("assignments", []):
+            if not isinstance(assignment, dict):
+                continue
+            if assignment.get("execution") != "stage_offer_v3":
+                continue
+            ready, _reason = self._stage_offer_assignment_ready(
+                str(assignment.get("node_id", "") or ""), assignment,
+            )
+            if not ready:
+                return
+        with self._layer_config_lock:
+            transaction = self._pipeline_load_transaction
+            if (
+                transaction
+                and transaction.get("config_id") == config_id
+                and transaction.get("phase") == "ready"
+            ):
+                self._clear_pipeline_recovery_fence()
+
+    @property
+    def _active_layer_config(self):
+        """当前生效的层段配置（`None` = 本节点不是层段 worker）。
+
+        用 property 而不是裸属性：它的**每一次变化**都会改变本节点在 hello 里上报的
+        `layer_worker` / `layer_ranges` / `models` 语义，因此必须同步给主节点
+        （`refresh_task_worker_capabilities()`）。此前层段路径**全都不 refresh**
+        —— 整模路径都 refresh、层段路径一条都没有 —— 于是主节点一直拿 hello 旧快照
+        判身份，远端 Stage 被 `model_identity_mismatch` 拒（`#28`）。
+
+        收口成 setter 就不会再漏：那 7 个赋值点一行都不用改，将来新增的也会自动生效。
+        """
+        return getattr(self, "_active_layer_config_value", None)
+
+    @_active_layer_config.setter
+    def _active_layer_config(self, value):
+        previous = getattr(self, "_active_layer_config_value", None)
+        self._active_layer_config_value = value
+        if previous == value:
+            return
+        # `refresh_task_worker_capabilities()` 是异步的（只起线程，内部只碰
+        # `_task_worker_refresh_lock`），所以在层配置锁内调用是安全的。构造早期
+        # `_tcp_client` 还没就位时它自己会返回 False。
+        refresh = getattr(self, "refresh_task_worker_capabilities", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:
+                logger.debug("层段状态变化后刷新 hello 失败（忽略）", exc_info=True)
+
     def request_authoritative_layer_sync(
         self, *, require_distributed: bool = False,
     ) -> bool:
@@ -270,17 +666,31 @@ class SchedulerPipelineMixin:
         ):
             return set()
         try:
-            status = self._task_worker_control.status(role="master")
+            if self._pipeline_recovery_pending:
+                # Use accepted HELLO capabilities while rebuilding the first
+                # fresh assignment. The normal status projection is
+                # heartbeat-gated and can still report ``not_configured``.
+                raw_workers = self._task_worker_control.connected_layer_stage_workers(
+                    set(connected_ids),
+                )
+                admitted = {
+                    str(worker.get("node_id", ""))
+                    for worker in raw_workers
+                    if isinstance(worker, dict)
+                    and int(worker.get("selected_version", 0) or 0) >= 2
+                }
+            else:
+                status = self._task_worker_control.status(role="master")
+                admitted = {
+                    str(worker.get("node_id", ""))
+                    for worker in status.get("workers", [])
+                    if isinstance(worker, dict)
+                    and worker.get("healthy")
+                    and worker.get("layer_stage_dispatch_enabled")
+                    and str(worker.get("node_id", "")) in connected_ids
+                }
         except Exception:
             return set()
-        admitted = {
-            str(worker.get("node_id", ""))
-            for worker in status.get("workers", [])
-            if isinstance(worker, dict)
-            and worker.get("healthy")
-            and worker.get("layer_stage_dispatch_enabled")
-            and str(worker.get("node_id", "")) in connected_ids
-        }
         with self._nodes_lock:
             # ★ 2026-10-03：PC 也能承层段 —— v3 `layer_forward` 已在
             #   `EngineHost.execute_task_worker_stage` 实现，工件与 shim 经 env 配置。
@@ -312,6 +722,11 @@ class SchedulerPipelineMixin:
         # `getattr` 而非直接取属性：`push_layer_config_to_clients()` 现在会在 task-worker
         # hello 之后被调用（legacy 重算），而测试/嵌入场景下的 `_tcp_server` 桩可能没有
         # `_running` ⇒ 直接取会 `AttributeError`（实测回归）。
+        if self._pipeline_recovery_pending:
+            # The persisted record is an epoch fence, not an executor
+            # assignment that may be replayed blindly.  Recompute a fresh
+            # authoritative generation from current worker capabilities.
+            require_distributed = True
         if not self._tcp_server or not getattr(self._tcp_server, "_running", False):
             return
         get_client_ids = getattr(self._tcp_server, "get_client_ids", None)
@@ -330,7 +745,14 @@ class SchedulerPipelineMixin:
                 node_id for node_id, node in self.nodes.items()
                 if node_id in connected_ids
                 and node_id != self.get_effective_node_id()
-                and getattr(node, "node_type", "pc") == "pc"
+                and (
+                    getattr(node, "node_type", "pc") == "pc"
+                    # Relay is an endpoint-backed role, not a local model
+                    # capability. Preserve it even when the host advertises
+                    # itself as Android so it can receive relay_middle rather
+                    # than being silently excluded before role resolution.
+                    or self._is_relay_host(node_id)
+                )
             }
         try:
             pending_worker_ids = self._task_worker_control.pending_worker_ids()
@@ -356,7 +778,7 @@ class SchedulerPipelineMixin:
         # remote relay service owns that segment's data path.
         relay_worker_ids = {
             node_id for node_id in releasable_legacy_ids
-            if self._relay_segment_for_worker(node_id) is not None
+            if self._is_relay_host(node_id)
         }
         releasable_legacy_ids -= self._task_worker_layer_stage_ids(set(connected_ids))
         # Route A Android workers use v3 stage_offer and must never receive a
@@ -410,6 +832,8 @@ class SchedulerPipelineMixin:
         master_sha256 = model_info.get("model_sha256", "")
         model_id = model_info.get("model_id", "")
         model_type = model_info.get("model_type", "")
+        if model_info and not self._recovery_model_matches(model_info):
+            return
         # ★ #31 M2：走**单一事实来源**（此前这里硬编码 `{"qwen","qwen2"}`
         #   ⇒ hybrid 会被静默拦掉，master **不推层配置**）
         if (not master_sha256 or not model_id
@@ -477,6 +901,11 @@ class SchedulerPipelineMixin:
                     eligible_node_ids,
                     require_distributed=require_distributed,
                 )
+            if isinstance(capacity_plan, dict):
+                capacity_plan = dict(capacity_plan)
+                capacity_plan["quant_type"] = str(
+                    model_info.get("quant_type", "") or ""
+                )
             if not capacity_plan.get("admitted"):
                 releases = {
                     node_id: {
@@ -493,7 +922,7 @@ class SchedulerPipelineMixin:
                 # ★ 与下面的 `:537` releases 同理：relay 宿主**不**收本地层配置，
                 #   容量求解的否定结论不该顺带释放它的预留 —— 否则它每次 hello 后
                 #   都「确认退出分层 worker」，relay 链再也拿不到中间段（实测）。
-                if self._relay_segment_for_worker(node_id) is None
+                if not self._is_relay_host(node_id)
                 }
                 with self._layer_config_lock:
                     self._pipeline_load_transaction = {
@@ -505,7 +934,9 @@ class SchedulerPipelineMixin:
                         "reason_code": capacity_plan.get("reason_code", ""),
                     }
                     self._active_pipeline_capacity_plan = None
+                    self._persist_pipeline_lifecycle_locked()
                 self._publish_layer_configs(releases)
+                self._maybe_finish_pipeline_recovery()
                 logger.warning(
                     "集群容量准入拒绝流水线加载: reason=%s",
                     capacity_plan.get("reason_code", "unknown"),
@@ -539,7 +970,12 @@ class SchedulerPipelineMixin:
                 #   `_run_pipeline` 就会按 v3 数据面去要它的层区间，而它手上根本没有
                 #   那段工件 ⇒ `layer_range_not_advertised`（实测：relay 链被误路由到
                 #   Route-A stage 路径后卡在这里）。
-                and self._relay_segment_for_worker(nid) is None
+                and not self._is_relay_host(nid)
+                # ★ 2026-10-05（DIST-4「发布闸门」）：A3 的独立开关。置 0 时不打
+                #   `stage_offer_v3` 标记 ⇒ `stage_offer_nodes` 为空，层段链整体不
+                #   参与，请求按既有路径处理。默认 1 = 保持现状行为（本开关是给
+                #   发布/部署侧显式关掉实验线路用的，不是改变已验收的行为）。
+                and PIPELINE_ROUTE_A_STAGE_OFFER_ENABLED
             ):
                 # Keep the assignment in the active capacity plan for the
                 # execution/readiness contract, but do not materialize a
@@ -570,7 +1006,7 @@ class SchedulerPipelineMixin:
                 "master_quant_type": model_info.get("quant_type", ""),
                 "engine": (
                     "relay_middle"
-                    if self._relay_segment_for_worker(nid) is not None
+                    if self._is_relay_host(nid)
                     else "pytorch"
                 ),
                 "sync_policy": (
@@ -614,7 +1050,7 @@ class SchedulerPipelineMixin:
             #   capacity_plan，所以那时释放等于把它踢出链路）。此前没有这一条，
             #   实测 Surface 每次 hello 后立刻「确认退出分层 worker」，
             #   relay 链永远拿不到中间段。
-            and self._relay_segment_for_worker(node_id) is None
+            and not self._is_relay_host(node_id)
         }
         configs = {**assignments, **releases}
         if capacity_plan is not None:
@@ -651,6 +1087,12 @@ class SchedulerPipelineMixin:
                     dict(capacity_plan) if stage_assignments and not assignments
                     else None
                 )
+                self._persist_pipeline_lifecycle_locked()
+                if capacity_plan.get("status") == "rejected":
+                    self._pipeline_recovery_failure = (
+                        str(capacity_plan.get("reason_code", "") or "")
+                        or "pipeline_recovery_failed"
+                    )
         self._publish_layer_configs(configs)
         if capacity_plan is not None and stage_assignments and not assignments:
             # No legacy worker has an ACK to drive the transaction forward.
@@ -685,15 +1127,60 @@ class SchedulerPipelineMixin:
                 return False, "layer_stage_dispatch_not_admitted"
             raw_caps = snapshot.get("capabilities", {})
             ranges = raw_caps.get("layer_ranges", []) if isinstance(raw_caps, dict) else []
+            artifacts = (
+                raw_caps.get("layer_artifacts", [])
+                if isinstance(raw_caps, dict) else []
+            )
+            layer_budget = (
+                raw_caps.get("layer_budget", {})
+                if isinstance(raw_caps, dict) else {}
+            )
             requested = (
                 int(assignment.get("start_layer", -1)),
                 int(assignment.get("end_layer", -1)),
             )
-            if ranges:
+            if artifacts:
+                planned_artifact = assignment.get("layer_artifact")
+                expected_artifact = (
+                    planned_artifact
+                    if isinstance(planned_artifact, dict) else None
+                )
+
+                def artifact_matches(item):
+                    if not (
+                        isinstance(item, dict)
+                        and isinstance(item.get("layer_range"), (list, tuple))
+                        and len(item["layer_range"]) == 2
+                        and tuple(int(value) for value in item["layer_range"]) == requested
+                    ):
+                        return False
+                    if expected_artifact is None:
+                        return True
+                    return all(
+                        str(item.get(key, "") or "") == str(
+                            expected_artifact.get(key, "") or ""
+                        )
+                        for key in (
+                            "segment_mode", "model_id", "artifact_sha256",
+                            "source_model_sha256",
+                        )
+                    )
+
+                matches = any(
+                    artifact_matches(item)
+                    for item in artifacts
+                )
+                if not matches:
+                    return False, "layer_artifact_contract_changed"
+            elif isinstance(assignment.get("layer_artifact"), dict):
+                return False, "layer_artifact_contract_changed"
+            elif ranges and not (
+                isinstance(layer_budget, dict) and layer_budget.get("local_cut") is True
+            ):
                 matches = any(
                     isinstance(item, (list, tuple)) and len(item) == 2
-                    and int(item[0]) <= requested[0]
-                    and int(item[1]) >= requested[1]
+                    and int(item[0]) == requested[0]
+                    and int(item[1]) == requested[1]
                     for item in ranges
                 )
                 if not matches:
@@ -707,7 +1194,9 @@ class SchedulerPipelineMixin:
             return False, type(exc).__name__
 
 
-    def _route_a_stage_model_identity(self, node_id: str):
+    def _route_a_stage_model_identity(
+        self, node_id: str, assignment: dict | None = None,
+    ):
         """Return the physical artifact identity a Route-A stage worker advertised.
 
         Route A 的层段在**设备**上执行，用的是设备手上那份 GGUF 工件 ⇒ offer 必须
@@ -735,7 +1224,58 @@ class SchedulerPipelineMixin:
             )
             if not isinstance(models, list) or not models:
                 return None
-            model = models[0]
+            expected_model_id = ""
+            expected_sha256 = ""
+            artifacts = capabilities.get("layer_artifacts", [])
+            planned_artifact = (
+                assignment.get("layer_artifact")
+                if isinstance(assignment, dict) else None
+            )
+            if isinstance(planned_artifact, dict):
+                expected_model_id = str(planned_artifact.get("model_id", "") or "")
+                expected_sha256 = str(
+                    planned_artifact.get("artifact_sha256", "") or ""
+                )
+                current_artifact = next((
+                    item for item in artifacts
+                    if isinstance(item, dict)
+                    and item.get("layer_range") == planned_artifact.get("layer_range")
+                    and all(
+                        str(item.get(key, "") or "") == str(
+                            planned_artifact.get(key, "") or ""
+                        )
+                        for key in (
+                            "segment_mode", "model_id", "artifact_sha256",
+                            "source_model_sha256",
+                        )
+                    )
+                ), None) if isinstance(artifacts, list) else None
+                if current_artifact is None:
+                    return None
+            elif assignment is not None and isinstance(artifacts, list) and artifacts:
+                requested = (
+                    int(assignment.get("start_layer", -1)),
+                    int(assignment.get("end_layer", -1)),
+                )
+                artifact = next((
+                    item for item in artifacts
+                    if isinstance(item, dict)
+                    and isinstance(item.get("layer_range"), (list, tuple))
+                    and len(item["layer_range"]) == 2
+                    and tuple(int(value) for value in item["layer_range"]) == requested
+                ), None)
+                if artifact is None:
+                    return None
+                expected_model_id = str(artifact.get("model_id", "") or "")
+                expected_sha256 = str(
+                    artifact.get("artifact_sha256", "") or ""
+                )
+            model = next((
+                item for item in models
+                if isinstance(item, dict)
+                and (not expected_model_id or item.get("model_id") == expected_model_id)
+                and (not expected_sha256 or item.get("sha256") == expected_sha256)
+            ), None)
             if not isinstance(model, dict):
                 return None
             try:
@@ -916,6 +1456,7 @@ class SchedulerPipelineMixin:
             transaction["reason"] = reason
             self._active_pipeline_capacity_plan = None
             model_id = str(transaction.get("plan", {}).get("model_id", "") or "")
+            self._persist_pipeline_lifecycle_locked()
         abort_materialization = getattr(
             self._host, "abort_pipeline_materialization", None
         )
@@ -946,6 +1487,28 @@ class SchedulerPipelineMixin:
         )
 
 
+    def _invalidate_pipeline_load_transaction(
+        self, reason_code: str = "pipeline_model_changed", reason: str = "",
+    ) -> None:
+        """Fence a pipeline transaction before replacing the local model."""
+        with self._layer_config_lock:
+            transaction = self._pipeline_load_transaction
+            if transaction and transaction.get("phase") not in {
+                "aborted", "rejected", "invalidated",
+            }:
+                transaction["phase"] = "invalidated"
+                transaction["reason_code"] = reason_code
+                transaction["reason"] = reason
+                self._layer_config_generation = max(
+                    self._layer_config_generation + 1,
+                    time.time_ns(),
+                )
+                self._persist_pipeline_lifecycle_locked()
+            self._active_pipeline_capacity_plan = None
+            self._prepared_layer_configs.clear()
+            self._layer_config_inflight.clear()
+
+
     def _commit_pipeline_load_transaction(self, config_id: str) -> None:
         """Materialize the local segment, then publish commit to all workers."""
         with self._layer_config_lock:
@@ -963,6 +1526,7 @@ class SchedulerPipelineMixin:
                 for node_id in worker_ids
             }
             transaction["phase"] = "committing_local"
+            self._persist_pipeline_lifecycle_locked()
 
         master_ids = {"master", self.get_effective_node_id()}
         local_assignment = next((
@@ -990,6 +1554,20 @@ class SchedulerPipelineMixin:
             )
             return
 
+        with self._layer_config_lock:
+            transaction = self._pipeline_load_transaction
+            if (
+                not transaction
+                or transaction.get("config_id") != config_id
+                or transaction.get("phase") != "committing_local"
+            ):
+                logger.info(
+                    "discarding superseded pipeline commit: config=%s phase=%s",
+                    config_id,
+                    transaction.get("phase", "") if transaction else "missing",
+                )
+                return
+
         commit_configs = {}
         for node_id, item in expected.items():
             if not item or item.get("release"):
@@ -1009,7 +1587,19 @@ class SchedulerPipelineMixin:
                     transaction = self._pipeline_load_transaction
                     if transaction and transaction.get("config_id") == config_id:
                         transaction["phase"] = "ready"
-                        self._active_pipeline_capacity_plan = dict(plan)
+                        # ★ 2026-10-05：与 legacy 提交路径对齐（见 `:2910-2913`）。
+                        #   legacy 提交成功时会把 active plan 的 `transaction_phase`
+                        #   提升为 `ready`，而 stage-only 此前只做 `dict(plan)` ⇒
+                        #   `/api/cluster/pipeline-capacity` 的投影**永远停在求解器
+                        #   初值 `planned`**（`scheduler.py` 里打的那个值），且该投影里
+                        #   本就没有 `config_id`/`generation` 键 ⇒ 看上去像"事务不存在"。
+                        #   实测中这个展示缺陷先把我误导过一次（去追一个不存在的事务）。
+                        active_plan = dict(plan)
+                        active_plan["computed_at"] = time.time()
+                        active_plan["transaction_phase"] = "ready"
+                        self._active_pipeline_capacity_plan = active_plan
+                        self._persist_pipeline_lifecycle_locked()
+                self._maybe_finish_pipeline_recovery()
                 logger.info(
                     "Route-A stage-only pipeline committed local assignment: config=%s",
                     config_id,
@@ -1024,6 +1614,7 @@ class SchedulerPipelineMixin:
             transaction = self._pipeline_load_transaction
             if transaction and transaction.get("config_id") == config_id:
                 transaction["phase"] = "committing"
+                self._persist_pipeline_lifecycle_locked()
         self._publish_layer_configs(commit_configs)
         logger.info(
             "流水线 prepare 全部通过，已下发 commit: config=%s workers=%s",
@@ -1282,27 +1873,26 @@ class SchedulerPipelineMixin:
             role=str(spec.get("role", "middle")), timeout=float(spec["timeout"]),
         )
         cache[task_id] = (key, client)
+        logger.info("relay 段会话已建立并缓存: task=%s cache_id=%s size=%d",
+                    task_id, id(cache), len(cache))
         return client
 
 
     def _close_relay_segment_client(self, task_id: str) -> None:
         cache = getattr(self, "_relay_segment_clients", None)
         if not cache:
+            logger.info("关闭 relay 段会话: task=%s 无缓存（cache=%r cache_id=%s self_id=%s）",
+                        task_id, cache, id(cache) if cache is not None else None,
+                        id(getattr(self, "_relay_segment_clients", None)))
             return
         current = cache.pop(task_id, None)
+        logger.info("关闭 relay 段会话: task=%s found=%s cache_id=%s keys=%r",
+                    task_id, current is not None, id(cache), list(cache))
         if current is not None:
             try:
                 current[1].close()
             except Exception:
-                logger.debug("close relay session failed: task=%s", task_id, exc_info=True)
-
-
-    def _close_all_relay_segment_clients(self) -> None:
-        cache = getattr(self, "_relay_segment_clients", None)
-        if not cache:
-            return
-        for task_id in list(cache):
-            self._close_relay_segment_client(task_id)
+                logger.warning("close relay session failed: task=%s", task_id, exc_info=True)
 
 
     def _mark_local_pipeline_cancelled(self, task_id: str) -> None:
@@ -2640,6 +3230,7 @@ class SchedulerPipelineMixin:
                             active_plan["computed_at"] = time.time()
                             active_plan["transaction_phase"] = "ready"
                             self._active_pipeline_capacity_plan = active_plan
+                            self._persist_pipeline_lifecycle_locked()
                             activated_plan = dict(active_plan)
                 elif prepared:
                     self._layer_config_pushed.discard(client_id)
@@ -2675,6 +3266,7 @@ class SchedulerPipelineMixin:
                             str(data.get("error", "") or "worker rejected phase"),
                         )
 
+        self._maybe_finish_pipeline_recovery()
         if release_ack:
             if released:
                 logger.info(
@@ -2730,7 +3322,7 @@ class SchedulerPipelineMixin:
                 node_id,
             )
             return
-        if self._relay_segment_for_worker(client_id) is not None:
+        if self._is_relay_host(client_id):
             with self._layer_config_lock:
                 self._pipeline_worker_opt_out.discard(client_id)
             logger.info(
@@ -3701,6 +4293,18 @@ class SchedulerPipelineMixin:
                 "workers": [],
             }
 
+        if self._pipeline_recovery_pending:
+            return {
+                "ready": False,
+                "reason_code": self._pipeline_recovery_failure
+                or "pipeline_recovery_pending",
+                "reason": (
+                    "pipeline configuration recovery is pending; waiting for "
+                    "authoritative republish"
+                ),
+                "workers": [],
+            }
+
         assignments = self.get_layer_assignments()
         master_ids = {"master", self.get_effective_node_id()}
         # ★ A1 / X 档（Y 档第二条缺口 3）：relay 段节点**也**是流水线成员，尽管它 `layers_count=0`
@@ -3796,11 +4400,15 @@ class SchedulerPipelineMixin:
 
             # ★ 2026-10-03：v3 层段 worker 的 legacy ACK 故意是 error（见
             #   `_handle_layer_config_locked` 的同名分流）⇒ 它**不参与** legacy 就绪判据。
-            #   否则会先命中下面的 `not layer_ready and error` 分支，报成
-            #   「模型同步或层加载失败」并卡住整个请求 —— 而它其实是通过 v3 stage offer
-            #   就绪的，legacy 通道与它无关。
-            if is_stage_offer_worker:
-                continue
+            #   否则会先命中 `not layer_ready and error` 分支，报成「模型同步或层加载
+            #   失败」并卡住整个请求 —— 而它其实是通过 v3 stage offer 就绪的。
+            #
+            # ★ 2026-10-05（DIST-2）：但它**不能因此跳过整个 failure 判定**。此前这里
+            #   是裸 `continue`，于是下方 `worker_stage_offer_not_ready` 分支**永远
+            #   不可达** ⇒ stage worker 不健康时 readiness 仍可能报 `ready=True`。
+            #   现在改为：基础存活检查（未注册/离线/TCP 断/心跳过期）照常参与；
+            #   legacy 专属的 `worker_layer_load_failed` 只对非 stage worker 生效；
+            #   stage worker 自己的就绪判据用 `_stage_offer_assignment_ready` 的结果。
 
             failure = None
             if node_info is None:
@@ -3815,15 +4423,15 @@ class SchedulerPipelineMixin:
                     "worker_heartbeat_stale",
                     f"从节点 {node_id} 心跳已过期 ({age_text})",
                 )
+            elif not layer_ready and is_stage_offer_worker:
+                failure = (
+                    "worker_stage_offer_not_ready",
+                    f"从节点 {node_id} v3 layer_forward 未就绪: {stage_reason or error}",
+                )
             elif not layer_ready and error:
                 failure = (
                     "worker_layer_load_failed",
                     f"从节点 {node_id} 模型同步或层加载失败: {error}",
-                )
-            elif not layer_ready and is_stage_offer_worker:
-                failure = (
-                    "worker_stage_offer_not_ready",
-                    f"从节点 {node_id} v3 layer_forward 未就绪: {error}",
                 )
             elif not layer_ready and expected:
                 failure = (
@@ -3884,7 +4492,7 @@ class SchedulerPipelineMixin:
 
     def _connected_client_ids(self) -> set[str]:
         """Return node ids of the TCP clients currently connected to this master."""
-        server = self._tcp_server
+        server = getattr(self, "_tcp_server", None)
         if not server or not getattr(server, "_running", False):
             return set()
         get_client_ids = getattr(server, "get_client_ids", None)
@@ -3933,7 +4541,13 @@ class SchedulerPipelineMixin:
         with self._layer_config_lock:
             plan = self._active_pipeline_capacity_plan
             transaction = self._pipeline_load_transaction
-            if not plan and transaction:
+            if (
+                not plan
+                and transaction
+                and transaction.get("phase") in {
+                    "preparing", "committing_local", "committing", "ready",
+                }
+            ):
                 plan = transaction.get("plan")
             assignments = plan.get("assignments", []) if isinstance(plan, dict) else []
             return len(assignments) >= 2
@@ -3969,11 +4583,44 @@ class SchedulerPipelineMixin:
             "worker_layer_not_configured",
             "worker_layer_loading",
             "worker_layer_load_failed",
+            "pipeline_recovery_pending",
         }
-        if (
-            not force_distributed_assignment
-            and readiness.get("reason_code") not in recoverable
-        ):
+        # ★ 2026-10-05（DIST-2）：把「不可恢复的就绪原因」从 force 短路里剥离出来。
+        #
+        #   此前 `not force_distributed_assignment and reason not in recoverable`
+        #   的组合意味着：**force 路径下连不可恢复的原因也会等满
+        #   `PIPELINE_MODEL_SYNC_TIMEOUT`（60s）** —— 包括 `worker_offline` /
+        #   `worker_tcp_disconnected` / `worker_heartbeat_stale`。这些状态等下去不会
+        #   变好：对端要么已经没了，要么需要重新连上，而重连本身会触发一次权威重发
+        #   （见 `_handle_task_worker_message` 的 hello 分支）。在这里死等只是把
+        #   「确定的失败」延迟成「超时」。
+        #
+        #   DIST-2 明确要求「禁止等待多个互相独立的超时后才 fallback」，故这几种
+        #   原因在 force 路径下同样快速具名返回。
+        #
+        #   只收编最无歧义的三种：`worker_not_registered` 可能是「刚注册、hello
+        #   还没到位」，仍有等待价值，保持原行为。
+        unrecoverable = {
+            "worker_offline",
+            "worker_tcp_disconnected",
+            "worker_heartbeat_stale",
+            "pipeline_lifecycle_persist_failed",
+            "pipeline_recovery_state_unavailable",
+            "pipeline_recovery_state_invalid",
+            "pipeline_recovery_model_identity_missing",
+            "pipeline_recovery_model_unavailable",
+            "pipeline_recovery_model_restore_failed",
+            "pipeline_recovery_model_mismatch",
+            "pipeline_recovery_model_digest_mismatch",
+        }
+        reason_code = str(readiness.get("reason_code", "") or "")
+        if reason_code in unrecoverable:
+            logger.info(
+                "分布式请求快速失败（不可恢复的就绪原因）: workers=%s reason_code=%s",
+                worker_ids, reason_code,
+            )
+            return readiness
+        if not force_distributed_assignment and reason_code not in recoverable:
             return readiness
 
         # An existing loading generation should finish without being superseded.
@@ -3987,7 +4634,7 @@ class SchedulerPipelineMixin:
                 worker_ids,
                 readiness.get("reason", ""),
             )
-            if force_distributed_assignment:
+            if force_distributed_assignment or self._pipeline_recovery_pending:
                 self.request_authoritative_layer_sync(require_distributed=True)
             else:
                 self.request_authoritative_layer_sync()
@@ -4000,7 +4647,7 @@ class SchedulerPipelineMixin:
                     transaction = self._pipeline_load_transaction or {}
                     phase = str(transaction.get("phase", "") or "")
                     plan = transaction.get("plan") or {}
-                if phase in {"rejected", "aborted"}:
+                if phase in {"rejected", "aborted", "invalidated"}:
                     return {
                         **readiness,
                         "ready": False,
@@ -4365,6 +5012,22 @@ class SchedulerPipelineMixin:
         缓存用 `getattr` 惰性挂在实例上，**不**改 `__init__`（本方法是 mixin 方法，
         实例可能来自多种构造路径）。
         """
+        # ★ 2026-10-04 产品裁定（分票规划 DIST-0）：A1 relay 已从**产品调度入口
+        #   剔除** —— 它依赖 probe/SSH 隧道与 loopback 段服务，只保留为技术探针与
+        #   历史证据（产品主线是 A3 `stage_offer_v3`）。默认 `PROBE_ONLY=1` 时本方法
+        #   直接不供给 relay 段：生产请求即使配了 `QLH_RELAY_ENABLED` /
+        #   `QLH_RELAY_SEGMENTS`，也只记一份具名诊断并继续走 A3，**不做静默切换**。
+        #   探针/实验要恢复 A1 行为时显式设 `QLH_RELAY_PROBE_ONLY=0`。
+        if PIPELINE_RELAY_PROBE_ONLY:
+            if not getattr(self, "_relay_probe_only_warned", False):
+                self._relay_probe_only_warned = True
+                logger.warning(
+                    "A1 relay 已从产品调度入口剔除（QLH_RELAY_PROBE_ONLY=1，默认）："
+                    "QLH_RELAY_ENABLED/QLH_RELAY_SEGMENTS 不再作为生产能力，生产请求"
+                    "继续走 A3 stage_offer_v3。需要 A1 探针行为请显式设 "
+                    "QLH_RELAY_PROBE_ONLY=0。首个受影响 worker=%s", worker_id,
+                )
+            return None
         if not PIPELINE_RELAY_ENABLED:
             return None
         if str(routing_preference or "auto") == "local_only":
@@ -4373,7 +5036,56 @@ class SchedulerPipelineMixin:
         if cache is None:
             cache = self._parse_relay_segment_map(PIPELINE_RELAY_SEGMENTS)
             self._relay_segment_map_cache = cache
-        return cache.get(str(worker_id))
+        worker_key = str(worker_id or "").strip()
+        spec = cache.get(worker_key)
+        if spec is not None:
+            return spec
+
+        # Client workers conventionally register as ``client_<hostname>``
+        # while deployment profiles often use the stable hostname alone. Keep
+        # the exact key authoritative, then allow only the one unambiguous
+        # client-prefix alias so a profile typo cannot silently assign a relay
+        # segment to a different node.
+        alias = (
+            worker_key[7:]
+            if worker_key.startswith("client_")
+            else f"client_{worker_key}"
+        )
+        if alias and alias != worker_key:
+            aliased = cache.get(alias)
+            if aliased is not None:
+                logger.info(
+                    "relay 节点名按 client_ 别名匹配: worker=%s configured=%s",
+                    worker_key, alias,
+                )
+                return aliased
+        return None
+
+    def _is_relay_host(self, node_id: str) -> bool:
+        """该节点是否是 **relay 宿主** —— 「谁是 relay 宿主」的**唯一判据入口**。
+
+        relay 宿主是**第三种角色**，不是「v3 层段 worker 的例外」。它的能力声明与层段
+        worker **正好相反**：
+
+        * **不能**声明 `FORWARD_LAYERS` —— 声明了它就会拒绝 legacy 层配置，而 relay
+          委派恰恰走那条通道（实测：Surface 报「本节点是 v3 层段 worker，拒绝 legacy
+          分层配置」）；
+        * **要的**恰恰是那份 legacy 层配置（`engine="relay_middle"`），因此既不能被当
+          Full Worker 释放预留，也不能被排出层段名单。
+
+        这两条结论此前被复写在**五条**判定路径上（hello 的 opt-out、`_task_worker_full_
+        model_ids`、容量求解的两处 releases、`_task_worker_layer_stage_ids`），每处各写
+        一遍 `_relay_segment_for_worker(...) is not None`。少写一处就退化成「relay 链丢掉
+        中间段」，而症状（该节点被释放预留）离原因很远 —— 实测连追了五轮。
+
+        **刻意不接 `routing_preference`**：这是**节点角色**判定，不该随单次请求变化。
+        `_relay_segment_for_worker()` 里的 `local_only` 闸门是**请求级**的（「本次只要本地
+        算」），把它混进角色判定会让同一个节点在不同请求下被判成不同角色。需要请求级
+        取舍的调用点直接调 `_relay_segment_for_worker(id, routing_preference)` 取 spec。
+
+        ⚠️ 只传 `node_id` 一个位置参数：调用方（含测试与嵌入方）常注入单参 stub。
+        """
+        return self._relay_segment_for_worker(node_id) is not None
 
 
     def _wait_for_layer_result(self, task_id: str, node_ids,
@@ -4592,6 +5304,23 @@ class SchedulerPipelineMixin:
 
         task_id = uuid.uuid4().hex[:12]
         worker_ids = [node["node_id"] for node in stage_nodes]
+        # ★ 产品裁定「分布式可用必须 fail-closed」：成功请求必须带非空
+        #   `claimed_layers`（与 A1 同口径：远端实际承了哪段层）。此前 A3 恒缺
+        #   该字段（它只在 `pipeline_capacity` 的 relay 零层条目里被填），按裁定
+        #   就不能计为分布式成功。这里由 `stage_nodes` 的每段 start/end 派生：
+        #   顶层给并集（判据只用非空 + 覆盖性），另给逐段明细供可观测性。
+        _stage_ranges: list[tuple[int, int]] = []
+        for _node in stage_nodes:
+            _start = _node.get("start_layer")
+            _end = _node.get("end_layer")
+            if _start is None or _end is None:
+                continue
+            _stage_ranges.append((int(_start), int(_end)))
+        _claimed_layers = (
+            [min(r[0] for r in _stage_ranges), max(r[1] for r in _stage_ranges)]
+            if _stage_ranges
+            else []
+        )
         pipeline_metrics = {
             "steps": [],
             "total_time_ms": 0,
@@ -4608,6 +5337,14 @@ class SchedulerPipelineMixin:
             "serving_node_id": self.get_effective_node_id(),
             "workers_used": worker_ids,
             "layer_assignments": stage_nodes,
+            "claimed_layers": _claimed_layers,
+            "layer_segments": [[s, e] for s, e in _stage_ranges],
+            # ★ 2026-10-05（DIST-4）：把层配置代际写进**请求级** metrics。
+            #   此前 `config_id` 只存在于内存 contract（`_pipeline_task_contracts`）
+            #   与 `/api/cluster/pipeline-capacity`，响应与日志里都看不到 ⇒ 出问题时
+            #   无法从单条请求回溯它用的是哪一代层配置。取值与本链的 contract 一致
+            #   （`route_a:{task_id}`）。
+            "config_id": f"route_a:{task_id}",
         }
         generated_ids: list[int] = []
         full_input_ids = input_ids
@@ -4679,11 +5416,18 @@ class SchedulerPipelineMixin:
                             "response": "",
                             "error": f"route_a_decode_step_{step}_missing_kv",
                         }
-                local_input_ids = (
-                    input_ids
-                    if is_prefill
-                    else torch.tensor([[new_token_id]], dtype=torch.long)
-                )
+                if is_prefill:
+                    local_input_ids = input_ids
+                elif hasattr(input_ids, "detach"):
+                    # PyTorch 引擎：decode 步只喂新 token。
+                    local_input_ids = torch.tensor([[new_token_id]], dtype=torch.long)
+                else:
+                    # llama.cpp / 去 torch 节点：载体是 numpy。这里若不判载体，
+                    # `torch_runtime.require_torch()` 会抛 `ModuleNotFoundError`，
+                    # 表现为 `route_a_stage_execution_failed: No module named 'torch'`。
+                    import numpy as _np
+
+                    local_input_ids = _np.array([[new_token_id]], dtype=_np.int64)
                 local_result = mgr.forward_layers(
                     input_ids=local_input_ids,
                     attention_mask=attention_mask if is_prefill else None,
@@ -4697,7 +5441,17 @@ class SchedulerPipelineMixin:
                 hidden = local_result.get("hidden_states")
                 if hidden is None:
                     return {"response": "", "error": "route_a_master_missing_hidden"}
-                hidden = hidden.detach().to(device="cpu", dtype=torch.float32).contiguous()
+                # hidden 的载体随引擎不同：PyTorch 给张量（要 `.detach().cpu()`），
+                # llama.cpp 给 numpy `[tokens, n_embd]` f32（legacy 首段路径同款判断）。
+                # 缺了这条分支，去 torch 的 master 会在这里抛
+                # `'numpy.ndarray' object has no attribute 'detach'`，被外层收敛成
+                # `route_a_stage_execution_failed` 后回退到全层主节点模式。
+                if hasattr(hidden, "detach"):
+                    hidden = hidden.detach().to(device="cpu", dtype=torch.float32).contiguous()
+                else:
+                    import numpy as _np
+
+                    hidden = _np.ascontiguousarray(hidden, dtype=_np.float32)
                 if hidden.ndim == 3 and int(hidden.shape[0]) == 1:
                     hidden = hidden.squeeze(0)
                 if hidden.ndim != 2:
@@ -4719,7 +5473,7 @@ class SchedulerPipelineMixin:
                     #   身份**：engine/format/sha256 必须与 worker 宣告的一致，否则
                     #   `_layer_model_matches` 会以 `model_identity_mismatch` 拒绝。
                     stage_model_identity = self._route_a_stage_model_identity(
-                        assignment["node_id"]
+                        assignment["node_id"], assignment,
                     )
                     if stage_model_identity is None:
                         return {
@@ -4779,8 +5533,22 @@ class SchedulerPipelineMixin:
                                 _stream_callback({"token": visible})
                     else:
                         _stream_callback({"token": token_text})
-                new_token_tensor = torch.tensor([[new_token_id]], dtype=torch.long)
-                full_input_ids = torch.cat([full_input_ids, new_token_tensor], dim=1)
+                # 载体随引擎不同：PyTorch 给张量，llama.cpp 给 numpy `[1, n_tokens]`。
+                # 必须跟 `full_input_ids` 同源拼接 —— 否则在去 torch 的节点上
+                # `torch_runtime.require_torch()` 会抛 `ModuleNotFoundError`，表现
+                # 为 `route_a_stage_execution_failed: No module named 'torch'`
+                # （legacy 首段的 decode 步早前已修同款，Route-A 这条漏了）。
+                if hasattr(full_input_ids, "detach"):
+                    new_token_tensor = torch.tensor([[new_token_id]], dtype=torch.long)
+                    full_input_ids = torch.cat([full_input_ids, new_token_tensor], dim=1)
+                else:
+                    import numpy as _np
+
+                    full_input_ids = _np.concatenate(
+                        [full_input_ids,
+                         _np.array([[new_token_id]], dtype=_np.int64)],
+                        axis=1,
+                    )
                 step_ms = (time.time() - step_start) * 1000
                 pipeline_metrics["steps"].append({
                     "step": step,
@@ -4789,6 +5557,19 @@ class SchedulerPipelineMixin:
                     "mode": "prefill" if is_prefill else "decode",
                 })
         except Exception as exc:
+            if (
+                getattr(exc, "code", "") == "provider_cancelled"
+                or (_cancel_event is not None and _cancel_event.is_set())
+            ):
+                logger.info(
+                    "event=route_a_stage_pipeline_cancelled task_id=%s",
+                    task_id,
+                )
+                return {
+                    "response": "",
+                    "error": "pipeline generation was cancelled",
+                    "cancelled": True,
+                }
             logger.error("Route-A stage pipeline failed", exc_info=True)
             return {"response": "", "error": f"route_a_stage_execution_failed: {exc}"}
         finally:
@@ -4799,10 +5580,20 @@ class SchedulerPipelineMixin:
                 pipeline_stack.pop()
 
         if generated_ids:
-            full_ids = torch.cat([
-                input_ids.squeeze(0),
-                torch.tensor(generated_ids, dtype=torch.long),
-            ], dim=0)
+            if hasattr(input_ids, "detach"):
+                full_ids = torch.cat([
+                    input_ids.squeeze(0),
+                    torch.tensor(generated_ids, dtype=torch.long),
+                ], dim=0)
+            else:
+                # 去 torch 节点：载体是 numpy，且 `tokenizer.decode` 也更适合收
+                # 普通序列 —— 这里不判载体同样会抛 `No module named 'torch'`。
+                import numpy as _np
+
+                full_ids = _np.concatenate([
+                    _np.asarray(input_ids).squeeze(0),
+                    _np.asarray(generated_ids, dtype=_np.int64),
+                ], axis=0).tolist()
             response_text = tokenizer.decode(full_ids, skip_special_tokens=True)
             raw_new_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
         else:
@@ -5359,6 +6150,20 @@ class SchedulerPipelineMixin:
         suppress_native_thinking = native_thinking_prompt
         stream_buffer = ""
         workers_used = [n["node_id"] for n in pipeline_nodes]
+        # ★ 2026-10-05（DIST-4）：与 A3 链同口径派生层区间（见
+        #   `_run_route_a_stage_pipeline` 里 `_stage_ranges` 的算法）。
+        _legacy_stage_ranges: list[tuple[int, int]] = []
+        for _node in pipeline_nodes:
+            _start = _node.get("start_layer")
+            _end = _node.get("end_layer")
+            if _start is None or _end is None:
+                continue
+            _legacy_stage_ranges.append((int(_start), int(_end)))
+        _legacy_claimed_layers = (
+            [min(r[0] for r in _legacy_stage_ranges),
+             max(r[1] for r in _legacy_stage_ranges)]
+            if _legacy_stage_ranges else []
+        )
         pipeline_metrics = {
             "steps": [],
             "total_time_ms": 0,
@@ -5375,6 +6180,15 @@ class SchedulerPipelineMixin:
             "serving_node_id": self.get_effective_node_id(),
             "workers_used": workers_used,
             "layer_assignments": pipeline_nodes,
+            # ★ 2026-10-05（DIST-4）：与 A3 链对齐。
+            #   ① 补 `claimed_layers` / `layer_segments`：此前 legacy 链成功时这两个
+            #      字段完全缺失，而 DIST-4 的判据是「成功即 `claimed_layers` 非空」
+            #      —— 缺字段就等于无法证明它真的做了分层。
+            #   ② 补 `config_id`：使层配置代际在**请求级**可见（此前只存在于内存
+            #      contract 与 `/api/cluster/pipeline-capacity`）。
+            "claimed_layers": _legacy_claimed_layers,
+            "layer_segments": [[s, e] for s, e in _legacy_stage_ranges],
+            "config_id": pipeline_config_id,
         }
         t_pipeline_start = time.time()
 
@@ -5548,9 +6362,26 @@ class SchedulerPipelineMixin:
                             raise RuntimeError(
                                 f"主节点 decode step {step} 缺少 KV cache"
                             )
-                    local_input_ids = input_ids if is_prefill else self._scheduler_facade_global('torch').tensor(
-                        [[new_token_id]], dtype=self._scheduler_facade_global('torch').long
-                    )
+                    if is_prefill:
+                        local_input_ids = input_ids
+                    else:
+                        # decode 步的输入载体随引擎而变：PyTorch 要张量，llama.cpp 要 numpy
+                        # （`LlamaCppEngine.forward_layers` 内部 `np.asarray`）。照 prefill 时
+                        # `input_ids` 的载体来造，别**无条件**造 torch —— 那会让无 torch 的
+                        # 主节点在**第二个 step** 就 `ModuleNotFoundError`（实测：relay 链的
+                        # 首段 prefill 已经过了、relay 段也回了前向结果，才炸在这里）。
+                        # 用 `loaded_torch()`（不触发 import）而不是调度门面的 `torch`。
+                        torch_mod = loaded_torch()
+                        if torch_mod is not None and hasattr(input_ids, "detach"):
+                            local_input_ids = torch_mod.tensor(
+                                [[new_token_id]], dtype=torch_mod.long
+                            )
+                        else:
+                            import numpy as _np
+
+                            local_input_ids = _np.asarray(
+                                [[new_token_id]], dtype=_np.int64
+                            )
                     local_attention_mask = attention_mask if is_prefill else None
 
                     t_master = time.time()
@@ -5716,7 +6547,9 @@ class SchedulerPipelineMixin:
                 logits_data = result["logits"]
                 if isinstance(logits_data, bytes):
                     logits = deserialize_tensor(logits_data).to(device=device)
-                elif self._scheduler_facade_global('torch') is not None and isinstance(logits_data, self._scheduler_facade_global('torch').Tensor):
+                elif (torch_mod := loaded_torch()) is not None and isinstance(
+                    logits_data, torch_mod.Tensor
+                ):
                     logits = logits_data.to(device=device)
                 else:
                     step_error = f"未知 logits 类型: {type(logits_data).__name__}"
@@ -5735,7 +6568,9 @@ class SchedulerPipelineMixin:
                             final_hidden = None
                     else:
                         final_hidden = deserialize_tensor(hidden_data)
-                elif self._scheduler_facade_global('torch') is not None and isinstance(hidden_data, self._scheduler_facade_global('torch').Tensor):
+                elif (torch_mod := loaded_torch()) is not None and isinstance(
+                    hidden_data, torch_mod.Tensor
+                ):
                     final_hidden = hidden_data
                 else:
                     step_error = (
@@ -5804,9 +6639,22 @@ class SchedulerPipelineMixin:
                 else:
                     _stream_callback({"token": new_token_text})
 
-            # 更新完整序列仅用于最终解码（不再发送给首节点）
-            new_token_tensor = self._scheduler_facade_global('torch').tensor([[new_token_id]], dtype=self._scheduler_facade_global('torch').long)
-            full_input_ids = self._scheduler_facade_global('torch').cat([full_input_ids, new_token_tensor], dim=1)
+            # 更新完整序列仅用于最终解码（不再发送给首节点）。
+            # 用 numpy 而不是 torch：`full_input_ids` 起初来自 tokenizer（两条引擎路径现在
+            # 都给 numpy），这里只做**累积**，`_save_preempt_state` 也只做**暂存** ——
+            # 全程没有任何张量运算。此前无条件造 `torch.tensor` + `torch.cat` ⇒ 无 torch
+            # 的主节点在**第一个 decode 步**就 `ModuleNotFoundError`（实测：整条 relay 链
+            # 已走通、relay 段真回了前向结果，才在这里炸，此前一直被外层包装吞成一句
+            # `str(e)`）。
+            import numpy as _np
+
+            full_input_ids = _np.concatenate(
+                [
+                    _np.asarray(full_input_ids),
+                    _np.asarray([[new_token_id]], dtype=_np.int64),
+                ],
+                axis=1,
+            )
 
             step_ms = (time.time() - step_start) * 1000
             pipeline_metrics["steps"].append({
@@ -5842,18 +6690,26 @@ class SchedulerPipelineMixin:
                 del self._kv_cache[task_id]
 
         # ---- Step 6: 解码结果 ----
+        # 拼接用 numpy：`input_ids` 来自 tokenizer（两条引擎路径现在都给 numpy），
+        # 而 `tokenizer.decode` 两侧都接受 numpy。此前无条件走 `torch.cat` ⇒ 无 torch 的
+        # 主节点在**生成结束后**这一步炸（整条链跑完才现形）。
+        import numpy as _np
+
         if generated_ids:
-            full_ids = self._scheduler_facade_global('torch').cat([
-                input_ids.squeeze(0),
-                self._scheduler_facade_global('torch').tensor(generated_ids, dtype=self._scheduler_facade_global('torch').long)
-            ], dim=0)
+            full_ids = _np.concatenate(
+                [
+                    _np.asarray(input_ids).squeeze(0),
+                    _np.asarray(generated_ids, dtype=_np.int64),
+                ],
+                axis=0,
+            )
             response_text = tokenizer.decode(full_ids, skip_special_tokens=True)
             raw_new_text = tokenizer.decode(
                 generated_ids, skip_special_tokens=True
             )
         else:
             response_text = tokenizer.decode(
-                input_ids.squeeze(0), skip_special_tokens=True
+                _np.asarray(input_ids).squeeze(0), skip_special_tokens=True
             )
             raw_new_text = ""
 
@@ -6115,6 +6971,15 @@ class SchedulerPipelineMixin:
             mgr and getattr(mgr, "is_pipeline_prepared", False)
         )
         if not mgr or (not mgr.is_loaded and not pipeline_prepared):
+            if self._pipeline_recovery_pending:
+                return {
+                    "response": "",
+                    "error": (
+                        "pipeline_recovery_pending: "
+                        "waiting for authoritative layer-config recovery"
+                    ),
+                    "metrics": {"distributed_used": False, "fallback": False},
+                }
             logger.warning("模型未加载，无法执行流水线推理")
             if require_distributed:
                 return {
@@ -6139,6 +7004,15 @@ class SchedulerPipelineMixin:
                     "error": (
                         "distributed_required: pipeline execution requires "
                         f"pytorch, got {engine_type}"
+                    ),
+                    "metrics": {"distributed_used": False, "fallback": False},
+                }
+            if self._pipeline_recovery_pending:
+                return {
+                    "response": "",
+                    "error": (
+                        "pipeline_recovery_pending: "
+                        "waiting for authoritative layer-config recovery"
                     ),
                     "metrics": {"distributed_used": False, "fallback": False},
                 }
@@ -6184,6 +7058,19 @@ class SchedulerPipelineMixin:
                 "部分流水线节点未就绪，回退到全层主节点模式: %s",
                 readiness_reason,
             )
+            if self._pipeline_recovery_pending:
+                return {
+                    "response": "",
+                    "error": (
+                        "pipeline_recovery_pending: "
+                        f"{readiness_reason}"
+                    ),
+                    "metrics": {
+                        "distributed_used": False,
+                        "fallback": False,
+                        "pipeline_readiness": readiness or {},
+                    },
+                }
             if require_distributed:
                 return {
                     "response": "",
@@ -6300,8 +7187,15 @@ class SchedulerPipelineMixin:
                 return result
             except Exception as e:
                 if self._stream_output_started(kwargs):
+                    logger.warning("流水线推理失败（流式已开始）: %s", e, exc_info=True)
                     return {"response": "", "error": str(e)}
                 if require_distributed:
+                    # `distributed_required` 的 error 会**原样抛给客户端**，所以必须先把
+                    # 完整 traceback 落盘 —— 否则排障只剩一句 `str(e)`（实测踩过：只看到
+                    # `No module named 'torch'`，看不出是哪条路径在 import，只能靠猜）。
+                    logger.error(
+                        "distributed_required 流水线失败: %s", e, exc_info=True,
+                    )
                     return {
                         "response": "",
                         "error": f"distributed_required: {e}",
@@ -6360,11 +7254,64 @@ class SchedulerPipelineMixin:
         #   缺 Embedding/LM Head 而报错（如 RuntimeError: 缺少 lm_head）。
         try:
             ensure_full = getattr(mgr, 'ensure_full_model', None)
+            logger.info(
+                "回退前完整模型检查: mgr=%s callable=%s is_pipeline_prepared=%s",
+                type(mgr).__name__, callable(ensure_full),
+                getattr(mgr, "is_pipeline_prepared", None),
+            )
             if callable(ensure_full):
                 ensure_full()
         except Exception as e:
             logger.error(f"完整模型重载失败: {e}")
             return {"response": "", "error": f"完整模型恢复失败: {e}"}
+
+        # ★ 2026-10-06（docs/已知问题记录.md #38）：**回退前必须确认 master 真的持有全层
+        #   模型**。此前只依赖 `is_pipeline_prepared`（= `_pipeline_distributed_only and
+        #   _pipeline_descriptor`）＋ `ensure_full_model()` 两道守卫，但二者都可能不成立却
+        #   仍放着裁层工件往下跑：实测 master 加载的是 `qwen25-05b-f16-head8.gguf`
+        #   （日志 `llama.cpp 层段已加载: [0,8) embed=True lm_head=False`），回退却按
+        #   「全层」硬跑 ⇒ 产出垃圾文本**却返回 HTTP 200**（fail-open 最坏的一种：掩盖故障
+        #   且伪装成功，对拍/验收/目视都会据此误判）。
+        #   这里改用**直接判据**：`layer_range`（`src/model_module.py:836` 明确
+        #   `None` = 完整模型）＋ `lm_head` —— 任一不满足即 fail-closed 且给具名原因。
+        _layer_range = getattr(mgr, "layer_range", None)
+        _desc: dict = {}
+        try:
+            _get_desc = getattr(mgr, "get_pipeline_descriptor", None)
+            if callable(_get_desc):
+                _d = _get_desc() or {}
+                if isinstance(_d, dict):
+                    _desc = _d
+        except Exception:  # noqa: BLE001 - 描述符不可用时按「未声明」处理
+            _desc = {}
+        # 判据用**描述符里的裁层痕迹**，因为两侧通用：PyTorch 侧另有 `layer_range`
+        # （`model_module.py:836`，None=整模），而 **llama.cpp 侧没有该实例属性**，
+        # 它的裁层状态只体现在 `_pipeline_descriptor` 的
+        # `assignment_layer_range` / `partial_assignment` / `loaded_artifact` 与
+        # `lm_head`（`llama_engine.py:516-528`）。实测 #38 正发生在 **llama.cpp** master：
+        # 日志 `llama.cpp 层段已加载: [0,8) embed=True lm_head=False` ——
+        # 而 LlamaCppEngine **既无 `ensure_full_model` 也无 `layer_range`** ⇒
+        # 上面两道旧守卫对它完全无效，只能靠这里挡住。
+        _partial = bool(
+            _desc.get("assignment_layer_range")
+            or _desc.get("partial_assignment")
+            or _desc.get("loaded_artifact")
+        )
+        _lm_head = _desc.get("lm_head") if "lm_head" in _desc else None
+        if _layer_range is not None or _partial or _lm_head is False:
+            logger.error(
+                "拒绝整模回退：master 并未持有全层模型 "
+                "(layer_range=%s partial=%s lm_head=%s)",
+                _layer_range, _partial, _lm_head,
+            )
+            return {
+                "response": "",
+                "error": (
+                    "refusing_full_model_fallback_with_partial_artifact: "
+                    f"layer_range={_layer_range} partial={_partial} lm_head={_lm_head}；"
+                    "master 持有的是裁层工件，整模回退会产出垃圾且伪装成功"
+                ),
+            }
 
         try:
             messages = kwargs.pop("messages", None) or [{"role": "user", "content": prompt}]
@@ -6673,6 +7620,12 @@ class SchedulerPipelineMixin:
         readiness_by_node = {
             item["node_id"]: item for item in readiness.get("workers", [])
         }
+        # Read the connection state from the master-side TCPServer directly.
+        # Readiness intentionally returns no worker details while the restart
+        # recovery fence is active, so falling back to ``detail.get(...,
+        # False)`` would report every live peer as disconnected and obscure
+        # the actual recovery state.
+        connected_ids = self._connected_client_ids()
         worker_status = []
         online_count = 0
         with self._nodes_lock:
@@ -6687,7 +7640,7 @@ class SchedulerPipelineMixin:
             worker_status.append({
                 "node_id": nid,
                 "online": is_online,
-                "tcp_connected": detail.get("tcp_connected", False),
+                "tcp_connected": nid in connected_ids,
                 "heartbeat_age_seconds": detail.get("heartbeat_age_seconds"),
                 "layer_ready": detail.get("layer_ready", False),
                 "layer_status": detail.get("layer_status", "not_configured"),

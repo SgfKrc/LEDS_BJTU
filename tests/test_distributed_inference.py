@@ -149,6 +149,32 @@ class TestDistributedInferenceWorkflow:
         assert len(result["response"]) > 0
         assert "error" not in result
 
+    def test_fallback_refuses_partial_artifact(self, scheduler, mgr, monkeypatch):
+        """★ #38（2026-10-06）：master 只持有裁层工件时，整模回退必须 fail-closed。
+
+        此前回退只看 `is_pipeline_prepared`（= `_pipeline_distributed_only and
+        _pipeline_descriptor`）与 `ensure_full_model()`，二者对 **llama.cpp master 完全无效**
+        —— 实测当时加载的是 `qwen25-05b-f16-head8.gguf`
+        （日志 `llama.cpp 层段已加载: [0,8) embed=True lm_head=False`），LlamaCppEngine
+        **既无 `ensure_full_model` 也无 `layer_range` 实例属性** ⇒ 回退按「全层」硬跑 ⇒
+        产出垃圾文本**却返回 HTTP 200**（fail-open 最坏的一种）。
+        现改用描述符里的**裁层痕迹**作判据（`assignment_layer_range` /
+        `partial_assignment` / `loaded_artifact` / `lm_head=False`），两侧通用。
+        """
+        # 不真的重载整模（那要 14s+）；本用例只验「有裁层痕迹 ⇒ 拒绝」这一步
+        monkeypatch.setattr(mgr, "ensure_full_model", lambda *a, **k: None, raising=False)
+        monkeypatch.setattr(
+            mgr, "get_pipeline_descriptor",
+            lambda: {"lm_head": False, "assignment_layer_range": [0, 8]},
+            raising=False,
+        )
+        result = scheduler._run_full_model_inference(
+            prompt="Hello, how are you?",
+            max_new_tokens=8,
+        )
+        assert result["response"] == ""
+        assert "refusing_full_model_fallback_with_partial_artifact" in result["error"]
+
     def test_fallback_inference_with_metrics(self, scheduler, mgr):
         """回退推理应返回 metrics（包含 mode 字段）。"""
         result = scheduler._run_full_model_inference(

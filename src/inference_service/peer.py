@@ -156,7 +156,15 @@ class PeerClient:
         logger.warning("与主节点连接断开: %s:%s", self._master_host, self._master_port)
         with self._layer_config_lock:
             self._active_layer_config = None
+            self._pending_layer_config = None
             self._local_pipeline_steps.clear()
+            self._active_pipeline_task_ids.clear()
+            self._local_pipeline_cancelled.clear()
+        # A reconnect must not reuse KV state from a socket that has already
+        # lost its coordinator. Keep the generation fence intact so delayed
+        # messages from the old connection cannot overwrite a new assignment.
+        with self._kv_cache_lock:
+            self._kv_cache.clear()
 
     def run_forever(self) -> None:
         """阻塞运行：连接失败/断开后自动重连（简单退避）。"""
@@ -271,11 +279,24 @@ class PeerClient:
                 )
                 return
             if incoming_generation is not None:
+                # Once a lifecycle carries a generation, config_id is its
+                # identity fence.  A missing id must not be treated as an
+                # idempotent duplicate: a delayed release with the same
+                # generation could otherwise clear the active assignment.
+                if not incoming_config_id:
+                    logger.warning(
+                        "ignore versioned layer config without config_id "
+                        "node=%s generation=%s latest=%s/%s",
+                        node_id,
+                        incoming_generation,
+                        latest_generation,
+                        latest_config_id or "legacy",
+                    )
+                    return
                 stale = (
                     incoming_generation < latest_generation
                     or (
                         incoming_generation == latest_generation
-                        and incoming_config_id
                         and latest_config_id
                         and incoming_config_id != latest_config_id
                     )
@@ -290,7 +311,13 @@ class PeerClient:
                         latest_config_id or "legacy",
                     )
                     return
-                if incoming_generation > latest_generation:
+                if (
+                    incoming_generation > latest_generation
+                    or (
+                        incoming_generation == latest_generation
+                        and not latest_config_id
+                    )
+                ):
                     self._latest_layer_config_generation = incoming_generation
                     self._latest_layer_config_id = incoming_config_id
 

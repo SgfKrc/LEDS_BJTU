@@ -46,7 +46,7 @@ K-Llama 是**一个进程里的两层**：面向人的控制面，以及面向�
 │ ├ ggml RPC worker（借算力）         ├ 层间流水线（qwen3_pipeline_*）         │
 │ └ 层段前向（keep-head shim）        └ 跨框架接力上游（model_module）         │
 └──────────────────────────────┬─────────────────────────────────────────────┘
-                               │ 层段通道：Relay TCP（HIDDEN / HIDDEN_SEQ / TOKEN）
+                               │ 层段通道：v3 stage（stage_offer_v3 / layer_forward）
 ┌──────────────────────────────┴─────────────────────────────────────────────┐
 │ 节点与传输（跨机、异构）                                                    │
 │ 本机 loopback · SSH 隧道 · Surface(x86_64, Windows) · y700(ARM64, Termux)   │

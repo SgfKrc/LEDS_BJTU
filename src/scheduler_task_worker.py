@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import importlib
 import logging
+import os
+import re
 import threading
 import time
 import uuid
@@ -32,6 +34,40 @@ from task_worker_protocol import (
 from torch_runtime import torch_available
 
 logger = logging.getLogger("scheduler")
+
+_LAYER_ARTIFACT_DIGEST_LOCK = threading.Lock()
+_LAYER_ARTIFACT_DIGEST_CACHE: dict[str, tuple[tuple[int, int, int], str]] = {}
+
+
+def _verified_layer_artifact_sha256(path) -> str:
+    """Hash one configured GGUF once per stable filesystem identity."""
+    try:
+        resolved = path.resolve(strict=True)
+        stat = resolved.stat()
+        if not resolved.is_file():
+            return ""
+        fingerprint = (
+            int(stat.st_size),
+            int(getattr(stat, "st_mtime_ns", 0)),
+            int(getattr(stat, "st_ctime_ns", 0)),
+        )
+    except OSError:
+        return ""
+    cache_key = str(resolved)
+    with _LAYER_ARTIFACT_DIGEST_LOCK:
+        cached = _LAYER_ARTIFACT_DIGEST_CACHE.get(cache_key)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+        digest = hashlib.sha256()
+        try:
+            with resolved.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            return ""
+        value = digest.hexdigest()
+        _LAYER_ARTIFACT_DIGEST_CACHE[cache_key] = (fingerprint, value)
+        return value
 
 
 @dataclass
@@ -63,13 +99,15 @@ class SchedulerTaskWorkerMixin:
         比对的正是这一项。
         """
         import json
-        import os
         from pathlib import Path
 
         model_path = os.environ.get("QLH_LAYER_GGUF", "").strip()
         if not model_path:
             return None
-        manifest_path = Path(model_path).with_suffix(".manifest.json")
+        artifact_path = Path(model_path)
+        if not artifact_path.is_file():
+            return None
+        manifest_path = artifact_path.with_suffix(".manifest.json")
         if not manifest_path.is_file():
             return None
         try:
@@ -83,6 +121,25 @@ class SchedulerTaskWorkerMixin:
             return None
         if value[0] < 0 or value[1] <= value[0]:
             return None
+        expected_sha256 = str(data.get("artifact_sha256", "") or "").lower()
+        if (
+            len(expected_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in expected_sha256)
+            or _verified_layer_artifact_sha256(artifact_path) != expected_sha256
+        ):
+            return None
+        segment_mode = str(data.get("mode", "") or "").lower()
+        if segment_mode not in {"head", "middle", "tail"}:
+            return None
+        source_sha256 = str(data.get("source_model_sha256", "") or "").lower()
+        if source_sha256 and (
+            len(source_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in source_sha256)
+        ):
+            return None
+        model_id = artifact_path.name
+        if re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", model_id) is None:
+            return None
         # `model_id` 取**文件名**，不用 manifest 的 `artifact` 字段：后者是相对路径
         # （含 `\`），而协议对它的要求是 `^[A-Za-z0-9_.:-]{1,128}$` —— 反斜杠不合法 ⇒
         # 整个 hello 会被判 `payload.capabilities.models[0].model_id is invalid`，worker
@@ -90,9 +147,11 @@ class SchedulerTaskWorkerMixin:
         return {
             "start": int(value[0]),
             "end": int(value[1]),
-            "model_id": Path(model_path).name,
-            "sha256": str(data.get("artifact_sha256", "") or ""),
+            "model_id": model_id,
+            "sha256": expected_sha256,
+            "source_model_sha256": source_sha256,
             "revision": str(data.get("generator_version", "") or ""),
+            "segment_mode": segment_mode,
         }
 
     def _task_worker_capabilities(self) -> dict:
@@ -170,7 +229,28 @@ class SchedulerTaskWorkerMixin:
         #   结果是 PC worker 永远不会被派到 `layer_forward`。
         stage_types = ["full_inference", "aggregate"]
         layer_ranges: list[list[int]] = []
-        if layer_worker:
+        # ★ #28：**工件身份**（「我手上有哪份权重」）与**就绪区间**（「我现在能跑哪几层」）
+        #   是两件事，此前共用一个 `if layer_worker / else` 分支 ⇒ 只要 `layer_range` 残留
+        #   或 `_active_layer_config` 还在，整个工件身份分支就被跳过，`models` 变空。
+        #   而主节点把这份 hello 快照当层分配与 Stage offer 的唯一身份来源 ⇒ 远端 Stage
+        #   以 `model_identity_mismatch` 被拒（worker 侧 `_handle_task_worker_stage_offer`
+        #   还会用**实时** capabilities 再比对一次，两侧都不一致时症状更隐蔽）。
+        #   ⇒ 身份**不再**依附于就绪状态：只要手上有工件就上报。
+        artifact = self._configured_layer_artifact()
+        artifact_required = bool(
+            os.environ.get("QLH_LAYER_GGUF", "").strip()
+        )
+        if artifact_required and artifact is None:
+            # An explicitly configured but missing/corrupt GGUF must not keep
+            # advertising a stale active range from the previous generation.
+            layer_worker = False
+        if artifact is not None:
+            # A fixed GGUF segment is executable only for the exact manifest
+            # range.  Never let a stale active config publish a second range
+            # beside the per-artifact contract.
+            layer_worker = True
+            layer_ranges.append([artifact["start"], artifact["end"]])
+        elif layer_worker:
             layer_range = active_layer_config.get("layer_range")
             if (
                 isinstance(layer_range, (list, tuple))
@@ -181,30 +261,31 @@ class SchedulerTaskWorkerMixin:
                 )
             ):
                 layer_ranges.append([int(layer_range[0]), int(layer_range[1])])
-        else:
-            # 首次 hello 时 master 还没下发 layer config —— 它只对**已声明**层段能力的
-            # worker 下发。若这里只看 `_active_layer_config` 就形成死锁：声明为空 ⇒
-            # 分配器没有区间约束 ⇒ 分到手上没有的区间 ⇒ `layer_range_not_advertised`
-            # 被拒 ⇒ 永远拿不到配置。改为从**工件 manifest** 推导，使声明先于配置成立。
-            artifact = self._configured_layer_artifact()
-            if artifact is not None:
-                layer_worker = True
-                layer_ranges.append([artifact["start"], artifact["end"]])
-                # 层段 worker 不加载整模 ⇒ `models` 会是空的，而 Route A 的 offer 身份
-                # 正是从这里取（`_route_a_stage_model_identity`）⇒ 缺了它整条链会以
-                # `route_a_stage_model_identity_unavailable` 失败。用**工件身份**顶上：
-                # `task_worker_adapter._layer_model_matches` 比对的就是 engine/format/sha256。
-                if artifact.get("sha256"):
-                    models.append({
-                        "model_id": artifact["model_id"],
-                        "engine": "llama_cpp",
-                        "format": "gguf",
-                        "revision": artifact["revision"],
-                        "sha256": artifact["sha256"],
-                    })
+        if artifact is not None and artifact.get("sha256"):
+            # 层段 worker 不加载整模 ⇒ 只靠上面的整模分支时 `models` 会是空的，而 Route A
+            # 的 offer 身份正是从这里取（`_route_a_stage_model_identity`）⇒ 缺了它整条链
+            # 会以 `route_a_stage_model_identity_unavailable` 失败。用**工件身份**顶上：
+            # `task_worker_adapter._layer_model_matches` 比对的就是 engine/format/sha256。
+            # 整模身份优先（上面已填 `models` 时不覆盖）—— 两者冲突说明本机同时握着整模
+            # 与工件，此时以整模为准是保守选择。
+            artifact_model = {
+                "model_id": artifact["model_id"],
+                "engine": "llama_cpp",
+                "format": "gguf",
+                "revision": artifact["revision"],
+                "sha256": artifact["sha256"],
+            }
+            existing = next((
+                item for item in models
+                if item.get("model_id") == artifact_model["model_id"]
+            ), None)
+            if existing is None:
+                models.append(artifact_model)
+            elif existing != artifact_model:
+                raise RuntimeError("layer_artifact_model_identity_conflict")
         if layer_worker and "layer_forward" not in stage_types:
             stage_types.append("layer_forward")
-        return {
+        capabilities = {
             "stage_types": stage_types,
             "engines": engines,
             "models": models,
@@ -218,11 +299,26 @@ class SchedulerTaskWorkerMixin:
             # 当前**就绪、马上能跑**的层区间（与 `layer_budget` 的"承载上限"分工明确）。
             "layer_ranges": layer_ranges,
             "relay_middle": bool(
-                active_layer_config
+                layer_worker
+                and active_layer_config
                 and str(active_layer_config.get("engine", ""))
                 == "relay_middle"
             ),
         }
+        if artifact is not None and artifact.get("segment_mode") in {
+            "head", "middle", "tail",
+        }:
+            item = {
+                "layer_range": [artifact["start"], artifact["end"]],
+                "segment_mode": artifact["segment_mode"],
+                "model_id": artifact["model_id"],
+                "artifact_sha256": artifact["sha256"],
+            }
+            if artifact.get("source_model_sha256"):
+                item["source_model_sha256"] = artifact["source_model_sha256"]
+            capabilities["layer_artifacts"] = [item]
+            capabilities["segment_mode"] = artifact["segment_mode"]
+        return capabilities
 
     @staticmethod
     def _runtime_profile_for_capabilities() -> str:
@@ -493,11 +589,21 @@ class SchedulerTaskWorkerMixin:
         with self._task_worker_stage_lock:
             active = self._task_worker_active_attempts.get(attempt_id)
             if active is None:
-                raise WorkerProtocolError(
-                    "Stage cancellation has no active attempt",
-                    code="unknown_attempt",
-                    field="payload.attempt_id",
+                now = time.monotonic()
+                completed = getattr(
+                    self, "_task_worker_completed_attempts", {},
                 )
+                for completed_id, (_record, expires_at) in list(completed.items()):
+                    if expires_at <= now:
+                        completed.pop(completed_id, None)
+                tombstone = completed.get(attempt_id)
+                if tombstone is None:
+                    raise WorkerProtocolError(
+                        "Stage cancellation has no active attempt",
+                        code="unknown_attempt",
+                        field="payload.attempt_id",
+                    )
+                active = tombstone[0]
             if not self._task_worker_active_identity_matches(payload, active):
                 raise WorkerProtocolError(
                     "Stage cancellation identity does not match the active attempt",
@@ -805,6 +911,17 @@ class SchedulerTaskWorkerMixin:
                 )
                 if removed is not None:
                     removed.done_event.set()
+                    completed = getattr(
+                        self, "_task_worker_completed_attempts", None,
+                    )
+                    if completed is None:
+                        completed = {}
+                        self._task_worker_completed_attempts = completed
+                    now = time.monotonic()
+                    for completed_id, (_record, expires_at) in list(completed.items()):
+                        if expires_at <= now:
+                            completed.pop(completed_id, None)
+                    completed[attempt_id] = (removed, now + 5.0)
 
 
     def _handle_task_worker_message(self, client_id: str, msg: dict) -> None:
@@ -864,18 +981,61 @@ class SchedulerTaskWorkerMixin:
                             field="payload.worker_kind",
                         )
                 if message.message_type == "hello":
-                    ack = self._task_worker_control.receive_on_coordinator(
-                        client_id,
-                        raw,
-                        coordinator_node_id=self.get_effective_node_id(),
-                    )
+                    # ★ 2026-10-05（DIST-3）：把 hello 校验的异常面显式记下来。
+                    #   此前这里异常直接向上抛，而更外层（TCP 接收循环）会吞掉它
+                    #   ⇒ worker 侧只看到"连上又断开"，master 侧**一行日志都没有**，
+                    #   排查只能靠猜（实测：Y700 每 30s 重连一次、只知道
+                    #   `task_worker_handshake_pending`，定位花了好几轮）。
+                    try:
+                        ack = self._task_worker_control.receive_on_coordinator(
+                            client_id,
+                            raw,
+                            coordinator_node_id=self.get_effective_node_id(),
+                        )
+                    except Exception:
+                        logger.error(
+                            "task worker hello 校验失败: node=%s", client_id,
+                            exc_info=True,
+                        )
+                        raise
                     self._send_task_worker_to_node(client_id, ack)
                     # The registration fence must end for both an accepted
                     # hello and a definitive rejection.  A rejected hello is
                     # no longer negotiating the task-worker path, so legacy
                     # scheduling can be recomputed for that connection.
                     self._task_worker_control.resolve_worker_connection_pending(client_id)
-                    self.push_layer_config_to_clients()
+                    # ★ 幂等 hello（#28）：**只有 capabilities 真的变了**才重推层配置。
+                    #   此前无条件 push，配合层段路径补 refresh 会形成
+                    #   `hello → push → load_layer_range → refresh → hello` 自激环（每次 push
+                    #   都取新 generation ⇒ worker 端永远判成"新配置"）。
+                    #   字段缺失时按"变了"处理（保守：多重推一次总好过永远不推）。
+                    worker_snapshot = self._task_worker_control.worker_snapshot(client_id)
+                    # Recovery must use one authoritative publish. A normal
+                    # capability push here would create a second generation.
+                    recovery_sync = bool(
+                        ack.payload["accepted"] and self._pipeline_recovery_pending
+                    )
+                    if not recovery_sync and worker_snapshot.get(
+                        "capabilities_changed", True
+                    ):
+                        self.push_layer_config_to_clients()
+                    # ★ 2026-10-05（DIST-1 三机重启实测）：权威重发此前**只在请求路径**
+                    #   触发，而请求会被恢复闸门自身拒绝 ⇒ 没有任何路径去产生「新代际」
+                    #   ⇒ 闸门永不解除（实测：三机全部在线、TCP 已重连、hello
+                    #   accepted=True，请求仍返回 `pipeline_recovery_pending`；
+                    #   readiness 停在 `layer_status=not_configured`，且准入名单在
+                    #   同一次会话内由非空变为空）。
+                    #   worker 重新 hello 是「这个节点回来了」的权威信号，恢复期就在
+                    #   此刻补一次**权威重发**：`require_distributed=True` 的语义是
+                    #   「按当前在线能力重算一份新计划」，而不是重放持久化的旧计划
+                    #   （见 `push_layer_config_to_clients_locked` 里对
+                    #   `_pipeline_recovery_pending` 的处理）。
+                    if recovery_sync:
+                        logger.info(
+                            "重启恢复期收到 worker hello，触发权威重发: node=%s",
+                            client_id,
+                        )
+                        self.request_authoritative_layer_sync(require_distributed=True)
                     if ack.payload["accepted"]:
                         self._ensure_remote_task_worker_provider(client_id)
                         # A node that has just advertised a complete model is
@@ -888,22 +1048,30 @@ class SchedulerTaskWorkerMixin:
                             if isinstance(message.payload, dict)
                             else []
                         )
+                        advertised_capabilities = (
+                            message.payload.get("capabilities", {})
+                            if isinstance(message.payload, dict)
+                            else {}
+                        )
+                        is_layer_stage_worker = bool(
+                            isinstance(advertised_capabilities, dict)
+                            and "layer_forward" in advertised_capabilities.get(
+                                "stage_types", []
+                            )
+                            and advertised_capabilities.get("layer_ranges")
+                        )
                         # Layer/relay workers deliberately advertise no full
                         # model identity.  Do not turn their hello into an
                         # opt-out: the layer-config handshake is their role.
-                        # ★ relay 宿主是**例外的第三类**：它不能声明
-                        #   `forward_layers`（声明了就会拒绝 legacy 层配置，而 relay
-                        #   委派正是走那条通道 —— 实测 Surface 报「本节点是 v3 层段
-                        #   worker，拒绝 legacy 分层配置」），但它要的**恰恰**就是那份
-                        #   legacy 配置。所以按「是否持有有效 relay_segment」豁免，
-                        #   否则它会被当 Full Worker 释放预留，relay 链直接失去中间段。
-                        is_relay_host = (
-                            self._relay_segment_for_worker(client_id) is not None
-                        )
+                        # ★ relay 宿主是第三类角色，判据唯一的出处在 `_is_relay_host()`：
+                        #   它不能声明 `forward_layers`（声明了就会拒绝 legacy 层配置，而
+                        #   relay 委派正是走那条通道），但它要的恰恰就是那份 legacy 配置，
+                        #   因此不能被当 Full Worker 释放预留。
                         if (advertised_models
-                                and not is_relay_host
+                                and not self._is_relay_host(client_id)
+                                and not is_layer_stage_worker
                                 and not bool(
-                                    message.payload.get("capabilities", {}).get(
+                                    advertised_capabilities.get(
                                         "layer_worker", False
                                     )
                                 )):

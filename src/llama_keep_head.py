@@ -298,8 +298,18 @@ class KeepHeadUpstream:
         worker = Path(__file__).with_name("llama_keep_head_worker.py")
         if not worker.is_file():
             raise KeepHeadUnavailable(f"keep-head worker missing: {worker}")
+        # ★ 冻结包（PyInstaller）内 `sys.executable` 是**主 exe 自己**，不是 Python
+        #   解释器 ⇒ 不能再写 `[sys.executable, worker.py, ...]`：那只会让 exe 重跑
+        #   自己的入口，worker 的 stdin/stdout 协议永不建立（2026-10-06 用 Edge 包当
+        #   layer worker 实测踩到：子进程在、keephead-worker.log 为 0 字节、master 等满
+        #   60s 超时）。冻结态改走 launcher 的 `--keephead-worker` 早期分派，把同一份
+        #   worker 脚本当 __main__ 跑；源码态保持原样。
+        if getattr(sys, "frozen", False):
+            worker_command = [sys.executable, "--keephead-worker"]
+        else:
+            worker_command = [sys.executable, str(worker)]
         command = [
-            sys.executable, str(worker),
+            *worker_command,
             "--shim", str(self.shim_path), "--model", str(self.model_path),
             "--mode", self.mode, "--n-ctx", str(int(n_ctx)),
             "--n-threads", str(int(n_threads)), "--n-batch", str(int(n_batch)),

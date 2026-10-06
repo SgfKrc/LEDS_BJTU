@@ -7,11 +7,14 @@
 """
 import os
 import sys
+import hashlib
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from scheduler import Scheduler  # noqa: E402
 import scheduler_task_worker  # noqa: E402
+from task_provider import ModelIdentity  # noqa: E402
 
 
 class _FakeHost:
@@ -75,11 +78,14 @@ class TestLayerCapabilities:
 
         gguf = tmp_path / "qwen25-05b-f16-cut-16-20.gguf"
         gguf.write_bytes(b"")
+        artifact_sha256 = hashlib.sha256(b"").hexdigest()
         (tmp_path / "qwen25-05b-f16-cut-16-20.manifest.json").write_text(
             json.dumps({
                 "source_layer_range": [16, 20],
                 "artifact": "models\\qwen25-05b-f16-cut-16-20.gguf",
-                "artifact_sha256": "a" * 64,
+                "artifact_sha256": artifact_sha256,
+                "source_model_sha256": "b" * 64,
+                "mode": "middle",
                 "generator_version": 2,
             }),
             encoding="utf-8",
@@ -91,7 +97,82 @@ class TestLayerCapabilities:
         assert _SAFE_ID.match(model_id), f"model_id 不合法: {model_id!r}"
         assert "\\" not in model_id
         assert caps["layer_ranges"] == [[16, 20]]
+        assert caps["segment_mode"] == "middle"
+        assert caps["layer_artifacts"] == [{
+            "layer_range": [16, 20],
+            "segment_mode": "middle",
+            "model_id": model_id,
+            "artifact_sha256": artifact_sha256,
+            "source_model_sha256": "b" * 64,
+        }]
         _validate_capabilities(caps, version=3)
+
+    def test_full_model_and_layer_artifact_identities_are_both_advertised(
+            self, tmp_path, monkeypatch):
+        import json
+
+        gguf = tmp_path / "cut-16-20.gguf"
+        gguf.write_bytes(b"")
+        artifact_sha256 = hashlib.sha256(b"").hexdigest()
+        gguf.with_suffix(".manifest.json").write_text(json.dumps({
+            "source_layer_range": [16, 20],
+            "artifact_sha256": artifact_sha256,
+            "source_model_sha256": "c" * 64,
+            "mode": "middle",
+            "generator_version": 2,
+        }), encoding="utf-8")
+        monkeypatch.setenv("QLH_LAYER_GGUF", str(gguf))
+        monkeypatch.setattr(scheduler_task_worker, "torch_available", lambda: True)
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler._host = _FakeHost(full_model_loaded=True)
+        scheduler._active_layer_config = None
+        scheduler._require_callbacks = lambda: SimpleNamespace(
+            active_task_graph_model_identity=lambda: ModelIdentity(
+                model_id="full-model", engine="pytorch", format="safetensors",
+                revision="local", sha256="a" * 64,
+            ),
+        )
+
+        caps = scheduler._task_worker_capabilities()
+
+        assert [item["model_id"] for item in caps["models"]] == [
+            "full-model", gguf.name,
+        ]
+        assert caps["layer_artifacts"][0]["model_id"] == gguf.name
+
+    def test_corrupt_or_incomplete_artifact_is_not_advertised(
+            self, tmp_path, monkeypatch):
+        import json
+
+        gguf = tmp_path / "cut-16-20.gguf"
+        gguf.write_bytes(b"actual artifact")
+        manifest = gguf.with_suffix(".manifest.json")
+        manifest.write_text(json.dumps({
+            "source_layer_range": [16, 20],
+            "artifact_sha256": "a" * 64,
+            "mode": "middle",
+        }), encoding="utf-8")
+        monkeypatch.setenv("QLH_LAYER_GGUF", str(gguf))
+
+        caps = _capabilities(
+            active_layer_config={"layer_range": [16, 20], "engine": "llama_cpp"},
+        )
+
+        assert caps["layer_worker"] is False
+        assert caps["layer_ranges"] == []
+        assert "layer_forward" not in caps["stage_types"]
+        assert "layer_artifacts" not in caps
+
+        # A valid digest without a boundary mode is equally unsafe: the
+        # scheduler must not downgrade it into a legacy exact-range worker.
+        manifest.write_text(json.dumps({
+            "source_layer_range": [16, 20],
+            "artifact_sha256": hashlib.sha256(b"actual artifact").hexdigest(),
+        }), encoding="utf-8")
+        caps = _capabilities()
+        assert caps["layer_worker"] is False
+        assert caps["layer_ranges"] == []
 
 
 class TestLayerCapabilitiesSurviveProtocolValidation:

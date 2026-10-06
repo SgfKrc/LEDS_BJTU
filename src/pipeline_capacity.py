@@ -79,6 +79,76 @@ def _normalize_layer_ranges(
     return tuple(sorted(set(normalized)))
 
 
+def _normalize_layer_artifacts(
+    value: Any,
+    field: str,
+    *,
+    total_layers: int | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """Validate exact ready-artifact ranges and their boundary semantics."""
+    if not isinstance(value, (list, tuple)) or not value:
+        raise PipelineCapacityError(f"{field} must be a non-empty list")
+    normalized: list[dict[str, Any]] = []
+    seen_ranges: set[tuple[int, int]] = set()
+    for index, item in enumerate(value):
+        item_field = f"{field}[{index}]"
+        if not isinstance(item, dict):
+            raise PipelineCapacityError(f"{item_field} must be an object")
+        allowed = {
+            "layer_range", "segment_mode", "model_id", "artifact_sha256",
+            "source_model_sha256",
+        }
+        required = allowed - {"source_model_sha256"}
+        if set(item) - allowed or not required.issubset(item):
+            raise PipelineCapacityError(
+                f"{item_field} has invalid or missing fields"
+            )
+        ranges = _normalize_layer_ranges(
+            [item.get("layer_range")],
+            f"{item_field}.layer_range",
+            total_layers=total_layers,
+        )
+        layer_range = ranges[0]
+        if layer_range in seen_ranges:
+            raise PipelineCapacityError(
+                f"{field} must not contain duplicate layer ranges"
+            )
+        seen_ranges.add(layer_range)
+        mode = str(item.get("segment_mode", "") or "").strip().lower()
+        if mode not in {"head", "middle", "tail"}:
+            raise PipelineCapacityError(
+                f"{item_field}.segment_mode must be head, middle, or tail"
+            )
+        model_id = str(item.get("model_id", "") or "").strip()
+        artifact_sha256 = str(item.get("artifact_sha256", "") or "").strip().lower()
+        source_sha256 = str(
+            item.get("source_model_sha256", "") or ""
+        ).strip().lower()
+        if not model_id:
+            raise PipelineCapacityError(f"{item_field}.model_id must not be empty")
+        if len(artifact_sha256) != 64 or any(
+            char not in "0123456789abcdef" for char in artifact_sha256
+        ):
+            raise PipelineCapacityError(
+                f"{item_field}.artifact_sha256 must be a SHA-256 digest"
+            )
+        if source_sha256 and (
+            len(source_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in source_sha256)
+        ):
+            raise PipelineCapacityError(
+                f"{item_field}.source_model_sha256 must be a SHA-256 digest"
+            )
+        normalized.append({
+            "layer_range": layer_range,
+            "segment_mode": mode,
+            "model_id": model_id,
+            "artifact_sha256": artifact_sha256,
+            "source_model_sha256": source_sha256,
+        })
+    return tuple(sorted(normalized, key=lambda item: item["layer_range"]))
+
+
 def _normalize_layer_budget(value: Any, field: str) -> dict[str, Any]:
     """Validate a worker's self-declared forward-layer budget.
 
@@ -230,11 +300,38 @@ def _normalize_nodes(
                 f"node[{node_id}].layer_ranges",
                 total_layers=total_layers,
             )
+        if "layer_artifacts" in raw:
+            normalized["layer_artifacts"] = _normalize_layer_artifacts(
+                raw.get("layer_artifacts"),
+                f"node[{node_id}].layer_artifacts",
+                total_layers=total_layers,
+            )
+            if "layer_ranges" in normalized:
+                advertised_ranges = set(normalized["layer_ranges"])
+                artifact_ranges = {
+                    item["layer_range"] for item in normalized["layer_artifacts"]
+                }
+                if artifact_ranges != advertised_ranges:
+                    raise PipelineCapacityError(
+                        f"node[{node_id}].layer_artifacts and layer_ranges must match"
+                    )
         # ★ 2026-10-03：设备自荐的层容量（本地裁层后可承载的层数上限）。
         if "layer_budget" in raw:
             normalized["layer_budget"] = _normalize_layer_budget(
                 raw.get("layer_budget"), f"node[{node_id}].layer_budget"
             )
+        # ★ 2026-10-05（DIST-3 三机实测）：工件段类型（`head`/`middle`/`tail`）。
+        #   只在取值为已知三种之一时透传；其它值（含缺失）视为未声明 ⇒ 不参与
+        #   求解器的段类型约束，保持旧行为。
+        if "segment_mode" in raw:
+            raw_segment_mode = raw.get("segment_mode")
+            if not isinstance(raw_segment_mode, str) or raw_segment_mode.lower() not in (
+                "head", "middle", "tail",
+            ):
+                raise PipelineCapacityError(
+                    f"node[{node_id}].segment_mode must be head, middle, or tail"
+                )
+            normalized["segment_mode"] = raw_segment_mode.lower()
         usable.append(normalized)
     usable.sort(
         key=lambda node: (
@@ -429,7 +526,13 @@ def solve_pipeline_capacity(
         return shortfall
 
     @lru_cache(maxsize=None)
-    def search(node_index: int, cursor: int, started: bool, used_count: int):
+    def search(
+        node_index: int,
+        cursor: int,
+        started: bool,
+        used_count: int,
+        source_model_sha256: str,
+    ):
         if cursor == layer_budget:
             # ★ Y 档第二条：relay 段**算参与节点**（它承载远端段工件），只是不占本机容量
             #   ⇒ "分布式"的判据是 `本机层节点数 + relay 段数 >= 2`，而不是只看前者。
@@ -441,7 +544,9 @@ def solve_pipeline_capacity(
         if node_index >= len(usable):
             return None
         node = usable[node_index]
-        best = search(node_index + 1, cursor, started, used_count)
+        best = search(
+            node_index + 1, cursor, started, used_count, source_model_sha256,
+        )
         remaining = layer_budget - cursor
         for count in range(remaining, 0, -1):
             end = cursor + count
@@ -455,10 +560,60 @@ def solve_pipeline_capacity(
             if advertised_budget is None or not advertised_budget.get("local_cut"):
                 allowed_ranges = node.get("layer_ranges")
                 if allowed_ranges is not None and not any(
-                    start <= cursor and end <= allowed_end
+                    start == cursor and end == allowed_end
                     for start, allowed_end in allowed_ranges
                 ):
                     continue
+            # ★ 2026-10-05（DIST-3 三机实测）：**段类型约束**。
+            #
+            #   区间包含判据不够：`layer_ranges` 只说"本节点覆盖哪些层"，不区分工件
+            #   是首段 / 中间段 / 末段。Y700 广告 `[8,24]`（实为 `mid8-24`，
+            #   `mode=middle`）⇒ `[20,24)` 落在该区间内、被照分，而中间段工件
+            #   **没有 lm_head / final_norm** ⇒ 必然执行失败（实测报
+            #   `remote worker reported a Stage error`）。
+            #
+            #   段类型来自设备声明的 `segment_mode`（取工件 manifest 的 `mode`）；
+            #   未声明的设备不参与本约束，保持旧行为。
+            matching_artifact = None
+            if advertised_budget is None or not advertised_budget.get("local_cut"):
+                artifacts = node.get("layer_artifacts")
+                if artifacts is not None:
+                    matching_artifact = next((
+                        artifact for artifact in artifacts
+                        if artifact["layer_range"] == (cursor, end)
+                    ), None)
+                    if matching_artifact is None:
+                        # The worker supplied per-artifact metadata, so ranges
+                        # without it are legacy-only and cannot be scheduled
+                        # safely as an executable segment.
+                        continue
+            segment_mode = (
+                matching_artifact.get("segment_mode")
+                if matching_artifact is not None
+                else None if advertised_budget is not None
+                and advertised_budget.get("local_cut")
+                else node.get("segment_mode")
+            )
+            if segment_mode == "tail" and end != layer_budget:
+                # 末段工件只含末尾层，接不了中间段。
+                continue
+            if segment_mode == "middle" and (cursor == 0 or end == layer_budget):
+                # 中间段工件既无 embedding 也无 lm_head。
+                continue
+            if segment_mode == "head" and cursor != 0:
+                # 首段工件只含开头层，接不了后续段。
+                continue
+            artifact_source_sha256 = (
+                str(matching_artifact.get("source_model_sha256", "") or "")
+                if matching_artifact is not None else ""
+            )
+            if (
+                source_model_sha256
+                and artifact_source_sha256
+                and source_model_sha256 != artifact_source_sha256
+            ):
+                continue
+            next_source_sha256 = source_model_sha256 or artifact_source_sha256
             raw_bytes = prefix[end] - prefix[cursor] + per_node_bytes
             has_embedding = not started
             has_lm_head = end == layer_budget
@@ -469,7 +624,9 @@ def solve_pipeline_capacity(
             required = _required_bytes(raw_bytes, node, safety_margin)
             if required > node["capacity_bytes"]:
                 continue
-            tail = search(node_index + 1, end, True, used_count + 1)
+            tail = search(
+                node_index + 1, end, True, used_count + 1, next_source_sha256,
+            )
             if tail is None:
                 continue
             item = (
@@ -501,12 +658,50 @@ def solve_pipeline_capacity(
                 best = candidate
         return best
 
-    solved = search(0, 0, False, 0)
+    solved = search(0, 0, False, 0, "")
     if solved is None:
         allocatable_bytes = sum(
             max(0, node["capacity_bytes"] - node["reserve_bytes"])
             for node in usable
         )
+        segment_constrained = any(
+            node.get("segment_mode") is not None
+            or node.get("layer_artifacts") is not None
+            for node in usable
+        )
+        if segment_constrained:
+            segmentless_nodes = [
+                {
+                    key: value for key, value in node.items()
+                    if key not in {"segment_mode", "layer_artifacts"}
+                }
+                for node in usable
+            ]
+            segmentless = solve_pipeline_capacity(
+                descriptor,
+                segmentless_nodes + relay_only,
+                safety_margin=safety_margin,
+                require_distributed=require_distributed,
+                local_layer_budget=local_layer_budget,
+                relay_claims=relay_claims,
+            )
+            if segmentless.get("admitted"):
+                return {
+                    **base,
+                    "status": "rejected",
+                    "admitted": False,
+                    "reason_code": "pipeline_segment_contract_unsatisfied",
+                    "reason": (
+                        "advertised layer artifact modes or source identities "
+                        "cannot form the requested pipeline"
+                    ),
+                    "allocatable_bytes": allocatable_bytes,
+                    "raw_capacity_deficit_bytes": max(
+                        0, raw_model_bytes - allocatable_bytes
+                    ),
+                    "assignments": [],
+                    "control_only_nodes": [node["node_id"] for node in usable],
+                }
         # Distinguish a topology contract failure from a plain memory
         # shortage. Re-run the same admission with the range contract
         # removed; only a plan that becomes admissible proves the advertised
@@ -515,7 +710,12 @@ def solve_pipeline_capacity(
         unconstrained_admission = False
         if range_constrained:
             unconstrained_nodes = [
-                {key: value for key, value in node.items() if key != "layer_ranges"}
+                {
+                    key: value for key, value in node.items()
+                    if key not in {
+                        "layer_ranges", "layer_artifacts", "segment_mode",
+                    }
+                }
                 for node in usable
             ]
             unconstrained = solve_pipeline_capacity(
@@ -582,6 +782,16 @@ def solve_pipeline_capacity(
                 [range_start, range_end]
                 for range_start, range_end in node["layer_ranges"]
             ]
+        if "layer_artifacts" in node:
+            artifact = next((
+                item for item in node["layer_artifacts"]
+                if item["layer_range"] == (start, end)
+            ), None)
+            if artifact is not None:
+                assignment["layer_artifact"] = {
+                    **artifact,
+                    "layer_range": list(artifact["layer_range"]),
+                }
         assignments.append(assignment)
 
     plan_identity = {
@@ -600,6 +810,8 @@ def solve_pipeline_capacity(
         }
         if "layer_ranges" in item:
             identity_item["layer_ranges"] = item["layer_ranges"]
+        if "layer_artifact" in item:
+            identity_item["layer_artifact"] = item["layer_artifact"]
         plan_identity["assignments"].append(identity_item)
     plan_id = hashlib.sha256(
         json.dumps(plan_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -608,7 +820,7 @@ def solve_pipeline_capacity(
     for node in usable:
         allowed_ranges = node.get("layer_ranges")
         if allowed_ranges is not None and not any(
-            start <= 0 and total_layers <= end
+            start == 0 and total_layers == end
             for start, end in allowed_ranges
         ):
             continue

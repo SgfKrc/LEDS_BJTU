@@ -115,6 +115,35 @@ from config import (
     TASK_GRAPH_MAX_PARALLEL_STAGES, TASK_GRAPH_JOURNAL_PATH,
     TASK_GRAPH_RETENTION_DAYS, TASK_GRAPH_RETENTION_MAX_RECORDS,
     TASK_WORKER_EXPERIMENTAL_ENABLED,
+    PIPELINE_RELAY_ENABLED,
+    PIPELINE_RELAY_PROBE_ONLY,
+)
+
+# ★ 2026-10-04 裁定「一个节点只能是一种角色」：这两个开关此前从未出现在同一
+#   条件里，且 `TASK_WORKER_EXPERIMENTAL_ENABLED` 还能运行时热切换。两者同时
+#   开启会让集群同时存在 relay 宿主与 v3 stage worker ⇒ `_run_pipeline` 对混合
+#   拓扑整体拒绝（`stage_offer_nodes != pipeline_nodes`），而调度侧仍把 relay
+#   宿主的容量计为可用（`capacity_source="relay_exempt"`）⇒ 看得见、拿不到。
+#   启动期直接 fail-closed，而不是留到运行时由「谁先生效」决定行为。
+def _validate_pipeline_role_switches(
+    *,
+    relay_enabled: bool,
+    relay_probe_only: bool,
+    task_worker_enabled: bool,
+) -> None:
+    """Reject only an active A1/data-plane collision with Route A."""
+    if relay_enabled and not relay_probe_only and task_worker_enabled:
+        raise RuntimeError(
+            "QLH_RELAY_ENABLED 与 QLH_TASK_WORKER_EXPERIMENTAL_ENABLED 不能同时开启："
+            "一个节点只能是一种角色（relay 段宿主 或 v3 stage worker）。"
+            "两者并存会让混合拓扑被整体拒绝。请只保留其中一个。"
+        )
+
+
+_validate_pipeline_role_switches(
+    relay_enabled=PIPELINE_RELAY_ENABLED,
+    relay_probe_only=PIPELINE_RELAY_PROBE_ONLY,
+    task_worker_enabled=TASK_WORKER_EXPERIMENTAL_ENABLED,
 )
 
 # 主节点用户自持 SQLite；生产运行时不再加载远端 PostgreSQL 驱动。
@@ -317,25 +346,43 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """FastAPI lifespan 上下文管理器（替代废弃的 @app.on_event）"""
-    global _runtime_startup_thread
-    _reset_runtime_readiness()
-    _mark_process_ready()
-    _runtime_startup_done.clear()
-    _runtime_startup_thread = threading.Thread(
-        target=_run_runtime_startup,
-        name="runtime-startup",
-        daemon=True,
-    )
-    _runtime_startup_thread.start()
+    """FastAPI lifespan 上下文管理器（替代废弃的 @app.on_event）
+
+    ★ 2026-10-05：runtime 启动/关闭改为**进程级只执行一次**。
+    `run_api_servers()` 在通配地址下为 `0.0.0.0` 与 `::` 各起一个
+    `uvicorn.Server`（共享同一 `app`），uvicorn 会对每个 server 各跑一次
+    lifespan。此前每次都重启 `_run_runtime_startup` 线程、每次 shutdown 都调
+    `_shutdown_resources()`，导致进程内两套 TCPServer，且任一 server 关闭会
+    连带停掉整个 runtime。现在用进程级引用计数共享一次启动，并只在最后一个
+    lifespan 退出时收尾；后续 lifespan 不会重置 readiness。
+    """
+    global _runtime_startup_thread, _runtime_lifecycle_users
+    with _runtime_lifecycle_lock:
+        first = _runtime_lifecycle_users == 0
+        _runtime_lifecycle_users += 1
+        if first:
+            _reset_runtime_readiness()
+            _mark_process_ready()
+            _runtime_startup_done.clear()
+            _runtime_startup_thread = threading.Thread(
+                target=_run_runtime_startup,
+                name="runtime-startup",
+                daemon=True,
+            )
+            _runtime_startup_thread.start()
     try:
         # The HTTP process can serve liveness/readiness while the slower
         # runtime components finish initializing in the background.
         yield
     finally:
         # ---- shutdown ----
-        _runtime_startup_done.wait(timeout=30.0)
-        await _shutdown_resources()
+        # 只有最后一个共享 lifespan 负责收尾。
+        with _runtime_lifecycle_lock:
+            _runtime_lifecycle_users = max(0, _runtime_lifecycle_users - 1)
+            last = _runtime_lifecycle_users == 0
+        if last:
+            _runtime_startup_done.wait(timeout=30.0)
+            await _shutdown_resources()
 
 
 app = FastAPI(
@@ -563,6 +610,15 @@ _runtime_readiness: dict[str, Any] = {
 }
 _runtime_startup_done = threading.Event()
 _runtime_startup_thread: Optional[threading.Thread] = None
+# ★ 2026-10-05：runtime 启动/关闭的**进程级**引用计数与锁。
+#   `run_api_servers()` 在通配地址下会为 `0.0.0.0` 与 `::` 各起一个
+#   `uvicorn.Server`（共享同一 `app`），uvicorn 因此对每个 server 各跑一次
+#   lifespan。此前 `_lifespan` 每次都重启 `_run_runtime_startup` 线程、且每次
+#   shutdown 都调 `_shutdown_resources()` ⇒ 进程内出现两套 TCPServer（已在
+#   `scheduler.start()` 侧止血），且任一 server 关闭会连带停掉整个 runtime。
+#   现在只让首个 lifespan 启动、最后一个 lifespan 关闭，后续 lifespan 复用运行时。
+_runtime_lifecycle_lock = threading.Lock()
+_runtime_lifecycle_users = 0
 
 
 def _reset_runtime_readiness() -> None:
@@ -870,6 +926,14 @@ def _run_exclusive_model_change(
         transition_started = callable(begin_transition)
         if transition_started:
             begin_transition()
+        invalidate_transaction = getattr(
+            scheduler, "_invalidate_pipeline_load_transaction", None,
+        )
+        if callable(invalidate_transaction):
+            invalidate_transaction(
+                reason_code="pipeline_model_changed",
+                reason="local model replacement started",
+            )
         with scheduler._inference_lock:
             with scheduler._layer_execution_lock:
                 with scheduler._layer_config_lock:
@@ -1180,6 +1244,13 @@ class ChatRequest(BaseModel):
         default=None,
         description="客户端预生成的 gen_ 执行 ID，用于所有聊天模式协作取消",
     )
+    task_graph_inferred: bool = Field(
+        default=False,
+        description=(
+            "`#29` 诊断位：`execution_mode` 是**由 N2.1 显式字段推断**而来，"
+            "不是用户直接指定的 `task_graph`。"
+        ),
+    )
     allow_external: bool = Field(
         default=False,
         description=(
@@ -1194,6 +1265,32 @@ class ChatRequest(BaseModel):
             "作用域门控约束；deny 档位下即使置 true 也不外发）。"
         ),
     )
+
+    @model_validator(mode="after")
+    def resolve_task_graph_mode(self):
+        """`#29`：`execution_mode=auto` 时按 **N2.1 显式字段**推断是否走任务图。
+
+        为什么要按「显式」判：`task_graph_template` 的默认值就是 `"dual_candidate"`
+        （`src/inference_service/protocol.py` 与这里同款），**光看它有值无法区分**用户
+        是否真的指定过 —— 得用 pydantic 的 `model_fields_set`。
+
+        这里只做**推断**（显式给了 N2.1 字段 ⇒ 意图明确是任务图，把 `auto` 升级为
+        `task_graph`）。这些字段此前只在 `execution_mode == "task_graph"` 分支内才被
+        读到，等于用户写了也不生效。
+
+        「只给模板、没有任何 N2.1 字段」那一档**不在这里**拒绝 —— 它需要带
+        `reason_code` 的 400 响应，而 validator 抛不出 `coded_http_error`；
+        该判定在路由层（`routes_chat`）做。
+        """
+        explicit_n21 = (
+            self.task_graph_auto_remote
+            or bool(str(self.task_graph_remote_stage or "").strip())
+            or bool(str(self.task_graph_remote_provider_id or "").strip())
+        )
+        if self.execution_mode == "auto" and explicit_n21:
+            self.execution_mode = "task_graph"
+            self.task_graph_inferred = True
+        return self
 
     @model_validator(mode="after")
     def validate_multimodal_route(self):
@@ -2277,6 +2374,52 @@ def _augment_chat_metrics(metrics: dict | None, req: ChatRequest, **defaults) ->
     result.setdefault("layer_assignments", [])
     result.setdefault("request_id", _request_id_ctx.get("-"))
     result.setdefault("generation_id", req.generation_id or "")
+    # ★ 2026-10-05（DIST-4）：单条结构化摘要，让**一条日志**即可重建整条链路
+    #   （验收条文：「从单条请求日志可重建完整链路」）。此前**没有任何日志打印最终
+    #   metrics** —— 层区间（`scheduler_pipeline` 的「Route-A 分配原始」）与 worker
+    #   名单（「Route-A stage handoff」）分属两条**不含 request_id** 的日志，单请求
+    #   串行时可靠时间顺序人工拼，并发时会串。
+    #   字段与 DIST-4 的六项要求一一对应：route / assignment（workers_used +
+    #   layer_assignments）/ generation（generation_id + config_id）/ worker /
+    #   layer range（claimed_layers + layer_segments）/ fallback reason。
+    #
+    #   ★ 另加三个「线路/能力状态」字段（DIST-4 第二句要求的显式指标，按裁定走
+    #   可 grep 的日志字段而非新增 metrics，避免同一事实两处维护）。这三类是最容易
+    #   让「为什么没走分布式」被误读的来源：
+    #     - `a1_relay_probe_only` / `relay_enabled`：A1 是否已处于探针专用
+    #       （= 已从产品入口剔除）。全局环境级，打进摘要才能让单条日志自证环境。
+    #     - `legacy_bridge_rejected`：本次是否撞上 legacy/A3 混链拒绝。
+    #     - `capability_missing_reason`：失败链里带出的具名就绪原因（若有）。
+    _failure_text = str(result.get("fallback_reason", "") or "")
+    _capability_reason = ""
+    _marker = "readiness="
+    if _marker in _failure_text:
+        _capability_reason = _failure_text.split(_marker, 1)[1].strip()
+    logger.info(
+        "event=chat_route_summary request_id=%s generation_id=%s "
+        "routing_preference=%s distributed_requested=%s distributed_used=%s "
+        "fallback=%s fallback_reason=%s execution_mode=%s route=%s "
+        "workers_used=%s claimed_layers=%s layer_segments=%s config_id=%s "
+        "a1_relay_probe_only=%s relay_enabled=%s legacy_bridge_rejected=%s "
+        "capability_missing_reason=%s",
+        result.get("request_id", ""),
+        result.get("generation_id", ""),
+        result.get("routing_preference", ""),
+        result.get("distributed_requested", False),
+        result.get("distributed_used", False),
+        result.get("fallback", False),
+        result.get("fallback_reason", ""),
+        result.get("execution_mode", ""),
+        result.get("route", ""),
+        result.get("workers_used", []),
+        result.get("claimed_layers", []),
+        result.get("layer_segments", []),
+        result.get("config_id", ""),
+        PIPELINE_RELAY_PROBE_ONLY,
+        PIPELINE_RELAY_ENABLED,
+        "route_a_mixed_legacy_execution_bridge_not_ready" in _failure_text,
+        _capability_reason,
+    )
     return result
 
 
@@ -3655,11 +3798,14 @@ def _execute_chat_full(
         )
 
     # ---- 分布式流水线推理路径（主节点 + PyTorch 引擎 + 从节点可用；local_only 跳过）----
+    pipeline_attempted = False
+    pipeline_failure_reason = ""
     if (req.routing_preference != "local_only"
             and scheduler.get_distributed_inference_enabled()
             and RUN_MODE == "distributed"
             and scheduler._effective_role() == "master"
             and runtime_supports(model_manager, Capability.FORWARD_LAYERS)):
+        pipeline_attempted = True
         try:
             pipeline_result = scheduler.run_pipeline_safe(
                 req.message,
@@ -3680,6 +3826,23 @@ def _execute_chat_full(
             )
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
             if pipeline_result.get("error"):
+                pipeline_failure_reason = str(pipeline_result["error"])
+                # ★ 2026-10-05（DIST-4）：pipeline 失败时除了 `error` 字符串，还要
+                #   保住 `metrics.pipeline_readiness` —— 那里带**具名 reason_code**
+                #   （如 `route_a_mixed_legacy_execution_bridge_not_ready` /
+                #   `pipeline_recovery_pending` / `worker_stage_offer_not_ready`），
+                #   而 `error` 文案可能已被折叠成更通用的表述。此前整份 metrics 被
+                #   丢弃 ⇒ 「为什么失败」在请求级不可追溯。
+                _pipeline_readiness = None
+                _raw_metrics = pipeline_result.get("metrics")
+                if isinstance(_raw_metrics, dict):
+                    _pipeline_readiness = _raw_metrics.get("pipeline_readiness")
+                if isinstance(_pipeline_readiness, dict) and _pipeline_readiness:
+                    pipeline_failure_reason = (
+                        f"{pipeline_failure_reason} | readiness="
+                        f"{_pipeline_readiness.get('reason_code', '')}"
+                        f": {_pipeline_readiness.get('reason', '')}"
+                    )
                 logger.warning(f"流水线推理失败: {pipeline_result['error']}，回退到本地推理")
                 _enforce_distributed_required(
                     req,
@@ -3745,6 +3908,7 @@ def _execute_chat_full(
             raise
         except Exception as e:
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
+            pipeline_failure_reason = str(e)
             logger.warning(f"流水线推理异常: {e}，回退到本地推理")
             _enforce_distributed_required(req, detail=str(e))
 
@@ -3753,6 +3917,23 @@ def _execute_chat_full(
 
     # ---- llama.cpp / 孤岛引擎路径（整请求推理，不参与层拆分）----
     if backend_id_for(model_manager) in ("llama_cpp", "island"):
+        if pipeline_attempted:
+            # Mixed A1 relay + A3 Route-A failures must reuse the full-model
+            # guard before this direct chat fallback.  Otherwise a partial
+            # GGUF can bypass the scheduler check and return HTTP 200 garbage.
+            ensure_full = getattr(model_manager, "ensure_full_model", None)
+            if not callable(ensure_full):
+                raise HTTPException(
+                    503,
+                    "分布式流水线失败且当前引擎不提供整模回退校验",
+                )
+            try:
+                ensure_full()
+            except Exception as exc:
+                raise HTTPException(
+                    503,
+                    f"分布式流水线失败，整模回退已拒绝: {exc}",
+                ) from exc
         try:
             engine_name = backend_id_for(model_manager)
             request_history = [
@@ -3800,6 +3981,8 @@ def _execute_chat_full(
             if external_fallback_reason:
                 # 路线 B 外部路由失败后的本地回退（原因优先展示外部失败）
                 fallback_reason = external_fallback_reason
+            elif pipeline_failure_reason:
+                fallback_reason = pipeline_failure_reason
             elif scheduler.get_distributed_inference_enabled() and RUN_MODE == "distributed":
                 if engine_name == "island":
                     fallback_reason = "island engine delegates whole-request inference to the TP island"
@@ -3972,8 +4155,21 @@ def _execute_chat_full(
                 else 0,
             },
             req,
-            fallback=bool(external_fallback_reason),
-            fallback_reason=external_fallback_reason,
+            # ★ 2026-10-05（DIST-4）：此前这里**只用** `external_fallback_reason`，
+            #   把同函数内 `:3783` / `:3849` 写入的 `pipeline_failure_reason` 丢掉了
+            #   ⇒ master 为 PyTorch 引擎时，「pipeline 失败 ⇒ 本地整模回退」的 metrics
+            #   是 `distributed_used=False` + `fallback=False` + `fallback_reason=""`。
+            #   这与「请求从来没走分布式」完全无法区分 —— 正是 DIST-4 要打击的
+            #   「整模回退伪装成普通本地推理」。现在两者取或，并在来自 pipeline 失败
+            #   时保留来源标识，使单条响应即可回溯到真实失败原因。
+            fallback=bool(external_fallback_reason or pipeline_failure_reason),
+            fallback_reason=(
+                external_fallback_reason
+                or (
+                    f"pipeline_failed_then_local_pytorch: {pipeline_failure_reason}"
+                    if pipeline_failure_reason else ""
+                )
+            ),
         )
 
         db_session_id = target_session_id or "default"

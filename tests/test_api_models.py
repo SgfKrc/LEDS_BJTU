@@ -870,6 +870,59 @@ def test_reserved_worker_forward_failure_does_not_restore_full_model(monkeypatch
     assert ensure_calls == []
 
 
+def test_mixed_pipeline_failure_cannot_bypass_partial_gguf_guard(monkeypatch):
+    """A1/A3 mixed failure must not fall through to direct partial-GGUF chat."""
+    calls = {"chat": 0, "ensure": 0}
+
+    class PartialGguf:
+        engine_type = "llama_cpp"
+        is_loaded = True
+        tokenizer = object()
+
+        def ensure_full_model(self):
+            calls["ensure"] += 1
+            raise RuntimeError("裁层工件 head8，禁止整模回退")
+
+        def chat(self, **kwargs):
+            calls["chat"] += 1
+            return {"content": "garbage", "usage": {}}
+
+    req = api_server.ChatRequest(
+        message="hello", routing_preference="distributed_preferred",
+    )
+    monkeypatch.setattr(api_server, "model_manager", PartialGguf())
+    monkeypatch.setattr(api_server.model_host, "model_loaded", True)
+    monkeypatch.setattr(api_server, "RUN_MODE", "distributed")
+    monkeypatch.setattr(
+        api_server.scheduler, "get_distributed_inference_enabled", lambda: True,
+    )
+    monkeypatch.setattr(api_server.scheduler, "_effective_role", lambda: "master")
+    monkeypatch.setattr(
+        api_server.scheduler, "has_pipeline_worker_reservation", lambda: False,
+    )
+    monkeypatch.setattr(api_server, "runtime_supports", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "run_pipeline_safe",
+        lambda *args, **kwargs: {
+            "error": "route_a_mixed_legacy_execution_bridge_not_ready",
+        },
+    )
+    monkeypatch.setattr(api_server, "active_session_id", None)
+    monkeypatch.setattr(
+        api_server,
+        "_external_route_decision",
+        lambda _req: types.SimpleNamespace(use_external=False, reason="disabled"),
+    )
+
+    with pytest.raises(api_server.HTTPException) as exc_info:
+        api_server._execute_chat_full(req)
+
+    assert exc_info.value.status_code == 503
+    assert "整模回退已拒绝" in str(exc_info.value.detail)
+    assert calls == {"chat": 0, "ensure": 1}
+
+
 def test_local_native_image_chat_uses_mtmd_and_removes_temp_file(monkeypatch):
     image = (
         "data:image/png;base64,"

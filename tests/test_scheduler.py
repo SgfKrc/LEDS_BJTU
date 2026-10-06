@@ -185,6 +185,25 @@ class TestComputeLayerAssignment:
         assert result[0]["has_embedding"] is True
         assert result[0]["has_lm_head"] is True
 
+    def test_pipeline_node_metadata_uses_task_worker_engine(
+            self, sched, monkeypatch):
+        monkeypatch.setattr("scheduler.TASK_WORKER_EXPERIMENTAL_ENABLED", True)
+        sched._role_override = "master"
+        sched._task_worker_control.status = lambda role: {
+            "workers": [{
+                "node_id": "client1",
+                "capabilities": {
+                    "engines": ["pytorch", "llama_cpp"],
+                    "models": [{"engine": "llama_cpp"}],
+                },
+            }],
+        }
+
+        metadata = sched._pipeline_node_metadata()
+
+        assert metadata["master"]["engine"] == "pytorch"
+        assert metadata["client1"]["engine"] == "llama_cpp"
+
     def test_active_deepseek_layer_count_replaces_fixed_qwen_count(self, sched, monkeypatch):
         from model_host import model_host as _host
 
@@ -320,6 +339,32 @@ class TestComputeLayerAssignment:
             for item in layout["nodes"]
         ) == 4
 
+    def test_stale_heartbeat_worker_leaves_capacity_candidates(self, sched):
+        """★ DIST-2：静默（TCP 半开）节点必须退出容量候选，不必等 TCP 巡检。
+
+        此前容量候选只看 `NodeInfo.is_available()`（`state == ONLINE`），而 TCP
+        半开（对端进程已死、不发 FIN）要等巡检约 129s 才置 OFFLINE ⇒ 这段窗口里
+        该节点**一直占容量**，容量求解器于是分配出既非它声明区间、层数也不对的
+        结果（实测：Y700 被带走后 master 仍把它算进规划，给出 `Layer 13-20` /
+        `Layer 15-24`）。现在候选与 readiness 共用 `WORKER_HEARTBEAT_MAX_AGE`。
+        """
+        now = time.time()
+        sched.nodes = {
+            "fresh": NodeInfo(
+                node_id="fresh", role="client", state=NodeState.ONLINE,
+                last_heartbeat=now - 5,
+            ),
+            "silent": NodeInfo(
+                node_id="silent", role="client", state=NodeState.ONLINE,
+                last_heartbeat=now - 200,  # 超过 WORKER_HEARTBEAT_MAX_AGE
+            ),
+        }
+
+        ids = {record["node_id"] for record in sched._get_pipeline_capacity_nodes()}
+
+        assert "fresh" in ids
+        assert "silent" not in ids
+
     def test_aggregate_resource_view_combines_online_nodes_without_addresses(self, sched):
         sched._role_override = "master"
         sched.nodes = {
@@ -441,6 +486,44 @@ class TestComputeLayerAssignment:
 
         assert records[0]["layer_ranges"] == [[4, 16]]
 
+    def test_android_task_worker_artifacts_reach_capacity_solver(
+            self, sched, monkeypatch):
+        monkeypatch.setattr("scheduler.TASK_WORKER_EXPERIMENTAL_ENABLED", True)
+        sched._role_override = "master"
+        artifact = {
+            "layer_range": [4, 16],
+            "segment_mode": "middle",
+            "model_id": "middle4-16.gguf",
+            "artifact_sha256": "a" * 64,
+            "source_model_sha256": "b" * 64,
+        }
+        sched._task_worker_control.status = lambda role: {
+            "workers": [{
+                "node_id": "android-worker",
+                "healthy": True,
+                "layer_stage_dispatch_enabled": True,
+                "capabilities": {
+                    "layer_ranges": [[4, 16]],
+                    "layer_artifacts": [artifact],
+                },
+            }],
+        }
+        sched.nodes = {
+            "android-worker": NodeInfo(
+                node_id="android-worker", role=NodeRole.CLIENT,
+                state=NodeState.ONLINE, node_type="android",
+                device_info={
+                    "backend_id": "llama_cpp",
+                    "capabilities": [Capability.FORWARD_LAYERS],
+                    "memory": {"available_bytes": 3 * 1024 ** 3},
+                },
+            ),
+        }
+
+        records = sched._get_pipeline_capacity_nodes()
+
+        assert records[0]["layer_artifacts"] == [artifact]
+
     def test_android_task_worker_layer_budget_reaches_capacity_solver(self, sched, monkeypatch):
         """设备自荐的层容量必须随 `layer_ranges` 一起投影进求解器输入 ——
 
@@ -483,6 +566,65 @@ class TestComputeLayerAssignment:
         assert records[0]["layer_budget"]["max_layers"] == 12
         assert records[0]["layer_budget"]["local_cut"] is False
 
+    def test_manual_capacity_plan_enforces_exact_artifact_boundary_mode(
+            self, sched, monkeypatch):
+        descriptor = {
+            "model_id": "model", "model_type": "qwen2",
+            "model_sha256": "a" * 64, "total_layers": 4,
+            "layer_weight_bytes": [10, 10, 10, 10],
+            "component_weight_bytes": {
+                "embedding": 5, "final_norm": 2, "lm_head": 5,
+                "visual": 0, "mtp": 0, "multimodal": 0, "other": 0,
+            },
+        }
+        artifact = {
+            "layer_range": [2, 4], "segment_mode": "middle",
+            "model_id": "tail.gguf", "artifact_sha256": "b" * 64,
+            "source_model_sha256": "c" * 64,
+        }
+        records = [
+            {
+                "node_id": "master", "capacity_bytes": 10_000,
+                "reserve_bytes": 0, "runtime_multiplier": 1.0,
+                "execution_device": "cpu", "capacity_source": "test",
+            },
+            {
+                "node_id": "worker", "capacity_bytes": 10_000,
+                "reserve_bytes": 0, "runtime_multiplier": 1.0,
+                "execution_device": "cpu", "capacity_source": "test",
+                "layer_ranges": [[2, 4]], "layer_artifacts": [artifact],
+            },
+        ]
+        monkeypatch.setattr(
+            sched, "_get_pipeline_capacity_nodes", lambda _ids: records,
+        )
+        assignments = [
+            {
+                "node_id": "master", "role": "master",
+                "start_layer": 0, "end_layer": 2,
+                "has_embedding": True, "has_lm_head": False,
+            },
+            {
+                "node_id": "worker", "role": "client",
+                "start_layer": 2, "end_layer": 4,
+                "has_embedding": False, "has_lm_head": True,
+            },
+        ]
+
+        rejected = sched._build_manual_pipeline_capacity_plan(
+            assignments, descriptor=descriptor,
+        )
+        assert rejected["admitted"] is False
+        assert rejected["reason_code"] == "pipeline_segment_contract_unsatisfied"
+
+        artifact["segment_mode"] = "tail"
+        admitted = sched._build_manual_pipeline_capacity_plan(
+            assignments, descriptor=descriptor,
+        )
+        assert admitted["admitted"] is True
+        assert admitted["assignments"][1]["layer_artifact"] == artifact
+        assert admitted["pipeline_layout"]["nodes"][1]["engine"] == "llama_cpp"
+
     def test_route_a_stage_identity_comes_from_worker_artifact(self, sched):
         """Route A 的 offer 必须带 **worker 宣告的工件身份**（engine/format/sha256），
         而不是 master 自己那份模型的摘要 —— 层段在设备上执行、用的是设备的 GGUF，
@@ -511,6 +653,61 @@ class TestComputeLayerAssignment:
         assert identity.sha256.startswith("f6dab6b7")
         # 找不到该节点 / 没有可用的 models ⇒ None（调用方 fail-closed）
         assert sched._route_a_stage_model_identity("missing-node") is None
+
+    def test_route_a_stage_identity_matches_the_assigned_artifact(self, sched):
+        status = {
+            "workers": [{
+                "node_id": "android-worker",
+                "capabilities": {
+                    "models": [
+                        {
+                            "model_id": "middle.gguf", "engine": "llama_cpp",
+                            "format": "gguf", "revision": "local",
+                            "sha256": "a" * 64,
+                        },
+                        {
+                            "model_id": "tail.gguf", "engine": "llama_cpp",
+                            "format": "gguf", "revision": "local",
+                            "sha256": "b" * 64,
+                        },
+                    ],
+                    "layer_artifacts": [
+                        {
+                            "layer_range": [8, 20], "segment_mode": "middle",
+                            "model_id": "middle.gguf", "artifact_sha256": "a" * 64,
+                        },
+                        {
+                            "layer_range": [20, 24], "segment_mode": "tail",
+                            "model_id": "tail.gguf", "artifact_sha256": "b" * 64,
+                        },
+                    ],
+                },
+            }],
+        }
+        sched._task_worker_control.status = lambda role: status
+
+        assignment = {
+            "start_layer": 20,
+            "end_layer": 24,
+            "layer_artifact": {
+                "layer_range": [20, 24], "segment_mode": "tail",
+                "model_id": "tail.gguf", "artifact_sha256": "b" * 64,
+            },
+        }
+        identity = sched._route_a_stage_model_identity("android-worker", assignment)
+
+        assert identity is not None
+        assert identity.model_id == "tail.gguf"
+        assert identity.sha256 == "b" * 64
+
+        # A capability refresh must not silently substitute a different byte
+        # artifact under the already admitted plan identity.
+        status["workers"][0]["capabilities"]["layer_artifacts"][1][
+            "artifact_sha256"
+        ] = "c" * 64
+        assert sched._route_a_stage_model_identity(
+            "android-worker", assignment,
+        ) is None
 
     def test_capacity_prepare_acks_all_workers_before_commit(self, sched):
         sent = []
@@ -681,6 +878,87 @@ class TestComputeLayerAssignment:
         assert sched._active_pipeline_capacity_plan["transaction_phase"] == "ready"
         assert sched.get_layer_assignments()["strategy"] == "capacity"
 
+    def test_model_change_invalidates_capacity_transaction(self, sched):
+        sched._layer_config_generation = 10
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-model-change",
+            "generation": 10,
+            "phase": "committing_local",
+            "plan": {"admitted": True, "plan_id": "plan-model-change"},
+            "worker_ids": {"worker"},
+        }
+        sched._active_pipeline_capacity_plan = {
+            "admitted": True, "plan_id": "plan-model-change",
+        }
+        sched._prepared_layer_configs["cfg-model-change"] = {
+            "plan_id": "plan-model-change",
+        }
+        sched._layer_config_inflight.add("worker")
+
+        sched._invalidate_pipeline_load_transaction(
+            reason_code="pipeline_model_changed",
+            reason="local model replacement started",
+        )
+
+        assert sched._pipeline_load_transaction["phase"] == "invalidated"
+        assert (
+            sched._pipeline_load_transaction["reason_code"]
+            == "pipeline_model_changed"
+        )
+        assert sched._active_pipeline_capacity_plan is None
+        assert sched._prepared_layer_configs == {}
+        assert sched._layer_config_inflight == set()
+        assert sched._layer_config_generation > 10
+
+    def test_superseded_local_commit_is_not_published(self, sched, monkeypatch):
+        sent = []
+        plan = {
+            "admitted": True,
+            "plan_id": "plan-superseded",
+            "model_id": "model",
+            "total_layers": 4,
+            "assignments": [
+                {"node_id": "master", "start_layer": 0, "end_layer": 2},
+                {"node_id": "worker", "start_layer": 2, "end_layer": 4},
+            ],
+        }
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-superseded",
+            "generation": 1,
+            "phase": "preparing",
+            "plan": plan,
+            "worker_ids": {"worker"},
+            "prepared_nodes": set(),
+        }
+        sched._layer_config_expected["worker"] = {
+            "node_id": "worker",
+            "config_id": "cfg-superseded",
+            "phase": "prepare",
+            "plan_id": "plan-superseded",
+            "start_layer": 2,
+            "end_layer": 4,
+        }
+        sched._host = type("Host", (), {
+            "prepare_pipeline_tokenizer": lambda self: None,
+            "load_layer_range": lambda self, *args, **kwargs: (
+                sched._invalidate_pipeline_load_transaction(
+                    reason_code="pipeline_model_changed",
+                    reason="local model replacement started",
+                )
+            ),
+        })()
+        sched._tcp_server = type("Server", (), {
+            "_running": True,
+            "send_layer_config": lambda self, node_id, payload: sent.append(
+                (node_id, dict(payload))
+            ),
+        })()
+
+        sched._commit_pipeline_load_transaction("cfg-superseded")
+
+        assert sent == []
+        assert sched._pipeline_load_transaction["phase"] == "invalidated"
+
     def test_late_prepare_ack_after_commit_is_not_logged_as_worker_error(
             self, sched, caplog):
         sched._pipeline_load_transaction = {
@@ -752,6 +1030,44 @@ class TestComputeLayerAssignment:
             "worker worker-drop disconnected during transaction",
         )]
         assert reshard_attempts == ["worker-drop"]
+
+    def test_ready_capacity_plan_is_invalidated_when_worker_disconnects(
+            self, sched, monkeypatch):
+        plan = {
+            "admitted": True,
+            "plan_id": "plan-ready-drop",
+            "total_layers": 4,
+            "assignments": [
+                {"node_id": "worker-drop", "start_layer": 0, "end_layer": 2},
+                {"node_id": "master", "start_layer": 2, "end_layer": 4},
+            ],
+        }
+        sched._active_pipeline_capacity_plan = dict(plan)
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-ready-drop",
+            "phase": "ready",
+            "plan": dict(plan),
+            "worker_ids": {"worker-drop"},
+            "ready_nodes": {"worker-drop"},
+        }
+        monkeypatch.setattr(
+            sched, "_fail_pending_pipeline_results_for_node", lambda *_args: None,
+        )
+        monkeypatch.setattr(sched, "deregister_node", lambda _node_id: False)
+        monkeypatch.setattr(
+            sched, "_stage_pipeline_reshard_after_disconnect", lambda _node_id: None,
+        )
+        monkeypatch.setattr(sched, "push_layer_config_to_clients", lambda: None)
+
+        sched._on_tcp_disconnect("worker-drop")
+
+        assert sched._active_pipeline_capacity_plan is None
+        assert sched._pipeline_load_transaction["phase"] == "invalidated"
+        assert (
+            sched._pipeline_load_transaction["reason_code"]
+            == "pipeline_worker_disconnected"
+        )
+        assert sched.get_layer_assignments()["strategy"] != "capacity"
 
     def test_disconnect_reshard_uses_only_connected_survivors(
             self, sched, monkeypatch):
@@ -1685,6 +2001,341 @@ class TestPipelineReadiness:
         sched._tcp_server = None
         assert sched._all_pipeline_nodes_ready() is False
 
+    def test_restart_recovery_fence_blocks_readiness_until_fresh_commit(
+            self, sched, monkeypatch):
+        """重启后的旧事务只能作为闸门，不能直接充当活动配置。"""
+        import local_store
+
+        monkeypatch.setattr(
+            local_store,
+            "get_local_setting",
+            lambda key, default=None: {
+                "schema_version": 1,
+                "config_id": "cfg-old",
+                "generation": 7,
+                "phase": "ready",
+                "model_sha256": "a" * 64,
+            } if key == "pipeline_config_lifecycle_v1" else default,
+        )
+        sched._tcp_server = type("Server", (), {"_running": True})()
+        sched._load_pipeline_recovery_state()
+
+        readiness = sched._get_pipeline_readiness()
+
+        assert readiness["ready"] is False
+        assert readiness["reason_code"] == "pipeline_recovery_pending"
+        assert sched._pipeline_recovery_state["config_id"] == "cfg-old"
+
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-new",
+            "generation": 8,
+            "phase": "ready",
+            "worker_ids": {"worker-a"},
+            "prepared_nodes": set(),
+            "ready_nodes": {"worker-a"},
+            "plan": {"assignments": []},
+        }
+        sched._layer_config_expected["worker-a"] = {
+            "config_id": "cfg-new",
+            "generation": 8,
+        }
+        sched._pipeline_recovery_pending = True
+        sched._maybe_finish_pipeline_recovery()
+        assert sched._pipeline_recovery_pending is True
+
+        sched._layer_config_pushed.add("worker-a")
+        sched._maybe_finish_pipeline_recovery()
+        assert sched._pipeline_recovery_pending is False
+
+    def test_restart_recovery_restores_persisted_model_before_republish(
+            self, sched, monkeypatch, tmp_path):
+        import model_config
+        from types import SimpleNamespace
+
+        model_dir = tmp_path / "qwen2.5-0.5b-instruct"
+        model_dir.mkdir()
+        sched._pipeline_recovery_pending = True
+        sched._pipeline_recovery_state = {
+            "model_id": "qwen2.5-0.5b-instruct",
+            "model_type": "qwen2",
+            "model_sha256": "a" * 64,
+            "quant_type": "fp16",
+        }
+        prepared = []
+        sched._host = SimpleNamespace(
+            prepare_pipeline_model=lambda **kwargs: prepared.append(kwargs) or {
+                "model_type": "qwen2", "total_layers": 24,
+                "model_sha256": "a" * 64,
+            },
+        )
+        monkeypatch.setattr(sched, "_get_active_pipeline_model_info", lambda: {})
+        monkeypatch.setattr(
+            model_config, "get_model_config", lambda _model_id, _db_models=None: None,
+        )
+        monkeypatch.setattr(
+            model_config,
+            "get_builtin_models",
+            lambda: [SimpleNamespace(
+                model_id="qwen2.5-0.5b",
+                model_path=str(model_dir),
+            )],
+        )
+        monkeypatch.setattr(model_config, "resolve_model_path", lambda value: value)
+
+        assert sched._restore_pipeline_model_for_recovery() is True
+        assert prepared == [{
+            "model_id": "qwen2.5-0.5b-instruct",
+            "model_path": str(model_dir),
+            "quant_type": "fp16",
+            "model_sha256": None,
+        }]
+
+    def test_restart_recovery_rejects_changed_local_model_digest(
+            self, sched, monkeypatch, tmp_path):
+        import model_config
+        from types import SimpleNamespace
+
+        model_dir = tmp_path / "model-a"
+        model_dir.mkdir()
+        sched._pipeline_recovery_pending = True
+        sched._pipeline_recovery_state = {
+            "model_id": "model-a", "model_type": "qwen2",
+            "model_sha256": "a" * 64, "quant_type": "fp16",
+        }
+        unloaded = []
+        sched._host = SimpleNamespace(
+            prepare_pipeline_model=lambda **_kwargs: {
+                "model_type": "qwen2", "total_layers": 24,
+                "model_sha256": "b" * 64,
+            },
+            unload_model=lambda: unloaded.append(True),
+        )
+        monkeypatch.setattr(sched, "_get_active_pipeline_model_info", lambda: {})
+        monkeypatch.setattr(
+            model_config, "get_model_config", lambda _model_id, _db_models=None: None,
+        )
+        monkeypatch.setattr(
+            model_config, "get_builtin_models",
+            lambda: [SimpleNamespace(model_id="model-a", model_path=str(model_dir))],
+        )
+        monkeypatch.setattr(model_config, "resolve_model_path", lambda value: value)
+
+        assert sched._restore_pipeline_model_for_recovery() is False
+        assert sched._pipeline_recovery_failure == "pipeline_recovery_model_digest_mismatch"
+        assert unloaded == [True]
+
+    def test_restart_recovery_resolves_db_registered_gguf(
+            self, sched, monkeypatch, tmp_path):
+        import local_store
+        import model_config
+        from types import SimpleNamespace
+
+        gguf_path = tmp_path / "custom.gguf"
+        gguf_path.write_bytes(b"gguf-probe")
+        sched._pipeline_recovery_pending = True
+        sched._pipeline_recovery_state = {
+            "model_id": "custom-gguf", "model_type": "qwen2",
+            "model_sha256": "c" * 64, "quant_type": "Q4_K_M",
+        }
+        prepared = []
+        sched._host = SimpleNamespace(
+            prepare_pipeline_model=lambda **kwargs: prepared.append(kwargs) or {
+                "model_type": "qwen2", "total_layers": 24,
+                "model_sha256": "c" * 64,
+            },
+        )
+        db_models = [{
+            "model_id": "custom-gguf", "model_type": "gguf",
+            "model_path": "", "gguf_path": str(gguf_path),
+        }]
+        monkeypatch.setattr(local_store, "get_local_experimental_models", lambda: db_models)
+        monkeypatch.setattr(
+            model_config, "get_model_config",
+            lambda model_id, values=None: SimpleNamespace(**values[0])
+            if model_id == "custom-gguf" and values else None,
+        )
+        monkeypatch.setattr(model_config, "get_builtin_models", lambda: [])
+        monkeypatch.setattr(model_config, "resolve_model_path", lambda value: value)
+        monkeypatch.setattr(sched, "_get_active_pipeline_model_info", lambda: {})
+
+        assert sched._restore_pipeline_model_for_recovery() is True
+        assert prepared == [{
+            "model_id": "custom-gguf",
+            "model_path": str(gguf_path),
+            "quant_type": "Q4_K_M",
+            "model_sha256": None,
+        }]
+
+    def test_restart_recovery_rejects_different_default_model(self, sched):
+        sched._pipeline_recovery_pending = True
+        sched._pipeline_recovery_state = {
+            "model_id": "qwen2.5-0.5b-instruct",
+            "model_type": "qwen2",
+        }
+
+        assert sched._recovery_model_matches({
+            "model_id": "qwen3-5-2b",
+            "model_type": "qwen3_5",
+        }) is False
+        assert sched._pipeline_recovery_failure == "pipeline_recovery_model_mismatch"
+
+    def test_pipeline_lifecycle_snapshot_is_bounded_and_json_safe(
+            self, sched):
+        """持久化记录不能携带 set、模型路径或执行器对象。"""
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-1",
+            "generation": 3,
+            "phase": "preparing",
+            "worker_ids": {"worker-b", "worker-a"},
+            "prepared_nodes": {"worker-a"},
+            "plan": {
+                "model_id": "model-1",
+                "model_type": "qwen2",
+                "plan_id": "plan-1",
+                "model_path": "C:/private/model.safetensors",
+                "assignments": [{
+                    "node_id": "worker-a",
+                    "start_layer": 0,
+                    "end_layer": 4,
+                    "execution": "legacy_layer_config",
+                    "runtime_object": object(),
+                }],
+            },
+        }
+
+        snapshot = sched._pipeline_lifecycle_snapshot_locked()
+
+        assert snapshot["schema_version"] == 2
+        assert snapshot["worker_ids"] == ["worker-a", "worker-b"]
+        assert snapshot["prepared_nodes"] == ["worker-a"]
+        assert snapshot["assignments"] == [{
+            "node_id": "worker-a",
+            "start_layer": 0,
+            "end_layer": 4,
+            "execution": "legacy_layer_config",
+        }]
+        assert "model_path" not in snapshot
+
+    def test_schema_v1_recovery_without_model_digest_fails_closed(
+            self, sched, monkeypatch):
+        import local_store
+
+        monkeypatch.setattr(
+            local_store, "get_local_setting",
+            lambda _key, _default=None: {
+                "schema_version": 1,
+                "config_id": "cfg-old",
+                "generation": 7,
+                "phase": "ready",
+                "model_id": "ambiguous-model",
+            },
+        )
+
+        sched._load_pipeline_recovery_state()
+
+        assert sched._pipeline_recovery_pending is True
+        assert sched._pipeline_recovery_failure == "pipeline_recovery_state_invalid"
+        assert sched._pipeline_lifecycle_persist_ok is False
+
+    def test_restart_recovery_fence_requires_durable_ready_state(
+            self, sched, monkeypatch):
+        """A ready in-memory generation cannot clear a fence after a write failure."""
+        import local_store
+
+        monkeypatch.setattr(sched, "_running", True)
+        monkeypatch.setattr(sched, "_effective_role", lambda: "master")
+        sched._pipeline_recovery_pending = True
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-new",
+            "generation": 8,
+            "phase": "ready",
+            "worker_ids": set(),
+            "prepared_nodes": set(),
+            "ready_nodes": set(),
+            "plan": {"assignments": []},
+        }
+
+        def fail_write(_key, _value):
+            raise OSError("sqlite unavailable")
+
+        monkeypatch.setattr(local_store, "set_local_setting", fail_write)
+        sched._persist_pipeline_lifecycle_locked()
+        sched._maybe_finish_pipeline_recovery()
+
+        assert sched._pipeline_recovery_pending is True
+        assert sched._pipeline_lifecycle_persist_ok is False
+
+        saved = []
+        monkeypatch.setattr(
+            local_store, "set_local_setting",
+            lambda key, value: saved.append((key, value)),
+        )
+        sched._persist_pipeline_lifecycle_locked()
+        sched._maybe_finish_pipeline_recovery()
+
+        assert saved[0][0] == "pipeline_config_lifecycle_v1"
+        assert saved[0][1]["phase"] == "ready"
+        assert sched._pipeline_lifecycle_persist_ok is True
+        assert sched._pipeline_recovery_pending is False
+
+    def test_restart_recovery_fence_waits_for_route_a_stage_readiness(
+            self, sched, monkeypatch):
+        """A stage-offer assignment is not committed by legacy ACK state."""
+        stage_ready = False
+        monkeypatch.setattr(
+            sched, "_stage_offer_assignment_ready",
+            lambda _node_id, _assignment: (stage_ready, "not_ready"),
+        )
+        sched._pipeline_recovery_pending = True
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-new",
+            "generation": 8,
+            "phase": "ready",
+            "worker_ids": set(),
+            "prepared_nodes": set(),
+            "ready_nodes": set(),
+            "plan": {"assignments": [{
+                "node_id": "android-worker",
+                "execution": "stage_offer_v3",
+                "start_layer": 0,
+                "end_layer": 4,
+            }]},
+        }
+
+        sched._maybe_finish_pipeline_recovery()
+        assert sched._pipeline_recovery_pending is True
+
+        stage_ready = True
+        sched._maybe_finish_pipeline_recovery()
+        assert sched._pipeline_recovery_pending is False
+
+    def test_restart_recovery_rejects_persisted_generation_as_active(
+            self, sched):
+        sched._pipeline_recovery_pending = True
+        sched._pipeline_recovery_state = {
+            "schema_version": 1,
+            "config_id": "cfg-old",
+            "generation": 7,
+            "phase": "ready",
+        }
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-old",
+            "generation": 7,
+            "phase": "ready",
+            "worker_ids": set(),
+            "prepared_nodes": set(),
+            "ready_nodes": set(),
+            "plan": {"assignments": []},
+        }
+
+        sched._maybe_finish_pipeline_recovery()
+        assert sched._pipeline_recovery_pending is True
+
+        sched._pipeline_load_transaction["config_id"] = "cfg-new"
+        sched._pipeline_load_transaction["generation"] = 8
+        sched._maybe_finish_pipeline_recovery()
+        assert sched._pipeline_recovery_pending is False
+
     def test_forced_sync_does_not_accept_ready_single_node_plan(
             self, sched, monkeypatch):
         calls = []
@@ -1792,6 +2443,11 @@ class TestPipelineReadiness:
             "model_type": "qwen",
             "total_layers": 24,
         })
+        # This test covers the legacy one-phase ACK path. Do not inherit a
+        # prepared-model flag left by another test in the process-wide host.
+        monkeypatch.setattr(
+            sched, "_host", type("Host", (), {"is_pipeline_prepared": False})(),
+        )
 
         sched.push_layer_config_to_clients()
 
@@ -1888,6 +2544,42 @@ class TestPipelineReadiness:
         assert status["active"] is False
         assert status["readiness_reason_code"] == "worker_layer_loading"
         assert status["workers"][0]["layer_status"] == "loading"
+
+    def test_pipeline_status_reports_tcp_connection_during_recovery_fence(
+        self, sched, monkeypatch,
+    ):
+        """Recovery readiness may be fenced without hiding a live TCP peer."""
+        from model_host import model_host as _host
+
+        sched._role_override = "master"
+        sched.nodes["client1"] = NodeInfo(
+            node_id="client1", role="client", state=NodeState.ONLINE,
+            address="100.64.1.2:8888", last_heartbeat=time.time(),
+        )
+        sched._tcp_server = type("FakeServer", (), {
+            "_running": True,
+            "clients": {"client1": object()},
+        })()
+        monkeypatch.setattr(_host, "_manager", type("Mgr", (), {
+            "is_loaded": True, "_engine_type": "pytorch",
+        })())
+        monkeypatch.setattr(sched, "get_layer_assignments", lambda: {
+            "total": 24,
+            "assignments": [
+                {"node_id": "master", "start_layer": 0, "end_layer": 8,
+                 "layers_count": 8},
+                {"node_id": "client1", "start_layer": 8, "end_layer": 24,
+                 "layers_count": 16},
+            ],
+        })
+        sched._pipeline_recovery_pending = True
+        sched._pipeline_recovery_failure = "pipeline_recovery_pending"
+
+        status = sched._get_pipeline_status()
+
+        assert status["readiness_reason_code"] == "pipeline_recovery_pending"
+        assert status["workers"][0]["tcp_connected"] is True
+        assert status["workers"][0]["layer_ready"] is False
 
 
 # ================================================================
@@ -2900,6 +3592,57 @@ class TestPipelineFallback:
 
         assert result["ready"] is True
         assert sync_calls == [True]
+
+    @pytest.mark.parametrize(
+        "reason_code",
+        ["worker_offline", "worker_tcp_disconnected", "worker_heartbeat_stale"],
+    )
+    def test_force_distributed_fails_fast_on_unrecoverable_readiness(
+            self, sched, monkeypatch, reason_code):
+        """★ DIST-2：force 路径下不可恢复的就绪原因必须快速返回，不等满超时。
+
+        此前 `not force_distributed_assignment and reason not in recoverable`
+        的组合让 force 路径**连这三种原因也会等满 `PIPELINE_MODEL_SYNC_TIMEOUT`**。
+        它们等下去不会变好：对端要么已经没了，要么要等重连，而重连本身会触发一次
+        权威重发（`_handle_task_worker_message` 的 hello 分支）。DIST-2 要求
+        「禁止等待多个互相独立的超时后才 fallback」。
+        """
+        sched._role_override = "master"
+        sched.nodes["worker1"] = NodeInfo(
+            node_id="worker1", role=NodeRole.CLIENT, state=NodeState.ONLINE,
+            node_type="pc", device_info={"tier": "ultrabook"},
+            last_heartbeat=time.time(),
+        )
+        sched._tcp_server = type("Server", (), {
+            "_running": True,
+            "clients": {"worker1": object()},
+        })()
+        monkeypatch.setattr(
+            sched, "_get_pipeline_readiness",
+            lambda: {
+                "ready": False,
+                "reason_code": reason_code,
+                "reason": "不可恢复的就绪原因",
+                "workers": [],
+            },
+        )
+        sync_calls = []
+        monkeypatch.setattr(
+            sched,
+            "request_authoritative_layer_sync",
+            lambda **kwargs: sync_calls.append(kwargs) or True,
+        )
+
+        started = time.monotonic()
+        result = sched._synchronize_pipeline_workers_for_request(
+            timeout=60.0, force_distributed_assignment=True,
+        )
+        elapsed = time.monotonic() - started
+
+        assert result["reason_code"] == reason_code
+        assert result["ready"] is False
+        assert elapsed < 5.0, f"应快速失败，实际耗时 {elapsed:.1f}s"
+        assert sync_calls == [], "不可恢复状态下不应再触发权威重发"
 
     def test_request_sync_stops_when_worker_reopts_out(
             self, sched, monkeypatch):
@@ -4476,6 +5219,39 @@ class TestChainTopology:
         assert "client1" not in sched._layer_config_expected
         assert "client1" not in sched._layer_config_retry_state
 
+    def test_disconnect_drops_obsolete_layer_config_state(self, sched, monkeypatch):
+        """Reconnect must start from a fresh per-node config transaction."""
+        from scheduler import NodeInfo, NodeState
+
+        sched.nodes["client1"] = NodeInfo(
+            node_id="client1", role="client", state=NodeState.ONLINE,
+        )
+        sched._layer_config_expected["client1"] = {
+            "node_id": "client1", "config_id": "cfg-old", "generation": 7,
+        }
+        sched._layer_config_acks["client1"] = {
+            "node_id": "client1", "config_id": "cfg-old", "status": "ready",
+        }
+        sched._layer_config_pushed.add("client1")
+        sched._layer_config_retry_state["client1"] = {
+            "attempts": 2, "next_retry": 0.0,
+        }
+        sched._tcp_server = type("Server", (), {
+            "clients": {},
+            "_running": False,
+        })()
+        monkeypatch.setattr(sched, "_push_node_update_to_all_clients", lambda *args: None)
+        monkeypatch.setattr(sched, "deregister_node", lambda _node_id: None)
+        monkeypatch.setattr(sched, "push_layer_config_to_clients", lambda: None)
+        monkeypatch.setattr(sched, "_stage_pipeline_reshard_after_disconnect", lambda _node_id: None)
+
+        sched._on_tcp_disconnect("client1")
+
+        assert "client1" not in sched._layer_config_expected
+        assert "client1" not in sched._layer_config_acks
+        assert "client1" not in sched._layer_config_pushed
+        assert "client1" not in sched._layer_config_retry_state
+
     def test_failed_release_send_remains_retryable(self, sched):
         class FailingServer:
             _running = True
@@ -4600,6 +5376,9 @@ class TestChainTopology:
             "total_layers": 24,
             "quant_type": "int4",
         })
+        monkeypatch.setattr(
+            sched, "_host", type("Host", (), {"is_pipeline_prepared": False})(),
+        )
 
         assert sched.request_authoritative_layer_sync() is True
 
@@ -4662,6 +5441,9 @@ class TestChainTopology:
         pushed = []
         monkeypatch.setattr(
             sched, "push_layer_config_to_clients", lambda: pushed.append(True),
+        )
+        monkeypatch.setattr(
+            sched, "_host", type("Host", (), {"is_pipeline_prepared": False})(),
         )
 
         sched._handle_layer_worker_opt_in("client1", {"data": {
@@ -5644,6 +6426,46 @@ class TestPipelineOrchestrationIntegration:
         monkeypatch.setattr(
             sched_master, "_task_worker_layer_stage_ids",
             lambda _connected: {relay_id},
+        )
+        monkeypatch.setattr(
+            sched_master, "_get_active_pipeline_model_info", lambda: {},
+        )
+        published = []
+        monkeypatch.setattr(
+            sched_master, "_publish_layer_configs",
+            lambda configs: published.append(configs),
+        )
+
+        sched_master._push_layer_config_to_clients_locked()
+
+        assert len(published) == 1
+        config = published[0][relay_id]
+        assert config["engine"] == "relay_middle"
+        assert config["relay_segment"] == relay_segment
+        assert config.get("release") is not True
+
+    def test_android_relay_host_is_not_excluded_from_legacy_rehydration(
+            self, sched_master, monkeypatch):
+        """Endpoint relay role survives candidate filtering regardless of platform."""
+        relay_id = "android-relay-host"
+        relay = NodeInfo(
+            node_id=relay_id, role="client", state=NodeState.ONLINE,
+            node_type="android", address="100.64.1.11:8888",
+            last_heartbeat=time.time(),
+        )
+        sched_master.nodes[relay_id] = relay
+        sched_master._tcp_server.clients = {relay_id: True}
+        relay_segment = {
+            "role": "middle",
+            "host": "127.0.0.1",
+            "port": 50283,
+            "n_embd": 4096,
+            "layer_start": 23,
+            "layer_end": 24,
+        }
+        monkeypatch.setattr(
+            sched_master, "_relay_segment_for_worker",
+            lambda node_id: relay_segment if node_id == relay_id else None,
         )
         monkeypatch.setattr(
             sched_master, "_get_active_pipeline_model_info", lambda: {},
@@ -7437,6 +8259,29 @@ def test_tcp_bind_failure_keeps_master_local_pipeline_available(monkeypatch):
         assert status["pipeline_queue"]["running"] is True
     finally:
         sched.stop()
+
+
+def test_start_failure_releases_idempotency_guard_for_retry(monkeypatch):
+    import scheduler as scheduler_mod
+
+    monkeypatch.setattr(scheduler_mod, "RUN_MODE", "single", raising=False)
+    scheduler = Scheduler()
+    monkeypatch.setattr(
+        scheduler, "init_nodes", lambda: (_ for _ in ()).throw(
+            RuntimeError("init failed")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="init failed"):
+        scheduler.start()
+    assert scheduler._running is False
+
+    monkeypatch.setattr(scheduler, "init_nodes", lambda: None)
+    scheduler.start()
+    try:
+        assert scheduler._running is True
+    finally:
+        scheduler.stop()
 
 
 def test_distributed_start_defers_network_identity(monkeypatch):
