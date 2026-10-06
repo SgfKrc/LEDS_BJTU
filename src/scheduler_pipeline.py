@@ -7265,6 +7265,54 @@ class SchedulerPipelineMixin:
             logger.error(f"完整模型重载失败: {e}")
             return {"response": "", "error": f"完整模型恢复失败: {e}"}
 
+        # ★ 2026-10-06（docs/已知问题记录.md #38）：**回退前必须确认 master 真的持有全层
+        #   模型**。此前只依赖 `is_pipeline_prepared`（= `_pipeline_distributed_only and
+        #   _pipeline_descriptor`）＋ `ensure_full_model()` 两道守卫，但二者都可能不成立却
+        #   仍放着裁层工件往下跑：实测 master 加载的是 `qwen25-05b-f16-head8.gguf`
+        #   （日志 `llama.cpp 层段已加载: [0,8) embed=True lm_head=False`），回退却按
+        #   「全层」硬跑 ⇒ 产出垃圾文本**却返回 HTTP 200**（fail-open 最坏的一种：掩盖故障
+        #   且伪装成功，对拍/验收/目视都会据此误判）。
+        #   这里改用**直接判据**：`layer_range`（`src/model_module.py:836` 明确
+        #   `None` = 完整模型）＋ `lm_head` —— 任一不满足即 fail-closed 且给具名原因。
+        _layer_range = getattr(mgr, "layer_range", None)
+        _desc: dict = {}
+        try:
+            _get_desc = getattr(mgr, "get_pipeline_descriptor", None)
+            if callable(_get_desc):
+                _d = _get_desc() or {}
+                if isinstance(_d, dict):
+                    _desc = _d
+        except Exception:  # noqa: BLE001 - 描述符不可用时按「未声明」处理
+            _desc = {}
+        # 判据用**描述符里的裁层痕迹**，因为两侧通用：PyTorch 侧另有 `layer_range`
+        # （`model_module.py:836`，None=整模），而 **llama.cpp 侧没有该实例属性**，
+        # 它的裁层状态只体现在 `_pipeline_descriptor` 的
+        # `assignment_layer_range` / `partial_assignment` / `loaded_artifact` 与
+        # `lm_head`（`llama_engine.py:516-528`）。实测 #38 正发生在 **llama.cpp** master：
+        # 日志 `llama.cpp 层段已加载: [0,8) embed=True lm_head=False` ——
+        # 而 LlamaCppEngine **既无 `ensure_full_model` 也无 `layer_range`** ⇒
+        # 上面两道旧守卫对它完全无效，只能靠这里挡住。
+        _partial = bool(
+            _desc.get("assignment_layer_range")
+            or _desc.get("partial_assignment")
+            or _desc.get("loaded_artifact")
+        )
+        _lm_head = _desc.get("lm_head") if "lm_head" in _desc else None
+        if _layer_range is not None or _partial or _lm_head is False:
+            logger.error(
+                "拒绝整模回退：master 并未持有全层模型 "
+                "(layer_range=%s partial=%s lm_head=%s)",
+                _layer_range, _partial, _lm_head,
+            )
+            return {
+                "response": "",
+                "error": (
+                    "refusing_full_model_fallback_with_partial_artifact: "
+                    f"layer_range={_layer_range} partial={_partial} lm_head={_lm_head}；"
+                    "master 持有的是裁层工件，整模回退会产出垃圾且伪装成功"
+                ),
+            }
+
         try:
             messages = kwargs.pop("messages", None) or [{"role": "user", "content": prompt}]
             callbacks = self._require_callbacks()
