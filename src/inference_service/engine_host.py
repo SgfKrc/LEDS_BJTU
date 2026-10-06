@@ -1961,6 +1961,12 @@ class EngineHost:
         """
         import os
 
+        # 本函数体要用 TaskGraphError，而该文件惯用函数内 import（同 :1802 / :2016 /
+        # :2140），此前漏了这一处 ⇒ 层段 keep-head 上游缺 env 或绑定失败时抛的是
+        # `NameError: name 'TaskGraphError' is not defined`，而不是真正的错误信息
+        # （2026-10-06 用 Edge 包当 layer worker 入网时实测踩到）。
+        from task_graph import TaskGraphError
+
         if self._layer_upstream is not None:
             return self._layer_upstream
         model_path = os.environ.get("QLH_LAYER_GGUF", "").strip()
