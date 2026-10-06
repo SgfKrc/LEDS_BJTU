@@ -2060,10 +2060,25 @@ class LlamaCppEngine:
                              dtype=np.float32)
             return out if all_positions else out[-1].copy()
 
-        if self._pipeline_descriptor and self._pipeline_descriptor.get("partial_assignment"):
+        # ★ 2026-10-06 加固（docs/已知问题记录.md #35）：
+        #   本函数末尾的 pip-embeddings 通道返回的是 `output_norm(H)`，而层接力要求
+        #   「末层输出、`output_norm` **之前**」—— 二者语义不同。直接交付会让下游段在
+        #   已归一化的残差流上继续算，**首步即分叉且不报错**（症状：token 与 prompt
+        #   无关地交替，见 #35 原文）。
+        #   此前只在 `partial_assignment` 时才 fail-closed ⇒ 「纯整模 GGUF +
+        #   直接 forward_layers」这条形态（legacy 首段 `scheduler_pipeline.py:3596/6388`、
+        #   peer 侧 `inference_service/peer.py:919`、relay 探针
+        #   `scripts/relay_experiment.py:948`）会**静默**走进 embeddings 分支。
+        #   现改为**默认一律 fail-closed**；确需旧行为者用 `QLH_ALLOW_NORMED_UPSTREAM=1`
+        #   显式放行（与 handoff 的 `upstream_applies_output_norm` 口径一致）。
+        _allow_normed = os.environ.get(
+            "QLH_ALLOW_NORMED_UPSTREAM", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if not _allow_normed:
             raise RuntimeError(
                 "llama.cpp 层接力需要 keep-head 上游（output_norm 之前的 hidden）；"
                 "当前 shim 不可用，拒绝使用语义不兼容的 embeddings 通道"
+                "（确需旧行为请设 QLH_ALLOW_NORMED_UPSTREAM=1）"
             )
 
         import numpy as np
