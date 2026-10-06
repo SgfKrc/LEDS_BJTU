@@ -424,6 +424,7 @@ _API_AUTH_EXEMPT_PATHS = frozenset({
     "/api/cluster/join/consume",
     "/api/cluster/android/register",
     "/api/cluster/android/heartbeat",
+    "/api/cluster/quorum/voter",
 })
 
 
@@ -676,6 +677,26 @@ def _runtime_readiness_snapshot() -> dict[str, Any]:
 # 调度器（单机 / 分布式模式共用）
 scheduler: ClusterScheduler = ClusterScheduler()
 scheduler.set_control_fence(control_fence)
+# HA-ROLE-AUTO-01: explicit ``NODE_ROLE=auto`` must construct the same
+# controller used by scheduler startup. Configuration failures stay read-only;
+# they are surfaced in ``/api/cluster/my-role`` rather than becoming a static
+# master by accident.
+auto_role_runtime = None
+if NODE_ROLE == "auto":
+    try:
+        from cluster_auto_role_runtime import install_auto_role_controller
+
+        auto_role_runtime = install_auto_role_controller(scheduler, control_fence)
+    except Exception as exc:
+        logger.error(
+            "auto role wiring unavailable; scheduler will remain read-only: %s",
+            getattr(exc, "code", type(exc).__name__),
+        )
+    # ``install_auto_role_controller`` may strengthen the initially optional
+    # fence with the auto-role authority. Keep middleware and route modules on
+    # that same object, otherwise API writes would bypass the runtime fence.
+    if scheduler._control_fence is not control_fence:
+        control_fence = scheduler._control_fence
 _task_graph_runtime_lock = threading.RLock()
 
 

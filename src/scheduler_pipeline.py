@@ -7476,6 +7476,37 @@ class SchedulerPipelineMixin:
             yield {"done": True, "error": f"完整模型恢复失败: {e}"}
             return
 
+        # A direct llama.cpp layer engine may not expose ``ensure_full_model``.
+        # Inspect its descriptor too so streaming fallback cannot execute a
+        # partial GGUF as though it were a whole model.
+        _layer_range = getattr(mgr, "layer_range", None)
+        _desc = {}
+        try:
+            _get_desc = getattr(mgr, "get_pipeline_descriptor", None)
+            if callable(_get_desc):
+                _candidate = _get_desc() or {}
+                if isinstance(_candidate, dict):
+                    _desc = _candidate
+        except Exception:  # noqa: BLE001 - unavailable descriptor stays fail-closed
+            _desc = {}
+        _partial = bool(
+            _desc.get("assignment_layer_range")
+            or _desc.get("partial_assignment")
+            or _desc.get("loaded_artifact")
+        )
+        _lm_head = _desc.get("lm_head") if "lm_head" in _desc else None
+        if _layer_range is not None or _partial or _lm_head is False:
+            self._inference_lock.release()
+            yield {
+                "done": True,
+                "error": (
+                    "refusing_full_model_fallback_with_partial_artifact: "
+                    f"layer_range={_layer_range} partial={_partial} lm_head={_lm_head};"
+                    " master holds a partial artifact; refusing full-model fallback"
+                ),
+            }
+            return
+
         max_new_tokens = kwargs.pop('max_new_tokens', 512)
         temperature = kwargs.pop('temperature', 0.7)
         top_p = kwargs.pop('top_p', 0.9)

@@ -51,6 +51,8 @@ def resolve_initial_node_role() -> str:
     if explicit:
         if explicit == "master":
             return "master"
+        if explicit == "auto":
+            return "auto"
         if explicit in {"slave", "worker", "client"}:
             return "client"
         # An unrecognised role must not promote a source checkout.
@@ -61,6 +63,8 @@ def resolve_initial_node_role() -> str:
     if configured:
         if configured == "master":
             return "master"
+        if configured == "auto":
+            return "auto"
         if configured in {"slave", "worker", "client"}:
             return "client"
         return "master" if getattr(sys, "frozen", False) else "client"

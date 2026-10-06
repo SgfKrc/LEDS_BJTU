@@ -175,6 +175,24 @@ class TestDistributedInferenceWorkflow:
         assert result["response"] == ""
         assert "refusing_full_model_fallback_with_partial_artifact" in result["error"]
 
+    def test_stream_fallback_refuses_partial_artifact(self, scheduler, mgr, monkeypatch):
+        """#38: streaming fallback must reject a partial GGUF too."""
+        monkeypatch.setattr(
+            mgr,
+            "get_pipeline_descriptor",
+            lambda: {"lm_head": False, "assignment_layer_range": [0, 8]},
+            raising=False,
+        )
+        events = list(
+            scheduler._run_full_model_inference_stream(
+                prompt="Hello, how are you?",
+                max_new_tokens=8,
+            )
+        )
+        assert events
+        assert events[-1]["done"] is True
+        assert "refusing_full_model_fallback_with_partial_artifact" in events[-1]["error"]
+
     def test_fallback_inference_with_metrics(self, scheduler, mgr):
         """回退推理应返回 metrics（包含 mode 字段）。"""
         result = scheduler._run_full_model_inference(

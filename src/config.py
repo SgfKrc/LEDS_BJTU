@@ -135,6 +135,8 @@ KV_COLD_MAX_BYTES = _env_int(
 
 def _normalize_node_role(value: str) -> str:
     role = (value or "master").strip().lower()
+    if role == "auto":
+        return "auto"
     if role in {"slave", "worker", "client"}:
         return "client"
     return "master"

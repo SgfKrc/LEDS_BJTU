@@ -1249,6 +1249,42 @@ class Scheduler(
         #   ★ 注意：两次 `start()` 是**并发**的（日志时间戳同毫秒），非原子的
         #     「检查后设置」两边都会通过 ⇒ 必须在 `_start_lock` 内占位。
         self._startup_cancel_event.clear()
+
+        # P4.5 HA-ROLE-AUTO-01: construct and start the quorum-backed role
+        # controller at the composition root. Missing key/peer configuration
+        # is reduced to read-only instead of falling back to a static master.
+        if NODE_ROLE == "auto":
+            runtime = getattr(self, "_auto_role_runtime", None)
+            if getattr(self, "_auto_role_controller", None) is None:
+                try:
+                    from cluster_auto_role_runtime import install_auto_role_controller
+
+                    runtime = install_auto_role_controller(self, self._control_fence)
+                except Exception as exc:
+                    from cluster_auto_role import AutoRoleController
+
+                    authority = self._control_fence.authority if self._control_fence is not None else None
+                    self.set_auto_role_controller(
+                        AutoRoleController(
+                            str(NODE_ID or "auto-node"),
+                            mode="auto",
+                            authority=authority,
+                            fence=self._control_fence,
+                        )
+                    )
+                    runtime = None
+                    logger.error(
+                        "auto role configuration unavailable; entering read-only: %s",
+                        getattr(exc, "code", type(exc).__name__),
+                    )
+            available = runtime.available_voter_ids if runtime is not None else None
+            decision = self.start_auto_role(available_voter_ids=available)
+            logger.info(
+                "event=auto_role_start accepted=%s state=%s runtime_role=%s reason=%s",
+                decision.get("accepted"), decision.get("state"),
+                decision.get("runtime_role"), decision.get("reason"),
+            )
+
         self.init_nodes()
         if self._effective_role() == "master":
             self._load_pipeline_recovery_state()
@@ -1307,7 +1343,7 @@ class Scheduler(
                 )
 
             # 检测实际局域网 IP 和 MAC 地址
-            if NODE_ROLE == "master":
+            if self._effective_role() == "master":
                 # Network address and MAC identity are populated by the
                 # post-startup worker below.
                 logger.info(f"调度器已启动（分布式模式），监听 {bind_host}:{actual_port}，局域网 IP: {self._lan_ip}，MAC: {self._mac_addresses}")
@@ -1378,7 +1414,7 @@ class Scheduler(
         else:
             logger.info("调度器已启动（单机模式）")
 
-        if RUN_MODE == "distributed" and NODE_ROLE == "master":
+        if RUN_MODE == "distributed" and self._effective_role() == "master":
             self._start_deferred_network_identity()
 
         # 启动流水线请求队列（仅主节点，FIFO 串行）
@@ -1465,6 +1501,12 @@ class Scheduler(
         """停止调度器"""
         self._startup_cancel_event.set()
         self._running = False
+        controller = getattr(self, "_auto_role_controller", None)
+        if controller is not None:
+            try:
+                controller.stop()
+            except Exception:
+                logger.debug("停止自动主节点控制器失败", exc_info=True)
         self.pipeline_queue.stop()
         tcp_client = getattr(self, "_tcp_client", None)
         if tcp_client is not None:
@@ -1563,6 +1605,10 @@ class Scheduler(
         controller = getattr(self, "_auto_role_controller", None)
         if controller is not None:
             return controller.runtime_role
+        if configured_role == "auto":
+            # Before the composition root has attached the controller, auto
+            # mode has no authority and must present as a read-only client.
+            return "client"
         return configured_role
 
     # ================================================================

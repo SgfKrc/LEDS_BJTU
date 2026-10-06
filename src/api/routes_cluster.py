@@ -45,7 +45,7 @@ def configure_api_module(module: ModuleType) -> None:
     configure_route_module(globals(), module, _RESOLUTION_NAMES)
 
 def exported_handlers() -> dict[str, object]:
-    return {name: globals()[name] for name in ['get_cluster_status', 'get_cluster_nodes', 'get_cluster_resources', 'deregister_node', 'delete_cluster_node', 'get_cluster_config', 'get_my_role', 'update_max_nodes', 'get_invite_info', 'create_cluster_join_request', 'issue_cluster_join_grant', 'consume_cluster_join_grant', 'first_connect_bootstrap', 'bootstrap_info', 'connect_to_master', 'manual_register_node', 'register_android_presence', 'heartbeat_android_presence', 'check_master_health', 'discover_master', 'reset_master_identity', 'get_control_plane_status', 'get_cluster_management_score', 'install_control_plane_certificate', 'get_queue_detail', 'set_queue_strategy', 'pause_queue', 'resume_queue', 'clear_queue', 'cancel_queue_task', 'get_task_graph_config', 'set_task_graph_config', 'get_distributed_inference_config', 'set_distributed_inference_config', 'get_layer_assignments', 'get_pipeline_capacity_plan', 'get_pipeline_reshard_status', 'override_layer_assignments', 'reset_layer_assignments', 'get_model_runtime_sidecar_status', 'get_model_runtime_contracts', 'bind_model_runtime_contract', 'begin_model_runtime_sidecar', 'release_model_runtime_sidecar', 'cancel_model_runtime_sidecar', 'get_qwen3_local_chain_status', 'begin_qwen3_local_chain', 'run_qwen3_local_prefill', 'run_qwen3_local_decode', 'verify_qwen3_local_parity', 'release_qwen3_local_chain', 'cancel_qwen3_local_chain', 'transfer_master_role', 'get_transfer_logs', 'get_spare_master', 'designate_spare_master', 'clear_spare_master', 'get_spare_master_logs', 'create_review_ticket', 'cast_review_vote', 'list_review_tickets', 'get_review_ticket', 'check_can_vote', 'trigger_expire_check', 'delete_review_ticket', 'delete_resolved_review_tickets']}
+    return {name: globals()[name] for name in ['get_cluster_status', 'get_cluster_nodes', 'get_cluster_resources', 'deregister_node', 'delete_cluster_node', 'get_cluster_config', 'get_my_role', 'update_max_nodes', 'get_invite_info', 'create_cluster_join_request', 'issue_cluster_join_grant', 'consume_cluster_join_grant', 'first_connect_bootstrap', 'bootstrap_info', 'connect_to_master', 'manual_register_node', 'register_android_presence', 'heartbeat_android_presence', 'check_master_health', 'discover_master', 'reset_master_identity', 'get_control_plane_status', 'get_cluster_management_score', 'install_control_plane_certificate', 'quorum_voter_rpc', 'get_queue_detail', 'set_queue_strategy', 'pause_queue', 'resume_queue', 'clear_queue', 'cancel_queue_task', 'get_task_graph_config', 'set_task_graph_config', 'get_distributed_inference_config', 'set_distributed_inference_config', 'get_layer_assignments', 'get_pipeline_capacity_plan', 'get_pipeline_reshard_status', 'override_layer_assignments', 'reset_layer_assignments', 'get_model_runtime_sidecar_status', 'get_model_runtime_contracts', 'bind_model_runtime_contract', 'begin_model_runtime_sidecar', 'release_model_runtime_sidecar', 'cancel_model_runtime_sidecar', 'get_qwen3_local_chain_status', 'begin_qwen3_local_chain', 'run_qwen3_local_prefill', 'run_qwen3_local_decode', 'verify_qwen3_local_parity', 'release_qwen3_local_chain', 'cancel_qwen3_local_chain', 'transfer_master_role', 'get_transfer_logs', 'get_spare_master', 'designate_spare_master', 'clear_spare_master', 'get_spare_master_logs', 'create_review_ticket', 'cast_review_vote', 'list_review_tickets', 'get_review_ticket', 'check_can_vote', 'trigger_expire_check', 'delete_review_ticket', 'delete_resolved_review_tickets']}
 
 async def get_cluster_status():
     """
@@ -579,7 +579,9 @@ async def reset_master_identity(req: ResetIdentityRequest):
 
 async def get_control_plane_status():
     """Read-only fencing status; it remains available while writes are fenced."""
-    return _api_module.control_fence.snapshot()
+    result = _api_module.control_fence.snapshot()
+    result["auto_role"] = _api_module.scheduler.get_auto_role_snapshot()
+    return result
 
 async def get_cluster_management_score():
     """Return the versioned, read-only management-capability score snapshot."""
@@ -608,6 +610,23 @@ async def install_control_plane_certificate(req: ControlCertificateRequest):
         status = 503 if exc.code == "control_fence_unavailable" else 409
         raise _api_module.HTTPException(status, {"code": exc.code, "message": str(exc)}) from exc
     return {"status": "installed", **result}
+
+
+async def quorum_voter_rpc(request: Request):
+    """Serve the authenticated local voter used by an auto-role peer."""
+    runtime = (
+        getattr(_api_module, "auto_role_runtime", None)
+        or getattr(_api_module.scheduler, "_auto_role_runtime", None)
+    )
+    if runtime is None:
+        raise _api_module.HTTPException(503, {"code": "quorum_unavailable", "message": "automatic role is not configured"})
+    if not runtime.authenticate(request.headers.get("X-QLH-Quorum-Secret")):
+        raise _api_module.HTTPException(403, {"code": "quorum_auth_failed", "message": "voter authentication failed"})
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise _api_module.HTTPException(400, {"code": "quorum_unavailable", "message": "voter request is invalid"}) from exc
+    return runtime.handle_rpc(payload)
 
 async def get_queue_detail():
     """
@@ -1185,6 +1204,7 @@ def register_routes() -> None:
     router.add_api_route('/api/cluster/control-plane', get_control_plane_status, methods=['GET'])
     router.add_api_route('/api/cluster/management-score', get_cluster_management_score, methods=['GET'])
     router.add_api_route('/api/cluster/control-plane/certificate', install_control_plane_certificate, methods=['POST'])
+    router.add_api_route('/api/cluster/quorum/voter', quorum_voter_rpc, methods=['POST'])
     router.add_api_route('/api/cluster/queue', get_queue_detail, methods=['GET'])
     router.add_api_route('/api/cluster/queue/strategy', set_queue_strategy, methods=['POST'])
     router.add_api_route('/api/cluster/queue/pause', pause_queue, methods=['POST'])
