@@ -3508,3 +3508,143 @@ def test_remote_worker_releases_slot_across_success_and_failure_cycles():
         finally:
             provider.release(reservation.reservation_id)
         assert provider.inspect().active_reservations == 0
+
+
+def _cancelled_ack(identity, *, reason_code="coordinator_cancelled",
+                   execution_state=None, message_id="msg_cancelacked0001"):
+    payload = {**identity, "reason_code": reason_code}
+    if execution_state is not None:
+        payload["execution_state"] = execution_state
+    return build_message(
+        "stage_cancelled",
+        payload,
+        message_id=message_id,
+        sent_at_ms=int(time.time() * 1000),
+        version=3,
+    ).snapshot()
+
+
+def test_remote_provider_distinguishes_cancel_ack_from_execution_stopped():
+    """★ DIST-NEXT-1：ACK 只证明「请求已送达」，`execution_stopped` 才证明「执行已停止」。"""
+    coordinator_control, _worker_control = _admitted_control_plane()
+    sent = []
+    provider = RemoteFullWorkerProvider(
+        node_id="worker_01",
+        peer_snapshot=lambda: coordinator_control.worker_snapshot("worker_01"),
+        send_message=sent.append,
+    )
+    request = _remote_request(provider.provider_id)
+    reservation = provider.reserve(request)
+    attempt = StageAttempt(
+        attempt_id="att_cancelstate01",
+        request=request,
+        provider_id=provider.provider_id,
+        lease_id="lease_cancelstate01",
+        lease_epoch=1,
+        lease_expires_at=time.time() + 5,
+    )
+    outcome = {}
+
+    def execute():
+        try:
+            provider.execute(attempt, reservation, threading.Event())
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=execute, daemon=True)
+    thread.start()
+    assert _wait_until(lambda: bool(sent))
+    identity = _response_identity(sent[0].payload)
+    provider.handle_message(build_message(
+        "stage_accept",
+        {**identity, "accepted": True, "reason_code": "", "retryable": False},
+        message_id="msg_cancelstateaccept01",
+        sent_at_ms=int(time.time() * 1000),
+        version=3,
+    ).snapshot())
+
+    provider.cancel(attempt.attempt_id)
+    provider.handle_message(_cancelled_ack(
+        identity, execution_state="execution_in_flight",
+    ))
+    in_flight = provider.cancel_diagnostics()
+    assert in_flight["cancel_ack_execution_states"] == {"execution_in_flight": 1}
+    assert in_flight["cancel_execution_stopped_confirmed"] == 0
+    assert in_flight["pending_cancel_ack_in_flight"] == 1
+
+    # 执行真正停止后，对端补一条终态 ACK；本地状态必须升级而不是被当成重复丢弃。
+    provider.handle_message(_cancelled_ack(
+        identity, execution_state="execution_stopped",
+        message_id="msg_cancelacked0002",
+    ))
+    stopped = provider.cancel_diagnostics()
+    assert stopped["cancel_execution_stopped_confirmed"] == 1
+    assert stopped["cancel_ack_execution_states"]["execution_stopped"] == 1
+    assert stopped["pending_cancel_ack_in_flight"] == 0
+
+    thread.join(2)
+    assert not thread.is_alive()
+    assert outcome["error"].code == "provider_cancelled"
+    provider.release(reservation.reservation_id)
+    provider.close()
+
+
+def test_remote_provider_accepts_remote_initiated_cancellation():
+    """★ DIST-NEXT-1：worker 主动取消（本地用户取消 / Service 回收）不再按协议违例拒绝。
+
+    此前该消息一律抛 `unexpected_stage_cancelled`，master 只能等到租约/步骤超时。
+    """
+    coordinator_control, _worker_control = _admitted_control_plane()
+    sent = []
+    provider = RemoteFullWorkerProvider(
+        node_id="worker_01",
+        peer_snapshot=lambda: coordinator_control.worker_snapshot("worker_01"),
+        send_message=sent.append,
+    )
+    request = _remote_request(provider.provider_id)
+    reservation = provider.reserve(request)
+    attempt = StageAttempt(
+        attempt_id="att_cancelremote02",
+        request=request,
+        provider_id=provider.provider_id,
+        lease_id="lease_cancelremote02",
+        lease_epoch=1,
+        lease_expires_at=time.time() + 5,
+    )
+    outcome = {}
+
+    def execute():
+        try:
+            provider.execute(attempt, reservation, threading.Event())
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=execute, daemon=True)
+    thread.start()
+    assert _wait_until(lambda: bool(sent))
+    identity = _response_identity(sent[0].payload)
+    provider.handle_message(build_message(
+        "stage_accept",
+        {**identity, "accepted": True, "reason_code": "", "retryable": False},
+        message_id="msg_cancelremoteaccept02",
+        sent_at_ms=int(time.time() * 1000),
+        version=3,
+    ).snapshot())
+
+    # 本端**没有**请求取消，worker 自己取消并发来 ACK。
+    provider.handle_message(_cancelled_ack(
+        identity, reason_code="user_cancelled",
+        execution_state="execution_stopped",
+        message_id="msg_cancelremoteack02",
+    ))
+
+    thread.join(2)
+    assert not thread.is_alive()
+    assert outcome["error"].code == "user_cancelled"
+    assert outcome["error"].retryable is True
+    diagnostics = provider.cancel_diagnostics()
+    assert diagnostics["cancel_remote_initiated"] == 1
+    assert diagnostics["cancel_execution_stopped_confirmed"] == 1
+    provider.release(reservation.reservation_id)
+    assert provider.inspect().active_reservations == 0
+    provider.close()

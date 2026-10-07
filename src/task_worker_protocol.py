@@ -89,6 +89,19 @@ _LAYER_FORWARD_OPTIONAL_FIELDS = {"middle_channel", "seq_ids", "positions"}
 #: * `keep_head_layer_out` —— `layer_inp` 的 `lid == n_layer` 槽位，返回**末层输出**。
 _LAYER_FORWARD_MIDDLE_CHANNELS = {"extract_hidden", "keep_head_layer_out"}
 
+#: ★ 2026-10-07（DIST-NEXT-1）：`stage_cancelled` 的**可选**执行状态。
+#: 取消合同把「已取消」拆成两个可分别取证的事实：ACK 先到，执行可能仍在
+#: in-flight（native 层段前向不可被一次调用打断）。取值：
+#: * `execution_stopped` —— 该 attempt 的执行已确实停止（终态，可释放）；
+#: * `execution_in_flight` —— 已确认收到 `stage_cancel`，执行尚未停止。
+#: **缺省 = 旧对端**（未携带状态），按 `unknown` 记录，不改变既有语义。
+#: 与 `_LAYER_FORWARD_OPTIONAL_FIELDS` 同一机制：只在 payload 真出现时放宽精确字段校验，
+#: 避免把可选字段变成必填而破坏既有对端。
+_STAGE_CANCELLED_OPTIONAL_FIELDS = {"execution_state"}
+_STAGE_CANCELLED_EXECUTION_STATES = frozenset({
+    "execution_stopped", "execution_in_flight",
+})
+
 #: 层段 `stage_result` 的结果字段：**放在 `output` 或 `metadata` 对象内**，不扩顶层。
 #: 原因：`stage_result` 的 payload 里没有 `stage_type`，无法按类型做动态字段校验；
 #: 而 `output` / `metadata` 本就是自由对象（仅校验类型与摘要一致性），可安全承载。
@@ -765,6 +778,15 @@ def _validate_payload(
         # ★ 2026-09-23：**可选**层段字段只在 payload 里**真的出现**时放宽 —— 精确校验是双向的，
         #   提前并入会把它们变成必填、破坏既有对端（实测踩到）。
         required = required | (_LAYER_FORWARD_OPTIONAL_FIELDS & set(payload))
+    # ★ 2026-10-07（DIST-NEXT-1）：取消 ACK 的执行状态同样是**可选**字段。
+    #   ⚠️ 限定 `version >= 3`：v1/v2 的字段表里没有它，若不加判定，v2 对端带字段
+    #      会静默通过而不是稳定的 `invalid_fields`。
+    if (
+        message_type == "stage_cancelled"
+        and version >= 3
+        and isinstance(payload, Mapping)
+    ):
+        required = required | (_STAGE_CANCELLED_OPTIONAL_FIELDS & set(payload))
     _require_exact_fields(payload, required, "payload")
     if message_type == "hello":
         _require_string(payload["node_id"], "payload.node_id", pattern=_SAFE_ID)
@@ -964,6 +986,20 @@ def _validate_payload(
             payload["reason_code"], "payload.reason_code", pattern=_SAFE_CODE,
             max_length=64,
         )
+        # ★ 2026-10-07（DIST-NEXT-1）：取消 ACK 的**执行状态**（可选）。
+        #   存在的目的是让 master 不把「请求已取消」当成「执行已停止」；
+        #   因此值域必须封闭（fail-closed），未知状态一律拒收而不是照抄。
+        if message_type == "stage_cancelled" and "execution_state" in payload:
+            state = _require_string(
+                payload["execution_state"], "payload.execution_state",
+                max_length=32,
+            )
+            if state not in _STAGE_CANCELLED_EXECUTION_STATES:
+                raise _error(
+                    "unsupported_execution_state", "payload.execution_state",
+                    "execution_state must be one of "
+                    + ", ".join(sorted(_STAGE_CANCELLED_EXECUTION_STATES)),
+                )
 
 
 def validate_message(value: Mapping[str, Any]) -> WorkerMessage:

@@ -386,3 +386,62 @@ def test_decode_normalizes_invalid_unicode_to_protocol_error():
     with pytest.raises(WorkerProtocolError) as captured:
         decode_message("\ud800")
     assert captured.value.code == "invalid_encoding"
+
+
+_CANCEL_IDENTITY = {
+    "workflow_id": "wf_cancelremote01",
+    "stage_id": "candidate_a",
+    "attempt_id": "att_cancelremote01",
+    "lease_id": "lease_cancelremote01",
+    "lease_epoch": 1,
+}
+
+
+def _cancelled_envelope(**extra):
+    return build_message(
+        "stage_cancelled",
+        {
+            **_CANCEL_IDENTITY,
+            "provider_id": "remote_worker_01",
+            "reason_code": "coordinator_cancelled",
+            **extra,
+        },
+        message_id="msg_cancelled00000001",
+        sent_at_ms=1_700_000_000_000,
+        version=3,
+    ).snapshot()
+
+
+def test_stage_cancelled_execution_state_is_optional_and_bounded():
+    """★ 2026-10-07（DIST-NEXT-1）：取消 ACK 的执行状态可选、值域封闭。
+
+    「请求已取消」与「执行已停止」是两个事实；协议层只接受这两个具名状态，
+    旧对端（不带该字段）保持原语义。
+    """
+    legacy = decode_message(_cancelled_envelope())
+    assert legacy.payload["reason_code"] == "coordinator_cancelled"
+    assert "execution_state" not in legacy.payload
+
+    for state in ("execution_stopped", "execution_in_flight"):
+        decoded = decode_message(_cancelled_envelope(execution_state=state))
+        assert decoded.payload["execution_state"] == state
+
+    with pytest.raises(WorkerProtocolError) as captured:
+        decode_message(_cancelled_envelope(execution_state="stopped"))
+    assert captured.value.code == "unsupported_execution_state"
+    assert captured.value.field == "payload.execution_state"
+
+
+def test_stage_cancel_does_not_accept_execution_state():
+    """执行状态只属于**回程** ACK；coordinator 的取消请求不得携带它。"""
+    with pytest.raises(WorkerProtocolError) as captured:
+        build_message(
+            "stage_cancel",
+            {**_CANCEL_IDENTITY, "reason_code": "coordinator_cancelled",
+             "execution_state": "execution_stopped"},
+            message_id="msg_cancelrequest0001",
+            sent_at_ms=1_700_000_000_000,
+            version=3,
+        )
+    assert captured.value.code == "invalid_fields"
+    assert captured.value.field == "payload"

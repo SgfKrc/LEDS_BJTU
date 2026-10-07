@@ -506,6 +506,13 @@ class _PendingRemoteAttempt:
     cancel_requested: bool = False
     cancel_enqueued: bool = False
     cancel_acknowledged: bool = False
+    #: ★ 2026-10-07（DIST-NEXT-1）：「已收到取消 ACK」与「执行确实已停止」是两个
+    #: 事实。前者由 `cancel_acknowledged` 表示；后者只有对端显式回报
+    #: `execution_state == "execution_stopped"` 时才成立（缺省/旧对端 = 未证明）。
+    cancel_ack_execution_state: str = ""
+    cancel_execution_stopped: bool = False
+    #: 对端**主动**取消（本地用户取消 / Service 回收），本端并未请求。
+    cancel_remote_initiated: bool = False
     released: bool = False
     released_at: float = 0.0
 
@@ -536,6 +543,13 @@ class RemoteFullWorkerProvider:
         self._reservation_attempts: dict[str, str] = {}
         self._seen_messages: dict[str, str] = {}
         self._seen_order: collections.deque[str] = collections.deque()
+        #: ★ 2026-10-07（DIST-NEXT-1）：取消合同的分类计数。把「请求已发出」
+        #: 「ACK 已收到」「执行确证已停止」「对端主动取消」「迟到结果被吸收」
+        #: 分开统计 —— 否则「请求已取消」会被当成「执行已停止」。
+        self._cancel_ack_states: collections.Counter[str] = collections.Counter()
+        self._cancel_execution_stopped = 0
+        self._cancel_remote_initiated = 0
+        self._late_stage_responses = 0
         self._closed = False
         self._lock = threading.RLock()
         self._outbound_queue: queue.Queue[
@@ -764,6 +778,34 @@ class RemoteFullWorkerProvider:
             available=healthy and active < max_concurrency,
             node_id=self.node_id,
         )
+
+    def cancel_diagnostics(self) -> dict[str, Any]:
+        """取消合同的分类计数（DIST-NEXT-1）。
+
+        把「收到 ACK」「执行确证已停止」「对端主动取消」「迟到结果被吸收」
+        分开统计。调用方（health / 测试 / 后续 metrics）据此区分
+        「请求已取消」与「执行已停止」，不再由单一布尔冒充。
+        """
+        with self._lock:
+            ack_states = dict(self._cancel_ack_states)
+            pending_with_cancel = sum(
+                1 for pending in self._pending.values()
+                if pending.cancel_requested
+            )
+            still_in_flight = sum(
+                1 for pending in self._pending.values()
+                if pending.cancel_requested
+                and pending.cancel_acknowledged
+                and not pending.cancel_execution_stopped
+            )
+            return {
+                "cancel_ack_execution_states": ack_states,
+                "cancel_execution_stopped_confirmed": self._cancel_execution_stopped,
+                "cancel_remote_initiated": self._cancel_remote_initiated,
+                "late_stage_responses_absorbed": self._late_stage_responses,
+                "pending_cancel_requests": pending_with_cancel,
+                "pending_cancel_ack_in_flight": still_in_flight,
+            }
 
     def supports_model_identity(
         self, model_identity: ModelIdentity, stage_type: str,
@@ -1154,6 +1196,7 @@ class RemoteFullWorkerProvider:
                 # absorb the stale response idempotently instead of treating
                 # the peer as a protocol violator.
                 self._remember_message_locked(message)
+                self._late_stage_responses += 1
                 logger.info(
                     "event=task_worker_late_stage_response_ignored node_id=%s "
                     "message_type=%s attempt_id=%s",
@@ -1221,25 +1264,91 @@ class RemoteFullWorkerProvider:
                 pending.accept_event.set()
                 pending.result_event.set()
             else:
+                # ★ 2026-10-07（DIST-NEXT-1）：取消合同。
+                #   `execution_state` 可选：旧对端不带 ⇒ `unknown`（不冒充已停止）。
+                execution_state = str(payload.get("execution_state") or "unknown")
                 if not pending.cancel_requested:
-                    raise WorkerProtocolError(
-                        "Stage cancellation acknowledgement was not requested",
-                        code="unexpected_stage_cancelled",
-                        field="message_type",
+                    # 对端**主动**取消（Android 本地用户取消 / Service 回收）。
+                    # 此前一律按 `unexpected_stage_cancelled` 拒绝 ⇒ master 只能等到
+                    # 租约/步骤超时，且在 coordinator 侧看不出是谁取消的。现在收敛成
+                    # 单一 reason：该 attempt 由对端终止，本端以可重试的远端取消结束等待。
+                    pending.cancel_remote_initiated = True
+                    pending.cancel_acknowledged = True
+                    pending.cancel_ack_execution_state = execution_state
+                    pending.cancel_execution_stopped = (
+                        execution_state == "execution_stopped"
                     )
-                if pending.cancel_acknowledged:
+                    if pending.cancel_execution_stopped:
+                        self._cancel_execution_stopped += 1
+                    pending.error = ProviderExecutionError(
+                        "remote worker cancelled the Stage",
+                        code=str(
+                            payload.get("reason_code") or "remote_worker_cancelled"
+                        ),
+                        provider_id=self.provider_id,
+                        retryable=True,
+                    )
+                    pending.accept_event.set()
+                    pending.result_event.set()
+                    pending.cancel_ack_event.set()
+                    self._cancel_remote_initiated += 1
+                    self._cancel_ack_states[execution_state] += 1
+                    logger.info(
+                        "event=task_worker_stage_cancel_remote_initiated node_id=%s "
+                        "workflow_id=%s stage_id=%s attempt_id=%s reason_code=%s "
+                        "execution_state=%s",
+                        self.node_id,
+                        payload.get("workflow_id", ""),
+                        payload.get("stage_id", ""),
+                        attempt_id,
+                        payload.get("reason_code", ""),
+                        execution_state,
+                    )
                     self._remember_message_locked(message)
                     return message
+                if pending.cancel_acknowledged and not pending.cancel_execution_stopped:
+                    # 第二条 ACK 可以把「仍在执行」升级为「已停止」——这是取消合同
+                    # 允许的唯一迟到的正向更新（其余迟到响应走上面的吸收分支）。
+                    pass
+                elif pending.cancel_acknowledged:
+                    self._remember_message_locked(message)
+                    return message
+                # 一条 ACK 只证明「取消请求已送达」；只有对端显式回报
+                # `execution_stopped` 才证明「执行已停止」。
+                first_ack = not pending.cancel_acknowledged
+                previous_state = pending.cancel_ack_execution_state
                 pending.cancel_acknowledged = True
+                if execution_state != "unknown":
+                    pending.cancel_ack_execution_state = execution_state
+                if (
+                    execution_state == "execution_stopped"
+                    and not pending.cancel_execution_stopped
+                ):
+                    pending.cancel_execution_stopped = True
+                    self._cancel_execution_stopped += 1
+                if first_ack or execution_state != previous_state:
+                    self._cancel_ack_states[execution_state] += 1
                 pending.cancel_ack_event.set()
-                logger.info(
-                    "event=task_worker_stage_cancel_acknowledged node_id=%s "
-                    "workflow_id=%s stage_id=%s attempt_id=%s",
-                    self.node_id,
-                    payload.get("workflow_id", ""),
-                    payload.get("stage_id", ""),
-                    attempt_id,
-                )
+                if first_ack:
+                    logger.info(
+                        "event=task_worker_stage_cancel_acknowledged node_id=%s "
+                        "workflow_id=%s stage_id=%s attempt_id=%s execution_state=%s",
+                        self.node_id,
+                        payload.get("workflow_id", ""),
+                        payload.get("stage_id", ""),
+                        attempt_id,
+                        execution_state,
+                    )
+                elif execution_state != previous_state:
+                    logger.info(
+                        "event=task_worker_stage_cancel_execution_stopped node_id=%s "
+                        "workflow_id=%s stage_id=%s attempt_id=%s execution_state=%s",
+                        self.node_id,
+                        payload.get("workflow_id", ""),
+                        payload.get("stage_id", ""),
+                        attempt_id,
+                        execution_state,
+                    )
                 if pending.released:
                     self._pending.pop(attempt_id, None)
             self._remember_message_locked(message)
