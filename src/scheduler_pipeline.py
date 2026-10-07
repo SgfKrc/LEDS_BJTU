@@ -28,12 +28,47 @@ from relay_segment_client import (
 )
 from relay_transport import is_loopback_host
 from scheduler_types import PreemptState, WORKER_HEARTBEAT_MAX_AGE
+from task_worker_protocol import (
+    hidden_fits_stage_frame,
+    hidden_wire_bytes,
+    max_hidden_tokens,
+    stage_payload_budget_bytes,
+)
 from torch_runtime import loaded_torch
 
 logger = logging.getLogger("scheduler")
 
 
 RELAY_HIDDEN_WIRE_FORMAT = "qlh.relay_hidden.f32.v1"
+
+
+class LayerStageFrameTooLarge(RuntimeError):
+    """★ 2026-10-07（DIST-NEXT-2）：层段 hidden 超出单帧预算。
+
+    在 **dispatch 前**抛出（offer 尚未 reserve/execute）：超限的 hidden 装不进
+    `MAX_MESSAGE_BYTES`，继续发送只会在执行完成后触发 `message_too_large`，
+    表现为 stage 超时与回退 —— 那是过晚的契约发现，不是有效的 fail-closed。
+
+    不可恢复：换一个更小的 prompt（更少 token）或更小的模型（更少 `n_embd`）
+    才能重试；reason code 稳定，供上层直接收敛为具名失败。
+    """
+
+    code = "route_a_stage_frame_too_large"
+
+    def __init__(
+        self, *, node_id: str, wire_bytes: int, budget_bytes: int,
+        n_tokens: int, n_embd: int,
+    ) -> None:
+        self.node_id = str(node_id)
+        self.wire_bytes = int(wire_bytes)
+        self.budget_bytes = int(budget_bytes)
+        self.n_tokens = int(n_tokens)
+        self.n_embd = int(n_embd)
+        super().__init__(
+            f"{self.code}:node={self.node_id}:wire={self.wire_bytes}"
+            f":budget={self.budget_bytes}:n_tokens={self.n_tokens}"
+            f":n_embd={self.n_embd}"
+        )
 
 #: 从节点心跳的**容忍上限**（秒）。★ 2026-10-05（DIST-2）：定义上移到
 #: `scheduler_types.WORKER_HEARTBEAT_MAX_AGE`，让**容量规划**与 **readiness**
@@ -222,6 +257,32 @@ def _layer_stage_result_to_pipeline_value(
     if isinstance(token, bool) or not isinstance(token, int) or token < 0:
         raise ValueError("tail layer stage result requires token_argmax")
     return {"kind": "token", "token_argmax": token}
+
+
+def _assert_layer_stage_offer_fits_frame(
+    *, node_id: str, n_tokens: int, n_embd: int, dtype: str = "float32",
+) -> None:
+    """★ 2026-10-07（DIST-NEXT-2）：dispatch 前的层段 wire 大小预检。
+
+    抽出为模块级纯函数（不依赖 `Scheduler` 状态），使两侧共用同一判据并可独立单测。
+    """
+    wire_bytes = hidden_wire_bytes(n_tokens, n_embd, dtype)
+    budget_bytes = stage_payload_budget_bytes()
+    if hidden_fits_stage_frame(n_tokens, n_embd, dtype):
+        return
+    logger.warning(
+        "Route-A stage 帧预算不足: node=%s n_tokens=%d n_embd=%d dtype=%s "
+        "wire=%dB budget=%dB max_tokens=%d",
+        node_id, n_tokens, n_embd, dtype, wire_bytes, budget_bytes,
+        max_hidden_tokens(n_embd, dtype),
+    )
+    raise LayerStageFrameTooLarge(
+        node_id=node_id,
+        wire_bytes=wire_bytes,
+        budget_bytes=budget_bytes,
+        n_tokens=n_tokens,
+        n_embd=n_embd,
+    )
 
 
 class SchedulerPipelineMixin:
@@ -1317,6 +1378,13 @@ class SchedulerPipelineMixin:
         from task_worker_adapter import remote_provider_id
 
         raw, n_tokens, n_embd = _hidden_to_raw_f32(hidden_states)
+        # ★ 2026-10-07（DIST-NEXT-2）：**offer 前**按 `n_tokens * n_embd * dtype` 预检
+        #   wire 大小。输入与中间段输出（`hidden_out_f32`）同尺寸，所以一次预检覆盖往返；
+        #   超限时在 reserve/execute 之前以稳定 reason 结束 —— 不再让大 payload 走到
+        #   「执行完成后才 `message_too_large`」。
+        _assert_layer_stage_offer_fits_frame(
+            node_id=str(node_id), n_tokens=n_tokens, n_embd=n_embd,
+        )
         hidden_spec = {
             "n_tokens": n_tokens,
             "n_embd": n_embd,
@@ -5510,28 +5578,34 @@ class SchedulerPipelineMixin:
                                 f"{assignment['node_id']}"
                             ),
                         }
-                    stage_result = self._execute_layer_stage_offer(
-                        node_id=assignment["node_id"],
-                        assignment=assignment,
-                        hidden_states=current_hidden,
-                        model_identity=stage_model_identity,
-                        # ★ 协议要求 `wf_` 前缀（`_WORKFLOW_ID = ^wf_[A-Za-z0-9_-]{8,96}$`）；
-                        #   Route A 原先直接传裸 `task_id`（12 位 hex），会被 offer 校验拒掉。
-                        workflow_id=f"wf_{task_id}",
-                        request_id=f"{task_id}:step:{step}",
-                        stage_id=f"{assignment['node_id']}:step:{step}",
-                        context_size=context_size,
-                        pos_base=0,
-                        want_hidden=not last_stage,
-                        # ★ 2026-10-03：层段接力必须走 **keep-head** 通道（末层输出，
-                        #   `output_norm` **之前**）—— 协议里 `extract_hidden` 是旧默认，
-                        #   会多一次 `output_norm`。传错通道会让跨机 D→L 从 decode 起
-                        #   分叉（真机实测：首 token 一致、第 3 个 token 起偏）。
-                        middle_channel="keep_head_layer_out",
-                        seq_ids=[0] * n_tokens,
-                        positions=positions,
-                        cancel_event=_cancel_event,
-                    )
+                    try:
+                        stage_result = self._execute_layer_stage_offer(
+                            node_id=assignment["node_id"],
+                            assignment=assignment,
+                            hidden_states=current_hidden,
+                            model_identity=stage_model_identity,
+                            # ★ 协议要求 `wf_` 前缀（`_WORKFLOW_ID = ^wf_[A-Za-z0-9_-]{8,96}$`）；
+                            #   Route A 原先直接传裸 `task_id`（12 位 hex），会被 offer 校验拒掉。
+                            workflow_id=f"wf_{task_id}",
+                            request_id=f"{task_id}:step:{step}",
+                            stage_id=f"{assignment['node_id']}:step:{step}",
+                            context_size=context_size,
+                            pos_base=0,
+                            want_hidden=not last_stage,
+                            # ★ 2026-10-03：层段接力必须走 **keep-head** 通道（末层输出，
+                            #   `output_norm` **之前**）—— 协议里 `extract_hidden` 是旧默认，
+                            #   会多一次 `output_norm`。传错通道会让跨机 D→L 从 decode 起
+                            #   分叉（真机实测：首 token 一致、第 3 个 token 起偏）。
+                            middle_channel="keep_head_layer_out",
+                            seq_ids=[0] * n_tokens,
+                            positions=positions,
+                            cancel_event=_cancel_event,
+                        )
+                    except LayerStageFrameTooLarge as exc:
+                        # ★ 2026-10-07（DIST-NEXT-2）：dispatch 前的不可恢复拒绝。
+                        #   具名 reason（含所需/上限字节数与维度）直接回给调用方，
+                        #   不再让请求走「发不出的 offer → 执行超时 → 回退」。
+                        return {"response": "", "error": str(exc)}
                     if last_stage:
                         if stage_result.get("kind") != "token":
                             return {"response": "", "error": "route_a_tail_missing_token"}

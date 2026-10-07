@@ -21,6 +21,18 @@ MAX_PROTOCOL_VERSION = 3
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 FULL_WORKER_KINDS = frozenset({"pc_full_worker", "android_full_worker"})
 
+#: ★ 2026-10-07（DIST-NEXT-2）：层段 hidden 的 **wire 预算**。
+#:
+#: 层段的 `root_input.hidden_f32` 与中间段的 `output.hidden_out_f32` 都是 raw 数据
+#: 经 base64 承载，而单条消息的上限是 `MAX_MESSAGE_BYTES`。**必须在 dispatch 前**按
+#: `n_tokens * n_embd * dtype` 估算，否则合法的长 prefill / 大 `n_embd` 会先通过准入、
+#: 在执行完成后才触发 `message_too_large`（过晚的契约发现，表现为 stage 超时/回退）。
+_BASE64_EXPANSION = 4 / 3
+HIDDEN_DTYPE_BYTES = {"float32": 4, "float16": 2}
+#: 帧内除 hidden 之外的余量：JSON 外壳、`layer_range`/`hidden_spec`、
+#: `seq_ids`/`positions`（n_tokens 量级）与 metadata。
+STAGE_FRAME_RESERVE_BYTES = 256 * 1024
+
 # Runtime profiles are part of the release capability contract.  Keep this
 # dependency-free so protocol validation can run in the slim worker process.
 RUNTIME_PROFILES = ("llama_cpp_only", "torch_cpu", "torch_cuda")
@@ -1136,3 +1148,79 @@ def worker_protocol_status(
             "admission_state", "n2_4_experiment_disabled"
         ),
     }
+
+
+def hidden_wire_bytes(
+    n_tokens: int, n_embd: int, dtype: str = "float32",
+) -> int:
+    """层段 hidden 在 JSON 帧里占用的字节数（raw + base64 膨胀）。
+
+    ★ 2026-10-07（DIST-NEXT-2）：dispatch 前的**唯一** wire 大小来源。协议两侧
+    （主仓 Python 与 `android` 的 `TaskWorkerProtocol`）用同一公式与同一余量常量。
+    """
+    if dtype not in HIDDEN_DTYPE_BYTES:
+        raise _error(
+            "unsupported_hidden_dtype", "hidden_spec.dtype",
+            "hidden dtype must be one of "
+            + ", ".join(sorted(HIDDEN_DTYPE_BYTES)),
+        )
+    tokens = int(n_tokens)
+    embd = int(n_embd)
+    if tokens < 1 or embd < 1:
+        raise _error(
+            "invalid_hidden_spec", "hidden_spec",
+            "hidden_spec.n_tokens/n_embd must be positive",
+        )
+    raw_bytes = tokens * embd * HIDDEN_DTYPE_BYTES[dtype]
+    return int(math.ceil(raw_bytes * _BASE64_EXPANSION))
+
+
+def stage_payload_budget_bytes(
+    *, max_message_bytes: int = MAX_MESSAGE_BYTES,
+) -> int:
+    """单条 stage 消息里可承载的 hidden 预算（已扣除帧内其它字段的余量）。"""
+    limit = int(max_message_bytes)
+    if limit <= STAGE_FRAME_RESERVE_BYTES:
+        raise _error(
+            "invalid_message_limit", "message",
+            "max_message_bytes must exceed the frame reserve",
+        )
+    return limit - STAGE_FRAME_RESERVE_BYTES
+
+
+def hidden_fits_stage_frame(
+    n_tokens: int,
+    n_embd: int,
+    dtype: str = "float32",
+    *,
+    max_message_bytes: int = MAX_MESSAGE_BYTES,
+) -> bool:
+    """该 hidden 能否装进单帧（不装得下就必须在 dispatch 前拒绝）。"""
+    return hidden_wire_bytes(n_tokens, n_embd, dtype) <= stage_payload_budget_bytes(
+        max_message_bytes=max_message_bytes,
+    )
+
+
+def max_hidden_tokens(
+    n_embd: int,
+    dtype: str = "float32",
+    *,
+    max_message_bytes: int = MAX_MESSAGE_BYTES,
+) -> int:
+    """给定额度下每帧可承载的最大 token 数（诊断与日志用）。"""
+    if dtype not in HIDDEN_DTYPE_BYTES:
+        raise _error(
+            "unsupported_hidden_dtype", "hidden_spec.dtype",
+            "hidden dtype must be one of "
+            + ", ".join(sorted(HIDDEN_DTYPE_BYTES)),
+        )
+    embd = int(n_embd)
+    if embd < 1:
+        raise _error(
+            "invalid_hidden_spec", "hidden_spec.n_embd",
+            "hidden_spec.n_embd must be positive",
+        )
+    per_token = embd * HIDDEN_DTYPE_BYTES[dtype] * _BASE64_EXPANSION
+    return int(stage_payload_budget_bytes(
+        max_message_bytes=max_message_bytes,
+    ) // per_token)
