@@ -6,6 +6,7 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import api_server
+from worker_assignment_state import WorkerAssignmentRegistry
 
 
 def test_unload_model_is_idempotent_and_keeps_lazy_manager_cold(monkeypatch):
@@ -16,6 +17,9 @@ def test_unload_model_is_idempotent_and_keeps_lazy_manager_cold(monkeypatch):
         _inference_lock=threading.RLock(),
         _layer_execution_lock=threading.RLock(),
         _layer_config_lock=threading.RLock(),
+        # ★ 2026-10-07（DIST-NEXT-3）：assignment 权威视图是卸载路径依赖的**真实契约**
+        #   （`_layer_config_pushed` 已降级为它的派生视图），fake scheduler 必须提供它。
+        _worker_assignments=WorkerAssignmentRegistry(),
         _layer_config_pushed=set(),
         _layer_config_expected={},
         _layer_config_acks={},
@@ -56,6 +60,8 @@ def test_unload_model_releases_engine_runtime_and_worker_reservation(monkeypatch
         _inference_lock=threading.RLock(),
         _layer_execution_lock=threading.RLock(),
         _layer_config_lock=threading.RLock(),
+        # ★ 2026-10-07（DIST-NEXT-3）：同上，卸载路径要求 assignment 权威视图存在。
+        _worker_assignments=WorkerAssignmentRegistry(),
         _layer_config_pushed=set(),
         _layer_config_expected={},
         _layer_config_acks={},
