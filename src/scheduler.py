@@ -94,6 +94,8 @@ from task_provider import (
     sanitize_result_metadata as sanitize_task_result_metadata,
 )
 from task_worker_adapter import (
+    RELEASE_REASON_DISCONNECTED,
+    RELEASE_REASON_HEARTBEAT_STALE,
     RemoteFullWorkerProvider,
     TaskWorkerControlPlane,
     remote_provider_id,
@@ -2708,11 +2710,58 @@ class Scheduler(
 
         return result
 
+    def _reap_stale_worker_reservations(
+        self, now: Optional[float] = None,
+    ) -> dict[str, list[str]]:
+        """★ 2026-10-07（DIST-NEXT-4b）：回收「心跳过期且无在跑 attempt」的 reservation。
+
+        审计 P0-3 要求「断线、心跳过期、服务重建都必须**原子撤销** assignment 和
+        reservation，并记录**单一 reason code**」。断线已有专门路径（`notify_disconnect`
+        全量回收）；这里补的是**心跳过期但 TCP 仍在线**的窗口：
+
+        * 只回收**已终结**的条目（`release_stale_reservations`），不打断 in-flight 执行；
+        * 逐节点记一条 `event=task_worker_reservations_released`，`reason` 固定为
+          `worker_heartbeat_stale`（单一 reason code，便于 grep 与对账）。
+
+        返回 `{node_id: [reservation_id...]}`；幂等，可安全地周期性调用。
+        """
+        current = time.time() if now is None else float(now)
+        with self._task_worker_stage_lock:
+            providers = dict(self._remote_task_worker_providers)
+        if not providers:
+            return {}
+        released: dict[str, list[str]] = {}
+        for node_id, provider in providers.items():
+            with self._nodes_lock:
+                node = self.nodes.get(node_id)
+            if node is None:
+                continue
+            try:
+                fresh = node.is_heartbeat_fresh(current, WORKER_HEARTBEAT_MAX_AGE)
+            except Exception:       # 嵌入/测试构造的节点可能没有该方法
+                continue
+            if fresh:
+                continue
+            freed = provider.release_stale_reservations(RELEASE_REASON_HEARTBEAT_STALE)
+            if freed:
+                released[node_id] = freed
+                logger.warning(
+                    "event=task_worker_reservations_released node_id=%s reason=%s "
+                    "released=%s",
+                    node_id, RELEASE_REASON_HEARTBEAT_STALE, freed,
+                )
+        return released
+
     def _get_pipeline_capacity_nodes(
         self, eligible_node_ids: Optional[set[str]] = None,
     ) -> list[dict]:
         """Project live layer-worker profiles into explicit free-memory budgets."""
         from config import PIPELINE_CAPACITY_RESERVE_MB
+
+        # ★ 2026-10-07（DIST-NEXT-4b）：规划前先回收「心跳已过期且没有在跑 attempt」的
+        #   reservation。TCP 半开/心跳线程失效的节点在巡检窗口（约 131s）里 TCP 仍算在线
+        #   ⇒ 不走断线回收路径，`max_concurrency=1` 的槽位会被「已预留未执行」永久占住。
+        self._reap_stale_worker_reservations()
 
         reserve_bytes = int(PIPELINE_CAPACITY_RESERVE_MB * 1024 * 1024)
         with self._layer_config_lock:
@@ -4402,7 +4451,11 @@ class Scheduler(
         with self._task_worker_stage_lock:
             remote_provider = self._remote_task_worker_providers.get(client_id)
         if remote_provider is not None:
-            remote_provider.notify_disconnect()
+            # ★ 2026-10-07（DIST-NEXT-4b）：断线走的 reason code 显式给定（单一来源），
+            #   provider 侧会记 `event=task_worker_reservations_released`。
+            remote_provider.notify_disconnect(
+                reason_code=RELEASE_REASON_DISCONNECTED,
+            )
         with self._forward_cancel_lock:
             client_cancellations = [
                 event for (owner_id, _), event

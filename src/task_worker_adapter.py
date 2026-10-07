@@ -44,6 +44,18 @@ from task_worker_protocol import (
 
 _MESSAGE_CACHE_LIMIT = 1024
 
+#: ★ 2026-10-07（DIST-NEXT-4b）：reservation 撤销的**单一 reason code**。
+#: 每次撤销都带其中一个值记一条 `event=task_worker_reservations_released` ——
+#: 否则「这个节点的槽位为什么被释放」在日志里说不清（审计 P0-3 要求单一 reason code）。
+RELEASE_REASON_DISCONNECTED = "worker_tcp_disconnected"
+RELEASE_REASON_HEARTBEAT_STALE = "worker_heartbeat_stale"
+RELEASE_REASON_SERVICE_RESTART = "worker_service_restarted"
+RELEASE_REASONS = (
+    RELEASE_REASON_DISCONNECTED,
+    RELEASE_REASON_HEARTBEAT_STALE,
+    RELEASE_REASON_SERVICE_RESTART,
+)
+
 
 def remote_provider_id(node_id: str) -> str:
     """Return a stable Provider ID for one authenticated worker node."""
@@ -1439,7 +1451,9 @@ class RemoteFullWorkerProvider:
         if message is not None:
             self._queue_cancel_message(attempt_id, message)
 
-    def notify_disconnect(self) -> None:
+    def notify_disconnect(
+        self, *, reason_code: str = RELEASE_REASON_DISCONNECTED,
+    ) -> None:
         """对端断连：唤醒所有 pending，并**主动回收本 provider 的全部 reservation**。
 
         ★ 2026-10-05（DIST-2 要求 2：「节点掉线…必须释放 lease」）：此前这里只把
@@ -1452,6 +1466,10 @@ class RemoteFullWorkerProvider:
         `release()` 是**纯本地 dict 操作**（不向 worker 发任何消息），在断连路径上
         调用没有副作用；先唤醒 pending 再回收，顺序保证等待方先拿到
         `remote_worker_disconnected` 错误。
+
+        ★ 2026-10-07（DIST-NEXT-4b）：`reason_code` 由调用方给出（断线 / 心跳过期 /
+        服务重建），调用方据此记**单一**撤销事件；错误码本身保持
+        `remote_worker_disconnected`（等待方语义不变）。
         """
         with self._lock:
             released = []
@@ -1474,6 +1492,33 @@ class RemoteFullWorkerProvider:
         # 锁内再取会自锁）。
         for reservation_id in reservation_ids:
             self.release(reservation_id)
+        if reservation_ids:
+            logger.info(
+                "event=task_worker_reservations_released node_id=%s reason=%s "
+                "released=%d",
+                self.node_id, reason_code, len(reservation_ids),
+            )
+
+    def release_stale_reservations(self, reason_code: str) -> list[str]:
+        """★ 2026-10-07（DIST-NEXT-4b）：撤销**没有在跑 attempt** 的 reservation。
+
+        与 [notify_disconnect] 的区别：断线是「对端确定没了」⇒ 全部回收；心跳过期
+        时对端可能只是心跳线程失效、stage 仍在跑 ⇒ 只回收**已终结**（无 pending 或
+        pending 的 `result_event` 已置）的条目，避免打断 in-flight 执行。返回被撤销的
+        reservation id，供调用方按 `reason_code` 记一条单一事件。
+        """
+        with self._lock:
+            freed: list[str] = []
+            for reservation_id in list(self._reservations.keys()):
+                attempt_id = self._reservation_attempts.get(reservation_id, "")
+                pending = self._pending.get(attempt_id) if attempt_id else None
+                if pending is not None and not pending.result_event.is_set():
+                    continue        # in-flight ⇒ 交给取消/租约路径收敛
+                freed.append(reservation_id)
+        # `release()` 自带锁 ⇒ 锁外调用。
+        for reservation_id in freed:
+            self.release(reservation_id)
+        return freed
 
     def release(self, reservation_id: str) -> None:
         with self._lock:
