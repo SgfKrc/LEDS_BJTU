@@ -1166,6 +1166,15 @@ class RemoteFullWorkerProvider:
         )
         try:
             self._send_message(offer)
+            # ★ 2026-10-08（诊断，定位后降级）：真机卡点是「18 片已发、offer 似乎从不被
+            #   worker 读到」⇒ 先确认 offer 到底有没有写出去（以及它是否已是 hidden_ref 形态）。
+            logger.info(
+                "event=task_worker_stage_offer_sent node_id=%s attempt_id=%s stage_id=%s "
+                "bytes=%d chunked=%s",
+                self.provider_id, attempt.attempt_id, attempt.request.stage_id,
+                len(json.dumps(offer, default=str).encode("utf-8")),
+                isinstance(root_input.get("hidden_ref"), dict),
+            )
         except Exception as exc:
             # A cancellation that raced with a failed offer send has no
             # remote work left to acknowledge. Mark it terminal so release()
