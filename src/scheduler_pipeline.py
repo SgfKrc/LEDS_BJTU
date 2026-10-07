@@ -294,14 +294,29 @@ def _layer_stage_result_to_pipeline_value(
 
 def _assert_layer_stage_offer_fits_frame(
     *, node_id: str, n_tokens: int, n_embd: int, dtype: str = "float32",
+    chunked_input: bool = False,
 ) -> None:
     """★ 2026-10-07（DIST-NEXT-2）：dispatch 前的层段 wire 大小预检。
 
     抽出为模块级纯函数（不依赖 `Scheduler` 状态），使两侧共用同一判据并可独立单测。
+
+    ★ 2026-10-08（DIST-NEXT-2b）：`chunked_input=True` 表示目标 worker 声明了
+    `stage_chunked_input` —— 此时**不得**在此拒绝。分片发生在 provider 层
+    （`task_worker_adapter._maybe_send_stage_chunks`，先发 `chunk_count` 条 `stage_chunk`
+    再发 offer），而本预检在 provider **之前**，无条件拒绝会让分片路径**永远走不到**：
+    实测 ≈2475 tokens 的 prompt 得到 `route_a_stage_frame_too_large:…:wire=24160940`
+    而非分片。未声明分片的对端仍保持 fail-closed。
     """
     wire_bytes = hidden_wire_bytes(n_tokens, n_embd, dtype)
     budget_bytes = stage_payload_budget_bytes()
     if hidden_fits_stage_frame(n_tokens, n_embd, dtype):
+        return
+    if chunked_input:
+        logger.debug(
+            "Route-A stage 帧超预算但对端声明分片，交由 provider 分片发送: node=%s "
+            "wire=%dB budget=%dB n_tokens=%d",
+            node_id, wire_bytes, budget_bytes, n_tokens,
+        )
         return
     logger.warning(
         "Route-A stage 帧预算不足: node=%s n_tokens=%d n_embd=%d dtype=%s "
@@ -316,6 +331,27 @@ def _assert_layer_stage_offer_fits_frame(
         n_tokens=n_tokens,
         n_embd=n_embd,
     )
+
+
+def _node_declares_stage_chunked_input(control: Any, node_id: str) -> bool:
+    """★ 2026-10-08（DIST-NEXT-2b）：该节点是否声明 `stage_chunked_input`。
+
+    声明 ⇒ 超预算的 hidden 由 provider 切 `stage_chunk` 分片发送，预检不得提前拒绝；
+    未声明（含查询失败）⇒ 返回 False，维持 fail-closed 的既有语义。
+    """
+    if control is None:
+        return False
+    try:
+        status = control.status(role="master")
+    except Exception:
+        logger.debug("查询 task worker 分片能力失败: node=%s", node_id, exc_info=True)
+        return False
+    for worker in (status or {}).get("workers", []) or []:
+        if not isinstance(worker, dict) or worker.get("node_id") != node_id:
+            continue
+        capabilities = worker.get("capabilities")
+        return isinstance(capabilities, dict) and capabilities.get("stage_chunked_input") is True
+    return False
 
 
 class SchedulerPipelineMixin:
@@ -1593,6 +1629,11 @@ class SchedulerPipelineMixin:
         #   「执行完成后才 `message_too_large`」。
         _assert_layer_stage_offer_fits_frame(
             node_id=str(node_id), n_tokens=n_tokens, n_embd=n_embd,
+            # ★ 2026-10-08（DIST-NEXT-2b）：对端声明 `stage_chunked_input` ⇒ 超预算的
+            #   hidden 交由 provider 切 `stage_chunk` 分片发送，不在此提前拒绝。
+            chunked_input=_node_declares_stage_chunked_input(
+                getattr(self, "_task_worker_control", None), str(node_id),
+            ),
         )
         hidden_spec = {
             "n_tokens": n_tokens,
