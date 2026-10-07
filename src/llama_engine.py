@@ -1987,16 +1987,19 @@ class LlamaCppEngine:
                 "keep-head 上游不可用：未找到 shim（可设 QLH_KEEP_HEAD_SHIM）；"
                 "拒绝交付语义不兼容的 embeddings hidden（docs/已知问题记录.md #35）")
             return None
-        # 挂点判据：`nextn` 导出「末层输出」，但**各架构挂点不同** —— qwen2 在
-        # `output_norm` **之前**（正是接力要的），qwen35 在**之后**（多一次 RMSNorm，
-        # 实测会让接力首步分叉，见 `src/llama_keep_head.py` 的模块说明）。后者一律
-        # 不用 keep-head：宁可回退并告警，也不交付语义错的 hidden。
-        model_type = str(desc.get("model_type", "") or "")
-        if model_type.startswith("qwen3"):
-            logger.warning(
-                "keep-head 上游不可用：%s 的 nextn 挂点在 output_norm 之后，交付会"
-                "错位（docs/已知问题记录.md #35）", model_type)
-            return None
+        # ★ 2026-10-07：**删除了此前的 `qwen3*` 无条件拒绝判据**。
+        #   旧判据依据「`nextn` 导出末层输出，各架构 `t_h_nextn` 挂点不同（qwen2 在
+        #   `output_norm` 之前、qwen3* 在之后，多一次 RMSNorm）」—— 但
+        #   `scripts/model_tools/keep_head_shim/qlh_keep_head.c:14-21` 记载 2026-09-23
+        #   起已统一改用 `layer_inp` 的 `lid == n_layer` 槽位（不再走
+        #   `llama_set_embeddings_nextn`），挂点即「模型自身最后一层的输出、
+        #   `output_norm` 之前」，**各架构一致**。
+        #   实测（2026-10-07，`scripts/model_tools/probes/probe_q35_hook.py`，qwen3_5）：
+        #   `mode="nextn"`（head16 工件）与 `mode="layer_inp"`（整模 cut=16）输出**相同**，
+        #   且都对应 `[0,16)` 层段的输出 —— `rel_err=7.169e-02`、**`cos=0.988463`**；
+        #   该 rel_err 量级是 GGUF Q4_K_M 量化 vs HF fp32 的正常差异。
+        #   ⇒ 判据已过时（会**误拒** qwen3.5 的 llama 上游），故移除。
+        #   详见 `docs/已知问题记录.md` #54 与 `docs/真三机产品路径攻坚-2026-10-07.md` §4.2。
         try:
             from llama_keep_head import KeepHeadUpstream
 
