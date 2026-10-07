@@ -47,6 +47,7 @@ from worker_assignment_state import (
     REASON_CONFIG_ACKED,
     REASON_CONFIG_CLEARED,
     REASON_WORKER_RELEASED,
+    evaluate_assignment_consistency,
 )
 from torch_runtime import loaded_torch
 
@@ -639,7 +640,14 @@ class SchedulerPipelineMixin:
             for node_id, expected in self._layer_config_expected.items():
                 if expected.get("release"):
                     return
-                if node_id not in self._layer_config_pushed:
+                pushed = node_id in self._layer_config_pushed
+                # ★ 2026-10-07（DIST-NEXT-3 第二步·观测）：用 assignment 权威视图校验这条
+                #   「多集合交叉判定」。**判据不变**（零行为变化）——只在两者不一致时记一条
+                #   具名事件，作为后续逐条切换读路径的证据。
+                self._observe_assignment_state_consistency(
+                    node_id, legacy_pushed=pushed, expected=expected,
+                )
+                if not pushed:
                     return
         for assignment in plan.get("assignments", []):
             if not isinstance(assignment, dict):
@@ -659,6 +667,34 @@ class SchedulerPipelineMixin:
                 and transaction.get("phase") == "ready"
             ):
                 self._clear_pipeline_recovery_fence()
+
+    def _observe_assignment_state_consistency(
+        self, node_id: str, *, legacy_pushed: bool, expected: dict,
+    ) -> None:
+        """★ 2026-10-07（DIST-NEXT-3 第二步）：比对权威视图与旧集合判据（**只观测**）。
+
+        不改变任何判据，只把「多集合交叉判定」与 `WorkerAssignmentState` 的分歧记成一条
+        具名事件（`event=worker_assignment_state_divergence`）——这是把读路径逐条切到
+        权威视图的前置证据（先让分歧可见，再切判据）。
+        """
+        registry = getattr(self, "_worker_assignments", None)
+        if registry is None:
+            return
+        state = registry.state(node_id)
+        verdict = evaluate_assignment_consistency(
+            state,
+            legacy_pushed=bool(legacy_pushed),
+            has_expected=isinstance(expected, dict) and bool(expected),
+        )
+        if verdict.consistent:
+            return
+        logger.warning(
+            "event=worker_assignment_state_divergence node_id=%s reason=%s "
+            "state_phase=%s assignment_id=%s legacy_pushed=%s",
+            node_id, verdict.reason_code, verdict.state_phase,
+            "" if state is None else state.assignment_id,
+            bool(legacy_pushed),
+        )
 
     @property
     def _active_layer_config(self):

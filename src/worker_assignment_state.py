@@ -245,3 +245,57 @@ def assignment_state_summary(
         )
         counts[phase] = counts.get(phase, 0) + 1
     return counts
+
+
+#: 一致性分歧的具名原因（`event=worker_assignment_state_divergence`）。
+DIVERGENCE_STATE_MISSING = "state_missing_but_legacy_expected"
+DIVERGENCE_TERMINAL_BUT_PUSHED = "terminal_state_but_legacy_pushed"
+DIVERGENCE_READY_BUT_NOT_PUSHED = "state_ready_but_legacy_not_pushed"
+
+
+@dataclass(frozen=True)
+class AssignmentConsistency:
+    """权威视图与旧集合判据的比对结果（仅用于**观测**，不改变任何判据）。"""
+
+    consistent: bool
+    reason_code: str = ""
+    state_phase: str = ""
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "consistent": self.consistent,
+            "reason_code": self.reason_code,
+            "state_phase": self.state_phase,
+        }
+
+
+def evaluate_assignment_consistency(
+    state: Optional[WorkerAssignmentState],
+    *,
+    legacy_pushed: bool,
+    has_expected: bool,
+) -> AssignmentConsistency:
+    """把「权威视图」与「`_layer_config_expected` / `_layer_config_pushed`」对照。
+
+    刻意**只判等价关系**，不决定任何行为：读路径切换前，先让真实分歧在日志里可见
+    （`event=worker_assignment_state_divergence`），而不是继续靠多集合各自推断。
+    """
+    if state is None:
+        if has_expected:
+            return AssignmentConsistency(
+                consistent=False, reason_code=DIVERGENCE_STATE_MISSING,
+            )
+        return AssignmentConsistency(consistent=True)
+    if state.terminal and legacy_pushed:
+        return AssignmentConsistency(
+            consistent=False,
+            reason_code=DIVERGENCE_TERMINAL_BUT_PUSHED,
+            state_phase=state.phase,
+        )
+    if state.phase == PHASE_READY and not legacy_pushed:
+        return AssignmentConsistency(
+            consistent=False,
+            reason_code=DIVERGENCE_READY_BUT_NOT_PUSHED,
+            state_phase=state.phase,
+        )
+    return AssignmentConsistency(consistent=True, state_phase=state.phase)

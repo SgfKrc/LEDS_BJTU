@@ -149,6 +149,76 @@ def test_snapshot_and_summary_are_serializable():
     }) == {PHASE_RELEASED: 1}
 
 
+def test_consistency_check_flags_the_three_divergences():
+    """权威视图 vs 旧集合判据：三种分歧各有具名原因，且只观测、不决定行为。"""
+    from worker_assignment_state import (
+        DIVERGENCE_READY_BUT_NOT_PUSHED,
+        DIVERGENCE_STATE_MISSING,
+        DIVERGENCE_TERMINAL_BUT_PUSHED,
+        evaluate_assignment_consistency,
+    )
+
+    # 一致：既无权威状态、也无旧期望
+    assert evaluate_assignment_consistency(
+        None, legacy_pushed=False, has_expected=False,
+    ).consistent
+
+    # 分歧①：旧期望在、权威视图没有
+    verdict = evaluate_assignment_consistency(
+        None, legacy_pushed=False, has_expected=True,
+    )
+    assert not verdict.consistent
+    assert verdict.reason_code == DIVERGENCE_STATE_MISSING
+
+    # 分歧②：终止态 vs 旧 pushed
+    registry, _ = _registry()
+    registry.begin("w", config_id="c")
+    registry.release("w", reason_code="config_cleared")
+    verdict = evaluate_assignment_consistency(
+        registry.state("w"), legacy_pushed=True, has_expected=True,
+    )
+    assert verdict.reason_code == DIVERGENCE_TERMINAL_BUT_PUSHED
+
+    # 分歧③：ready 相位 vs 旧未 pushed
+    ready_registry, _ = _registry()
+    ready_registry.begin("w", config_id="c")
+    ready_registry.transition("w", phase=PHASE_READY)
+    verdict = evaluate_assignment_consistency(
+        ready_registry.state("w"), legacy_pushed=False, has_expected=True,
+    )
+    assert verdict.reason_code == DIVERGENCE_READY_BUT_NOT_PUSHED
+
+    # 一致：pushing 相位 + 旧未 pushed（ACK 还没到，两边都"未就绪"）
+    assert evaluate_assignment_consistency(
+        ready_registry.state("w") if False else None,
+        legacy_pushed=False,
+        has_expected=False,
+    ).consistent
+
+
+def test_recovery_fence_observes_divergence_without_changing_the_verdict(caplog):
+    """观测点：分歧进日志，判据不变（这是"先让分歧可见、再切读路径"的落点）。"""
+    sched = Scheduler()
+    registry = sched._worker_assignments
+    registry.begin("worker_01", config_id="cfg-1")
+    registry.release("worker_01", reason_code=REASON_CONFIG_CLEARED)
+
+    with caplog.at_level("WARNING", logger="scheduler"):
+        sched._observe_assignment_state_consistency(
+            "worker_01", legacy_pushed=True, expected={"config_id": "cfg-1"},
+        )
+
+    assert "event=worker_assignment_state_divergence" in caplog.text
+    assert "terminal_state_but_legacy_pushed" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="scheduler"):
+        sched._observe_assignment_state_consistency(
+            "worker_01", legacy_pushed=False, expected={},
+        )
+    assert "worker_assignment_state_divergence" not in caplog.text
+
+
 def test_scheduler_write_paths_feed_the_authority_view():
     """现有写路径（publish / ACK / clear）已同步进权威视图。"""
     sched = Scheduler()
