@@ -219,6 +219,48 @@ def test_recovery_fence_observes_divergence_without_changing_the_verdict(caplog)
     assert "worker_assignment_state_divergence" not in caplog.text
 
 
+def test_pushed_equivalence_mapping_and_effective_verdict(caplog):
+    """`_layer_config_pushed` 的等价映射，以及"读路径切换"的保守规则。"""
+    from worker_assignment_state import pushed_from_state
+
+    registry, _ = _registry()
+    # 无记录 ⇒ 无从推导
+    assert pushed_from_state(None) is None
+    # 未 ACK 的相位 ⇒ False
+    registry.begin("w_pushing", config_id="c")
+    assert pushed_from_state(registry.state("w_pushing")) is False
+    # ACK 之后 ⇒ True（与 `_layer_config_pushed.add` 的语义等价）
+    registry.transition("w_pushing", phase=PHASE_ACKED)
+    assert pushed_from_state(registry.state("w_pushing")) is True
+    registry.transition("w_pushing", phase=PHASE_READY)
+    assert pushed_from_state(registry.state("w_pushing")) is True
+    # 终止态 ⇒ False
+    registry.release("w_pushing", reason_code=REASON_CONFIG_CLEARED)
+    assert pushed_from_state(registry.state("w_pushing")) is False
+
+    sched = Scheduler()
+    # ① 无记录 ⇒ 沿用旧集合
+    assert sched._effective_layer_config_pushed("unknown_node", True) is True
+    assert sched._effective_layer_config_pushed("unknown_node", False) is False
+
+    # ② 等价场景 ⇒ 读权威视图（结果与旧集合一致）
+    sched._worker_assignments.begin("w_acked", config_id="c")
+    sched._worker_assignments.transition("w_acked", phase=PHASE_ACKED)
+    assert sched._effective_layer_config_pushed("w_acked", True) is True
+    assert sched._effective_layer_config_pushed("w_acked", False) is False
+
+    # ③ 分歧场景 ⇒ 保留旧判据（fail-closed），且观测点已留证据
+    sched._worker_assignments.begin("w_released", config_id="c")
+    sched._worker_assignments.release("w_released", reason_code=REASON_CONFIG_CLEARED)
+    with caplog.at_level("WARNING", logger="scheduler"):
+        sched._observe_assignment_state_consistency(
+            "w_released", legacy_pushed=True, expected={"config_id": "c"},
+        )
+        verdict = sched._effective_layer_config_pushed("w_released", True)
+    assert verdict is True                       # 不改判据
+    assert "terminal_state_but_legacy_pushed" in caplog.text
+
+
 def test_scheduler_write_paths_feed_the_authority_view():
     """现有写路径（publish / ACK / clear）已同步进权威视图。"""
     sched = Scheduler()

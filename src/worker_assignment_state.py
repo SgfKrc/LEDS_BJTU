@@ -252,6 +252,20 @@ DIVERGENCE_STATE_MISSING = "state_missing_but_legacy_expected"
 DIVERGENCE_TERMINAL_BUT_PUSHED = "terminal_state_but_legacy_pushed"
 DIVERGENCE_READY_BUT_NOT_PUSHED = "state_ready_but_legacy_not_pushed"
 
+#: 旧集合 `_layer_config_pushed` 的等价相位：节点已确认收到本代际配置。
+PUSHED_PHASES = (PHASE_ACKED, PHASE_READY)
+
+
+def pushed_from_state(state: Optional[WorkerAssignmentState]) -> Optional[bool]:
+    """用权威视图推导「`_layer_config_pushed` 的等价值」。
+
+    返回 `None` 表示**无从推导**（没有 assignment 记录）——调用方应继续用旧集合，
+    而不是把"没有记录"当成 False（那会误伤尚未走配置流程的节点）。
+    """
+    if state is None:
+        return None
+    return state.phase in PUSHED_PHASES
+
 
 @dataclass(frozen=True)
 class AssignmentConsistency:

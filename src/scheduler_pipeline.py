@@ -48,6 +48,7 @@ from worker_assignment_state import (
     REASON_CONFIG_CLEARED,
     REASON_WORKER_RELEASED,
     evaluate_assignment_consistency,
+    pushed_from_state,
 )
 from torch_runtime import loaded_torch
 
@@ -647,7 +648,10 @@ class SchedulerPipelineMixin:
                 self._observe_assignment_state_consistency(
                     node_id, legacy_pushed=pushed, expected=expected,
                 )
-                if not pushed:
+                # ★ DIST-NEXT-3 第二步：**读路径切换** —— 权威视图有该节点的 assignment 时
+                #   用它的相位判定（等价场景与旧集合完全一致；分歧场景保留旧判据，且已在
+                #   上面留下 `event=worker_assignment_state_divergence` 证据）。
+                if not self._effective_layer_config_pushed(node_id, pushed):
                     return
         for assignment in plan.get("assignments", []):
             if not isinstance(assignment, dict):
@@ -695,6 +699,30 @@ class SchedulerPipelineMixin:
             "" if state is None else state.assignment_id,
             bool(legacy_pushed),
         )
+
+    def _effective_layer_config_pushed(
+        self, node_id: str, legacy_pushed: bool,
+    ) -> bool:
+        """★ 2026-10-07（DIST-NEXT-3 第二步）：读路径切换 —— **以权威视图为准**。
+
+        返回规则（fail-closed 且零行为漂移）：
+
+        * 权威视图有该节点的 assignment ⇒ 用它的相位推导（`pushed_from_state`）；
+        * 无记录 ⇒ 沿用旧集合 `_layer_config_pushed`（不把"没有记录"当 False）；
+        * 两者**不一致** ⇒ 保留旧值并已由 `_observe_assignment_state_consistency()` 记下
+          具名分歧 —— 也就是说，分歧场景下判据不变，等日志证据足够后再收口。
+
+        注意：本方法在 `_layer_config_lock` 持锁区内被调用；registry 自身不加锁，无锁序问题。
+        """
+        registry = getattr(self, "_worker_assignments", None)
+        state = None if registry is None else registry.state(node_id)
+        authoritative = pushed_from_state(state)
+        if authoritative is None:
+            return bool(legacy_pushed)
+        if authoritative == bool(legacy_pushed):
+            return authoritative
+        # 分歧：保留旧判据（保守），日志已记录
+        return bool(legacy_pushed)
 
     @property
     def _active_layer_config(self):
