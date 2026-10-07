@@ -30,8 +30,10 @@ from scheduler_pipeline import (  # noqa: E402
 )
 from task_worker_protocol import (  # noqa: E402
     MAX_MESSAGE_BYTES,
+    STAGE_CHUNK_BYTES,
     STAGE_FRAME_RESERVE_BYTES,
     WorkerProtocolError,
+    _base64_wire_length,
     hidden_fits_stage_frame,
     hidden_wire_bytes,
     max_hidden_tokens,
@@ -40,10 +42,12 @@ from task_worker_protocol import (  # noqa: E402
 
 
 def test_hidden_wire_bytes_includes_base64_expansion():
-    # 1024 个 f32 元素 = 4096 B ⇒ base64 后 5462 B（向上取整）
-    assert hidden_wire_bytes(1, 1024, "float32") == 5462
+    # 1024 个 f32 元素 = 4096 B ⇒ base64 后 4 × ceil(4096/3) = 5464 字符
+    assert hidden_wire_bytes(1, 1024, "float32") == 5464
     # f16 是同一公式的一半
-    assert hidden_wire_bytes(1, 1024, "float16") == 2731
+    assert hidden_wire_bytes(1, 1024, "float16") == 2732
+    # 1 MiB 边界：必须与真实 base64 长度一致（近似公式会少算 2 个字符）
+    assert _base64_wire_length(STAGE_CHUNK_BYTES) == 1_398_104
     with pytest.raises(WorkerProtocolError) as captured:
         hidden_wire_bytes(1, 1024, "bfloat16")
     assert captured.value.code == "unsupported_hidden_dtype"

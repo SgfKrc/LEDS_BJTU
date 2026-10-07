@@ -576,6 +576,12 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     #   连接建立即 0.7s 静默断开（`segment_mode` 那次实测的坑）。
     if "layer_artifact_diagnostics" in capabilities:
         expected_fields.add("layer_artifact_diagnostics")
+    # ★ 2026-10-07（DIST-NEXT-2b）：大 payload 分片接收能力（可选，默认关）。
+    #   只有声明 `stage_chunked_input == true` 的 worker 才会收到 `stage_chunk` +
+    #   `stage_offer.root_input.hidden_ref`；未声明者继续走内联 hidden（由 DIST-NEXT-2a
+    #   的 dispatch 前预检负责拒绝超预算请求）。两侧必须同时放行。
+    if "stage_chunked_input" in capabilities:
+        expected_fields.add("stage_chunked_input")
     _require_exact_fields(
         capabilities,
         expected_fields,
@@ -741,6 +747,11 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     if "layer_artifact_diagnostics" in capabilities:
         _validate_layer_artifact_diagnostics(
             capabilities["layer_artifact_diagnostics"],
+        )
+    if "stage_chunked_input" in capabilities:
+        _require_bool(
+            capabilities["stage_chunked_input"],
+            "payload.capabilities.stage_chunked_input",
         )
     engines = capabilities["engines"]
     if not isinstance(engines, list) or not engines or any(
@@ -1144,9 +1155,10 @@ def _validate_payload(
                 "invalid_string", "payload.payload_b64",
                 "payload.payload_b64 must be a non-empty string",
             )
-        # 单片上限用**具名**错误码（不能走 `_require_string` 的通用长度上限 ——
-        # 那会把它报成 `invalid_string`，丢掉「分片太大」这个可操作的信息）。
-        if len(chunk) > int(math.ceil(STAGE_CHUNK_BYTES * _BASE64_EXPANSION)):
+        # 单片上限：把 base64 字符数换算回 raw 字节（`±2` 是 padding 的量化误差；
+        # **精确**判定在装配器 `StageChunkAssembler.add`，那里按真实字节数比较）。
+        approx_raw_bytes = 3 * (-(-len(chunk) // 4))
+        if approx_raw_bytes > STAGE_CHUNK_BYTES + 2:
             raise _error(
                 "chunk_too_large", "payload.payload_b64",
                 f"a single chunk must not exceed {STAGE_CHUNK_BYTES} raw bytes",
@@ -1311,6 +1323,16 @@ def worker_protocol_status(
     }
 
 
+def _base64_wire_length(raw_bytes: int) -> int:
+    """标准 base64 编码后的字符数：`4 × ceil(n / 3)`。
+
+    ⚠️ 不要用 `ceil(n × 4/3)` 近似：对 1 MiB 这类 n 会少算 2 个字符，
+    使「刚好一片」的分片被误判为超限（实测踩到）。
+    """
+    count = int(raw_bytes)
+    return 4 * (-(-count // 3))
+
+
 def hidden_wire_bytes(
     n_tokens: int, n_embd: int, dtype: str = "float32",
 ) -> int:
@@ -1333,7 +1355,7 @@ def hidden_wire_bytes(
             "hidden_spec.n_tokens/n_embd must be positive",
         )
     raw_bytes = tokens * embd * HIDDEN_DTYPE_BYTES[dtype]
-    return int(math.ceil(raw_bytes * _BASE64_EXPANSION))
+    return _base64_wire_length(raw_bytes)
 
 
 def stage_payload_budget_bytes(

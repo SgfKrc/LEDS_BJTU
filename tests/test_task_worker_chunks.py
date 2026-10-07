@@ -83,8 +83,8 @@ def test_protocol_rejects_malformed_chunks():
 
     with pytest.raises(WorkerProtocolError) as chunk_too_large:
         _build(
-            payload=b"z" * (STAGE_CHUNK_BYTES + 1),
-            total_bytes=STAGE_CHUNK_BYTES + 1,
+            payload=b"z" * (STAGE_CHUNK_BYTES * 2),
+            total_bytes=STAGE_CHUNK_BYTES * 2,
         )
     assert chunk_too_large.value.code == "chunk_too_large"
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import collections
 import hashlib
 import json
@@ -29,6 +30,11 @@ from task_provider import (
     StageResult,
 )
 
+from task_worker_chunks import (
+    build_stage_chunk,
+    plan_stage_payload_chunks,
+    stage_chunk_ref,
+)
 from task_worker_protocol import (
     MAX_MESSAGE_BYTES,
     PROTOCOL_VERSION,
@@ -37,6 +43,7 @@ from task_worker_protocol import (
     build_message,
     canonical_message_bytes,
     decode_message,
+    hidden_fits_stage_frame,
     negotiate_protocol_version,
     stage_input_sha256,
 )
@@ -733,6 +740,91 @@ class RemoteFullWorkerProvider:
             for model in models
         )
 
+    def _supports_stage_chunked_input(self) -> bool:
+        """对端是否声明能接收 `stage_chunk` + `hidden_ref`（默认否）。"""
+        capabilities = (self._snapshot() or {}).get("capabilities")
+        if not isinstance(capabilities, dict):
+            return False
+        return capabilities.get("stage_chunked_input") is True
+
+    def _maybe_send_stage_chunks(self, attempt: StageAttempt) -> dict[str, Any]:
+        """★ 2026-10-07（DIST-NEXT-2b）：超预算的层段 hidden 先分片发出，返回改写后的 root_input。
+
+        * 非层段 / 无内联 hidden / 未超预算 / 对端未声明能力 ⇒ **原样返回**（零行为变化）；
+        * 声明能力且超预算 ⇒ 同步发出 `chunk_count` 条 `stage_chunk`，再把 `hidden_f32`
+          换成 `hidden_ref`（`total_bytes` / `payload_sha256` 供 worker 装配校验）；
+        * 发送失败 ⇒ `ProviderExecutionError`（明确失败，不静默退回内联 —— 那会在协议层
+          抛 `message_too_large`，把「分片发不出去」的原因丢掉）。
+        """
+        request = attempt.request
+        root_input = request.root_input if isinstance(request.root_input, dict) else {}
+        encoded = root_input.get("hidden_f32")
+        if not isinstance(encoded, str):
+            return root_input
+        stage_fields = request.stage_fields or {}
+        spec = stage_fields.get("hidden_spec") or {}
+        n_tokens = int(spec.get("n_tokens", 0) or 0)
+        n_embd = int(spec.get("n_embd", 0) or 0)
+        dtype = str(spec.get("dtype", "float32") or "float32")
+        if n_tokens < 1 or n_embd < 1:
+            return root_input
+        if hidden_fits_stage_frame(n_tokens, n_embd, dtype):
+            return root_input
+        if not self._supports_stage_chunked_input():
+            # 对端不支持 ⇒ 维持内联路径（超限由 dispatch 前的预检负责拒绝）。
+            return root_input
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except Exception as exc:
+            raise ProviderExecutionError(
+                "layer stage hidden is not valid base64",
+                code="invalid_stage_input",
+                provider_id=self.provider_id,
+            ) from exc
+        try:
+            plan = plan_stage_payload_chunks(raw)
+        except WorkerProtocolError as exc:
+            raise ProviderExecutionError(
+                f"layer stage hidden cannot be chunked: {exc}",
+                code=getattr(exc, "code", "stage_payload_too_large"),
+                provider_id=self.provider_id,
+            ) from exc
+        sent_at_ms = int(time.time() * 1000)
+        for index, chunk in enumerate(plan.chunks):
+            chunk_message = build_stage_chunk(
+                workflow_id=request.workflow_id,
+                stage_id=request.stage_id,
+                attempt_id=attempt.attempt_id,
+                lease_id=attempt.lease_id,
+                lease_epoch=attempt.lease_epoch,
+                provider_id=self.provider_id,
+                chunk_index=index,
+                chunk_count=plan.chunk_count,
+                payload=chunk,
+                total_bytes=plan.total_bytes,
+                message_id=_message_id("chunk_"),
+                sent_at_ms=sent_at_ms,
+            )
+            try:
+                self._send_message(chunk_message)
+            except Exception as exc:
+                raise ProviderExecutionError(
+                    "failed to send a layer stage input chunk",
+                    code="remote_worker_disconnected",
+                    provider_id=self.provider_id,
+                    retryable=True,
+                ) from exc
+        logger.info(
+            "event=task_worker_stage_chunks_sent node_id=%s attempt_id=%s "
+            "chunks=%d bytes=%d",
+            self.node_id, attempt.attempt_id, plan.chunk_count, plan.total_bytes,
+        )
+        chunked = {
+            key: value for key, value in root_input.items() if key != "hidden_f32"
+        }
+        chunked["hidden_ref"] = stage_chunk_ref(plan)
+        return chunked
+
     def inspect(self) -> ProviderCapabilities:
         snapshot = self._snapshot()
         capabilities = snapshot.get("capabilities", {})
@@ -1035,6 +1127,10 @@ class RemoteFullWorkerProvider:
 
         sent_at_ms = int(time.time() * 1000)
         lease_expires_at_ms = int(attempt.lease_expires_at * 1000)
+        # ★ 2026-10-07（DIST-NEXT-2b）：超帧预算的 hidden 走**有序分片**（仅当对端声明
+        #   `stage_chunked_input`）。分片必须在 offer **之前**发出：offer 只带 `hidden_ref`，
+        #   worker 收到 offer 时要求分片已齐备。未声明能力/未超预算 ⇒ 原样返回（零行为变化）。
+        root_input = self._maybe_send_stage_chunks(attempt)
         offer_payload = {
                     "workflow_id": attempt.request.workflow_id,
                     "request_id": attempt.request.request_id,
@@ -1045,10 +1141,10 @@ class RemoteFullWorkerProvider:
                     "lease_epoch": attempt.lease_epoch,
                     "lease_expires_at_ms": lease_expires_at_ms,
                     "provider_id": self.provider_id,
-                    "root_input": attempt.request.root_input,
+                    "root_input": root_input,
                     "dependencies": attempt.request.dependencies,
                     "input_sha256": stage_input_sha256(
-                        attempt.request.root_input,
+                        root_input,
                         attempt.request.dependencies,
                     ),
                     "model_identity": attempt.request.model_identity.snapshot(),
