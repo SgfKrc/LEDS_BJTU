@@ -4160,7 +4160,16 @@ def _execute_chat_full(
         generated_ids = outputs[0][prompt_len:]
         raw_text = model_manager._decode_generated_ids(generated_ids, stop_sequences).strip()
 
-        native_thinking_prompt = "<think>" in prompt[-128:].lower()
+        # ★ 2026-10-07（与 Route-A 同源的真机根因）：判据必须是「模板注入的思考块**尚未闭合**」，
+        #   而不是「prompt 里出现过 `<think`」。qwen3-5-2b 模板在 `enable_thinking` 非 true 时
+        #   注入的是已闭合的 `'<think>\n\n</think>\n\n'` ⇒ 生成段只含正文，永远等不到
+        #   `</think>`，旧判据会把正文整段丢掉（判成空响应）。
+        _prompt_tail = prompt[-128:].lower()
+        native_thinking_prompt = bool(
+            not req.show_thinking
+            and "<think" in _prompt_tail
+            and "</think>" not in _prompt_tail
+        )
         parsed_text = raw_text
         if req.show_thinking and not native_thinking_prompt and "<think" not in raw_text.lower():
             parsed_text = "【思考】\n" + raw_text

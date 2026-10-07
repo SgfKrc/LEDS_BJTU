@@ -22,6 +22,23 @@ from config import (
 )
 # ★ #31 M2：层流水线支持的架构**单一事实来源**（此前在 4 处各写了一份 `{"qwen","qwen2"}`）
 from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
+
+
+def native_thinking_suppression_required(show_thinking: bool, model_prompt: str) -> bool:
+    """★ 2026-10-07（真机复验根因）：是否需要抑制「模型原生思考」的外露。
+
+    Route-A stage 链路此前只判 `"<think" in model_prompt[-128:]` —— 把**模板给模型的指令**
+    当成了「模型已进入思考」的证据。`qwen3-5-2b` 的 chat template 在 `enable_thinking` 非 true
+    时注入的是**已闭合**的 `'<think>\\n\\n</think>\\n\\n'`（见
+    `models/qwen3-5-2b/tokenizer_config.json` 的 `chat_template`），生成段因此只含正文、
+    永远等不到 `</think>` ⇒ 流式 token 全被吞进缓冲（真机 `tokens=0`），非流式则被
+    `_format_model_response` 判成空正文（「流水线返回空响应」）。
+
+    正确判据是「模板注入的思考块**尚未闭合**」：只有那种情况下，生成文本里的思考才需要
+    等到 `</think>` 之后再外露。
+    """
+    tail = (model_prompt or "")[-128:].lower()
+    return bool(not show_thinking and "<think" in tail and "</think>" not in tail)
 # ★ 2026-10-07（DIST-NEXT-7）：A1 relay 的隔离边界（唯一门 + 独立诊断 namespace）。
 from relay_a1_legacy import (
     a1_isolation_status,
@@ -5661,8 +5678,8 @@ class SchedulerPipelineMixin:
             eos_ids = {eos_token_ids}
         else:
             eos_ids = set(eos_token_ids)
-        native_thinking_prompt = bool(
-            not show_thinking and "<think" in model_prompt[-128:].lower()
+        native_thinking_prompt = native_thinking_suppression_required(
+            show_thinking, model_prompt,
         )
         suppress_native_thinking = native_thinking_prompt
         stream_buffer = ""
@@ -5890,6 +5907,14 @@ class SchedulerPipelineMixin:
             if pipeline_stack and pipeline_stack[-1].get("task_id") == task_id:
                 pipeline_stack.pop()
 
+        # ★ 2026-10-07（真机复验根因）：抑制门若一直没等到 `</think>`，循环结束时**必须**
+        #   把缓冲内容交出去 —— 否则已生成的正文既不在 SSE 事件里、也不在 response 里
+        #   （真机表现：流式 `tokens=0`、非流式「流水线返回空响应」）。放在组装 response
+        #   之前，让两条出口看到同一份文本。
+        if _stream_callback and stream_buffer:
+            _stream_callback({"token": stream_buffer})
+        stream_buffer = ""
+        suppress_native_thinking = False
         if generated_ids:
             if hasattr(input_ids, "detach"):
                 full_ids = torch.cat([
@@ -7828,7 +7853,14 @@ class SchedulerPipelineMixin:
         engine_name = backend_id_for(mgr, default="pytorch") or "pytorch"
         try:
             model_prompt = callbacks.build_model_chat_prompt(mgr.tokenizer, messages)
-            native_thinking_prompt = "<think>" in model_prompt[-128:].lower()
+            # ★ 2026-10-07（真机复验根因，与 Route-A 同源）：判据必须是「模板注入的思考块
+            #   **尚未闭合**」。旧判据只看 `"<think>"` 是否出现，而 qwen3-5-2b 模板在
+            #   `enable_thinking` 非 true 时注入的是**已闭合**的 `'<think>\n\n</think>\n\n'`
+            #   ⇒ 生成段只含正文、永远等不到 `</think>`，正文被整段丢掉（真机实测：PyTorch
+            #   单机流式档 180s 超时且回答为空）。
+            native_thinking_prompt = native_thinking_suppression_required(
+                show_thinking, model_prompt,
+            )
         except Exception:
             native_thinking_prompt = bool(
                 engine_name == "llama_cpp"
