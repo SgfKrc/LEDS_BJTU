@@ -10,7 +10,15 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
 
-from xframe_divergence_report import profile  # noqa: E402
+from xframe_divergence_report import llama_relay_greedy, profile  # noqa: E402
+
+
+def test_relay_greedy_rejects_single_segment():
+    """分层链至少两段；单段是调用方错误，必须在加载任何模型前 fail-fast。"""
+    import pytest
+
+    with pytest.raises(ValueError):
+        llama_relay_greedy(["only-one.gguf"], [1, 2, 3], 4)
 
 
 def test_identical_sequences():
