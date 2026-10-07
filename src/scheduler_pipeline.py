@@ -1901,7 +1901,12 @@ class SchedulerPipelineMixin:
         pending = []
         with self._layer_config_lock:
             for node_id, expected in self._layer_config_expected.items():
-                if node_id in self._layer_config_pushed:
+                # ★ 2026-10-07（DIST-NEXT-3 第二步）：重发判据同样以 assignment 权威视图为准
+                #   （只收紧）。若 `_layer_config_pushed` 残留而该 assignment 已终止，旧逻辑
+                #   会**永远跳过重发** —— 那个节点再也等不到配置，只能等下一次全量下发。
+                if self._effective_layer_config_pushed(
+                    node_id, node_id in self._layer_config_pushed,
+                ):
                     continue
                 state = self._layer_config_retry_state.setdefault(
                     node_id, {"attempts": 0, "next_retry": now}

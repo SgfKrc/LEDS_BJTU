@@ -196,6 +196,60 @@ def test_consistency_check_flags_the_three_divergences():
     ).consistent
 
 
+def test_retry_scan_is_not_blocked_by_a_stale_pushed_entry():
+    """陈旧 pushed（权威视图已终止）不再阻止重发 —— 否则该节点永远等不到配置。"""
+    sched = Scheduler()
+    registry = sched._worker_assignments
+    sent = []
+
+    class _Server:
+        _running = True
+
+        def get_client_ids(self):
+            return ["stale"]
+
+        def send_layer_config(self, node_id, payload):
+            sent.append((node_id, payload))
+
+    sched._tcp_server = _Server()
+    with sched._layer_config_lock:
+        sched._layer_config_expected["stale"] = {"config_id": "c", "generation": 1}
+        sched._layer_config_pushed.add("stale")
+        sched._layer_config_retry_state["stale"] = {"attempts": 0, "next_retry": 0.0}
+        registry.begin("stale", config_id="c")
+        registry.release("stale", reason_code=REASON_CONFIG_CLEARED)
+
+    assert sched._retry_pending_layer_configs(now=1_000_000.0) == 1
+    assert sent and sent[0][0] == "stale"
+
+
+def test_retry_scan_still_skips_genuinely_pushed_nodes():
+    """对照：旧集合与权威视图都说 pushed ⇒ 重发照旧跳过（零行为漂移）。"""
+    sched = Scheduler()
+    registry = sched._worker_assignments
+    sent = []
+
+    class _Server:
+        _running = True
+
+        def get_client_ids(self):
+            return ["fresh"]
+
+        def send_layer_config(self, node_id, payload):
+            sent.append((node_id, payload))
+
+    sched._tcp_server = _Server()
+    with sched._layer_config_lock:
+        sched._layer_config_expected["fresh"] = {"config_id": "c", "generation": 1}
+        sched._layer_config_pushed.add("fresh")
+        sched._layer_config_retry_state["fresh"] = {"attempts": 0, "next_retry": 0.0}
+        registry.begin("fresh", config_id="c")
+        registry.transition("fresh", phase=PHASE_ACKED)
+
+    assert sched._retry_pending_layer_configs(now=1_000_000.0) == 0
+    assert sent == []
+
+
 def test_recovery_fence_observes_divergence_without_changing_the_verdict(caplog):
     """观测点：分歧进日志，判据不变（这是"先让分歧可见、再切读路径"的落点）。"""
     sched = Scheduler()
