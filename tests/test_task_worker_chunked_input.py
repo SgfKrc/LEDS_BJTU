@@ -241,6 +241,8 @@ def test_worker_assembles_hidden_ref_and_verifies_the_digest():
 
     assert base64.b64decode(assembled["hidden_f32"]) == raw
     assert assembled["want_hidden"] is True
+    # 改写后移除 `hidden_ref`（执行侧只应看到一个来源）
+    assert "hidden_ref" not in assembled
     # 装配完成后分片状态被丢弃（不长期占用内存）
     assert assembler.pending() == {}
 

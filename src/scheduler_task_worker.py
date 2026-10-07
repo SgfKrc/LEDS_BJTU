@@ -697,7 +697,12 @@ class SchedulerTaskWorkerMixin:
                 f"层段 Stage 装配后的 hidden 摘要不符: {actual} != {declared}"
             )
         assembler.discard(attempt_id)
-        return {**root_input, "hidden_f32": _b64.b64encode(raw).decode("ascii")}
+        # 改写后**移除** `hidden_ref`：执行侧只应看到内联 `hidden_f32`（避免两个来源并存）。
+        assembled = {
+            key: value for key, value in root_input.items() if key != "hidden_ref"
+        }
+        assembled["hidden_f32"] = _b64.b64encode(raw).decode("ascii")
+        return assembled
 
     @staticmethod
     def _task_worker_attempt_payload(
