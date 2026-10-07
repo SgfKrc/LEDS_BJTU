@@ -351,7 +351,7 @@ async def get_nodes_log_aggregate(
             #   `POST /api/chat/stream` 落在断开窗口里被判
             #   `pipeline workers not ready: advertised layer_ranges cannot cover …`。
             and not (
-                isinstance(info.device_info, dict)
+                isinstance(getattr(info, "device_info", None), dict)
                 and (
                     info.device_info.get("task_worker")
                     or info.device_info.get("pipeline_worker")
