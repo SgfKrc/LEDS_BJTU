@@ -55,6 +55,23 @@ class TestLayerCapabilities:
         assert caps["layer_worker"] is True
         assert caps["layer_ranges"] == [[16, 20]]
 
+    def test_layer_worker_declares_stage_chunked_input(self):
+        """★ 2026-10-08（DIST-NEXT-2b）：层段 worker 必须声明能接收分片 hidden。
+
+        接收侧（`_handle_task_worker_stage_chunk` + `_assemble_stage_root_input` 的
+        装配/摘要校验/fail-closed）早已实现，但此前**从未声明** ⇒ provider 的
+        `_maybe_send_stage_chunks` 直接跳过分片、dispatch 前的预检按超限拒绝 ⇒
+        大 prompt 只能 503（2b 实测 `route_a_stage_frame_too_large:…:wire=24160940`）。
+        """
+        caps = _capabilities(
+            active_layer_config={"layer_range": [16, 20], "engine": "llama_cpp"},
+        )
+        assert caps["stage_chunked_input"] is True
+
+    def test_full_worker_does_not_declare_chunked_input(self):
+        """非层段 worker 不做 hidden 交接 ⇒ 保守不声明（维持既有语义）。"""
+        assert _capabilities()["stage_chunked_input"] is False
+
     def test_malformed_layer_range_does_not_break_hello(self):
         # layer_ranges 必须是 [start, end) 整数对；畸形值宁可不上报，也不能让 hello 挂掉。
         caps = _capabilities(

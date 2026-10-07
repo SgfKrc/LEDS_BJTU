@@ -114,3 +114,79 @@ def test_layer_stage_offer_rejects_before_touching_the_provider():
 
     assert captured.value.code == "route_a_stage_frame_too_large"
     assert provider_calls == []
+
+
+def test_precheck_allows_oversized_hidden_when_peer_declares_chunks():
+    """★ 2026-10-08（DIST-NEXT-2b）：对端声明 `stage_chunked_input` 时，预检**不得**拒绝。
+
+    否则 provider 层（`task_worker_adapter._maybe_send_stage_chunks`）的 `stage_chunk`
+    分片路径**永远走不到** —— 这正是 2b 实测到的现象：≈2475 tokens 的 prompt 只能得到
+    `route_a_stage_frame_too_large:…:wire=24160940:budget=8126464`。
+    """
+    _assert_layer_stage_offer_fits_frame(
+        node_id="worker-b", n_tokens=1, n_embd=2_000_000, chunked_input=True,
+    )
+
+
+def test_node_declares_stage_chunked_input_reads_capabilities():
+    """★ 2026-10-08（DIST-NEXT-2b）：能力判定三态 —— 命中 / 未命中 / 查询失败。"""
+    from scheduler_pipeline import _node_declares_stage_chunked_input
+
+    class _Control:
+        def __init__(self, workers=None, boom=False):
+            self._workers = workers or []
+            self._boom = boom
+
+        def status(self, role: str = "master"):
+            assert role == "master"
+            if self._boom:
+                raise RuntimeError("control plane down")
+            return {"workers": self._workers}
+
+    def _worker(node_id, value):
+        return {"node_id": node_id, "capabilities": {"stage_chunked_input": value}}
+
+    # 无控制面 / 查询失败 ⇒ 保守为「不支持」（维持 fail-closed）
+    assert _node_declares_stage_chunked_input(None, "w1") is False
+    assert _node_declares_stage_chunked_input(_Control(boom=True), "w1") is False
+    # 未命中节点、或声明值不是布尔真 ⇒ False
+    assert _node_declares_stage_chunked_input(_Control([_worker("w2", True)]), "w1") is False
+    assert _node_declares_stage_chunked_input(_Control([_worker("w1", "yes")]), "w1") is False
+    # 命中且为 True ⇒ True
+    assert _node_declares_stage_chunked_input(_Control([_worker("w1", True)]), "w1") is True
+
+
+def test_layer_stage_offer_reaches_provider_when_peer_declares_chunks():
+    """声明分片的节点：预检放行，流程继续到 provider —— 分片发送就发生在那里。"""
+    sched = Scheduler()
+    touched = []
+
+    def _provider(node_id):
+        touched.append(node_id)
+        raise AssertionError("分片路径：预检放行后应触碰 provider")
+
+    sched._ensure_remote_task_worker_provider = _provider  # type: ignore[assignment]
+    sched._task_worker_control = type("_Control", (), {
+        "status": lambda self, role="master": {
+            "workers": [{
+                "node_id": "worker-b",
+                "capabilities": {"stage_chunked_input": True},
+            }],
+        },
+    })()
+
+    hidden = np.zeros((1, 2_000_000), dtype=np.float32)
+
+    with pytest.raises(AssertionError):
+        sched._execute_layer_stage_offer(
+            node_id="worker-b",
+            assignment={"start_layer": 2, "end_layer": 4},
+            hidden_states=hidden,
+            model_identity=object(),
+            workflow_id="wf_framebudget02",
+            request_id="request-framebudget02",
+            stage_id="worker-b:step:0",
+            context_size=2048,
+        )
+
+    assert touched == ["worker-b"]
