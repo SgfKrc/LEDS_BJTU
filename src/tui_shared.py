@@ -132,6 +132,21 @@ ROUTE_SHORT_ARGS = {
     "required": "distributed_required",
 }
 
+#: ★ 2026-10-07（#29 的**发起侧**缺口）：请求级执行模式。
+#:
+#: TUI 此前只传 `routing_preference`，`execution_mode` 恒为后端默认 `auto` ⇒ 用户想请求
+#: 任务图（`task_graph`）时在 UI 里**没有任何入口**，双机 TUI 端到端档（F3）也因此拿不到
+#: `distributed_used`。`#29` 修的是后端「推断 / 拒绝」语义，这里补齐 TUI 的传递能力。
+EXECUTION_MODES = (
+    "auto",
+    "task_graph",
+)
+
+EXECUTION_MODE_LABELS = {
+    "auto": "execute:auto",
+    "task_graph": "execute:task_graph",
+}
+
 
 # ============================================================
 # interactive 请求体构造
@@ -143,6 +158,7 @@ def build_interactive_request(
     session_id: Optional[str] = None,
     generation_id: Optional[str] = None,
     routing_preference: str = "auto",
+    execution_mode: str = "auto",
     show_thinking: bool = False,
     enable_thinking: Optional[bool] = None,
     max_new_tokens: int = 1024,
@@ -153,6 +169,8 @@ def build_interactive_request(
     """构造 /api/chat/stream 的 interactive 请求体（T9 契约 §9.4.1）。"""
     if routing_preference not in ROUTING_PREFERENCES:
         routing_preference = "auto"
+    if execution_mode not in EXECUTION_MODES:
+        execution_mode = "auto"
     images = validate_image_data_urls(image_data_urls or [])
     local_image = bool(images and routing_preference == "local_only")
     if local_image and len(images) != 1:
@@ -163,6 +181,7 @@ def build_interactive_request(
         "generation_id": generation_id,
         "session_id": session_id,
         "routing_preference": routing_preference,
+        "execution_mode": execution_mode,
         "show_thinking": show_thinking,
         "enable_thinking": enable_thinking,
         "max_new_tokens": max_new_tokens,
@@ -170,6 +189,7 @@ def build_interactive_request(
         "top_p": top_p,
     }
     if images:
+        # 图像请求仍固定在 `auto`：本地 MTMD 与任务图的组合尚未验证，不做顺带放开。
         body.update({
             "image_data_urls": images,
             "execution_mode": "auto",
@@ -271,6 +291,7 @@ COMMAND_SPECS: List[Dict[str, str]] = [
     {"name": "/rename", "args": "<title>", "desc": "重命名当前会话"},
     {"name": "/sessions", "args": "", "desc": "列出最近会话"},
     {"name": "/delete-session", "args": "", "desc": "删除当前会话及其全部消息（需确认）"},
+    {"name": "/mode", "args": "auto|task_graph", "desc": "请求级执行模式（task_graph=显式任务图）"},
     {"name": "/reset", "args": "", "desc": "清空后端会话历史与 KV 缓存（需确认）"},
     {"name": "/model", "args": "load <id> [engine] [quant] | unload",
      "desc": "加载/卸载模型（需确认；仅 loopback 后端可调用）"},

@@ -50,6 +50,24 @@ class TestBuildInteractiveRequest:
         body = build_interactive_request("hi", routing_preference="bogus")
         assert body["routing_preference"] == "auto"
 
+    def test_execution_mode_defaults_to_auto_and_is_transmitted(self):
+        """★ 2026-10-07（#29 发起侧缺口）：`execution_mode` 必须真的进请求体。
+
+        此前 TUI 只传 `routing_preference`，`execution_mode` 恒为后端默认 ⇒ 任务图模式
+        在 UI 里没有入口，双机 TUI 端到端档（F3）拿不到 `distributed_used`。
+        """
+        assert build_interactive_request("hi")["execution_mode"] == "auto"
+        assert (
+            build_interactive_request("hi", execution_mode="task_graph")["execution_mode"]
+            == "task_graph"
+        )
+
+    def test_invalid_execution_mode_falls_back_to_auto(self):
+        assert (
+            build_interactive_request("hi", execution_mode="bogus")["execution_mode"]
+            == "auto"
+        )
+
     def test_image_request_requires_external_and_preserves_data_url(self):
         image = "data:image/png;base64,iVBORw0KGgo="
         body = build_interactive_request("描述图片", image_data_urls=[image])

@@ -90,6 +90,18 @@ def _online_node_count(api) -> int:
     )
 
 
+def _distributed_enabled(api) -> bool:
+    """`/api/cluster/config` 里分布式推理开关的当前值（取不到 ⇒ False）。"""
+    try:
+        payload = api.get("/cluster/config")
+    except Exception:  # noqa: BLE001 - 后端不可达 ⇒ 视为未开启，由断言暴露
+        return False
+    if not isinstance(payload, dict):
+        return False
+    switch = payload.get("distributed_inference")
+    return bool(isinstance(switch, dict) and switch.get("enabled") is True)
+
+
 def _skip_reason(api=None) -> str:
     if not _enabled():
         return "设置 QLH_RUN_DUAL_HOST_TUI=1 才运行双机物理 TUI E2E（F3 档）"
@@ -109,15 +121,11 @@ def _skip_reason(api=None) -> str:
     if online < MIN_ONLINE_NODES:
         return (f"双机集群未就绪：online 节点 {online} < {MIN_ONLINE_NODES}"
                 f"（F3 前置：Surface 需已 /api/cluster/connect 入集群）")
-    # ⚠️ **#29（已登记）**：TUI 只传 `routing_preference`、**不传 `execution_mode`**
-    #    （`src/tui_api.py:439` 一带），而后者默认 `auto` ⇒ 请求会被**静默导向层流水线**，
-    #    既到不了任务图、也不会产生 `distributed_used` ⇒ F3 的判据无从满足。
-    #    在 #29 修好（或 TUI 侧提供 `execution_mode` 传递）之前本档只能 skip；
-    #    确认已修复后用 `QLH_TUI_E2E_EXPECT_DISTRIBUTED=1` 显式开启（届时必须真拿到判据）。
-    if (os.environ.get("QLH_TUI_E2E_EXPECT_DISTRIBUTED") or "").strip() != "1":
-        return ("已知问题 #29：TUI 未传递 execution_mode（默认 auto ⇒ 静默走层流水线），"
-                "无法请求任务图分布式、拿不到 distributed_used。"
-                "确认修复后设 QLH_TUI_E2E_EXPECT_DISTRIBUTED=1 再跑本档")
+    # ★ 2026-10-07：#29 的**发起侧**缺口已闭合 —— TUI 现在通过 `/mode task_graph` 显式传递
+    #   `execution_mode`（`tui_shared.build_interactive_request` → `tui_api.iter_chat_payloads`
+    #   → `tui_textual` 的 `/mode` 命令）。此前 TUI 只传 `routing_preference`，请求被静默导向
+    #   层流水线 ⇒ 到不了任务图、拿不到 `distributed_used`，本档只能靠
+    #   `QLH_TUI_E2E_EXPECT_DISTRIBUTED=1` 手工放行。现在默认就跑，断言必须真拿到判据。
     return ""
 
 
@@ -172,11 +180,20 @@ def test_dual_host_tui_distributed_end_to_end():
                 pilot, lambda: bool((screen.cluster_aux or {}).get("distributed"))), (
                 f"cluster_aux 未加载到分布式配置，无法切换: {screen.cluster_aux!r}")
 
-            # 真按 `t`（`Binding("t", "cluster_toggle")`）⇒ 弹确认框 ⇒ 按 `y` 确认
-            await pilot.press("t")
-            await pilot.pause()
-            await pilot.press("y")
-            await pilot.pause()
+            # 真按 `t`（`Binding("t", "cluster_toggle")`）⇒ 弹确认框 ⇒ 按 `y` 确认。
+            # ★ 2026-10-07 两处修正：
+            #   ① `t` 是屏幕级 binding，键盘焦点若被别的控件吃掉就**静默无效**（实测：按了
+            #      `t`、`y` 后端没收到任何 PUT，开关仍 false ⇒ 请求被 `distributed_required`
+            #      路由门拒成 `outcome=refused`）⇒ 改走屏幕动作触发同一条 UI 路径。
+            #   ② 它是**反转**开关 ⇒ 档不能盲目按（第二次运行会把已开启的开关关掉）⇒
+            #      先读后端当前值，仅在关闭时才 toggle。两次都**复核后端状态**，失败立刻暴露。
+            if not _distributed_enabled(control):
+                screen.action_cluster_toggle()
+                await pilot.pause()
+                await pilot.press("y")
+            assert await wait_for(
+                pilot, lambda: _distributed_enabled(control)), (
+                "分布式开关未开启（/api/cluster/config 复核失败）")
 
             # --- 2) 路由偏好：/route required ⇒ distributed_required ---
             pane = screen.query_one("#chat-pane")
@@ -190,6 +207,15 @@ def test_dual_host_tui_distributed_end_to_end():
                 == "distributed_required"), (
                 f"/route required 未生效: routing_preference="
                 f"{getattr(app, 'routing_preference', None)!r}")
+
+            # --- 2b) 执行模式：/mode task_graph ⇒ 显式任务图（否则拿不到 distributed_used）---
+            box.value = "/mode task_graph"
+            box.focus()
+            await pilot.press("enter")
+            assert await wait_for(
+                pilot, lambda: getattr(app, "execution_mode", None) == "task_graph"), (
+                f"/mode task_graph 未生效: execution_mode="
+                f"{getattr(app, 'execution_mode', None)!r}")
 
             # --- 3) 发一条真消息，等回答 ---
             box.value = PROMPT
@@ -218,7 +244,8 @@ def test_dual_host_tui_distributed_end_to_end():
             isinstance(metrics, dict) and metrics.get("distributed_used") is True
         ), (f"本次 TUI 请求未走分布式: distributed_used="
             f"{latest.get('distributed_used')!r} / metrics="
-            f"{(metrics or {}).get('distributed_used')!r}; workflow={workflow_id!r}")
+            f"{(metrics or {}).get('distributed_used')!r}; workflow={workflow_id!r}; "
+            f"最近 workflow 数={len(items)}")
         assert not (latest.get("fallback") or (metrics or {}).get("fallback")), (
             f"不应发生回退: fallback={latest.get('fallback')!r} / "
             f"{(metrics or {}).get('fallback')!r}")
