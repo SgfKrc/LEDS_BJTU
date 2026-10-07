@@ -196,24 +196,12 @@ def test_dual_host_tui_routed_pipeline_streams_text():
         pytest.skip(
             f"Route-A 前提未满足：capacity 求解失败（{capacity_reason or 'unknown'}）；"
             f"需先让三机层段链就绪（master 参与层段 + worker 段覆盖完整）再跑本用例")
-    # ★ 2026-10-08：**再实时探测一次**。`/cluster/status` 的 `pipeline.available` 只看
-    #   "节点在线/心跳"，与请求路径的层段就绪判定（`_stage_offer_assignment_ready` + capacity）
-    #   **口径不同** —— 实测 status 报 `available=True reason=ready workers=2/2`，请求却在入口
-    #   被拒 `pipeline workers not ready: advertised layer_ranges cannot cover …`（真机 Y700
-    #   每 ~37 秒断连重连一次，重连后它的 `layer_ranges` 需要几秒才刷新回来）。
-    #   用一个最小请求探真实可路由性：失败 ⇒ skip 并说明，而不是把瞬态报成用例失败。
-    try:
-        probe = control.post("/chat", {
-            "message": "ping",
-            "max_new_tokens": 1,
-            "routing_preference": "distributed_required",
-            "enable_thinking": False,
-            "session_id": "f3-routed-probe",
-        })
-    except Exception as exc:  # noqa: BLE001 - 探测失败 ⇒ 未就绪
-        pytest.skip(f"Route-A 实时探测失败（{type(exc).__name__}）: {exc}")
-    if isinstance(probe, dict) and probe.get("error"):
-        pytest.skip(f"Route-A 实时探测被拒: {probe.get('error')}")
+    # ★ 2026-10-08：**不做"实时探测请求"**。曾用一个 `POST /chat`（max_new_tokens=1）探真实
+    #   可路由性，但它本身就是一次真实的分布式请求：会让链路进入重配置/能力刷新窗口，紧随其后的
+    #   验收请求被拒（实测：探测通过后 0 秒 / 5 秒，验收请求都报
+    #   `advertised layer_ranges cannot cover …`，而同一时刻单发请求成功）。前置只保留
+    #   「`/cluster/status` 就绪 + capacity 可解」这两项**只读**检查；真跑不通时用例的失败信息
+    #   已经足够定位。
 
     async def _main() -> str:
         from textual.widgets import Input, Static
