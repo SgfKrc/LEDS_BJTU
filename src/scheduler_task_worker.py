@@ -1085,6 +1085,31 @@ class SchedulerTaskWorkerMixin:
                         ack.payload["accepted"],
                         ack.payload["selected_version"],
                     )
+                    # ★ 2026-10-07（DIST-NEXT-6）：把「哪些工件被判不可用、为什么」打到
+                    #   master 日志 —— 否则节点被静默剔除时这里只剩
+                    #   `layer_range_not_advertised`，看不出是缺文件、摘要不符还是架构不符。
+                    unusable_artifacts = (
+                        advertised_capabilities.get("layer_artifact_diagnostics")
+                        if isinstance(advertised_capabilities, dict) else None
+                    ) or []
+                    if unusable_artifacts:
+                        logger.warning(
+                            "event=task_worker_layer_artifact_unusable node_id=%s "
+                            "count=%d details=%s",
+                            client_id,
+                            len(unusable_artifacts),
+                            [
+                                {
+                                    "error_code": entry.get("error_code"),
+                                    "manifest": entry.get("manifest"),
+                                    "layer_range": entry.get("layer_range"),
+                                    "mode": entry.get("mode"),
+                                    "architecture": entry.get("architecture"),
+                                }
+                                for entry in unusable_artifacts
+                                if isinstance(entry, dict)
+                            ],
+                        )
                 elif message.message_type in {
                     "stage_accept", "stage_result", "stage_error",
                     "stage_cancelled",

@@ -101,6 +101,17 @@ _LAYER_FORWARD_OPTIONAL_FIELDS = {"middle_channel", "seq_ids", "positions"}
 #: * `keep_head_layer_out` —— `layer_inp` 的 `lid == n_layer` 槽位，返回**末层输出**。
 _LAYER_FORWARD_MIDDLE_CHANNELS = {"extract_hidden", "keep_head_layer_out"}
 
+#: ★ 2026-10-07（DIST-NEXT-6）：层段工件诊断的稳定 error code（与 Android
+#: `LayerArtifactDiagnostic` 同集合）。能力广告只带**不可用**项，因此不含"可用"。
+_LAYER_ARTIFACT_DIAGNOSTIC_CODES = frozenset({
+    "manifest_unreadable",
+    "manifest_invalid",
+    "source_digest_mismatch",
+    "artifact_missing",
+    "artifact_digest_mismatch",
+})
+_LAYER_ARTIFACT_DIAGNOSTIC_MAX = 32
+
 #: ★ 2026-10-07（DIST-NEXT-1）：`stage_cancelled` 的**可选**执行状态。
 #: 取消合同把「已取消」拆成两个可分别取证的事实：ACK 先到，执行可能仍在
 #: in-flight（native 层段前向不可被一次调用打断）。取值：
@@ -421,6 +432,78 @@ def _validate_layer_budget(value: Any) -> None:
         )
 
 
+def _validate_layer_artifact_diagnostics(value: Any) -> None:
+    """★ 2026-10-07（DIST-NEXT-6）：校验不可用层段工件的诊断广告。
+
+    键集固定、**不含本地路径**（路径只留在设备日志与本地诊断）；这样主节点能看到
+    「哪个区间为什么不可用」，而不是只看到 `layer_range_not_advertised`。
+    """
+    field = "payload.capabilities.layer_artifact_diagnostics"
+    if (
+        not isinstance(value, list)
+        or not value
+        or len(value) > _LAYER_ARTIFACT_DIAGNOSTIC_MAX
+    ):
+        raise _error(
+            "invalid_capabilities", field,
+            "layer_artifact_diagnostics must be a non-empty list with at most "
+            f"{_LAYER_ARTIFACT_DIAGNOSTIC_MAX} entries",
+        )
+    for index, entry in enumerate(value):
+        item_field = f"{field}[{index}]"
+        entry = _require_object(entry, item_field)
+        _require_exact_fields(
+            entry,
+            {
+                "error_code", "manifest", "architecture", "mode",
+                "layer_range", "artifact_present",
+            },
+            item_field,
+        )
+        error_code = _require_string(
+            entry["error_code"], f"{item_field}.error_code",
+            pattern=_SAFE_CODE, max_length=64,
+        )
+        if error_code not in _LAYER_ARTIFACT_DIAGNOSTIC_CODES:
+            raise _error(
+                "invalid_capabilities", f"{item_field}.error_code",
+                "error_code must be one of "
+                + ", ".join(sorted(_LAYER_ARTIFACT_DIAGNOSTIC_CODES)),
+            )
+        _require_string(entry["manifest"], f"{item_field}.manifest", pattern=_SAFE_ID)
+        _require_string(
+            entry["architecture"], f"{item_field}.architecture",
+            pattern=_SAFE_ID, allow_empty=True, max_length=64,
+        )
+        mode = _require_string(
+            entry["mode"], f"{item_field}.mode",
+            pattern=_SAFE_ID, allow_empty=True, max_length=32,
+        )
+        if mode and mode not in _LAYER_SEGMENT_MODES:
+            raise _error(
+                "invalid_capabilities", f"{item_field}.mode",
+                "mode must be empty or one of head, middle, tail",
+            )
+        _require_bool(entry["artifact_present"], f"{item_field}.artifact_present")
+        layer_range = entry["layer_range"]
+        if layer_range is None:
+            continue
+        if (
+            not isinstance(layer_range, list)
+            or len(layer_range) != 2
+            or any(
+                isinstance(bound, bool) or not isinstance(bound, int)
+                for bound in layer_range
+            )
+            or layer_range[0] < 0
+            or layer_range[1] <= layer_range[0]
+        ):
+            raise _error(
+                "invalid_capabilities", f"{item_field}.layer_range",
+                "layer_range must be null or a non-empty [start, end) integer range",
+            )
+
+
 def _validate_capabilities(value: Any, *, version: int) -> None:
     capabilities = _require_object(value, "payload.capabilities")
     expected_fields = {"stage_types", "engines", "models", "max_concurrency"}
@@ -468,6 +551,12 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     # node-level ``segment_mode`` cannot describe that safely.
     if "layer_artifacts" in capabilities:
         expected_fields.add("layer_artifacts")
+    # ★ 2026-10-07（DIST-NEXT-6）：不可用层段工件的结构化原因（可选，向后兼容）。
+    #   广告侧只带 error code 与身份/区间，**不含本地路径**。与其余可选键同样
+    #   按「出现才允许」处理 —— 两侧必须同时放行，否则 hello 自校验失败后
+    #   连接建立即 0.7s 静默断开（`segment_mode` 那次实测的坑）。
+    if "layer_artifact_diagnostics" in capabilities:
+        expected_fields.add("layer_artifact_diagnostics")
     _require_exact_fields(
         capabilities,
         expected_fields,
@@ -630,6 +719,10 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
                 "invalid_capabilities", "payload.capabilities.segment_mode",
                 "node-level segment_mode must agree with every layer_artifact",
             )
+    if "layer_artifact_diagnostics" in capabilities:
+        _validate_layer_artifact_diagnostics(
+            capabilities["layer_artifact_diagnostics"],
+        )
     engines = capabilities["engines"]
     if not isinstance(engines, list) or not engines or any(
         value not in _SUPPORTED_ENGINES

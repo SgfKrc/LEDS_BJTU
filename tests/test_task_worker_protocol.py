@@ -388,6 +388,87 @@ def test_decode_normalizes_invalid_unicode_to_protocol_error():
     assert captured.value.code == "invalid_encoding"
 
 
+def test_hello_capabilities_may_advertise_unusable_artifact_reasons():
+    """★ 2026-10-07（DIST-NEXT-6）：不可用工件的结构化原因（无路径）。
+
+    fail-closed 不变：这些项**不**进 `layer_ranges`/`layer_artifacts`，只是把
+    「为什么没有该区间」以稳定 error code + 身份/区间广告出去。
+    """
+    identity_fields = {
+        "error_code": "artifact_missing",
+        "manifest": "mid.manifest.json",
+        "architecture": "qwen35",
+        "mode": "middle",
+        "layer_range": [4, 16],
+        "artifact_present": False,
+    }
+
+    def capabilities(diagnostics):
+        return {
+            "stage_types": ["layer_forward"],
+            "engines": ["llama_cpp"],
+            "models": [{
+                "model_id": "qwen35_2b_mid4_16",
+                "engine": "llama_cpp",
+                "format": "gguf",
+                "revision": "local-v1",
+                "sha256": "b" * 64,
+            }],
+            "max_concurrency": 1,
+            "layer_artifact_diagnostics": diagnostics,
+        }
+
+    def hello(diagnostics):
+        return build_message(
+            "hello",
+            {
+                "node_id": "android_worker_01",
+                "worker_kind": "android_full_worker",
+                "min_version": 1,
+                "max_version": 3,
+                "capabilities": capabilities(diagnostics),
+            },
+            message_id="msg_hello_artifactdiag1",
+            sent_at_ms=1_700_000_000_000,
+            version=3,
+        )
+
+    decoded = hello([identity_fields])
+    assert decoded.payload["capabilities"]["layer_artifact_diagnostics"] == [
+        identity_fields,
+    ]
+
+    # `layer_range = null` 合法（「读不到 manifest」还没解析出区间）
+    unreadable = {**identity_fields, "error_code": "manifest_unreadable",
+                  "layer_range": None}
+    assert hello([unreadable]).payload["capabilities"][
+        "layer_artifact_diagnostics"
+    ] == [unreadable]
+
+    # 空列表没有信息量：要么不给该键，要么给非空列表
+    with pytest.raises(WorkerProtocolError) as empty:
+        hello([])
+    assert empty.value.code == "invalid_capabilities"
+
+    # error code 值域封闭
+    with pytest.raises(WorkerProtocolError) as unknown:
+        hello([{**identity_fields, "error_code": "whatever"}])
+    assert unknown.value.code == "invalid_capabilities"
+    assert unknown.value.field == (
+        "payload.capabilities.layer_artifact_diagnostics[0].error_code"
+    )
+
+    # 键集固定：携带本地路径的额外键会被拒（广告面只带原因，不带路径）
+    with pytest.raises(WorkerProtocolError) as extra:
+        hello([{**identity_fields, "path": "/sdcard/models/x.gguf"}])
+    assert extra.value.code == "invalid_fields"
+
+    # 上限 32 条
+    with pytest.raises(WorkerProtocolError) as too_many:
+        hello([identity_fields] * 33)
+    assert too_many.value.code == "invalid_capabilities"
+
+
 _CANCEL_IDENTITY = {
     "workflow_id": "wf_cancelremote01",
     "stage_id": "candidate_a",
