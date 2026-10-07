@@ -4041,10 +4041,9 @@ class Scheduler(
             # client's registration handshake.
 
         elif msg_type == "heartbeat":
-            # ★ 2026-10-08（诊断，定位后降级）：确认 master 是否**真的收到** task worker 心跳。
-            #   真机上 Y700 每 ~40-60 秒断开重连，补了 `heartbeat_ack` 仍未改善 ⇒ 必须先证明
-            #   "心跳有没有到达 master"，否则无法区分「worker 没发心跳」与「ACK 没被 worker 读到」。
-            logger.info("event=tcp_heartbeat_received client_id=%s", client_id)
+            # ★ 2026-10-08：诊断期已过（定位结论：心跳确实到达 master，且 `tcp_comm` 层
+            #   已回 ACK），降级为 debug 以免每 15 秒×N worker 刷屏。
+            logger.debug("event=tcp_heartbeat_received client_id=%s", client_id)
             if self._effective_role() == "master":
                 self._task_worker_control.mark_worker_heartbeat(client_id)
             client_info = (
