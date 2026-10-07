@@ -5544,6 +5544,15 @@ class SchedulerPipelineMixin:
                 if stage_token is None:
                     return {"response": "", "error": "route_a_stage_chain_empty"}
                 new_token_id = stage_token
+                # ★ 2026-10-07：逐 token 取证日志。此前 Route-A 生成循环**不打印任何 token**，
+                #   导致「空响应」无法区分「没生成」与「生成的全是特殊 token 被
+                #   skip_special_tokens 滤掉」。与 Android 侧（无逐 token 日志）配合时，
+                #   这是唯一能定位数值分歧的观测点。
+                logger.info(
+                    "Route-A 生成 step=%d token=%d eos=%s text=%r",
+                    step, int(new_token_id), new_token_id in eos_ids,
+                    tokenizer.decode([int(new_token_id)]),
+                )
                 if new_token_id in eos_ids:
                     break
                 generated_ids.append(new_token_id)
