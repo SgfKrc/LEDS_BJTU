@@ -70,6 +70,92 @@ WORKER_HEARTBEAT_MAX_AGE = 120.0
 TASK_WORKER_HEALTH_TIMEOUT_FLOOR_SECONDS = 30.0
 
 
+#: Android **task-worker** 控制面心跳间隔（秒）。设备侧
+#: `TaskWorkerClient.HEARTBEAT_INTERVAL_MS` 是唯一发送方，必须与它同值。
+#: ★ 2026-10-07（DIST-NEXT-4）：此前这个数字只存在于设备侧硬编码里，主仓没有任何
+#: 地方记录它 ⇒ 「设备心跳间隔 vs 主仓容忍上限」这类错配只能靠真机实测发现
+#: （历史实测：presence 心跳 45s 而容忍上限写死 10s，`11.4s > 10s` 被判过期）。
+ANDROID_TASK_WORKER_HEARTBEAT_INTERVAL_SECONDS = 15.0
+
+#: Android presence（HTTP 心跳）间隔（秒）。`scheduler` 的
+#: `ANDROID_HTTP_CLIENT_HEARTBEAT_INTERVAL_SECONDS` 由此派生，避免两处各写一份。
+ANDROID_PRESENCE_HEARTBEAT_INTERVAL_SECONDS = 45.0
+
+
+def worker_heartbeat_max_age_seconds() -> float:
+    """worker 心跳容忍上限（秒）—— **容量规划与 readiness 的唯一来源**。
+
+    返回 `WORKER_HEARTBEAT_MAX_AGE`（现值 120s）。该值必须同时满足：
+
+    * ≥ 2 × Android task-worker 心跳（15s ⇒ 30s）；
+    * ≥ 2 × Android presence 心跳（45s ⇒ 90s）；
+    * < TCP 半开巡检上限（`tcp_comm.TCPServer.MAX_HEARTBEAT_MISSED` 派生）——
+      让心跳判据**先**于 TCP 巡检翻转，静默节点不会在「仍占容量」的窗口里被派活。
+    """
+    return WORKER_HEARTBEAT_MAX_AGE
+
+
+def task_worker_control_plane_health_timeout_seconds(
+    heartbeat_interval_seconds: float,
+) -> float:
+    """task-worker 控制面 health 超时（秒）= `max(下界, 心跳间隔 × 4)`。
+
+    故意**短于** [worker_heartbeat_max_age_seconds]：先停止派 stage，再让节点退出
+    规划，两层不同时翻转（若并成同一个数，节点会在「仍被规划进层区间」的同时
+    「已不再接受 stage」）。
+    """
+    return max(
+        TASK_WORKER_HEALTH_TIMEOUT_FLOOR_SECONDS,
+        float(heartbeat_interval_seconds) * 4.0,
+    )
+
+
+def worker_liveness_thresholds(
+    heartbeat_interval_seconds: float,
+) -> dict[str, float]:
+    """一次给出全部相关阈值（诊断与回归测试用，便于打印/对比）。"""
+    return {
+        "pc_heartbeat_interval_seconds": float(heartbeat_interval_seconds),
+        "android_task_worker_heartbeat_interval_seconds": (
+            ANDROID_TASK_WORKER_HEARTBEAT_INTERVAL_SECONDS
+        ),
+        "android_presence_heartbeat_interval_seconds": (
+            ANDROID_PRESENCE_HEARTBEAT_INTERVAL_SECONDS
+        ),
+        "control_plane_health_timeout_seconds": (
+            task_worker_control_plane_health_timeout_seconds(
+                heartbeat_interval_seconds,
+            )
+        ),
+        "worker_heartbeat_max_age_seconds": worker_heartbeat_max_age_seconds(),
+    }
+
+
+def assert_worker_liveness_thresholds(heartbeat_interval_seconds: float) -> None:
+    """启动期自检：各阈值必须互相自洽（错配直接 fail-loud）。
+
+    把「心跳间隔 → 容忍上限」的关系固化成断言，下一次改阈值时立即暴露错配，
+    而不是等真机实测出现「节点被判过期 / 静默占容量」。
+    """
+    thresholds = worker_liveness_thresholds(heartbeat_interval_seconds)
+    max_age = thresholds["worker_heartbeat_max_age_seconds"]
+    for key in (
+        "android_task_worker_heartbeat_interval_seconds",
+        "android_presence_heartbeat_interval_seconds",
+    ):
+        interval = thresholds[key]
+        if max_age < interval * 2:
+            raise ValueError(
+                f"WORKER_HEARTBEAT_MAX_AGE={max_age}s must cover at least two "
+                f"{key} ({interval}s)"
+            )
+    if thresholds["control_plane_health_timeout_seconds"] > max_age:
+        raise ValueError(
+            "task-worker control-plane health timeout must not exceed the worker "
+            "heartbeat max age: stop dispatching before evicting the node"
+        )
+
+
 @dataclass
 class NodeInfo:
     """节点信息（分布式模式下通过 TCP 注册填充）"""

@@ -51,8 +51,11 @@ from pipeline_reshard import PipelineArtifactAvailability, PipelineReshardCoordi
 import scheduler_layer_plan as _layer_plan
 from scheduler_types import (
     InferenceTask, NodeInfo, NodeRole, NodeState, PreemptState, QueueTask,
+    ANDROID_PRESENCE_HEARTBEAT_INTERVAL_SECONDS,
     TASK_WORKER_HEALTH_TIMEOUT_FLOOR_SECONDS,
     WORKER_HEARTBEAT_MAX_AGE,
+    assert_worker_liveness_thresholds,
+    task_worker_control_plane_health_timeout_seconds,
 )
 from scheduler_sidecars import SchedulerSidecarMixin
 from llama_rpc_contract import RpcShardLeaseBook
@@ -131,10 +134,19 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-ANDROID_HTTP_CLIENT_HEARTBEAT_INTERVAL_SECONDS = 45
+# ★ 2026-10-07（DIST-NEXT-4）：Android presence 心跳间隔的唯一来源是
+#   `scheduler_types.ANDROID_PRESENCE_HEARTBEAT_INTERVAL_SECONDS`；这里保留既有名字
+#   （`scheduler_cluster` 通过 `_scheduler_facade_global` 读它）。
+ANDROID_HTTP_CLIENT_HEARTBEAT_INTERVAL_SECONDS = (
+    ANDROID_PRESENCE_HEARTBEAT_INTERVAL_SECONDS
+)
 ANDROID_HTTP_CLIENT_LEASE_SECONDS = 120
 ANDROID_HTTP_CLIENT_TIMEOUT_SECONDS = ANDROID_HTTP_CLIENT_LEASE_SECONDS
 _LAYER_ASSIGNMENT_CACHE_VERSION = 3
+
+# ★ 2026-10-07（DIST-NEXT-4）：启动期自检 —— 心跳间隔与容忍上限必须自洽，
+#   否则直接以清晰原因失败（历史踩过「心跳 45s vs 上限 10s」的静默错配）。
+assert_worker_liveness_thresholds(HEARTBEAT_INTERVAL)
 
 from scheduler_task_worker import SchedulerTaskWorkerMixin, _TaskWorkerActiveAttempt
 from scheduler_cluster import SchedulerClusterMixin
@@ -1133,9 +1145,8 @@ class Scheduler(
             "spare_master_logs": [],
         }
         self._task_worker_control = TaskWorkerControlPlane(
-            health_timeout_seconds=max(
-                TASK_WORKER_HEALTH_TIMEOUT_FLOOR_SECONDS,
-                HEARTBEAT_INTERVAL * 4.0,
+            health_timeout_seconds=task_worker_control_plane_health_timeout_seconds(
+                HEARTBEAT_INTERVAL,
             ),
         )
         self._task_worker_refresh_lock = threading.Lock()
