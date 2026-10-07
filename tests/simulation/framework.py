@@ -18,6 +18,24 @@ from typing import AsyncGenerator, Dict, List, Optional, Tuple
 import httpx
 
 
+def _default_sim_model() -> str:
+    """仿真套件的默认模型：**跟随设备画像**（与产品「自动加载默认模型」同源）。
+
+    原值是已退役的 `qwen-1.8b`（本机无工件 ⇒ 后端起不来、每条请求 60 s 超时，见验收清单 D4）。
+    """
+    src = Path(__file__).resolve().parents[2] / "src"
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    try:
+        import model_config
+
+        paths = model_config.get_profile_default_model_paths()
+        model_id = str(paths.get("model_id") or "").strip()
+        return model_id or str(model_config.DEFAULT_MODEL_ID)
+    except Exception:
+        return "qwen3-0.6b"
+
+
 # ============================================================================
 # 数据类定义
 # ============================================================================
@@ -31,7 +49,7 @@ class TestConfig:
     start_master: bool = True
     start_slaves: bool = False
     slave_count: int = 0
-    model: str = "qwen-1.8b"
+    model: str = field(default_factory=_default_sim_model)
 
     # 端口配置
     master_api_port: int = 8000
