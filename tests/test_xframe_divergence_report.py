@@ -10,7 +10,34 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
 
-from xframe_divergence_report import llama_relay_greedy, profile  # noqa: E402
+from xframe_divergence_report import (  # noqa: E402
+    comparison_stats,
+    llama_relay_greedy,
+    profile,
+)
+
+
+def test_comparison_stats_identical_and_scaled():
+    """逐层画像的纯函数：同值 ⇒ 全零/余弦 1；整体缩放 ⇒ 非零误差。"""
+    import numpy as np
+
+    a = np.array([[1.0, 2.0], [3.0, 4.0]])
+    same = comparison_stats(a, a)
+    assert same["rel_err"] == 0.0
+    assert same["max_abs"] == 0.0
+    assert same["cos"] == 1.0
+
+    scaled = comparison_stats(a, a * 2.0)
+    assert scaled["rel_err"] > 0.0
+    assert scaled["max_abs"] > 0.0
+
+
+def test_comparison_stats_rejects_shape_mismatch():
+    import numpy as np
+    import pytest
+
+    with pytest.raises(ValueError):
+        comparison_stats(np.zeros((2, 3)), np.zeros((3, 2)))
 
 
 def test_relay_greedy_rejects_single_segment():

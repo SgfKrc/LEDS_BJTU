@@ -330,10 +330,113 @@ def profile(left: dict[str, Any], right: dict[str, Any], eos_id: int | None) -> 
     }
 
 
+def comparison_stats(reference: Any, actual: Any) -> dict[str, float]:
+    """两侧 hidden 的逐元素画像：`rel_err` / `cos` / `max_abs`。
+
+    `XFRAME-1` 的逐层画像用它把「同一切点 K 的两侧 hidden」折成一行指标 —— 与 `profile()`
+    同属纯函数，可脱离引擎单测。参照系约定不变：**同引擎整模**才是接力差的参照。
+    """
+    import numpy as np
+
+    r0 = np.asarray(reference, dtype=np.float64)
+    a0 = np.asarray(actual, dtype=np.float64)
+    if r0.shape != a0.shape:
+        raise ValueError(f"shape mismatch: {r0.shape} vs {a0.shape}")
+    r = r0.reshape(-1)
+    a = a0.reshape(-1)
+    d = r - a
+    nr = float(np.linalg.norm(r))
+    na = float(np.linalg.norm(a))
+    return {
+        "rel_err": float(np.linalg.norm(d) / nr) if nr else 0.0,
+        "max_abs": float(np.abs(d).max()) if d.size else 0.0,
+        "cos": float(np.dot(r, a) / (nr * na)) if (nr and na) else 1.0,
+    }
+
+
+def _run_layer_profile(args) -> int:
+    """逐层画像：对每个切点 K 比较 HF `hidden_states[K]` 与 keep-head 上游 hidden。
+
+    这是 `XFRAME-1` 交付里原先「用 `KeepHeadUpstream` 手工做」的那一步，现并入本工具。
+    """
+    _root = pathlib.Path(__file__).resolve().parents[1]
+    for _p in (str(_root), str(_root / "src")):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
+
+    import numpy as np
+    import torch
+    from llama_keep_head import KeepHeadUpstream
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    specs: list[tuple[int, str]] = []
+    for chunk in (args.layer_artifacts or "").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        k_s, sep, path = chunk.partition(":")
+        if not sep:
+            print(f"  [FAIL] --layer-artifacts 项应为 `K:path`，实得 {chunk!r}")
+            return 2
+        specs.append((int(k_s), path.strip()))
+    if not specs:
+        print("  [FAIL] --layer-profile 需要 --layer-artifacts")
+        return 2
+
+    shim = args.shim or os.environ.get("QLH_KEEP_HEAD_SHIM", "").strip()
+    if not shim:
+        shim = str(_root / "build" / "keephead" / "build-cpu" / "bin" / "qlh_keep_head.dll")
+    os.environ["QLH_KEEP_HEAD_SHIM"] = shim
+
+    prompts = DEFAULT_PROMPTS[:1]
+    if args.prompts:
+        prompts = [
+            ln for ln in pathlib.Path(args.prompts).read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+
+    tok = AutoTokenizer.from_pretrained(args.hf_dir, trust_remote_code=False)
+    hf = AutoModelForCausalLM.from_pretrained(args.hf_dir, torch_dtype=torch.float32)
+    hf.eval()
+
+    rows = []
+    for prompt in prompts:
+        ids = tok(prompt, add_special_tokens=False)["input_ids"]
+        pids = ids.tolist() if hasattr(ids, "tolist") else list(ids)
+        with torch.no_grad():
+            hs = hf(torch.tensor([pids]), output_hidden_states=True).hidden_states
+        for k, path in sorted(specs):
+            if k >= len(hs):
+                print(f"  [skip] K={k} 超出 HF hidden_states 长度 {len(hs)}")
+                continue
+            h_hf = hs[k][0].to(torch.float32).cpu().numpy()
+            up = KeepHeadUpstream(shim, path, mode="nextn", n_ctx=512, n_threads=8)
+            try:
+                h_ll = np.asarray(up.forward_tokens_to_hidden(pids, n_past=0), dtype=np.float32)
+            finally:
+                up.close()
+            if h_hf.shape[1] != h_ll.shape[1]:
+                h_hf = h_hf[:, :h_ll.shape[1]]
+            st = comparison_stats(h_hf, h_ll)
+            rows.append({"prompt": prompt[:40], "layer": k, **st})
+            print(f"  [K={k:3d}] rel_err={st['rel_err']:.4g} cos={st['cos']:.6f} "
+                  f"max_abs={st['max_abs']:.4g}")
+
+    if args.out:
+        dest = pathlib.Path(args.out)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(
+            json.dumps({"mode": "layer-profile", "rows": rows}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"  已写入 {dest}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="XFRAME-1 跨引擎分歧画像")
     ap.add_argument("--hf-dir", required=True, help="HF 模型目录（提供 tokenizer 与左引擎）")
-    ap.add_argument("--gguf", required=True, help="右引擎的整模 GGUF")
+    ap.add_argument("--gguf", help="右引擎的整模 GGUF（`--layer-profile` 模式下不用）")
     ap.add_argument("--prompts", help="每行一个 prompt 的文件；缺省用内置 4 条")
     ap.add_argument("--max-new-tokens", type=int, default=16)
     ap.add_argument(
@@ -349,6 +452,16 @@ def main() -> int:
         "--shim",
         help="keep-head shim 路径；缺省走 QLH_KEEP_HEAD_SHIM 或 "
              "build/keephead/build-cpu/bin/qlh_keep_head.dll",
+    )
+    ap.add_argument(
+        "--layer-profile", action="store_true",
+        help="逐层画像：对每个切点 K 比较 HF `hidden_states[K]` 与 keep-head 上游 hidden，"
+             "输出 rel_err / cos / max_abs（配合 --layer-artifacts）",
+    )
+    ap.add_argument(
+        "--layer-artifacts",
+        help="逗号分隔的 `K:path` 列表（如 `4:...head4.gguf,12:...head12.gguf`），"
+             "配合 --layer-profile",
     )
     ap.add_argument(
         "--hf-rmsnorm", choices=["hf", "ggml-like"], default="hf",
@@ -368,6 +481,12 @@ def main() -> int:
             ln for ln in pathlib.Path(args.prompts).read_text(encoding="utf-8").splitlines()
             if ln.strip()
         ]
+
+    if args.layer_profile:
+        return _run_layer_profile(args)
+
+    if not args.gguf:
+        ap.error("需要 --gguf（`--layer-profile` 模式除外）")
 
     relay_segments = [s.strip() for s in (args.relay_segments or "").split(",") if s.strip()]
     if args.same_engine and len(relay_segments) < 2:
