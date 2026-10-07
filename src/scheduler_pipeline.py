@@ -40,6 +40,14 @@ from task_worker_protocol import (
     max_hidden_tokens,
     stage_payload_budget_bytes,
 )
+# ★ 2026-10-07（DIST-NEXT-3）：assignment 权威视图的相位与 reason code。
+from worker_assignment_state import (
+    PHASE_ACKED,
+    PHASE_READY,
+    REASON_CONFIG_ACKED,
+    REASON_CONFIG_CLEARED,
+    REASON_WORKER_RELEASED,
+)
 from torch_runtime import loaded_torch
 
 logger = logging.getLogger("scheduler")
@@ -1490,6 +1498,13 @@ class SchedulerPipelineMixin:
                     "attempts": 1,
                     "next_retry": time.monotonic() + 5.0,
                 }
+                # ★ 2026-10-07（DIST-NEXT-3）：每次下发都**换代际**（新 `assignment_id`）
+                #   —— 迟到的旧 ACK 因此无法冒充当前配置的就绪。
+                self._worker_assignments.begin(
+                    node_id,
+                    config_id=str(config.get("config_id", "") or ""),
+                    connection_generation=int(self._layer_config_generation),
+                )
         self._start_layer_config_retry_monitor()
         for node_id, config in configs.items():
             try:
@@ -1509,6 +1524,11 @@ class SchedulerPipelineMixin:
             self._layer_config_expected.pop(node_id, None)
             self._layer_config_acks.pop(node_id, None)
             self._layer_config_retry_state.pop(node_id, None)
+            # ★ 2026-10-07（DIST-NEXT-3）：同一事实写进权威视图 —— 终止态只记**一个**
+            #   reason code，取代「多处各自推断为什么这个节点被清掉」。
+            self._worker_assignments.release(
+                node_id, reason_code=REASON_CONFIG_CLEARED,
+            )
 
 
     def _abort_pipeline_load_transaction(
@@ -3205,11 +3225,20 @@ class SchedulerPipelineMixin:
                     self._layer_config_expected.pop(client_id, None)
                     self._layer_config_pushed.discard(client_id)
                     self._layer_config_retry_state.pop(client_id, None)
+                    # ★ 2026-10-07（DIST-NEXT-3）：worker 确认释放 ⇒ 权威视图进终止态。
+                    self._worker_assignments.release(
+                        client_id, reason_code=REASON_WORKER_RELEASED,
+                    )
                 else:
                     state = self._layer_config_retry_state.setdefault(
                         client_id, {"attempts": 0, "next_retry": 0.0}
                     )
                     state["next_retry"] = time.monotonic() + 5.0
+                    # ★ 2026-10-07（DIST-NEXT-3）：ACK 到达 ⇒ 相位前进（越级/过期换代
+                    #   会被 registry 拒绝，这正是「不是当前 assignment 的事件」的判据）。
+                    self._worker_assignments.transition(
+                        client_id, phase=PHASE_ACKED, reason_code=REASON_CONFIG_ACKED,
+                    )
                 release_ack = True
                 ready = False
                 prepared = False

@@ -57,6 +57,8 @@ from scheduler_types import (
     assert_worker_liveness_thresholds,
     task_worker_control_plane_health_timeout_seconds,
 )
+# ★ 2026-10-07（DIST-NEXT-3）：assignment 的权威视图（单一事实源）。
+from worker_assignment_state import WorkerAssignmentRegistry
 from scheduler_sidecars import SchedulerSidecarMixin
 from llama_rpc_contract import RpcShardLeaseBook
 from qwen3_pipeline_transaction import (
@@ -1037,6 +1039,11 @@ class Scheduler(
         self._layer_config_expected: dict[str, dict] = {}
         self._layer_config_acks: dict[str, dict] = {}
         self._layer_config_retry_state: dict[str, dict] = {}
+        # ★ 2026-10-07（DIST-NEXT-3）：assignment 的**权威视图**（`assignment_id` +
+        #   `config_id` + connection generation + lease + phase + 单一 reason code）。
+        #   本步**只写不读**（读路径后续切换）⇒ 零行为变化；它是「多集合交叉判定」
+        #   （pushed/expected/acks/transaction/recovery）的替代方向。
+        self._worker_assignments = WorkerAssignmentRegistry()
         self._layer_config_lock = threading.Lock()
         self._layer_config_push_lock = threading.Lock()
         # Model transitions temporarily invalidate the local descriptor. Do
