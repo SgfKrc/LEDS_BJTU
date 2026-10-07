@@ -196,6 +196,37 @@ def test_consistency_check_flags_the_three_divergences():
     ).consistent
 
 
+def test_legacy_ready_ack_advances_the_authority_view():
+    """legacy ready ACK 也要推进权威视图 —— 这是"降级为派生视图"的前置不变量。
+
+    此前只有 release 类配置的分支推进相位，registry 长期停在 `pushing`，派生集合会漏掉
+    这类节点（回归实测：`test_push_waits_for_worker_load_ack` 一收紧就变红）。
+    """
+    sched = Scheduler()
+    config = {
+        "config_id": "cfg-1", "generation": 11, "nodes": [],
+        "phase": "commit", "plan_id": "plan-1",
+        "start_layer": 8, "end_layer": 24,
+        "model_sha256": "a" * 64, "model_type": "qwen2", "engine": "pytorch",
+    }
+    sched._publish_layer_configs({"worker_01": config})
+
+    sched._handle_layer_config_ack("worker_01", {"data": {
+        "node_id": "worker_01", "config_id": "cfg-1", "generation": 11,
+        "status": "ready", "phase": "commit", "plan_id": "plan-1",
+        "layer_range": [8, 24], "model_sha256": "a" * 64, "model_type": "qwen2",
+        "engine": "pytorch",
+    }})
+
+    assert "worker_01" in sched._layer_config_pushed
+    derived = {
+        node for node, state in sched._worker_assignments.snapshot().items()
+        if state["phase"] in (PHASE_ACKED, PHASE_READY)
+    }
+    # 不变量：旧集合与权威视图派生的集合一致（达成后即可把旧集合降级为派生视图）
+    assert derived == set(sched._layer_config_pushed)
+
+
 def test_retry_scan_is_not_blocked_by_a_stale_pushed_entry():
     """陈旧 pushed（权威视图已终止）不再阻止重发 —— 否则该节点永远等不到配置。"""
     sched = Scheduler()

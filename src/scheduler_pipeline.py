@@ -3445,6 +3445,13 @@ class SchedulerPipelineMixin:
                     )
                 if ready:
                     self._layer_config_pushed.add(client_id)
+                    # ★ 2026-10-07（DIST-NEXT-3 第三步）：legacy ready ACK 同样推进**权威视图**。
+                    #   此前只有 release 类配置的分支推进相位 ⇒ registry 长期停在 `pushing`，
+                    #   与 `_layer_config_pushed` 不一致（派生集合会漏掉这类节点）。补上这一步，
+                    #   registry 才可能成为「`_layer_config_pushed` 的派生来源」。
+                    self._worker_assignments.transition(
+                        client_id, phase=PHASE_READY, reason_code=REASON_CONFIG_ACKED,
+                    )
                     self._layer_config_retry_state.pop(client_id, None)
                     transaction = self._pipeline_load_transaction
                     if (
@@ -5018,7 +5025,11 @@ class SchedulerPipelineMixin:
                     ack = self._layer_config_acks.get(node_id, {})
                     expected_range = [node.get("start_layer"), node.get("end_layer")]
                     layer_ready = (
-                        node_id in self._layer_config_pushed
+                        # ★ 2026-10-07（DIST-NEXT-3 第三步）：与 readiness / 重发判据共用同一
+                        #   入口（只收紧）—— 陈旧 pushed 不再让节点被当成"已确认层配置"。
+                        self._effective_layer_config_pushed(
+                            node_id, node_id in self._layer_config_pushed,
+                        )
                         and ack.get("config_id") == expected.get("config_id")
                         and ack.get("layer_range") == expected_range
                         and ack.get("model_sha256") == expected.get("model_sha256")
