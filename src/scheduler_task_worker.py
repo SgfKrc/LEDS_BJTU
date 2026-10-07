@@ -298,6 +298,13 @@ class SchedulerTaskWorkerMixin:
             "layer_worker": layer_worker,
             # 当前**就绪、马上能跑**的层区间（与 `layer_budget` 的"承载上限"分工明确）。
             "layer_ranges": layer_ranges,
+            # ★ 2026-10-08（DIST-NEXT-2b）：声明**能接收分片 hidden**。接收侧
+            #   （`_handle_task_worker_stage_chunk` + `hidden_ref` 装配）早已实现，但此前
+            #   没有任何声明处 —— 于是 provider 的 `_maybe_send_stage_chunks` 直接跳过
+            #   分片、dispatch 前的预检按超限拒绝，大 prompt 只能 503
+            #   （实测 `route_a_stage_frame_too_large:…:wire=24160940:budget=8126464`）。
+            #   非层段 worker 不接收 hidden，故按 `layer_worker` 保守声明。
+            "stage_chunked_input": bool(layer_worker),
             "relay_middle": bool(
                 layer_worker
                 and active_layer_config
