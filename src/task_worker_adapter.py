@@ -1369,6 +1369,19 @@ class RemoteFullWorkerProvider:
                     provider_id=self.provider_id,
                     retryable=bool(payload["retryable"]),
                 )
+                # ★ 2026-10-07（DIST-NEXT-1d 真机复测发现）：此前只把泛化消息抛出，
+                #   worker 回传的 `error_code` / `retryable` **没有落日志** ⇒ 现场只能看到
+                #   「remote worker reported a Stage error」，无法区分是身份不匹配、预算超限
+                #   还是执行失败。这里补一条具名事件（与 cancel 路径的事件风格一致）。
+                logger.info(
+                    "event=task_worker_stage_error node_id=%s stage_id=%s attempt_id=%s "
+                    "error_code=%s retryable=%s",
+                    self.provider_id,
+                    payload.get("stage_id", "-"),
+                    payload.get("attempt_id", "-"),
+                    payload["error_code"],
+                    payload["retryable"],
+                )
                 pending.accept_event.set()
                 pending.result_event.set()
             else:
