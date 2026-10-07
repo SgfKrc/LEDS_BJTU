@@ -22,6 +22,12 @@ from config import (
 )
 # ★ #31 M2：层流水线支持的架构**单一事实来源**（此前在 4 处各写了一份 `{"qwen","qwen2"}`）
 from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
+# ★ 2026-10-07（DIST-NEXT-7）：A1 relay 的隔离边界（唯一门 + 独立诊断 namespace）。
+from relay_a1_legacy import (
+    a1_isolation_status,
+    a1_production_enabled,
+    parse_relay_segment_map,
+)
 from relay_segment_client import (
     RelaySegmentClient,
     RelaySegmentError,
@@ -5051,42 +5057,13 @@ class SchedulerPipelineMixin:
     def _parse_relay_segment_map(raw: str) -> dict[str, dict[str, object]]:
         """★ A1 / X 档（Y 档第二条扩层区间）：解析 `QLH_RELAY_SEGMENTS`。
 
-        条目格式：`node=role@host:port#n_embd#start-end`（`;`/`,` 分隔），
-        其中 **`start-end` 是该段认领的层区间 `[start, end)`，必填**。
-
-        校验**复用** `_normalize_relay_segment`（单一真源，避免两套判据漂移）。任何不合法、
-        或**未声明层区间**的条目**整条丢弃** —— 宁可不下发，也不下发"只带 n_embd"的半懂规格：
-        后者会让主节点无从扣除该段的层，退化成"段在已过全部层的 hidden 上重算"。
-        空配置 ⇒ `{}`（行为与接线前一致）。
+        ★ 2026-10-07（DIST-NEXT-7）：实现已迁到 `relay_a1_legacy.parse_relay_segment_map`
+        （A1 的隔离边界），判据仍复用 `_normalize_relay_segment`（单一真源）。
+        保留本静态方法名以兼容既有调用点与测试。
         """
-        result: dict[str, dict[str, object]] = {}
-        for chunk in str(raw or "").replace(",", ";").split(";"):
-            chunk = chunk.strip()
-            if not chunk or "=" not in chunk or "@" not in chunk:
-                continue
-            name, _, value = chunk.partition("=")
-            body, _, fields_text = value.partition("#")
-            role, _, host_port = body.partition("@")
-            host, _, port_text = host_port.rpartition(":")
-            fields = fields_text.split("#")
-            if len(fields) != 2:
-                continue        # 缺层区间（或多余字段）⇒ 整条丢弃
-            n_embd_text, range_text = fields
-            range_start, _, range_end = range_text.partition("-")
-            try:
-                spec = SchedulerPipelineMixin._normalize_relay_segment({
-                    "role": role.strip(),
-                    "host": host.strip(),
-                    "port": int(port_text),
-                    "n_embd": int(n_embd_text),
-                    "layer_start": int(range_start),
-                    "layer_end": int(range_end),
-                })
-            except ValueError:
-                continue
-            if name.strip() and spec is not None:
-                result[name.strip()] = spec
-        return result
+        return parse_relay_segment_map(
+            raw, SchedulerPipelineMixin._normalize_relay_segment,
+        )
 
     def _relay_segment_for_worker(self, worker_id: str,
                                   routing_preference: str = "auto") -> Optional[dict]:
@@ -5113,17 +5090,22 @@ class SchedulerPipelineMixin:
         #   直接不供给 relay 段：生产请求即使配了 `QLH_RELAY_ENABLED` /
         #   `QLH_RELAY_SEGMENTS`，也只记一份具名诊断并继续走 A3，**不做静默切换**。
         #   探针/实验要恢复 A1 行为时显式设 `QLH_RELAY_PROBE_ONLY=0`。
-        if PIPELINE_RELAY_PROBE_ONLY:
-            if not getattr(self, "_relay_probe_only_warned", False):
-                self._relay_probe_only_warned = True
-                logger.warning(
-                    "A1 relay 已从产品调度入口剔除（QLH_RELAY_PROBE_ONLY=1，默认）："
-                    "QLH_RELAY_ENABLED/QLH_RELAY_SEGMENTS 不再作为生产能力，生产请求"
-                    "继续走 A3 stage_offer_v3。需要 A1 探针行为请显式设 "
-                    "QLH_RELAY_PROBE_ONLY=0。首个受影响 worker=%s", worker_id,
-                )
-            return None
-        if not PIPELINE_RELAY_ENABLED:
+        if not a1_production_enabled(
+            probe_only=PIPELINE_RELAY_PROBE_ONLY,
+            relay_enabled=PIPELINE_RELAY_ENABLED,
+        ):
+            # ★ 2026-10-07（DIST-NEXT-7）：门集中在 `relay_a1_legacy.a1_production_enabled`；
+            #   这里只保留「为什么不供给」的两种具名表现：探针闸门（默认，一次性告警）
+            #   与总开关关闭（静默，保持既有行为）。
+            if PIPELINE_RELAY_PROBE_ONLY:
+                if not getattr(self, "_relay_probe_only_warned", False):
+                    self._relay_probe_only_warned = True
+                    logger.warning(
+                        "A1 relay 已从产品调度入口剔除（QLH_RELAY_PROBE_ONLY=1，默认）："
+                        "QLH_RELAY_ENABLED/QLH_RELAY_SEGMENTS 不再作为生产能力，生产请求"
+                        "继续走 A3 stage_offer_v3。需要 A1 探针行为请显式设 "
+                        "QLH_RELAY_PROBE_ONLY=0。首个受影响 worker=%s", worker_id,
+                    )
             return None
         if str(routing_preference or "auto") == "local_only":
             return None
@@ -5181,6 +5163,31 @@ class SchedulerPipelineMixin:
         ⚠️ 只传 `node_id` 一个位置参数：调用方（含测试与嵌入方）常注入单参 stub。
         """
         return self._relay_segment_for_worker(node_id) is not None
+
+    def get_relay_a1_status(self) -> dict:
+        """★ 2026-10-07（DIST-NEXT-7）：A1 的**独立诊断 namespace**（`relay_a1`）。
+
+        把「A1 现在能不能被调度选中」收敛成单一入口：返回开关、段配置与 relay 宿主
+        计数，其中 `production_enabled` 与 `assignment_selectable` 同源取值。生产侧
+        （health / 日志 / 测试）据此判断，而不必逐个开关去猜，也不会与 Route A 的
+        原因码混在一起。
+        """
+        cache = getattr(self, "_relay_segment_map_cache", None)
+        if cache is None:
+            cache = self._parse_relay_segment_map(PIPELINE_RELAY_SEGMENTS)
+            self._relay_segment_map_cache = cache
+        nodes = getattr(self, "nodes", {}) or {}
+        relay_hosts = [
+            node_id for node_id in nodes
+            if self._relay_segment_for_worker(node_id) is not None
+        ]
+        return a1_isolation_status(
+            probe_only=PIPELINE_RELAY_PROBE_ONLY,
+            relay_enabled=PIPELINE_RELAY_ENABLED,
+            segments_raw=PIPELINE_RELAY_SEGMENTS,
+            configured_nodes=cache,
+            relay_host_count=len(relay_hosts),
+        )
 
 
     def _wait_for_layer_result(self, task_id: str, node_ids,

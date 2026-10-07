@@ -151,6 +151,8 @@ assert_worker_liveness_thresholds(HEARTBEAT_INTERVAL)
 from scheduler_task_worker import SchedulerTaskWorkerMixin, _TaskWorkerActiveAttempt
 from scheduler_cluster import SchedulerClusterMixin
 from scheduler_pipeline import SchedulerPipelineMixin
+# ★ 2026-10-07（DIST-NEXT-7）：A1 隔离状态自证（独立 namespace，启动即见）。
+from relay_a1_legacy import log_isolation_status
 
 # Keep the current scheduler import surface explicit while the implementation
 # is split into smaller modules. Private helpers listed here are compatibility
@@ -1149,6 +1151,9 @@ class Scheduler(
                 HEARTBEAT_INTERVAL,
             ),
         )
+        # ★ 2026-10-07（DIST-NEXT-7）：启动即自证 A1 隔离状态（`event=relay_a1_isolation`）——
+        #   「A1 会不会被调度选中」不再需要逐个开关推断。
+        log_isolation_status(self.get_relay_a1_status())
         self._task_worker_refresh_lock = threading.Lock()
         self._task_worker_refresh_requested = False
         self._task_worker_refresh_generation = 0
