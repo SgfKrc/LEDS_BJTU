@@ -181,17 +181,21 @@ def test_dual_host_tui_routed_pipeline_streams_text():
     from tui_textual import KoakumaApp, MainScreen
 
     control = ApiClient(host=HOST, port=PORT, timeout=120.0)
-    reason = _skip_reason(control)
-    if reason:
-        pytest.skip(reason)
-    # ★ 2026-10-07：Route-A 还需要 **worker 层配置就绪**（见 `_pipeline_workers_layer_ready`
-    #   的说明）—— 冷启动 master 只有完整模型时会卡在覆盖不足，档必须 skip 而不是误报。
-    layer_ready, worker_total = _pipeline_workers_layer_ready(control)
-    if not layer_ready:
+    if not _enabled():
+        pytest.skip("设置 QLH_RUN_DUAL_HOST_TUI=1 才运行双机物理 TUI E2E（F3 档）")
+    try:
+        import textual  # noqa: F401
+    except ImportError:
+        pytest.skip("需要 textual（TUI 档）")
+    # ★ 与主判据（任务图）**不同**：Route-A 不要求 master 处于"完整模型"状态 —— 恰恰相反，
+    #   Route-A 要求 master **按层段参与**（跑起来后 `/status.model_loaded` 会变成 False，
+    #   实测因此被 `_skip_reason` 误 skip）。这里的前置只判 capacity 能否给出可用计划
+    #   （v3 语义，见 `_pipeline_capacity_ready`）。
+    capacity_ready, capacity_reason = _pipeline_capacity_ready(control)
+    if not capacity_ready:
         pytest.skip(
-            f"Route-A 前提未满足：{worker_total} 个 worker 的层配置未全部就绪"
-            f"（冷启动 master 只加载完整模型 ⇒ capacity 判它 control_only ⇒ 覆盖不足）；"
-            f"需先让 master 按层段参与再跑本用例")
+            f"Route-A 前提未满足：capacity 求解失败（{capacity_reason or 'unknown'}）；"
+            f"需先让三机层段链就绪（master 参与层段 + worker 段覆盖完整）再跑本用例")
 
     async def _main() -> str:
         from textual.widgets import Input, Static
@@ -255,29 +259,33 @@ def test_dual_host_tui_routed_pipeline_streams_text():
         assert marker not in answer, f"回答里出现失败文案 {marker!r}: {answer[:200]!r}"
 
 
-def _pipeline_workers_layer_ready(api) -> tuple:
-    """Route-A 前提：**所有** worker 的层配置已就绪（`layer_ready=True`）。
+def _pipeline_capacity_ready(api) -> tuple:
+    """Route-A 前提：capacity 求解能给出可用计划（**v3 语义**）。
 
-    冷启动的 master 若只加载了完整模型，capacity 会把它判成 `control_only`（完整权重不算
-    "层段工件"）⇒ 候选只剩 worker 段 ⇒ 覆盖缺 `[0,20)` ⇒
-    `pipeline_layer_range_coverage_insufficient` ⇒ 层配置推不出去、worker 停在
-    `not_configured`，请求报「advertised layer_ranges cannot cover the requested contiguous
-    layer interval」。此时档应 **skip 并说明前提**，而不是把它报成"回答为空/未走分布式"
-    这种误导性失败（旧代码时代之所以正常，是 master 早已处于层段状态）。
+    ⚠️ **不能**用 `/cluster/status` 的 `layer_ready` —— 那是 **legacy 层配置 ACK** 的概念；
+    v3 层段 worker（`stage_offer_v3`）不走 legacy ACK，该字段恒为 `False/not_configured`
+    ⇒ 拿它做前置会让本档永远 skip（实测踩到：capacity 明明已经 `admitted=True`、
+    `assignments=[('master',0,16),(Surface,16,20),(Y700,20,24)]`，档却 skip 了）。
+
+    这里改为读 `/cluster/pipeline-capacity`：只有**具名的区间/容量失败**才判未就绪（那时
+    skip 并说明原因），其余情况交给用例去跑 —— 真跑不通时用例的失败信息比 skip 有用。
     """
     try:
-        payload = api.get("/cluster/status")
-    except Exception:  # noqa: BLE001 - 后端不可达 ⇒ 未就绪
-        return False, 0
-    pipeline = payload.get("pipeline") if isinstance(payload, dict) else None
-    workers = pipeline.get("workers") if isinstance(pipeline, dict) else None
-    if not workers:
-        return False, 0
-    ready = [
-        worker for worker in workers
-        if isinstance(worker, dict) and worker.get("layer_ready") is True
-    ]
-    return len(ready) == len(workers), len(workers)
+        payload = api.get("/cluster/pipeline-capacity")
+    except Exception:  # noqa: BLE001 - 取不到 ⇒ 未就绪
+        return False, "capacity 不可达"
+    if not isinstance(payload, dict):
+        return False, "capacity 返回异常"
+    if payload.get("admitted") is True:
+        return True, ""
+    reason_code = str(payload.get("reason_code") or "")
+    if reason_code in {
+        "pipeline_layer_range_coverage_insufficient",
+        "pipeline_distributed_capacity_insufficient",
+        "pipeline_cluster_capacity_insufficient",
+    }:
+        return False, reason_code
+    return True, ""
 
 
 def _assistant_body(text: str) -> str:
