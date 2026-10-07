@@ -335,7 +335,7 @@ Real hardware, cross-host networks, Android ARM64, performance and long-run soak
 
 ## Documentation Index
 
-- [Overall architecture](整体架构.md) · [Module interfaces](模块接口说明.md) · [Core principles](核心技术原理.md)
+- [Overall architecture](整体架构.md) · [Module interfaces](模块接口说明.md) · [Core principles](核心技术原理.md) · [Distributed resource scheduling](分布式资源调度系统.md)
 - [Cross-framework relay — current baseline and follow-up plan](跨框架接力-当前有效基线与后续优化计划-2026-09-21.md) (index for the relay direction) · [project report](跨框架层接力-项目报告.md) · [capacity-gain measurements](跨框架层接力-容量收益实测-2026-09-21.md)
 - [TUI guide](TUI使用指南.md) · [TUI command set](TUI指令集.md)
 - [Testing and acceptance criteria](测试与评判标准.md) · [test channel notes](测试通道运行说明.md)
