@@ -310,9 +310,19 @@ async def chat(req: ChatRequest, request: Request = None):
     try:
         result = await _api_module.run_in_threadpool(_run_chat_request)
     except _api_module.ChatGenerationCancelled as exc:
+        # ★ 2026-10-07（DIST-NEXT-8）：非流式取消同样带独立终态与稳定 reason code，
+        #   与其它 409/拒绝响应的风格一致（此前只有一个中文 message）。
         raise _api_module.HTTPException(
             409,
-            {"message": "生成已取消", "generation_id": exc.generation_id},
+            {
+                "message": "生成已取消",
+                "generation_id": exc.generation_id,
+                **_api_module.request_outcome_metrics(
+                    started=True,
+                    cancelled=True,
+                    reason_code=_api_module.REASON_GENERATION_CANCELLED,
+                ),
+            },
         ) from exc
     finally:
         if watcher is not None:
@@ -378,12 +388,26 @@ async def chat_stream(req: ChatRequest, request: Request):
 
         return await loop.run_in_executor(None, _runner)
 
-    def _error_event(message) -> str:
+    def _error_event(message, *, refused: bool = False, reason_code: str = "") -> str:
+        """★ DIST-NEXT-8：错误事件同样带相位与互斥终态。
+
+        `refused=True` 用于「不可恢复、dispatch 前的具名拒绝」（例如路由门）；
+        其余为链路/执行失败。两者以前只有一段 `error` 文本，聚合时分不开。
+        """
         if isinstance(message, dict):
             message = message.get("message") or _api_module.json.dumps(
                 message, ensure_ascii=False,
             )
-        return f"data: {_json.dumps({'done': True, 'error': message, 'request_id': request_id}, ensure_ascii=False)}\n\n"
+        phase = _api_module.request_outcome_metrics(
+            started=True,
+            refused=bool(refused),
+            failed=not refused,
+            reason_code=reason_code or (
+                _api_module.REASON_REQUEST_REFUSED if refused
+                else _api_module.REASON_REQUEST_FAILED
+            ),
+        )
+        return f"data: {_json.dumps({'done': True, 'error': message, 'request_id': request_id, **phase}, ensure_ascii=False)}\n\n"
 
     async def _iterate_sync_generator(iterable):
         """Bridge a blocking generator without blocking the ASGI event loop."""
@@ -425,7 +449,7 @@ async def chat_stream(req: ChatRequest, request: Request):
         # T9.5：distributed_required 无分布式路径时明确失败（interactive/fast 共用）
         routing_gate = _api_module._routing_gate_error(req)
         if routing_gate:
-            yield _error_event(routing_gate)
+            yield _error_event(routing_gate, refused=True)
             return
         # ================================================================
         # ★ interactive 模式（T9 聊天页契约）：真流式逐 token +
@@ -611,7 +635,22 @@ async def chat_stream(req: ChatRequest, request: Request):
 
             if cancelled:
                 partial = "".join(response_parts)
-                yield f"data: {_json.dumps({'cancelled': True, 'generation_id': generation_id, 'request_id': request_id, 'session_id': target_session_id, 'partial': partial}, ensure_ascii=False)}\n\n"
+                # ★ 2026-10-07（DIST-NEXT-8）：取消是**独立终态**，带相位与稳定 reason ——
+                #   此前这条事件只有一个 `cancelled` 布尔，聚合时会与「链路错误」「回退」
+                #   混在一起，真机排障看不出「用户取消」还是「执行失败」。
+                payload = {
+                    "cancelled": True,
+                    "generation_id": generation_id,
+                    "request_id": request_id,
+                    "session_id": target_session_id,
+                    "partial": partial,
+                    **_api_module.request_outcome_metrics(
+                        started=True,
+                        cancelled=True,
+                        reason_code=_api_module.REASON_GENERATION_CANCELLED,
+                    ),
+                }
+                yield f"data: {_json.dumps(payload, ensure_ascii=False)}\n\n"
                 return
             if error:
                 yield _error_event(error)
@@ -646,6 +685,21 @@ async def chat_stream(req: ChatRequest, request: Request):
                     "fallback_reason",
                     "distributed_unavailable_fallback_to_local",
                 )
+            # ★ 2026-10-07（DIST-NEXT-8）：统一相位 + 互斥终态。
+            #   `admitted` = 本次请求真的拿到了分布式 assignment（config_id /
+            #   workers_used / layer_assignments 任一存在）；`fallback=True` 只描述
+            #   「回退后仍完成」，不再用于表达取消或拒绝。
+            metrics = _api_module.merge_request_outcome(
+                metrics,
+                admitted=bool(
+                    metrics.get("config_id")
+                    or metrics.get("workers_used")
+                    or metrics.get("layer_assignments")
+                ),
+                started=True,
+                completed=True,
+                fallback=bool(metrics.get("fallback")),
+            )
             committed = _api_module._commit_interactive_history(
                 target_session_id, req.message, response_text, metrics,
             )

@@ -148,6 +148,15 @@ _validate_pipeline_role_switches(
 
 # 主节点用户自持 SQLite；生产运行时不再加载远端 PostgreSQL 驱动。
 import local_store as _local_store
+# ★ 2026-10-07（DIST-NEXT-8）：请求相位/终态的单一来源 —— 取消、拒绝与链路错误
+#   不再被 `fallback` 或 error 语义吞掉（详见 `src/request_outcome.py`）。
+from request_outcome import (
+    REASON_GENERATION_CANCELLED,
+    REASON_REQUEST_FAILED,
+    REASON_REQUEST_REFUSED,
+    merge_phase_metrics as merge_request_outcome,
+    request_phase_metrics as request_outcome_metrics,
+)
 import model_download_jobs
 import model_search
 from cluster_join import (
@@ -2416,11 +2425,17 @@ def _augment_chat_metrics(metrics: dict | None, req: ChatRequest, **defaults) ->
     _marker = "readiness="
     if _marker in _failure_text:
         _capability_reason = _failure_text.split(_marker, 1)[1].strip()
+    # ★ 2026-10-07（DIST-NEXT-8）：把互斥终态打进摘要 —— 一行内即可区分
+    #   completed / fallback_completed / cancelled / refused / failed，
+    #   不再靠 `fallback` 布尔去猜。
+    _metrics = result.get("metrics")
+    _outcome = dict(_metrics or {}).get("outcome", "")
     logger.info(
         "event=chat_route_summary request_id=%s generation_id=%s "
         "routing_preference=%s distributed_requested=%s distributed_used=%s "
         "fallback=%s fallback_reason=%s execution_mode=%s route=%s "
         "workers_used=%s claimed_layers=%s layer_segments=%s config_id=%s "
+        "outcome=%s "
         "a1_relay_probe_only=%s relay_enabled=%s legacy_bridge_rejected=%s "
         "capability_missing_reason=%s",
         result.get("request_id", ""),
@@ -2436,6 +2451,7 @@ def _augment_chat_metrics(metrics: dict | None, req: ChatRequest, **defaults) ->
         result.get("claimed_layers", []),
         result.get("layer_segments", []),
         result.get("config_id", ""),
+        _outcome,
         PIPELINE_RELAY_PROBE_ONLY,
         PIPELINE_RELAY_ENABLED,
         "route_a_mixed_legacy_execution_bridge_not_ready" in _failure_text,
