@@ -713,16 +713,48 @@ class SchedulerPipelineMixin:
           具名分歧 —— 也就是说，分歧场景下判据不变，等日志证据足够后再收口。
 
         注意：本方法在 `_layer_config_lock` 持锁区内被调用；registry 自身不加锁，无锁序问题。
+
+        **只收紧、不放宽**：权威视图判否（含终止态）⇒ 不再算 pushed（排除陈旧项，这正是
+        清理 `_layer_config_pushed` 残留的方向）；权威视图判真而旧集合判假时**保持旧值**
+        （放宽集合会改变 readiness 结论，需要单独的回归依据）。两种分歧都由
+        `_observe_assignment_state_consistency()` 留下具名事件。
         """
         registry = getattr(self, "_worker_assignments", None)
         state = None if registry is None else registry.state(node_id)
         authoritative = pushed_from_state(state)
         if authoritative is None:
             return bool(legacy_pushed)
-        if authoritative == bool(legacy_pushed):
-            return authoritative
-        # 分歧：保留旧判据（保守），日志已记录
-        return bool(legacy_pushed)
+        if authoritative:
+            return bool(legacy_pushed)
+        return False
+
+    def _effective_layer_config_pushed_nodes(
+        self, legacy_pushed: set[str], expected_configs: dict,
+    ) -> set[str]:
+        """★ 2026-10-07（DIST-NEXT-3 第二步）：readiness 的 ready 集合 —— 权威视图优先。
+
+        规则与 `_effective_layer_config_pushed()` 一致，并保持**集合层面**的零行为漂移：
+
+        * 旧集合里、且权威视图也判 pushed ⇒ 保留（等价）；
+        * 旧集合里、但权威视图判否（陈旧项）⇒ **排除**（收紧：readiness 不再因残留的
+          `_layer_config_pushed` 而误判就绪）；
+        * 旧集合没有、但权威视图判 pushed ⇒ **不加入**（不放宽），只记一条具名分歧 ——
+          放宽集合会改变 readiness 结论，留到清理旧集合时一并切换。
+        """
+        resolved = {
+            node_id for node_id in legacy_pushed
+            if self._effective_layer_config_pushed(node_id, True)
+        }
+        registry = getattr(self, "_worker_assignments", None)
+        if registry is not None:
+            for node_id in set(expected_configs) - set(legacy_pushed):
+                if pushed_from_state(registry.state(node_id)) is True:
+                    self._observe_assignment_state_consistency(
+                        node_id,
+                        legacy_pushed=False,
+                        expected=expected_configs.get(node_id) or {},
+                    )
+        return resolved
 
     @property
     def _active_layer_config(self):
@@ -4527,9 +4559,13 @@ class SchedulerPipelineMixin:
         with self._nodes_lock:
             nodes_snapshot = dict(self.nodes)
         with self._layer_config_lock:
-            ready_nodes = set(self._layer_config_pushed)
             expected_configs = dict(self._layer_config_expected)
             ack_snapshot = dict(self._layer_config_acks)
+            # ★ 2026-10-07（DIST-NEXT-3 第二步）：readiness 的 ready 集合改走权威视图
+            #   （等价时与旧集合逐位一致；无记录/分歧保留旧集合值并记具名事件）。
+            ready_nodes = self._effective_layer_config_pushed_nodes(
+                set(self._layer_config_pushed), expected_configs,
+            )
         get_client_ids = getattr(self._tcp_server, "get_client_ids", None)
         connected = set(
             get_client_ids()

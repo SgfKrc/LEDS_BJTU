@@ -251,6 +251,8 @@ def assignment_state_summary(
 DIVERGENCE_STATE_MISSING = "state_missing_but_legacy_expected"
 DIVERGENCE_TERMINAL_BUT_PUSHED = "terminal_state_but_legacy_pushed"
 DIVERGENCE_READY_BUT_NOT_PUSHED = "state_ready_but_legacy_not_pushed"
+#: 权威视图说「已 ACK」而旧集合说「未 pushed」——「放宽」方向的分歧（当前**不**随它放宽）。
+DIVERGENCE_PUSHED_BUT_LEGACY_NOT = "state_pushed_but_legacy_not_pushed"
 
 #: 旧集合 `_layer_config_pushed` 的等价相位：节点已确认收到本代际配置。
 PUSHED_PHASES = (PHASE_ACKED, PHASE_READY)
@@ -259,12 +261,21 @@ PUSHED_PHASES = (PHASE_ACKED, PHASE_READY)
 def pushed_from_state(state: Optional[WorkerAssignmentState]) -> Optional[bool]:
     """用权威视图推导「`_layer_config_pushed` 的等价值」。
 
-    返回 `None` 表示**无从推导**（没有 assignment 记录）——调用方应继续用旧集合，
-    而不是把"没有记录"当成 False（那会误伤尚未走配置流程的节点）。
+    返回 `None` = **无从推导**，调用方应沿用旧集合。三档语义：
+
+    * `ACKED` / `READY` ⇒ `True`；
+    * `RELEASED` / `ABORTED` ⇒ `False`（明确否定：这才是"陈旧 pushed"要收紧的情形）；
+    * `STAGED` / `PUSHING` ⇒ `None` —— 尚无 ACK 证据**不等于**否定：旧集合可能由不经过
+      本视图的路径维护（历史 ready ACK 路径、测试夹具），把它当 `False` 会误伤仍在
+      就绪的节点（实测：`test_push_waits_for_worker_load_ack`）。
     """
     if state is None:
         return None
-    return state.phase in PUSHED_PHASES
+    if state.phase in PUSHED_PHASES:
+        return True
+    if state.phase in TERMINAL_PHASES:
+        return False
+    return None
 
 
 @dataclass(frozen=True)
@@ -304,6 +315,13 @@ def evaluate_assignment_consistency(
         return AssignmentConsistency(
             consistent=False,
             reason_code=DIVERGENCE_TERMINAL_BUT_PUSHED,
+            state_phase=state.phase,
+        )
+    if state.phase == PHASE_ACKED and not legacy_pushed:
+        # 「放宽」方向的分歧：权威视图已 ACK，但旧集合尚未标记 pushed。
+        return AssignmentConsistency(
+            consistent=False,
+            reason_code=DIVERGENCE_PUSHED_BUT_LEGACY_NOT,
             state_phase=state.phase,
         )
     if state.phase == PHASE_READY and not legacy_pushed:

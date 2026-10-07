@@ -226,9 +226,9 @@ def test_pushed_equivalence_mapping_and_effective_verdict(caplog):
     registry, _ = _registry()
     # 无记录 ⇒ 无从推导
     assert pushed_from_state(None) is None
-    # 未 ACK 的相位 ⇒ False
+    # 未 ACK 的相位 ⇒ **未知**（不等于否定：旧集合可能由其它路径维护）
     registry.begin("w_pushing", config_id="c")
-    assert pushed_from_state(registry.state("w_pushing")) is False
+    assert pushed_from_state(registry.state("w_pushing")) is None
     # ACK 之后 ⇒ True（与 `_layer_config_pushed.add` 的语义等价）
     registry.transition("w_pushing", phase=PHASE_ACKED)
     assert pushed_from_state(registry.state("w_pushing")) is True
@@ -249,7 +249,7 @@ def test_pushed_equivalence_mapping_and_effective_verdict(caplog):
     assert sched._effective_layer_config_pushed("w_acked", True) is True
     assert sched._effective_layer_config_pushed("w_acked", False) is False
 
-    # ③ 分歧场景 ⇒ 保留旧判据（fail-closed），且观测点已留证据
+    # ③ 收紧了场景 ⇒ 权威视图判否 ⇒ 不再算 pushed（排除陈旧项），且观测点已留证据
     sched._worker_assignments.begin("w_released", config_id="c")
     sched._worker_assignments.release("w_released", reason_code=REASON_CONFIG_CLEARED)
     with caplog.at_level("WARNING", logger="scheduler"):
@@ -257,8 +257,37 @@ def test_pushed_equivalence_mapping_and_effective_verdict(caplog):
             "w_released", legacy_pushed=True, expected={"config_id": "c"},
         )
         verdict = sched._effective_layer_config_pushed("w_released", True)
-    assert verdict is True                       # 不改判据
+    assert verdict is False                      # 陈旧项被排除（收紧）
     assert "terminal_state_but_legacy_pushed" in caplog.text
+
+    # ④ **不放宽**：权威视图判真、旧集合判假 ⇒ 保持旧值（放宽集合会改 readiness 结论）
+    sched._worker_assignments.begin("w_acked2", config_id="c")
+    sched._worker_assignments.transition("w_acked2", phase=PHASE_ACKED)
+    assert sched._effective_layer_config_pushed("w_acked2", False) is False
+
+
+def test_ready_node_set_excludes_stale_entries_and_never_widens(caplog):
+    """readiness 的 ready 集合：陈旧 pushed 被排除、无记录项保留、权威独有项不加入。"""
+    sched = Scheduler()
+    registry = sched._worker_assignments
+    registry.begin("stale", config_id="c")
+    registry.release("stale", reason_code=REASON_CONFIG_CLEARED)
+    registry.begin("fresh", config_id="c")
+    registry.transition("fresh", phase=PHASE_ACKED)
+    registry.begin("authority_only", config_id="c")
+    registry.transition("authority_only", phase=PHASE_ACKED)
+
+    with caplog.at_level("WARNING", logger="scheduler"):
+        ready = sched._effective_layer_config_pushed_nodes(
+            {"stale", "fresh", "legacy_only"},
+            {"fresh": {"config_id": "c"}, "authority_only": {"config_id": "c"}},
+        )
+
+    # stale：旧集合有、权威视图已 released ⇒ 排除
+    # legacy_only：无 assignment 记录 ⇒ 沿用旧集合（不当作未就绪）
+    # authority_only：权威说 pushed 但旧集合没有 ⇒ 不放宽（只记事件）
+    assert ready == {"fresh", "legacy_only"}
+    assert "worker_assignment_state_divergence" in caplog.text
 
 
 def test_scheduler_write_paths_feed_the_authority_view():
