@@ -312,12 +312,36 @@ def _assert_layer_stage_offer_fits_frame(
     if hidden_fits_stage_frame(n_tokens, n_embd, dtype):
         return
     if chunked_input:
-        logger.debug(
-            "Route-A stage 帧超预算但对端声明分片，交由 provider 分片发送: node=%s "
-            "wire=%dB budget=%dB n_tokens=%d",
-            node_id, wire_bytes, budget_bytes, n_tokens,
+        # ★ 2026-10-08（DIST-NEXT-2b）：声明分片只放宽**单帧**预算。分片本身仍有总量上限
+        #   （`MAX_STAGE_CHUNKS × STAGE_CHUNK_BYTES` 原始字节），越过它必须**仍在此**
+        #   fail-closed —— 否则会在 provider 的分片计划中途才抛
+        #   （`stage_payload_too_large: payload needs N chunks, at most 64 are allowed`），
+        #   又退回成"过晚的契约发现"。
+        from task_worker_protocol import (
+            MAX_STAGE_PAYLOAD_BYTES,
+            _base64_wire_length,
         )
-        return
+
+        chunked_wire_limit = int(_base64_wire_length(int(MAX_STAGE_PAYLOAD_BYTES)))
+        if wire_bytes <= chunked_wire_limit:
+            logger.debug(
+                "Route-A stage 帧超单帧预算但对端声明分片，交由 provider 分片发送: "
+                "node=%s wire=%dB budget=%dB n_tokens=%d",
+                node_id, wire_bytes, budget_bytes, n_tokens,
+            )
+            return
+        logger.warning(
+            "Route-A stage 分片总量超限: node=%s n_tokens=%d n_embd=%d wire=%dB "
+            "max_chunked_wire=%dB",
+            node_id, n_tokens, n_embd, wire_bytes, chunked_wire_limit,
+        )
+        raise LayerStageFrameTooLarge(
+            node_id=node_id,
+            wire_bytes=wire_bytes,
+            budget_bytes=chunked_wire_limit,
+            n_tokens=n_tokens,
+            n_embd=n_embd,
+        )
     logger.warning(
         "Route-A stage 帧预算不足: node=%s n_tokens=%d n_embd=%d dtype=%s "
         "wire=%dB budget=%dB max_tokens=%d",

@@ -30,6 +30,7 @@ from scheduler_pipeline import (  # noqa: E402
 )
 from task_worker_protocol import (  # noqa: E402
     MAX_MESSAGE_BYTES,
+    MAX_STAGE_PAYLOAD_BYTES,
     STAGE_CHUNK_BYTES,
     STAGE_FRAME_RESERVE_BYTES,
     WorkerProtocolError,
@@ -190,3 +191,29 @@ def test_layer_stage_offer_reaches_provider_when_peer_declares_chunks():
         )
 
     assert touched == ["worker-b"]
+
+
+def test_precheck_rejects_when_chunked_total_exceeds_chunk_limit():
+    """★ 2026-10-08（DIST-NEXT-2b）：分片只放宽**单帧**预算。
+
+    总量越过 `MAX_STAGE_CHUNKS × STAGE_CHUNK_BYTES` 时仍须在 dispatch 前具名失败，
+    否则会在 provider 的分片计划里才抛 `stage_payload_too_large` —— 又是过晚的契约发现。
+    """
+    limit_wire = int(_base64_wire_length(int(MAX_STAGE_PAYLOAD_BYTES)))
+
+    inside = 8000  # 8000 × 2048 × 4 B ≈ 63 片，正好在 64 片上限内
+    assert hidden_wire_bytes(inside, 2048, "float32") <= limit_wire
+    _assert_layer_stage_offer_fits_frame(
+        node_id="worker-b", n_tokens=inside, n_embd=2048, chunked_input=True,
+    )
+
+    outside = 9000  # 超过 64 片 ⇒ 分片也装不下
+    assert hidden_wire_bytes(outside, 2048, "float32") > limit_wire
+    with pytest.raises(LayerStageFrameTooLarge) as captured:
+        _assert_layer_stage_offer_fits_frame(
+            node_id="worker-b", n_tokens=outside, n_embd=2048, chunked_input=True,
+        )
+    error = captured.value
+    assert error.code == "route_a_stage_frame_too_large"
+    assert error.budget_bytes == limit_wire
+    assert error.wire_bytes > error.budget_bytes
