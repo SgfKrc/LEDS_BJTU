@@ -895,6 +895,36 @@ class SchedulerPipelineMixin:
                 }
             else:
                 status = self._task_worker_control.status(role="master")
+                # ★ 2026-10-08（诊断，定位后降级）：逐 worker 打出**准入三分量**，用来回答
+                #   "为什么状态显示健康的 v3 层段 worker 仍被判 not_eligible"。capacity 候选的
+                #   白名单正取自本函数的返回值（`stage_releasable_worker_ids`），所以这里缺哪个
+                #   分量，就是候选缺它的原因。
+                for _worker in status.get("workers", []) or []:
+                    if not isinstance(_worker, dict):
+                        continue
+                    _caps = _worker.get("capabilities")
+                    _ok = (
+                        _worker.get("healthy") is True
+                        and _worker.get("layer_stage_dispatch_enabled") is True
+                        and isinstance(_caps, dict)
+                        and bool(_caps.get("layer_ranges"))
+                        and _worker.get("node_id") in connected_ids
+                    )
+                    if _ok:
+                        # 合格 ⇒ 不打日志（避免每次请求每个 worker 一条）。
+                        continue
+                    # 只有**不合格**时才记 —— 那正是"候选为什么缺它"的答案。
+                    logger.info(
+                        "event=stage_admission_rejected node=%s healthy=%s dispatch=%s "
+                        "ranges=%s in_connected=%s version=%s",
+                        _worker.get("node_id"),
+                        _worker.get("healthy"),
+                        _worker.get("layer_stage_dispatch_enabled"),
+                        (str(_caps.get("layer_ranges"))[:48]
+                         if isinstance(_caps, dict) else "n/a"),
+                        _worker.get("node_id") in connected_ids,
+                        _worker.get("selected_version"),
+                    )
                 admitted = {
                     str(worker.get("node_id", ""))
                     for worker in status.get("workers", [])
