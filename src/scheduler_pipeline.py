@@ -1534,6 +1534,33 @@ class SchedulerPipelineMixin:
             if item.get("node_id") in master_ids
         ), None)
         try:
+            # ★ 2026-10-07：**stage-only 路径**（只有 A3 worker、没有 legacy ACK）在
+            #   `:1097-1101` 直接调用本函数，于是从来没有远端 ACK 驱动 master 的
+            #   `prepare` 阶段 ⇒ `prepare_pipeline_tokenizer()` 会因
+            #   `is_pipeline_prepared=False` 抛
+            #   `当前没有已准备的 distributed-only 流水线模型`
+            #   （实测 reason_code=`pipeline_local_commit_failed`）。
+            #   这里在 commit 前为本地节点补一次 prepare。已 prepared 时是 no-op。
+            if local_assignment is not None and not getattr(
+                self._host, "is_pipeline_prepared", False
+            ):
+                prepare_local = getattr(self._host, "prepare_pipeline_model", None)
+                local_model_path = (
+                    getattr(self._host, "_full_model_path", None)
+                    or getattr(self._host, "_model_path", None)
+                    or getattr(self._host, "model_path", None)
+                )
+                if callable(prepare_local) and local_model_path:
+                    prepare_local(
+                        model_id=str(plan.get("model_id", "") or ""),
+                        model_path=str(local_model_path),
+                        quant_type=getattr(self._host, "quant_type", None),
+                        layer_range=(
+                            int(local_assignment["start_layer"]),
+                            int(local_assignment["end_layer"]),
+                        ),
+                        model_sha256=None,
+                    )
             prepare_tokenizer = getattr(self._host, "prepare_pipeline_tokenizer", None)
             if callable(prepare_tokenizer):
                 prepare_tokenizer()

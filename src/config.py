@@ -486,6 +486,16 @@ PIPELINE_ROUTE_A_STAGE_OFFER_ENABLED = _env_bool(
     "QLH_ROUTE_A_STAGE_OFFER", True,
 )
 
+# ★ 2026-10-07：强制本机（master）走 PyTorch 上游。
+#   动机：qwen3.5 的 keep-head 上游挂点在 `output_norm` **之后**（多一次 RMSNorm，
+#   实测会让接力首步分叉）⇒ `LlamaCppEngine` 上游被 fail-closed 拒绝
+#   （docs/已知问题记录.md #35）。而 `_auto_load_default_model()` 里 GGUF **永远
+#   优先**（api_server.py 的 `if gguf_candidates:`），画像模型又自带 gguf ⇒ 无法
+#   自动落到 PyTorch。置 1 且画像模型有 safetensors 目录时，优先选该目录
+#   （`engine=pytorch`），让本机用 `model_module.forward_layers` 出 hidden。
+#   默认 0：不改变既有行为（llama 优先）。
+PREFER_PYTORCH = _env_bool("QLH_PREFER_PYTORCH", False)
+
 # 图算法智能编排阈值：节点数超过此值（>5）时自动启用最大带宽生成树 + DFS，
 # 替代纯算力权重分配；节点数 ≤ 阈值时回退到简单排序（权重比例分配）
 GRAPH_ORCHESTRATOR_THRESHOLD = 5         # 节点数 > 5 启用图算法，≤ 5 使用简单排序

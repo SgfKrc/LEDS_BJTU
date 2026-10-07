@@ -2895,6 +2895,38 @@ class Scheduler(
             #   「中间段接末段 / 末段接中间段」这类分配。
             if node_id in segment_mode_by_node:
                 record["segment_mode"] = segment_mode_by_node[node_id]
+            # ★ 2026-10-07：**本地节点**也要声明自己的层段工件区间。
+            #   背景：`pipeline_capacity.py` 的 `range_constrained = any(
+            #   node.get("layer_ranges") is not None ...)` —— 只要**任一**远端节点
+            #   声明了区间，全链就必须由区间拼满 `[0, total)`（契约也要求
+            #   `pipeline_node_contract.py` 的 "cover every layer exactly once"）。
+            #   本地 master 此前**从不**带 `layer_ranges`（`layer_ranges_by_node`
+            #   只从 task worker hello 取）⇒ 一旦远端声明区间，本地这段就成了
+            #   覆盖缺口，实测 `status=rejected
+            #   reason=pipeline_layer_range_coverage_insufficient`。
+            #   本机若是**裁层 GGUF 上游**（`QLH_LAYER_GGUF`），用与 PC worker
+            #   同一份推导（`_configured_layer_artifact`）声明自己的区间。
+            #   ⚠️ 判据必须与 `_pipeline_node_metadata` 一致：主节点的本地 ID 是
+            #   字面量 `"master"`，而 `get_effective_node_id()` 返回的是
+            #   `_configured_node_id()`（可能是主机名）—— 两者**不等**，
+            #   用后者会让本地节点永远匹配不上（实测投影里只有远端两个节点）。
+            local_node_id = (
+                "master" if self._effective_role() == "master"
+                else self.get_effective_node_id()
+            )
+            if (
+                node_id == local_node_id
+                and "layer_ranges" not in record
+                and node_id not in layer_ranges_by_node
+            ):
+                local_artifact = self._configured_layer_artifact()
+                if local_artifact:
+                    record["layer_ranges"] = [
+                        [int(local_artifact["start"]), int(local_artifact["end"])],
+                    ]
+                    local_mode = str(local_artifact.get("mode", "") or "").lower()
+                    if local_mode in {"head", "middle", "tail"}:
+                        record["segment_mode"] = local_mode
             records.append(record)
         return records
 

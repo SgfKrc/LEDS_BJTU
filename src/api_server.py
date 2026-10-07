@@ -4397,7 +4397,22 @@ def _auto_load_default_model():
     if _active_id:
         logger.info(f"默认模型按设备画像选择: {_active_id}")
 
-    if gguf_candidates:
+    # ★ 2026-10-07：`QLH_PREFER_PYTORCH=1` 且画像模型带 safetensors 目录时，
+    #   跳过下面的 GGUF 分支，让本机走 PyTorch（`engine=pytorch`）。
+    #   动机见 `config.PREFER_PYTORCH` 的说明：qwen3.5 的 keep-head 上游挂点在
+    #   `output_norm` 之后，llama.cpp 上游被 fail-closed 拒绝（#35），
+    #   而 GGUF 分支的优先级在 PyTorch 之前 ⇒ 必须显式让路。
+    prefer_pytorch = (
+        bool(getattr(cfg, "PREFER_PYTORCH", False))
+        and bool(_active_safetensors)
+        and os.path.isdir(_active_safetensors)
+    )
+    if prefer_pytorch:
+        logger.info(
+            f"QLH_PREFER_PYTORCH=1 ⇒ 本机优先走 PyTorch: {_active_safetensors}"
+        )
+
+    if gguf_candidates and not prefer_pytorch:
         gguf_path = gguf_candidates[0]
         engine = "llama_cpp"
         model_path = gguf_path
