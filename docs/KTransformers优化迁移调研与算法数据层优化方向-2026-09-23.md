@@ -111,8 +111,8 @@ Gate/Up 融合实现、GPTQ/Marlin/FP8 依赖栈。它们可以作为外部对�
 | **P0** | **先裁决"上游 torch GPU 层是否真的更贵"的口径冲突**（见 §7），用已有的段画像 `fit_segment_profile`（固定开销 + 边际每层）替代「平均每层」做路由决策 | 两处结论**方向相反** | 0.5–1 人日（纯分析，可复用 `scripts/relay_cut_plan.py`） |
 | **P1** | **prefix cache / 会话级 KV 复用落到 L 档主路径**（llama.cpp prompt cache / `src/paged_kv_cache.py`），量化"多轮对话重复 prefill"的节省 | KT 用三层 GPU-CPU-Disk 复用证明**数据层**收益；QLH 调研已把「本地 prefix cache」列为 ✅ 可行 | 2–4 人日 |
 | **P1** | **量化资产管线纪律**：上游/下游量化源一律从 **BF16** 出发；核对 `quant_type="int4"` **静默回退 fp16** 的实际生效 dtype | KT 明确警告 FP8→INT4 明显掉精度；QLH 已记录该回退陷阱 | 0.5–1 人日（多为核对与文档） |
-| **P2** | **投机解码从 PoC 走到真实链路**（`src/speculative.py` 尚未接入生产循环） | 属算法层提速；vLLM/SGLang 生态的 MTP 是同类杠杆 | 5–10 人日（含分布等价回归） |
-| **P2** | **hidden 压缩真正上线**（`int8_block128` 数值往返已 32/32，但 `RELAY_WIRE_VERSION=1` 仍固定 f32） | **只对弱网/跨机有意义**（同机占比 <1%） | 2–3 人日（含协议版本升级与兼容门） |
+| **已完成** | **hidden 压缩已上 wire**（2026-10-07 核实；原条目「`RELAY_WIRE_VERSION=1` 仍固定 f32」作废） | **只对弱网/跨机有意义**（同机占比 <1%） | — |
+| **已废止** | **投机解码**：2026-10-07 核实为**永久关闭**，原 P2 条目「从 PoC 走到真实链路」作废，不再排期 | — | — |
 | **科研档** | Expert Deferral、选择性专家激活、专家放置策略 | 先在 PyTorch 上游和 MoE 样本中验证；默认不能绕过逐 token 一致门 | 仅产出实验报告 |
 
 ### 6.2 工程层
