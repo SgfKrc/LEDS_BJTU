@@ -31,6 +31,7 @@ import asyncio
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -90,6 +91,29 @@ def _online_node_count(api) -> int:
     )
 
 
+def _workflow_items(api) -> list:
+    """`/api/workflows` 里的 workflow 记录列表（取不到 ⇒ 空）。"""
+    try:
+        payload = api.get("/workflows")
+    except Exception:  # noqa: BLE001 - 后端不可达 ⇒ 空，由断言暴露
+        return []
+    items = payload.get("workflows") if isinstance(payload, dict) else None
+    return [item for item in (items or []) if isinstance(item, dict)]
+
+
+def _workflow_ids(api) -> set:
+    """当前全部 workflow id —— 用于「操作前后差集」定位**本次新增**的那一条。
+
+    ⚠️ 不能取 `items[0]`：`/workflows` 的首条恒为旧记录（实测三次运行都取到同一条
+    `wf_21e78e…`，而本次请求其实已产生新 workflow ⇒ 判据永远失败）。
+    """
+    return {
+        str(item.get("workflow_id"))
+        for item in _workflow_items(api)
+        if item.get("workflow_id")
+    }
+
+
 def _distributed_enabled(api) -> bool:
     """`/api/cluster/config` 里分布式推理开关的当前值（取不到 ⇒ False）。"""
     try:
@@ -117,6 +141,18 @@ def _skip_reason(api=None) -> str:
         return f"本机 master 后端不可达（F3 需先起 api_server）: {exc}"
     if not isinstance(status, dict) or status.get("model_loaded") is not True:
         return "本机 master 未加载完整模型（F3 前置：先加载模型）"
+    # ★ 2026-10-07：层段流水线（Route-A / 任务图）要求 **PyTorch** 引擎 —— llama.cpp 只能
+    #   整模本地推理（`llama.cpp engine does not support layer-split pipeline`）。实测引擎
+    #   不对时请求会静默落到 `local_llama_cpp`：既不产生 workflow，也没有 `distributed_used`
+    #   ⇒ 档会给出**误导性失败**（"未走分布式"），而不是说明"环境没就绪"。这里补前置检查。
+    try:
+        current = api.get("/models/current")
+    except Exception:  # noqa: BLE001 - 取不到就当作未知，交给下游断言
+        current = {}
+    engine = str((current or {}).get("engine") or "").strip().lower()
+    if engine and engine != "pytorch":
+        return (f"本机 master 引擎为 {engine!r}（层段流水线需要 pytorch；llama.cpp 只能整模"
+                f"本地推理，F3 会静默落到 local_llama_cpp）")
     online = _online_node_count(api)
     if online < MIN_ONLINE_NODES:
         return (f"双机集群未就绪：online 节点 {online} < {MIN_ONLINE_NODES}"
@@ -153,6 +189,8 @@ def test_dual_host_tui_distributed_end_to_end():
     reason = _skip_reason(control)
     if reason:
         pytest.skip(reason)
+    # ★ 2026-10-07：记录操作**前**已有的 workflow，稍后用差集定位本次新增项。
+    before_ids = _workflow_ids(control)
 
     async def _main():
         from textual.widgets import Input, Static
@@ -232,10 +270,25 @@ def test_dual_host_tui_distributed_end_to_end():
                     f"{str(pane.query_one('#chat-log', Static).render())[:400]!r}")
 
         # --- 4) 后端视角的硬判据：这次请求真的走了分布式 ---
-        workflows = control.get("/workflows")
-        items = workflows.get("workflows") if isinstance(workflows, dict) else None
-        assert items, f"/workflows 无记录，无法判定分布式: {workflows!r}"
-        latest = items[0]
+        # ★ 2026-10-07：不取 `items[0]`（该端点首条**恒为旧记录**，实测三次运行都取到同一条
+        #   `wf_21e78e…`，而本次请求其实已产生新 workflow ⇒ 判据永远失败）。改为用
+        #   「操作前后 id 差集」定位本次新增项，并轮询等它落库（任务图是异步的）。
+        def _new_workflow():
+            for item in _workflow_items(control):
+                candidate = str(item.get("workflow_id") or "")
+                if candidate and candidate not in before_ids:
+                    return item
+            return None
+
+        deadline = time.time() + REPLY_TIMEOUT
+        latest = None
+        while latest is None and time.time() < deadline:
+            latest = _new_workflow()
+            if latest is None:
+                time.sleep(1.0)
+        assert latest is not None, (
+            f"{REPLY_TIMEOUT:.0f}s 内未出现新 workflow（操作前 {len(before_ids)} 条）"
+            f"⇒ 本次 TUI 请求没有落到任务图")
         workflow_id = str(latest.get("workflow_id") or "")
         detail = control.get(f"/workflows/{workflow_id}") if workflow_id else {}
         metrics = detail.get("metrics") if isinstance(detail, dict) else None
@@ -245,7 +298,7 @@ def test_dual_host_tui_distributed_end_to_end():
         ), (f"本次 TUI 请求未走分布式: distributed_used="
             f"{latest.get('distributed_used')!r} / metrics="
             f"{(metrics or {}).get('distributed_used')!r}; workflow={workflow_id!r}; "
-            f"最近 workflow 数={len(items)}")
+            f"操作前 {len(before_ids)} 条 / 现在 {len(_workflow_items(control))} 条")
         assert not (latest.get("fallback") or (metrics or {}).get("fallback")), (
             f"不应发生回退: fallback={latest.get('fallback')!r} / "
             f"{(metrics or {}).get('fallback')!r}")
