@@ -141,6 +141,18 @@ class BackendManager:
         import tempfile
         return os.path.join(tempfile.gettempdir(), "qlh_simulation_backend.log")
 
+    def _sim_state_dir(self) -> Path:
+        """单机仿真的独立 state 目录（惰性创建，同一进程复用）。
+
+        主仓 `STATE_DIR` 里可能残留上次真机实验的 pipeline 状态；隔离掉它，
+        `scheduler_pipeline` 的 recovery 才不会把模型变成「分布式专用」（D4 第四层）。
+        """
+        if not hasattr(self, "_state_dir"):
+            import tempfile
+
+            self._state_dir = Path(tempfile.mkdtemp(prefix="qlh_sim_state_"))
+        return self._state_dir
+
     def __init__(self):
         self.master_process: Optional[subprocess.Popen] = None
         self.slave_processes: List[subprocess.Popen] = []
@@ -175,6 +187,11 @@ class BackendManager:
         if not enable_route_a:
             env["QLH_ROUTE_A_STAGE_OFFER"] = "0"
             env["QLH_RUN_MODE"] = "single"
+            # 独立的 state 目录：主仓的 `STATE_DIR` 可能残留上次真机实验持久化的
+            # pipeline 状态 ⇒ 启动时被 `scheduler_pipeline` 的 recovery 恢复 ⇒
+            # `_pipeline_model_is_prepared()` 为真 ⇒ `local_only` 命中 409、
+            # `_auto_load_default_model` 永不执行（实测 D4 的第四层根因）。
+            env["QLH_STATE_DIR"] = str(self._sim_state_dir())
 
         # 构建启动命令
         api_server_path = self.project_root / "src" / "api_server.py"
