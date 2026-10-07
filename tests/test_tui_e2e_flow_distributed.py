@@ -165,6 +165,88 @@ def _skip_reason(api=None) -> str:
     return ""
 
 
+def test_dual_host_tui_routed_pipeline_streams_text():
+    """★ Route-A（stage_offer_v3 层段链）的**产物级**验收：TUI 真操作 + 普通分布式流水线。
+
+    与主判据（任务图 + `distributed_used`）互补：这里**不切任务图**，只走 `/route required`
+    ⇒ 普通流水线 ⇒ 远端层段参与 ⇒ **回答非空**。普通流水线**不产生 workflow**，所以主判据
+    的取数方式在这里天然不适用（这正是"未出现新 workflow"的由来）。
+
+    这条正是「原生思考抑制判据」缺陷的产物级回归：修复前该判据把**模板给模型的指令**当成
+    「模型已进入思考」，而 `qwen3-5-2b` 模板在 `enable_thinking` 非 true 时注入的是**已闭合**
+    的思考块 ⇒ 生成段永远等不到 `</think>` ⇒ 正文被整段吞掉（流式 0 个 token 事件、非流式
+    「流水线返回空响应」）。
+    """
+    from tui_api import ApiClient
+    from tui_textual import KoakumaApp, MainScreen
+
+    control = ApiClient(host=HOST, port=PORT, timeout=120.0)
+    reason = _skip_reason(control)
+    if reason:
+        pytest.skip(reason)
+
+    async def _main() -> str:
+        from textual.widgets import Input, Static
+
+        app = KoakumaApp(ApiClient(host=HOST, port=PORT, timeout=120.0), interval=30)
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.show_main()
+            await wait_for(pilot, lambda: isinstance(app.screen, MainScreen))
+            assert await wait_for(
+                pilot, lambda: bool(app.screen.query("#chat-pane"))), "聊天屏 #chat-pane 未挂载"
+            screen = app.screen
+
+            # 1) 分布式开关：与主判据同样的「确保开启」语义（`t` 是反转开关，不能盲目按）
+            landed = await pilot.click("#nav ListItem#nav-cluster")
+            assert landed, "点击侧栏 cluster 项未命中（`Pilot.click` 自带落点断言）"
+            await pilot.pause()
+            screen.load_cluster_aux()
+            assert await wait_for(
+                pilot, lambda: bool((screen.cluster_aux or {}).get("distributed"))), (
+                f"cluster_aux 未加载到分布式配置: {screen.cluster_aux!r}")
+            if not _distributed_enabled(control):
+                screen.action_cluster_toggle()
+                await pilot.pause()
+                await pilot.press("y")
+            assert await wait_for(
+                pilot, lambda: _distributed_enabled(control)), (
+                "分布式开关未开启（/api/cluster/config 复核失败）")
+
+            # 2) 路由偏好：/route required（**不**切任务图 ⇒ 走普通流水线）
+            pane = screen.query_one("#chat-pane")
+            assert await wait_for(pilot, lambda: bool(pane.query(Input))), "聊天输入框未挂载"
+            box = pane.query_one(Input)
+            box.value = "/route required"
+            box.focus()
+            await pilot.press("enter")
+            assert await wait_for(
+                pilot, lambda: getattr(app, "routing_preference", None)
+                == "distributed_required"), (
+                f"/route required 未生效: routing_preference="
+                f"{getattr(app, 'routing_preference', None)!r}")
+
+            # 3) 发一条真消息，等非空回答
+            box.value = PROMPT
+            box.focus()
+            await pilot.press("enter")
+
+            def _answer() -> str:
+                return _assistant_body(str(pane.query_one("#chat-log", Static).render()))
+
+            got = await wait_for(pilot, lambda: len(_answer()) >= 2, timeout=REPLY_TIMEOUT)
+            if not got:
+                raise AssertionError(
+                    f"真模型在 {REPLY_TIMEOUT:.0f}s 内未给出非空回答（Route-A 产物级判据）；"
+                    f"已渲染文本（前 400 字）: "
+                    f"{str(pane.query_one('#chat-log', Static).render())[:400]!r}")
+            return _answer()
+
+    answer = _run(_main())
+    assert len(answer) >= 2, f"回答过短: {answer!r}"
+    for marker in ("流水线返回空响应", "当前没有可用的分布式路径", "distributed_required"):
+        assert marker not in answer, f"回答里出现失败文案 {marker!r}: {answer[:200]!r}"
+
+
 def _assistant_body(text: str) -> str:
     """剥掉角色标签，取 assistant 回答**正文**（同 F2：整体长度会把空回答误判成通过）。"""
     parts = re.split(r"assistant", text)
