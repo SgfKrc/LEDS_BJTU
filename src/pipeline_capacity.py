@@ -393,6 +393,30 @@ def _relay_zero_layer_assignments(
     return entries
 
 
+def _uncovered_layer_ranges(ranges, total_layers: int) -> list[tuple[int, int]]:
+    """★ 2026-10-08（真机复测）：`[0, total_layers)` 里**没有任何节点区间覆盖**的段。
+
+    真机上 `pipeline_layer_range_coverage_insufficient` 被反复误读成"工件区间配置错"，
+    而实际原因是 **worker 进程被系统回收/重连、掉出候选**（实测 Y700 每 4–16 分钟重建一次，
+    落在断开窗口里的请求就报这个码）。把缺口写进 `reason`，现场一眼可分"区间不连续"与
+    "有节点不在"。
+    """
+    covered = sorted(
+        (int(start), int(stop))
+        for start, stop in (ranges or ())
+        if int(stop) > int(start)
+    )
+    gaps: list[tuple[int, int]] = []
+    cursor = 0
+    for start, stop in covered:
+        if start > cursor:
+            gaps.append((cursor, start))
+        cursor = max(cursor, stop)
+    if cursor < int(total_layers or 0):
+        gaps.append((cursor, int(total_layers)))
+    return gaps
+
+
 def solve_pipeline_capacity(
     descriptor: dict[str, Any],
     nodes: list[dict[str, Any]],
@@ -728,15 +752,35 @@ def solve_pipeline_capacity(
             )
             unconstrained_admission = bool(unconstrained.get("admitted"))
         if range_constrained and unconstrained_admission:
+            # ★ 2026-10-08：把「缺口区间」写进 reason —— 现场多次把本码误读成"工件区间配置错"，
+            #   真因往往是 worker 掉线/未准入（见 `_uncovered_layer_ranges` 的说明）。
+            gaps = _uncovered_layer_ranges(
+                [
+                    item
+                    for node in usable
+                    for item in (node.get("layer_ranges") or [])
+                ],
+                int(descriptor.get("total_layers") or 0),
+            )
+            reason = (
+                "advertised layer_ranges cannot cover the requested contiguous layer interval"
+            )
+            if gaps:
+                reason = (
+                    f"{reason}（未覆盖区间: "
+                    f"{', '.join(f'[{start},{stop})' for start, stop in gaps)}；"
+                    f"若这些区间本应有节点承担，检查该节点是否掉线/未准入）"
+                )
             return {
                 **base,
                 "status": "rejected",
                 "admitted": False,
                 "reason_code": "pipeline_layer_range_coverage_insufficient",
-                "reason": "advertised layer_ranges cannot cover the requested contiguous layer interval",
+                "reason": reason,
                 "allocatable_bytes": allocatable_bytes,
                 "raw_capacity_deficit_bytes": max(0, raw_model_bytes - allocatable_bytes),
                 "assignments": [],
+                "uncovered_layer_ranges": [list(gap) for gap in gaps],
                 "control_only_nodes": [node["node_id"] for node in usable],
             }
         return {
