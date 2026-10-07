@@ -33,6 +33,16 @@ HIDDEN_DTYPE_BYTES = {"float32": 4, "float16": 2}
 #: `seq_ids`/`positions`（n_tokens 量级）与 metadata。
 STAGE_FRAME_RESERVE_BYTES = 256 * 1024
 
+#: ★ 2026-10-07（DIST-NEXT-2b）：大 payload 的**有序分片**契约。
+#:
+#: 超单帧预算的输入（长 prefill / 大 `n_embd`）不再只能被拒：coordinator 先发
+#: `chunk_count` 条 `stage_chunk`（每条带 attempt 身份与自身摘要），再发引用它们的
+#: `stage_offer`；worker 收齐并校验后装配。三个上限都是**硬上限**：分片不能用来绕过
+#: 帧预算（总数 × 单片上限 = 装配上限）。
+MAX_STAGE_CHUNKS = 64
+STAGE_CHUNK_BYTES = 1 * 1024 * 1024
+MAX_STAGE_PAYLOAD_BYTES = MAX_STAGE_CHUNKS * STAGE_CHUNK_BYTES
+
 # Runtime profiles are part of the release capability contract.  Keep this
 # dependency-free so protocol validation can run in the slim worker process.
 RUNTIME_PROFILES = ("llama_cpp_only", "torch_cpu", "torch_cuda")
@@ -48,6 +58,8 @@ MESSAGE_TYPES = frozenset({
     "stage_error",
     "stage_cancel",
     "stage_cancelled",
+    #: ★ 2026-10-07（DIST-NEXT-2b）：大 payload 的有序分片（v3 起）。
+    "stage_chunk",
 })
 
 _MESSAGE_ID = re.compile(r"^msg_[A-Za-z0-9_-]{8,96}$")
@@ -165,6 +177,13 @@ _PAYLOAD_FIELDS = {
     "stage_cancel": _IDENTITY_FIELDS | {"reason_code"},
     "stage_cancelled": _IDENTITY_FIELDS | {
         "provider_id", "reason_code",
+    },
+    #: ★ 2026-10-07（DIST-NEXT-2b）：大 payload 分片（v3 起，见 `MAX_STAGE_CHUNKS`）。
+    #: `payload_b64` 是**原始字节**的 base64；`payload_sha256` 是这些字节的摘要，
+    #: 使接收端能在装配前逐片校验（装配完仍以 `stage_offer.hidden_sha256` 兜底）。
+    "stage_chunk": _IDENTITY_FIELDS | {
+        "provider_id", "chunk_index", "chunk_count", "payload_b64",
+        "payload_sha256", "total_bytes",
     },
 }
 _PAYLOAD_FIELDS_V2 = {
@@ -1086,6 +1105,55 @@ def _validate_payload(
             max_length=64,
         )
         _require_bool(payload["retryable"], "payload.retryable")
+    elif message_type == "stage_chunk":
+        # ★ 2026-10-07（DIST-NEXT-2b）：分片的形状与硬上限。顺序语义（不得乱序、
+        #   不得重复、集齐才装配）由接收端状态机 `task_worker_chunks.StageChunkAssembler`
+        #   保证 —— 协议层只拒绝「单条就不合法」的分片。
+        if version < 3:
+            raise _error(
+                "unsupported_message_type", "message_type",
+                "stage_chunk requires protocol v3 or newer",
+            )
+        chunk_count = _require_int(
+            payload["chunk_count"], "payload.chunk_count", minimum=1,
+        )
+        if chunk_count > MAX_STAGE_CHUNKS:
+            raise _error(
+                "chunk_count_out_of_range", "payload.chunk_count",
+                f"chunk_count must be <= {MAX_STAGE_CHUNKS}",
+            )
+        chunk_index = _require_int(
+            payload["chunk_index"], "payload.chunk_index", minimum=0,
+        )
+        if chunk_index >= chunk_count:
+            raise _error(
+                "chunk_index_out_of_range", "payload.chunk_index",
+                "chunk_index must be less than chunk_count",
+            )
+        total_bytes = _require_int(
+            payload["total_bytes"], "payload.total_bytes", minimum=1,
+        )
+        if total_bytes > MAX_STAGE_PAYLOAD_BYTES:
+            raise _error(
+                "stage_payload_too_large", "payload.total_bytes",
+                f"total_bytes must be <= {MAX_STAGE_PAYLOAD_BYTES}",
+            )
+        chunk = payload["payload_b64"]
+        if not isinstance(chunk, str) or not chunk:
+            raise _error(
+                "invalid_string", "payload.payload_b64",
+                "payload.payload_b64 must be a non-empty string",
+            )
+        # 单片上限用**具名**错误码（不能走 `_require_string` 的通用长度上限 ——
+        # 那会把它报成 `invalid_string`，丢掉「分片太大」这个可操作的信息）。
+        if len(chunk) > int(math.ceil(STAGE_CHUNK_BYTES * _BASE64_EXPANSION)):
+            raise _error(
+                "chunk_too_large", "payload.payload_b64",
+                f"a single chunk must not exceed {STAGE_CHUNK_BYTES} raw bytes",
+            )
+        _require_string(
+            payload["payload_sha256"], "payload.payload_sha256", pattern=_SHA256,
+        )
     else:
         _require_string(
             payload["reason_code"], "payload.reason_code", pattern=_SAFE_CODE,
