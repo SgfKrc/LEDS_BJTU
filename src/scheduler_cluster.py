@@ -2979,7 +2979,8 @@ class SchedulerClusterMixin:
                 logger.info(f"  清理幽灵节点: {pid}")
         if phantoms:
             with self._layer_config_lock:
-                self._layer_config_pushed.clear()
+                # ★ 2026-10-07（DIST-NEXT-3）：清空 assignment 权威视图（派生视图随之空）。
+                self._worker_assignments.clear()
                 self._layer_config_expected.clear()
                 self._layer_config_acks.clear()
 

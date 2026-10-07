@@ -245,8 +245,8 @@ def test_retry_scan_is_not_blocked_by_a_stale_pushed_entry():
     sched._tcp_server = _Server()
     with sched._layer_config_lock:
         sched._layer_config_expected["stale"] = {"config_id": "c", "generation": 1}
-        sched._layer_config_pushed.add("stale")
         sched._layer_config_retry_state["stale"] = {"attempts": 0, "next_retry": 0.0}
+        # 陈旧证据：旧集合曾有该节点，但权威视图已终止（派生视图不再包含）
         registry.begin("stale", config_id="c")
         registry.release("stale", reason_code=REASON_CONFIG_CLEARED)
 
@@ -272,7 +272,6 @@ def test_retry_scan_still_skips_genuinely_pushed_nodes():
     sched._tcp_server = _Server()
     with sched._layer_config_lock:
         sched._layer_config_expected["fresh"] = {"config_id": "c", "generation": 1}
-        sched._layer_config_pushed.add("fresh")
         sched._layer_config_retry_state["fresh"] = {"attempts": 0, "next_retry": 0.0}
         registry.begin("fresh", config_id="c")
         registry.transition("fresh", phase=PHASE_ACKED)

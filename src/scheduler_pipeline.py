@@ -700,6 +700,32 @@ class SchedulerPipelineMixin:
             bool(legacy_pushed),
         )
 
+    def _ensure_assignment_state(self, node_id: str, *, reason_code: str) -> None:
+        """★ 2026-10-07（DIST-NEXT-3）：ACK 到达但权威视图没有该节点时补一条 assignment。
+
+        产品路径总会先 `_publish_layer_configs()`（⇒ 已有记录）；这条兜底覆盖「本端直接
+        写入 `_layer_config_expected` 后收到 ACK」的路径（历史/夹具），使相位推进不会因为
+        「没有记录」而静默丢失 —— 否则 `_layer_config_pushed` 作为派生视图会漏掉该节点。
+        """
+        registry = getattr(self, "_worker_assignments", None)
+        if registry is None or registry.state(node_id) is not None:
+            return
+        registry.begin(node_id, reason_code=reason_code)
+
+    @property
+    def _layer_config_pushed(self) -> frozenset:
+        """★ 2026-10-07（DIST-NEXT-3）：**派生视图**，不再是事实源。
+
+        集合语义 = 「该节点已确认收到本代际层配置」，唯一来源是
+        `_worker_assignments` 的相位（`ACKED` / `READY`）。返回 `frozenset`：
+        任何遗留的 `add` / `discard` / `clear` 会立刻 `AttributeError`（fail-loud），
+        而不是静默失效 —— 这是"降级为派生视图"能安全落地的前提。
+        """
+        return frozenset(
+            node_id for node_id, state in self._worker_assignments.snapshot().items()
+            if state["phase"] in (PHASE_ACKED, PHASE_READY)
+        )
+
     def _effective_layer_config_pushed(
         self, node_id: str, legacy_pushed: bool,
     ) -> bool:
@@ -1587,7 +1613,8 @@ class SchedulerPipelineMixin:
             return
         with self._layer_config_lock:
             for node_id, config in configs.items():
-                self._layer_config_pushed.discard(node_id)
+                # ★ 2026-10-07（DIST-NEXT-3）：`_layer_config_pushed` 已是**派生视图** ⇒
+                #   不再直接写；`begin()` 把相位置回 `pushing`，派生集合自然不含该节点。
                 self._layer_config_acks.pop(node_id, None)
                 self._layer_config_expected[node_id] = dict(config)
                 self._layer_config_retry_state[node_id] = {
@@ -1616,7 +1643,7 @@ class SchedulerPipelineMixin:
     def _clear_layer_config_state(self, node_id: str) -> None:
         """清除节点的层配置期望、ACK 和 ready 状态。"""
         with self._layer_config_lock:
-            self._layer_config_pushed.discard(node_id)
+            # ★ 2026-10-07（DIST-NEXT-3）：派生视图不直接写；下面的 `release()` 即清除语义。
             self._layer_config_expected.pop(node_id, None)
             self._layer_config_acks.pop(node_id, None)
             self._layer_config_retry_state.pop(node_id, None)
@@ -1848,7 +1875,11 @@ class SchedulerPipelineMixin:
             if not expected or expected.get("config_id") != config_id:
                 return False
             assignment = dict(expected)
-            self._layer_config_pushed.discard(node_id)
+            # ★ 2026-10-07（DIST-NEXT-3）：撤销 ready ACK = 就绪证据作废 ⇒ 相位退回 `pushing`
+            #   （保留 assignment_id / generation，迟到 ACK 仍无法冒充）。
+            self._worker_assignments.invalidate(
+                node_id, reason_code="layer_config_ack_revoked",
+            )
             self._layer_config_acks[node_id] = {
                 "node_id": node_id,
                 "config_id": config_id,
@@ -3322,11 +3353,16 @@ class SchedulerPipelineMixin:
                     and ack_generation == int(expected.get("generation", 0) or 0)
                 )
                 self._layer_config_acks[client_id] = dict(data)
+                # ★ 2026-10-07（DIST-NEXT-3）：相位推进前先确保权威视图有这条 assignment
+                #   （产品路径由 publish 建立；本端直写 expected 的路径在这里补）。
+                self._ensure_assignment_state(
+                    client_id, reason_code="layer_config_ack",
+                )
                 if released:
                     self._layer_config_expected.pop(client_id, None)
-                    self._layer_config_pushed.discard(client_id)
                     self._layer_config_retry_state.pop(client_id, None)
-                    # ★ 2026-10-07（DIST-NEXT-3）：worker 确认释放 ⇒ 权威视图进终止态。
+                    # ★ 2026-10-07（DIST-NEXT-3）：worker 确认释放 ⇒ 权威视图进终止态
+                    #   （派生视图随之不再包含该节点，无需单独 discard）。
                     self._worker_assignments.release(
                         client_id, reason_code=REASON_WORKER_RELEASED,
                     )
@@ -3397,6 +3433,11 @@ class SchedulerPipelineMixin:
                     )
                 )
                 self._layer_config_acks[client_id] = dict(data)
+                # ★ 2026-10-07（DIST-NEXT-3）：同上，legacy 路径的 ACK 也要确保权威视图有记录
+                #   （否则相位推进会被静默丢弃，派生视图漏掉该节点）。
+                self._ensure_assignment_state(
+                    client_id, reason_code="layer_config_ack",
+                )
                 # ★ 2026-10-03：v3 层段 worker 会**明确拒绝** legacy 配置（它手上有工件、
                 #   层段由 stage offer 驱动，见 `_handle_layer_config_locked` 里的同名分流）。
                 #   这不是"未就绪"，而是"不参与这条通道" ⇒ 把它从待 ACK 集合里摘掉，
@@ -3410,8 +3451,13 @@ class SchedulerPipelineMixin:
                     == "layer_stage_worker_rejects_legacy_config"
                 ):
                     self._layer_config_expected.pop(client_id, None)
-                    self._layer_config_pushed.discard(client_id)
                     self._layer_config_retry_state.pop(client_id, None)
+                    # ★ 2026-10-07（DIST-NEXT-3）：该节点不参与 legacy 通道 ⇒ 权威视图进
+                    #   终止态（派生视图随之不含它）。
+                    self._worker_assignments.release(
+                        client_id,
+                        reason_code="layer_stage_worker_rejects_legacy_config",
+                    )
                     transaction = self._pipeline_load_transaction
                     if (
                         transaction
@@ -3444,11 +3490,8 @@ class SchedulerPipelineMixin:
                         },
                     )
                 if ready:
-                    self._layer_config_pushed.add(client_id)
-                    # ★ 2026-10-07（DIST-NEXT-3 第三步）：legacy ready ACK 同样推进**权威视图**。
-                    #   此前只有 release 类配置的分支推进相位 ⇒ registry 长期停在 `pushing`，
-                    #   与 `_layer_config_pushed` 不一致（派生集合会漏掉这类节点）。补上这一步，
-                    #   registry 才可能成为「`_layer_config_pushed` 的派生来源」。
+                    # ★ 2026-10-07（DIST-NEXT-3 第三步）：legacy ready ACK 推进**权威视图**；
+                    #   `_layer_config_pushed` 是派生视图，无需再单独 add。
                     self._worker_assignments.transition(
                         client_id, phase=PHASE_READY, reason_code=REASON_CONFIG_ACKED,
                     )
@@ -3471,7 +3514,9 @@ class SchedulerPipelineMixin:
                             self._persist_pipeline_lifecycle_locked()
                             activated_plan = dict(active_plan)
                 elif prepared:
-                    self._layer_config_pushed.discard(client_id)
+                    # ★ 2026-10-07（DIST-NEXT-3）：派生视图不因**迟到的 prepared** 撤回 ready
+                    #   （正常流程 prepared 先于 ready；旧写法在这里 discard 会把已就绪的节点
+                    #   踢出 `pushed`，那本身是个隐患）。
                     self._layer_config_retry_state.pop(client_id, None)
                     transaction = self._pipeline_load_transaction
                     if (
@@ -3487,7 +3532,11 @@ class SchedulerPipelineMixin:
                 elif prepared_late:
                     self._layer_config_retry_state.pop(client_id, None)
                 else:
-                    self._layer_config_pushed.discard(client_id)
+                    # ★ 2026-10-07（DIST-NEXT-3）：ACK 未通过任一判据 ⇒ 就绪证据作废
+                    #   （相位退回 `pushing`），派生视图随之不含该节点。
+                    self._worker_assignments.invalidate(
+                        client_id, reason_code="layer_config_ack_rejected",
+                    )
                     state = self._layer_config_retry_state.setdefault(
                         client_id, {"attempts": 0, "next_retry": 0.0}
                     )

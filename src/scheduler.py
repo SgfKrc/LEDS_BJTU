@@ -1035,7 +1035,8 @@ class Scheduler(
         self._kv_cache: dict = {}               # task_id → past_key_values（本节点层范围的 KV cache）
         # 节点只有完成模型层加载并返回当前 config_id 的 ACK 后才进入该集合。
         # 保留旧字段名，避免状态接口和测试夹具发生无关改动。
-        self._layer_config_pushed: set = set()
+        # ★ 2026-10-07（DIST-NEXT-3）：`_layer_config_pushed` 已**降级为派生视图**
+        #   （property，见 `scheduler_pipeline`）—— 事实源只有 `_worker_assignments`。
         self._layer_config_expected: dict[str, dict] = {}
         self._layer_config_acks: dict[str, dict] = {}
         self._layer_config_retry_state: dict[str, dict] = {}

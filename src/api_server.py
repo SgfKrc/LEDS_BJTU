@@ -967,7 +967,8 @@ def _run_exclusive_model_change(
         with scheduler._inference_lock:
             with scheduler._layer_execution_lock:
                 with scheduler._layer_config_lock:
-                    scheduler._layer_config_pushed.clear()
+                    # ★ 2026-10-07（DIST-NEXT-3）：清空 assignment 权威视图（派生视图随之空）。
+                    scheduler._worker_assignments.clear()
                     scheduler._layer_config_expected.clear()
                     scheduler._layer_config_acks.clear()
                     scheduler._active_layer_config = None

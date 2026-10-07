@@ -233,6 +233,32 @@ class WorkerAssignmentRegistry:
         """移除记录（测试与节点彻底退场时使用）。"""
         self._states.pop(str(node_id or ""), None)
 
+    def clear(self) -> None:
+        """清空全部记录（对应用户侧的重启/幽灵节点清理语义）。"""
+        self._states.clear()
+
+    def invalidate(
+        self, node_id: str, *, reason_code: str,
+    ) -> Optional[WorkerAssignmentState]:
+        """把当前 assignment 的相位**退回** `pushing`（本轮就绪证据作废）。
+
+        与 [transition] 的「只许前进」不冲突：这不是状态推进，而是「刚收到的 ACK 不成立
+        ⇒ 重新等待 ACK」，因此保留 `assignment_id` 与 generation（迟到 ACK 仍无法冒充）。
+        终止态不接受作废（已终止的 assignment 不再等 ACK）。
+        """
+        key = str(node_id or "")
+        state = self._states.get(key)
+        if state is None or state.terminal:
+            return None
+        updated = replace(
+            state,
+            phase=PHASE_PUSHING,
+            reason_code=str(reason_code or ""),
+            updated_at=self._clock(),
+        )
+        self._states[key] = updated
+        return updated
+
 
 def assignment_state_summary(
     states: Mapping[str, WorkerAssignmentState] | Mapping[str, Mapping[str, Any]],
