@@ -370,11 +370,33 @@ def _node_declares_stage_chunked_input(control: Any, node_id: str) -> bool:
     except Exception:
         logger.debug("查询 task worker 分片能力失败: node=%s", node_id, exc_info=True)
         return False
+    worker_ids = [
+        item.get("node_id")
+        for item in ((status or {}).get("workers") or [])
+        if isinstance(item, dict)
+    ]
     for worker in (status or {}).get("workers", []) or []:
         if not isinstance(worker, dict) or worker.get("node_id") != node_id:
             continue
         capabilities = worker.get("capabilities")
-        return isinstance(capabilities, dict) and capabilities.get("stage_chunked_input") is True
+        declared = (
+            isinstance(capabilities, dict)
+            and capabilities.get("stage_chunked_input") is True
+        )
+        # ★ 2026-10-08（诊断，定位后降级为 debug）：分辨「worker 不在控制面」与
+        #   「hello 没带该键」——2b 真机回归已用它确认 Android 侧 `declared=True`
+        #   且分片真实生效（`task_worker_stage_chunks_sent chunks=18`）。
+        logger.debug(
+            "event=stage_chunked_probe node=%s declared=%s caps_keys=%s worker_ids=%s",
+            node_id, declared,
+            sorted(capabilities.keys()) if isinstance(capabilities, dict) else None,
+            worker_ids,
+        )
+        return declared
+    logger.debug(
+        "event=stage_chunked_probe node=%s declared=False worker_ids=%s",
+        node_id, worker_ids,
+    )
     return False
 
 
