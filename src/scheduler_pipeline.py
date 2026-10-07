@@ -893,6 +893,32 @@ class SchedulerPipelineMixin:
                     if isinstance(worker, dict)
                     and int(worker.get("selected_version", 0) or 0) >= 2
                 }
+                # ★ 2026-10-08（真机闸门卡点）：**恢复期不得比正常路径更严**。
+                #
+                #   v3 层段 worker 的能力来自它自己的 hello（`layer_stage_dispatch_enabled`
+                #   = healthy ∧ version≥2 ∧ `layer_forward` ∧ `layer_ranges` 非空），与 legacy
+                #   层配置的「重启恢复闸门」是两回事。实测：master 重启后的恢复窗口里本分支
+                #   返回**空集** ⇒ capacity 候选缺 Y700 ⇒ 请求被判
+                #   `pipeline_layer_range_coverage_insufficient`（把"恢复中"误导成"区间覆盖不足"），
+                #   而 **1.2 秒后**恢复期一解除，**同一个请求**就 `admitted=True`
+                #   （00:47:06 / 00:47:08 的对照日志）。
+                #   这里在空集时回退到正常准入判据（三分量齐备的 worker 照常参与规划），
+                #   并记一条诊断 —— 恢复期里到底有没有可用的 v3 worker，从此可查。
+                if not admitted:
+                    status = self._task_worker_control.status(role="master")
+                    fallback_admitted = {
+                        str(worker.get("node_id", ""))
+                        for worker in status.get("workers", []) or []
+                        if isinstance(worker, dict)
+                        and worker.get("healthy")
+                        and worker.get("layer_stage_dispatch_enabled")
+                        and str(worker.get("node_id", "")) in connected_ids
+                    }
+                    logger.info(
+                        "event=stage_admission_recovery_empty raw=%s fallback=%s",
+                        sorted(admitted), sorted(fallback_admitted),
+                    )
+                    admitted = fallback_admitted
             else:
                 status = self._task_worker_control.status(role="master")
                 # ★ 2026-10-08（诊断，定位后降级）：逐 worker 打出**准入三分量**，用来回答
