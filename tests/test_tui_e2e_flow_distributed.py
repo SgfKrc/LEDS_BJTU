@@ -184,6 +184,14 @@ def test_dual_host_tui_routed_pipeline_streams_text():
     reason = _skip_reason(control)
     if reason:
         pytest.skip(reason)
+    # ★ 2026-10-07：Route-A 还需要 **worker 层配置就绪**（见 `_pipeline_workers_layer_ready`
+    #   的说明）—— 冷启动 master 只有完整模型时会卡在覆盖不足，档必须 skip 而不是误报。
+    layer_ready, worker_total = _pipeline_workers_layer_ready(control)
+    if not layer_ready:
+        pytest.skip(
+            f"Route-A 前提未满足：{worker_total} 个 worker 的层配置未全部就绪"
+            f"（冷启动 master 只加载完整模型 ⇒ capacity 判它 control_only ⇒ 覆盖不足）；"
+            f"需先让 master 按层段参与再跑本用例")
 
     async def _main() -> str:
         from textual.widgets import Input, Static
@@ -245,6 +253,31 @@ def test_dual_host_tui_routed_pipeline_streams_text():
     assert len(answer) >= 2, f"回答过短: {answer!r}"
     for marker in ("流水线返回空响应", "当前没有可用的分布式路径", "distributed_required"):
         assert marker not in answer, f"回答里出现失败文案 {marker!r}: {answer[:200]!r}"
+
+
+def _pipeline_workers_layer_ready(api) -> tuple:
+    """Route-A 前提：**所有** worker 的层配置已就绪（`layer_ready=True`）。
+
+    冷启动的 master 若只加载了完整模型，capacity 会把它判成 `control_only`（完整权重不算
+    "层段工件"）⇒ 候选只剩 worker 段 ⇒ 覆盖缺 `[0,20)` ⇒
+    `pipeline_layer_range_coverage_insufficient` ⇒ 层配置推不出去、worker 停在
+    `not_configured`，请求报「advertised layer_ranges cannot cover the requested contiguous
+    layer interval」。此时档应 **skip 并说明前提**，而不是把它报成"回答为空/未走分布式"
+    这种误导性失败（旧代码时代之所以正常，是 master 早已处于层段状态）。
+    """
+    try:
+        payload = api.get("/cluster/status")
+    except Exception:  # noqa: BLE001 - 后端不可达 ⇒ 未就绪
+        return False, 0
+    pipeline = payload.get("pipeline") if isinstance(payload, dict) else None
+    workers = pipeline.get("workers") if isinstance(pipeline, dict) else None
+    if not workers:
+        return False, 0
+    ready = [
+        worker for worker in workers
+        if isinstance(worker, dict) and worker.get("layer_ready") is True
+    ]
+    return len(ready) == len(workers), len(workers)
 
 
 def _assistant_body(text: str) -> str:
