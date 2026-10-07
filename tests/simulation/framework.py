@@ -153,6 +153,7 @@ class BackendManager:
         api_port: int = 8000,
         tcp_port: int = 8888,
         startup_timeout: int = 30,
+        enable_route_a: bool = False,
     ) -> None:
         """启动主节点后端
 
@@ -168,6 +169,12 @@ class BackendManager:
         env["QLH_NODE_ROLE"] = "master"
         env["QLH_SERVER_PORT"] = str(tcp_port)
         env["QLH_API_PORT"] = str(api_port)
+        # 单机场景：`RUN_MODE=single` 并且关掉 Route-A（A3 `stage_offer_v3`）。
+        # 否则 master 会进「强制分布式分层」，把分层配置推给从节点并等加载 ACK，
+        # 直到 60 s 超时（实测 D4）；单机仿真既没有从节点，也不该等它。
+        if not enable_route_a:
+            env["QLH_ROUTE_A_STAGE_OFFER"] = "0"
+            env["QLH_RUN_MODE"] = "single"
 
         # 构建启动命令
         api_server_path = self.project_root / "src" / "api_server.py"
@@ -366,8 +373,17 @@ class BackendManager:
 class RequestSender:
     """HTTP 请求发送器"""
 
-    def __init__(self, base_url: str = "http://127.0.0.1:8000"):
+    def __init__(self, base_url: str = "http://127.0.0.1:8000",
+                 routing_preference: Optional[str] = None):
         self.base_url = base_url
+        # 请求级路由偏好：单机仿真设 `local_only`（见 `setup()` 写的
+        # `QLH_SIM_ROUTING_PREFERENCE`）。否则 master 会进「强制分布式分层」、
+        # 等从节点加载 ACK 直到 60 s 超时（实测 D4）。
+        self.routing_preference = (
+            routing_preference
+            if routing_preference is not None
+            else (os.environ.get("QLH_SIM_ROUTING_PREFERENCE") or None)
+        )
         self.session: Optional[httpx.AsyncClient] = None
 
     async def __aenter__(self):
@@ -406,6 +422,8 @@ class RequestSender:
             "message": message,
             "session_id": session_id,
         }
+        if self.routing_preference:
+            payload["routing_preference"] = self.routing_preference
 
         start_time = time.time()
 
@@ -757,6 +775,13 @@ class TestOrchestrator:
         print("=" * 60)
 
         self.config = config
+        # 单机场景显式声明 `local_only`：master 默认开分布式推理总闸
+        # （`config.DISTRIBUTED_INFERENCE_ENABLED` 恒 True），否则会进「强制分布式
+        # 分层」并等从节点加载 ACK 至 60 s 超时（实测 D4）。
+        if not config.start_slaves:
+            os.environ["QLH_SIM_ROUTING_PREFERENCE"] = "local_only"
+        else:
+            os.environ.pop("QLH_SIM_ROUTING_PREFERENCE", None)
 
         # 启动主节点
         if config.start_master:
@@ -765,6 +790,8 @@ class TestOrchestrator:
                 api_port=config.master_api_port,
                 tcp_port=config.master_tcp_port,
                 startup_timeout=config.startup_timeout,
+                # 有从节点（分布式场景）才开 A3；单机场景关掉，避免选入外部在线节点。
+                enable_route_a=config.start_slaves,
             )
 
         # 启动从节点

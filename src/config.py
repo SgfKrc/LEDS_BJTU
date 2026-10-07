@@ -609,7 +609,12 @@ AUTH_TIMESTAMP_WINDOW = 300  # ±5 分钟
 # ============================================================
 # 7. 运行模式
 # ============================================================
-RUN_MODE = "distributed"         # "single" 单机 | "distributed" 分布式
+# 运行模式：`QLH_RUN_MODE`（`single` / `distributed`）可覆盖，默认 `distributed` **不变**。
+# 用途：单机仿真/测试进程需要 `single`，否则 master 会进「强制分布式分层」并等从节点
+# 加载 ACK 直到 60 s 超时（实测 D4）。
+RUN_MODE = os.environ.get("QLH_RUN_MODE", "").strip().lower() or "distributed"
+if RUN_MODE not in ("single", "distributed"):
+    RUN_MODE = "distributed"
 LOG_LEVEL = "INFO"               # 日志级别: DEBUG | INFO | WARNING | ERROR
 LOG_DIR = os.path.join(_APP_ROOT, "logs")  # 日志文件目录（绝对路径）
 
