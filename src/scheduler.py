@@ -4057,6 +4057,35 @@ class Scheduler(
                             "last_rtt_ms", node.last_rtt_ms,
                         )
 
+            # ★ 2026-10-08（真机复测根因）：**必须回心跳应答**。
+            #
+            #   Android task worker 的 `SocketTaskWorkerTransport` 设了 `soTimeout = 45_000`
+            #   （`TaskWorkerClient.kt:472`/`:480`），而它每 15 秒发一次 `heartbeat`。此前
+            #   master 只 `mark_worker_heartbeat` + 刷新 `last_heartbeat`、**从不回包** ⇒ 连接
+            #   在 45 秒后必然 `SocketTimeoutException` ⇒ 断开重连。真机表现正是「Y700 每 ~37
+            #   秒客户端主动断开一次」（`tcp_comm: 客户端 android-21af7c52 已断开`，间隔 37/36
+            #   秒），落在断开窗口里的请求就报
+            #   `pipeline_layer_range_coverage_insufficient` ⇒ "分布式时好时坏"。
+            #
+            #   PC 从节点那条路径早在 `tcp_comm.py:1711` 回 `HEARTBEAT_ACK`，task worker 这条
+            #   一直缺失；Android 侧 `receiveEvent()` 已显式把 `heartbeat_ack` 映射为
+            #   `TaskWorkerInboundEvent.HeartbeatAck`（吞掉、不抛），因此回包是安全的。
+            tcp_server = self._tcp_server
+            if tcp_server is not None:
+                from transport_port import MessageType
+
+                payload = msg.get("data") if isinstance(msg, dict) else None
+                t_send = payload.get("t_send", 0) if isinstance(payload, dict) else 0
+                try:
+                    tcp_server.send_to_client(
+                        client_id, {"t_send": t_send}, MessageType.HEARTBEAT_ACK,
+                    )
+                except Exception as exc:  # noqa: BLE001 - 应答失败不影响主流程
+                    logger.debug(
+                        "event=tcp_heartbeat_ack_failed client_id=%s error=%s",
+                        client_id, exc,
+                    )
+
         elif msg_type == "task_worker":
             self._handle_task_worker_message(client_id, msg)
 
