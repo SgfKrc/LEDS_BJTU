@@ -524,6 +524,19 @@ class ChatPane(Vertical):
                 self.query_one("#chat-status", Static).update(
                     "[red]用法: /route auto|local|distributed|required")
             return
+        if text.startswith("/mode "):
+            # ★ 2026-10-07（#29 发起侧缺口）：请求级执行模式。
+            #   `auto` = 沿用后端推断（含 N2.1 显式字段推断）；`task_graph` = 显式任务图。
+            value = text.split(" ", 1)[1].strip().lower()
+            mapping = {"auto": "auto", "task_graph": "task_graph", "graph": "task_graph"}
+            if value in mapping:
+                self.app.execution_mode = mapping[value]
+                self.query_one("#chat-status", Static).update(
+                    f"执行模式 → {mapping[value]}")
+            else:
+                self.query_one("#chat-status", Static).update(
+                    "[red]用法: /mode auto|task_graph")
+            return
         if text.startswith("/thinking "):
             value = text.split(" ", 1)[1].strip().lower()
             self.app.show_thinking = value in {"on", "1", "true", "yes"}
@@ -1232,6 +1245,7 @@ class ChatPane(Vertical):
                 session_id=getattr(app, "session_id", None),
                 generation_id=getattr(app, "generation_id", None),
                 routing_preference=app.routing_preference,
+                execution_mode=getattr(app, "execution_mode", "auto"),
                 show_thinking=app.show_thinking,
                 enable_thinking=app.enable_thinking,
             ):
@@ -3295,6 +3309,9 @@ class KoakumaApp(App):
         self.api = api
         self.interval = float(interval)
         self.routing_preference = routing_preference
+        # ★ 2026-10-07（#29 发起侧缺口）：请求级执行模式（`/mode` 命令可改）。
+        #   之前 TUI 从不传该字段 ⇒ 任务图模式在 UI 里没有入口。
+        self.execution_mode = "auto"
         self.show_thinking = show_thinking
         #: ★ 深度思考**开关**（None=auto 沿用模板默认 / True=强制思考 / False=强制不思考）。
         #:  与 `show_thinking`（仅控制 UI 是否显示）语义不同：本项**改变模型行为** ——

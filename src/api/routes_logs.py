@@ -342,6 +342,23 @@ async def get_nodes_log_aggregate(
             for nid, info in _api_module.scheduler.nodes.items()
             if info.role != NodeRole.MASTER
             and info.state == NodeState.ONLINE
+            # ★ 2026-10-08（真机闸门根因）：**task worker（v3 层段）不参与日志聚合**。
+            #   它们走 task-worker 自己的协议，不认 PC 的 `LOG_REQUEST` 帧；Android 侧
+            #   `TaskWorkerClient.receiveEvent()` 对未知帧是
+            #   `else -> throw unexpected task worker frame` ⇒ **收到就断连重连**。
+            #   实测：`GET /api/cluster/nodes/log-aggregate` 每调一次就让 Y700 断开一次
+            #   （约 1 秒后重连）；而 TUI 启动正好会调它 ⇒ 紧随其后的
+            #   `POST /api/chat/stream` 落在断开窗口里被判
+            #   `pipeline workers not ready: advertised layer_ranges cannot cover …`。
+            and not (
+                isinstance(getattr(info, "device_info", None), dict)
+                and (
+                    info.device_info.get("task_worker")
+                    or info.device_info.get("pipeline_worker")
+                    or str(info.device_info.get("connection_type", ""))
+                    == "tcp_task_worker"
+                )
+            )
         ])
 
     import asyncio

@@ -51,9 +51,14 @@ from pipeline_reshard import PipelineArtifactAvailability, PipelineReshardCoordi
 import scheduler_layer_plan as _layer_plan
 from scheduler_types import (
     InferenceTask, NodeInfo, NodeRole, NodeState, PreemptState, QueueTask,
+    ANDROID_PRESENCE_HEARTBEAT_INTERVAL_SECONDS,
     TASK_WORKER_HEALTH_TIMEOUT_FLOOR_SECONDS,
     WORKER_HEARTBEAT_MAX_AGE,
+    assert_worker_liveness_thresholds,
+    task_worker_control_plane_health_timeout_seconds,
 )
+# ★ 2026-10-07（DIST-NEXT-3）：assignment 的权威视图（单一事实源）。
+from worker_assignment_state import WorkerAssignmentRegistry
 from scheduler_sidecars import SchedulerSidecarMixin
 from llama_rpc_contract import RpcShardLeaseBook
 from qwen3_pipeline_transaction import (
@@ -91,6 +96,8 @@ from task_provider import (
     sanitize_result_metadata as sanitize_task_result_metadata,
 )
 from task_worker_adapter import (
+    RELEASE_REASON_DISCONNECTED,
+    RELEASE_REASON_HEARTBEAT_STALE,
     RemoteFullWorkerProvider,
     TaskWorkerControlPlane,
     remote_provider_id,
@@ -131,14 +138,25 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-ANDROID_HTTP_CLIENT_HEARTBEAT_INTERVAL_SECONDS = 45
+# ★ 2026-10-07（DIST-NEXT-4）：Android presence 心跳间隔的唯一来源是
+#   `scheduler_types.ANDROID_PRESENCE_HEARTBEAT_INTERVAL_SECONDS`；这里保留既有名字
+#   （`scheduler_cluster` 通过 `_scheduler_facade_global` 读它）。
+ANDROID_HTTP_CLIENT_HEARTBEAT_INTERVAL_SECONDS = (
+    ANDROID_PRESENCE_HEARTBEAT_INTERVAL_SECONDS
+)
 ANDROID_HTTP_CLIENT_LEASE_SECONDS = 120
 ANDROID_HTTP_CLIENT_TIMEOUT_SECONDS = ANDROID_HTTP_CLIENT_LEASE_SECONDS
 _LAYER_ASSIGNMENT_CACHE_VERSION = 3
 
+# ★ 2026-10-07（DIST-NEXT-4）：启动期自检 —— 心跳间隔与容忍上限必须自洽，
+#   否则直接以清晰原因失败（历史踩过「心跳 45s vs 上限 10s」的静默错配）。
+assert_worker_liveness_thresholds(HEARTBEAT_INTERVAL)
+
 from scheduler_task_worker import SchedulerTaskWorkerMixin, _TaskWorkerActiveAttempt
 from scheduler_cluster import SchedulerClusterMixin
 from scheduler_pipeline import SchedulerPipelineMixin
+# ★ 2026-10-07（DIST-NEXT-7）：A1 隔离状态自证（独立 namespace，启动即见）。
+from relay_a1_legacy import log_isolation_status
 
 # Keep the current scheduler import surface explicit while the implementation
 # is split into smaller modules. Private helpers listed here are compatibility
@@ -1017,10 +1035,16 @@ class Scheduler(
         self._kv_cache: dict = {}               # task_id → past_key_values（本节点层范围的 KV cache）
         # 节点只有完成模型层加载并返回当前 config_id 的 ACK 后才进入该集合。
         # 保留旧字段名，避免状态接口和测试夹具发生无关改动。
-        self._layer_config_pushed: set = set()
+        # ★ 2026-10-07（DIST-NEXT-3）：`_layer_config_pushed` 已**降级为派生视图**
+        #   （property，见 `scheduler_pipeline`）—— 事实源只有 `_worker_assignments`。
         self._layer_config_expected: dict[str, dict] = {}
         self._layer_config_acks: dict[str, dict] = {}
         self._layer_config_retry_state: dict[str, dict] = {}
+        # ★ 2026-10-07（DIST-NEXT-3）：assignment 的**权威视图**（`assignment_id` +
+        #   `config_id` + connection generation + lease + phase + 单一 reason code）。
+        #   本步**只写不读**（读路径后续切换）⇒ 零行为变化；它是「多集合交叉判定」
+        #   （pushed/expected/acks/transaction/recovery）的替代方向。
+        self._worker_assignments = WorkerAssignmentRegistry()
         self._layer_config_lock = threading.Lock()
         self._layer_config_push_lock = threading.Lock()
         # Model transitions temporarily invalidate the local descriptor. Do
@@ -1133,11 +1157,13 @@ class Scheduler(
             "spare_master_logs": [],
         }
         self._task_worker_control = TaskWorkerControlPlane(
-            health_timeout_seconds=max(
-                TASK_WORKER_HEALTH_TIMEOUT_FLOOR_SECONDS,
-                HEARTBEAT_INTERVAL * 4.0,
+            health_timeout_seconds=task_worker_control_plane_health_timeout_seconds(
+                HEARTBEAT_INTERVAL,
             ),
         )
+        # ★ 2026-10-07（DIST-NEXT-7）：启动即自证 A1 隔离状态（`event=relay_a1_isolation`）——
+        #   「A1 会不会被调度选中」不再需要逐个开关推断。
+        log_isolation_status(self.get_relay_a1_status())
         self._task_worker_refresh_lock = threading.Lock()
         self._task_worker_refresh_requested = False
         self._task_worker_refresh_generation = 0
@@ -1249,6 +1275,42 @@ class Scheduler(
         #   ★ 注意：两次 `start()` 是**并发**的（日志时间戳同毫秒），非原子的
         #     「检查后设置」两边都会通过 ⇒ 必须在 `_start_lock` 内占位。
         self._startup_cancel_event.clear()
+
+        # P4.5 HA-ROLE-AUTO-01: construct and start the quorum-backed role
+        # controller at the composition root. Missing key/peer configuration
+        # is reduced to read-only instead of falling back to a static master.
+        if NODE_ROLE == "auto":
+            runtime = getattr(self, "_auto_role_runtime", None)
+            if getattr(self, "_auto_role_controller", None) is None:
+                try:
+                    from cluster_auto_role_runtime import install_auto_role_controller
+
+                    runtime = install_auto_role_controller(self, self._control_fence)
+                except Exception as exc:
+                    from cluster_auto_role import AutoRoleController
+
+                    authority = self._control_fence.authority if self._control_fence is not None else None
+                    self.set_auto_role_controller(
+                        AutoRoleController(
+                            str(NODE_ID or "auto-node"),
+                            mode="auto",
+                            authority=authority,
+                            fence=self._control_fence,
+                        )
+                    )
+                    runtime = None
+                    logger.error(
+                        "auto role configuration unavailable; entering read-only: %s",
+                        getattr(exc, "code", type(exc).__name__),
+                    )
+            available = runtime.available_voter_ids if runtime is not None else None
+            decision = self.start_auto_role(available_voter_ids=available)
+            logger.info(
+                "event=auto_role_start accepted=%s state=%s runtime_role=%s reason=%s",
+                decision.get("accepted"), decision.get("state"),
+                decision.get("runtime_role"), decision.get("reason"),
+            )
+
         self.init_nodes()
         if self._effective_role() == "master":
             self._load_pipeline_recovery_state()
@@ -1307,7 +1369,7 @@ class Scheduler(
                 )
 
             # 检测实际局域网 IP 和 MAC 地址
-            if NODE_ROLE == "master":
+            if self._effective_role() == "master":
                 # Network address and MAC identity are populated by the
                 # post-startup worker below.
                 logger.info(f"调度器已启动（分布式模式），监听 {bind_host}:{actual_port}，局域网 IP: {self._lan_ip}，MAC: {self._mac_addresses}")
@@ -1378,7 +1440,7 @@ class Scheduler(
         else:
             logger.info("调度器已启动（单机模式）")
 
-        if RUN_MODE == "distributed" and NODE_ROLE == "master":
+        if RUN_MODE == "distributed" and self._effective_role() == "master":
             self._start_deferred_network_identity()
 
         # 启动流水线请求队列（仅主节点，FIFO 串行）
@@ -1465,6 +1527,12 @@ class Scheduler(
         """停止调度器"""
         self._startup_cancel_event.set()
         self._running = False
+        controller = getattr(self, "_auto_role_controller", None)
+        if controller is not None:
+            try:
+                controller.stop()
+            except Exception:
+                logger.debug("停止自动主节点控制器失败", exc_info=True)
         self.pipeline_queue.stop()
         tcp_client = getattr(self, "_tcp_client", None)
         if tcp_client is not None:
@@ -1563,6 +1631,10 @@ class Scheduler(
         controller = getattr(self, "_auto_role_controller", None)
         if controller is not None:
             return controller.runtime_role
+        if configured_role == "auto":
+            # Before the composition root has attached the controller, auto
+            # mode has no authority and must present as a read-only client.
+            return "client"
         return configured_role
 
     # ================================================================
@@ -2646,11 +2718,58 @@ class Scheduler(
 
         return result
 
+    def _reap_stale_worker_reservations(
+        self, now: Optional[float] = None,
+    ) -> dict[str, list[str]]:
+        """★ 2026-10-07（DIST-NEXT-4b）：回收「心跳过期且无在跑 attempt」的 reservation。
+
+        审计 P0-3 要求「断线、心跳过期、服务重建都必须**原子撤销** assignment 和
+        reservation，并记录**单一 reason code**」。断线已有专门路径（`notify_disconnect`
+        全量回收）；这里补的是**心跳过期但 TCP 仍在线**的窗口：
+
+        * 只回收**已终结**的条目（`release_stale_reservations`），不打断 in-flight 执行；
+        * 逐节点记一条 `event=task_worker_reservations_released`，`reason` 固定为
+          `worker_heartbeat_stale`（单一 reason code，便于 grep 与对账）。
+
+        返回 `{node_id: [reservation_id...]}`；幂等，可安全地周期性调用。
+        """
+        current = time.time() if now is None else float(now)
+        with self._task_worker_stage_lock:
+            providers = dict(self._remote_task_worker_providers)
+        if not providers:
+            return {}
+        released: dict[str, list[str]] = {}
+        for node_id, provider in providers.items():
+            with self._nodes_lock:
+                node = self.nodes.get(node_id)
+            if node is None:
+                continue
+            try:
+                fresh = node.is_heartbeat_fresh(current, WORKER_HEARTBEAT_MAX_AGE)
+            except Exception:       # 嵌入/测试构造的节点可能没有该方法
+                continue
+            if fresh:
+                continue
+            freed = provider.release_stale_reservations(RELEASE_REASON_HEARTBEAT_STALE)
+            if freed:
+                released[node_id] = freed
+                logger.warning(
+                    "event=task_worker_reservations_released node_id=%s reason=%s "
+                    "released=%s",
+                    node_id, RELEASE_REASON_HEARTBEAT_STALE, freed,
+                )
+        return released
+
     def _get_pipeline_capacity_nodes(
         self, eligible_node_ids: Optional[set[str]] = None,
     ) -> list[dict]:
         """Project live layer-worker profiles into explicit free-memory budgets."""
         from config import PIPELINE_CAPACITY_RESERVE_MB
+
+        # ★ 2026-10-07（DIST-NEXT-4b）：规划前先回收「心跳已过期且没有在跑 attempt」的
+        #   reservation。TCP 半开/心跳线程失效的节点在巡检窗口（约 131s）里 TCP 仍算在线
+        #   ⇒ 不走断线回收路径，`max_concurrency=1` 的槽位会被「已预留未执行」永久占住。
+        self._reap_stale_worker_reservations()
 
         reserve_bytes = int(PIPELINE_CAPACITY_RESERVE_MB * 1024 * 1024)
         with self._layer_config_lock:
@@ -2849,6 +2968,38 @@ class Scheduler(
             #   「中间段接末段 / 末段接中间段」这类分配。
             if node_id in segment_mode_by_node:
                 record["segment_mode"] = segment_mode_by_node[node_id]
+            # ★ 2026-10-07：**本地节点**也要声明自己的层段工件区间。
+            #   背景：`pipeline_capacity.py` 的 `range_constrained = any(
+            #   node.get("layer_ranges") is not None ...)` —— 只要**任一**远端节点
+            #   声明了区间，全链就必须由区间拼满 `[0, total)`（契约也要求
+            #   `pipeline_node_contract.py` 的 "cover every layer exactly once"）。
+            #   本地 master 此前**从不**带 `layer_ranges`（`layer_ranges_by_node`
+            #   只从 task worker hello 取）⇒ 一旦远端声明区间，本地这段就成了
+            #   覆盖缺口，实测 `status=rejected
+            #   reason=pipeline_layer_range_coverage_insufficient`。
+            #   本机若是**裁层 GGUF 上游**（`QLH_LAYER_GGUF`），用与 PC worker
+            #   同一份推导（`_configured_layer_artifact`）声明自己的区间。
+            #   ⚠️ 判据必须与 `_pipeline_node_metadata` 一致：主节点的本地 ID 是
+            #   字面量 `"master"`，而 `get_effective_node_id()` 返回的是
+            #   `_configured_node_id()`（可能是主机名）—— 两者**不等**，
+            #   用后者会让本地节点永远匹配不上（实测投影里只有远端两个节点）。
+            local_node_id = (
+                "master" if self._effective_role() == "master"
+                else self.get_effective_node_id()
+            )
+            if (
+                node_id == local_node_id
+                and "layer_ranges" not in record
+                and node_id not in layer_ranges_by_node
+            ):
+                local_artifact = self._configured_layer_artifact()
+                if local_artifact:
+                    record["layer_ranges"] = [
+                        [int(local_artifact["start"]), int(local_artifact["end"])],
+                    ]
+                    local_mode = str(local_artifact.get("mode", "") or "").lower()
+                    if local_mode in {"head", "middle", "tail"}:
+                        record["segment_mode"] = local_mode
             records.append(record)
         return records
 
@@ -3890,6 +4041,9 @@ class Scheduler(
             # client's registration handshake.
 
         elif msg_type == "heartbeat":
+            # ★ 2026-10-08：诊断期已过（定位结论：心跳确实到达 master，且 `tcp_comm` 层
+            #   已回 ACK），降级为 debug 以免每 15 秒×N worker 刷屏。
+            logger.debug("event=tcp_heartbeat_received client_id=%s", client_id)
             if self._effective_role() == "master":
                 self._task_worker_control.mark_worker_heartbeat(client_id)
             client_info = (
@@ -3905,6 +4059,35 @@ class Scheduler(
                         node.last_rtt_ms = client_info.get(
                             "last_rtt_ms", node.last_rtt_ms,
                         )
+
+            # ★ 2026-10-08（真机复测根因）：**必须回心跳应答**。
+            #
+            #   Android task worker 的 `SocketTaskWorkerTransport` 设了 `soTimeout = 45_000`
+            #   （`TaskWorkerClient.kt:472`/`:480`），而它每 15 秒发一次 `heartbeat`。此前
+            #   master 只 `mark_worker_heartbeat` + 刷新 `last_heartbeat`、**从不回包** ⇒ 连接
+            #   在 45 秒后必然 `SocketTimeoutException` ⇒ 断开重连。真机表现正是「Y700 每 ~37
+            #   秒客户端主动断开一次」（`tcp_comm: 客户端 android-21af7c52 已断开`，间隔 37/36
+            #   秒），落在断开窗口里的请求就报
+            #   `pipeline_layer_range_coverage_insufficient` ⇒ "分布式时好时坏"。
+            #
+            #   PC 从节点那条路径早在 `tcp_comm.py:1711` 回 `HEARTBEAT_ACK`，task worker 这条
+            #   一直缺失；Android 侧 `receiveEvent()` 已显式把 `heartbeat_ack` 映射为
+            #   `TaskWorkerInboundEvent.HeartbeatAck`（吞掉、不抛），因此回包是安全的。
+            tcp_server = self._tcp_server
+            if tcp_server is not None:
+                from transport_port import MessageType
+
+                payload = msg.get("data") if isinstance(msg, dict) else None
+                t_send = payload.get("t_send", 0) if isinstance(payload, dict) else 0
+                try:
+                    tcp_server.send_to_client(
+                        client_id, {"t_send": t_send}, MessageType.HEARTBEAT_ACK,
+                    )
+                except Exception as exc:  # noqa: BLE001 - 应答失败不影响主流程
+                    logger.debug(
+                        "event=tcp_heartbeat_ack_failed client_id=%s error=%s",
+                        client_id, exc,
+                    )
 
         elif msg_type == "task_worker":
             self._handle_task_worker_message(client_id, msg)
@@ -4308,7 +4491,11 @@ class Scheduler(
         with self._task_worker_stage_lock:
             remote_provider = self._remote_task_worker_providers.get(client_id)
         if remote_provider is not None:
-            remote_provider.notify_disconnect()
+            # ★ 2026-10-07（DIST-NEXT-4b）：断线走的 reason code 显式给定（单一来源），
+            #   provider 侧会记 `event=task_worker_reservations_released`。
+            remote_provider.notify_disconnect(
+                reason_code=RELEASE_REASON_DISCONNECTED,
+            )
         with self._forward_cancel_lock:
             client_cancellations = [
                 event for (owner_id, _), event

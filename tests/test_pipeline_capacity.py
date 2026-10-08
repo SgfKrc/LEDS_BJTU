@@ -506,6 +506,27 @@ def test_advertised_layer_ranges_reject_uncovered_cursor():
     assert plan["admitted"] is False
     assert plan["reason_code"] == "pipeline_layer_range_coverage_insufficient"
     assert plan["assignments"] == []
+    # ★ 2026-10-08（真机复测）：拒绝时要把**未覆盖区间**一并给出 —— 现场多次把本码误读成
+    #   "工件区间配置错"，真因往往是 worker 掉线/未准入（Y700 每 4–16 分钟重建一次）。
+    #   这里 `android` 只声明 `[2,4)`，`[0,2)` 无人覆盖（master 是整模、无区间声明）。
+    assert plan["uncovered_layer_ranges"] == [[0, 2]]
+    assert "未覆盖区间: [0,2)" in plan["reason"]
+    assert "检查该节点是否掉线/未准入" in plan["reason"]
+
+
+def test_uncovered_layer_ranges_helper_reports_head_gap_and_tail():
+    from pipeline_capacity import _uncovered_layer_ranges
+
+    # 全覆盖 / 空声明 ⇒ 无缺口（空声明表示"未约束"，不是"不允许任何区间"）。
+    assert _uncovered_layer_ranges([(0, 24)], 24) == []
+    assert _uncovered_layer_ranges([], 24) == [(0, 24)]
+    # 缺中间段 + 缺尾段 ⇒ 两段缺口（按起点升序）。
+    assert _uncovered_layer_ranges([(0, 16), (20, 24)], 24) == [(16, 20)]
+    assert _uncovered_layer_ranges([(0, 16)], 24) == [(16, 24)]
+    # 区间重叠/乱序也按并集处理。
+    assert _uncovered_layer_ranges([(16, 20), (0, 16)], 24) == [(20, 24)]
+    # 超出 total_layers 的声明不制造负缺口。
+    assert _uncovered_layer_ranges([(0, 32)], 24) == []
 
 
 def test_tied_embedding_is_charged_to_output_capacity():

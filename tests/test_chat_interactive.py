@@ -150,6 +150,14 @@ class TestInteractiveContract:
         assert done["history_committed"] is True
         assert done["metrics"]["routing_preference"] == "local_only"
         assert done["metrics"]["distributed_requested"] is False
+        # ★ DIST-NEXT-8：完成路径带统一相位与互斥终态（本地执行 ⇒ 非 admitted）。
+        assert done["metrics"]["outcome"] == "completed"
+        assert done["metrics"]["started"] is True
+        assert done["metrics"]["completed"] is True
+        assert done["metrics"]["fallback"] is False
+        assert done["metrics"]["refused"] is False
+        assert done["metrics"]["cancelled"] is False
+        assert done["metrics"]["failed"] is False
 
     def test_cancel_emits_cancelled_event(self, interactive_env):
         client, calls = interactive_env
@@ -165,6 +173,13 @@ class TestInteractiveContract:
         assert len(cancelled) == 1
         assert cancelled[0]["generation_id"] == "gen_t9_cancel"
         assert "partial" in cancelled[0]
+        # ★ DIST-NEXT-8：取消是独立终态（带相位与稳定 reason），不被 fallback/error 覆盖。
+        assert cancelled[0]["outcome"] == "cancelled"
+        assert cancelled[0]["cancelled"] is True
+        assert cancelled[0]["started"] is True
+        assert cancelled[0]["fallback"] is False
+        assert cancelled[0]["failed"] is False
+        assert cancelled[0]["outcome_reason"] == "generation_cancelled"
         assert not [e for e in events if e.get("done")]
         # 取消不提交历史
         assert calls["commits"] == []
@@ -181,6 +196,11 @@ class TestInteractiveContract:
         error = [e for e in events if e.get("error")]
         assert len(error) == 1
         assert "engine exploded" in error[0]["error"]
+        # ★ DIST-NEXT-8：链路错误是 `failed` 终态，不是 `refused`、也不靠 fallback 表达。
+        assert error[0]["outcome"] == "failed"
+        assert error[0]["failed"] is True
+        assert error[0]["refused"] is False
+        assert error[0]["outcome_reason"] == "request_failed"
         assert calls["commits"] == []
 
     def test_commit_receives_user_and_response_together(self, interactive_env):
@@ -328,6 +348,12 @@ class TestRoutingPreference:
         error = [e for e in events if e.get("error")]
         assert len(error) == 1
         assert "distributed_required" in error[0]["error"]
+        # ★ DIST-NEXT-8：路由门是「不可恢复、dispatch 前的具名拒绝」⇒ `refused`，
+        #   与链路失败（`failed`）在 metrics 层面分开。
+        assert error[0]["outcome"] == "refused"
+        assert error[0]["refused"] is True
+        assert error[0]["failed"] is False
+        assert error[0]["outcome_reason"] == "request_refused"
 
     def test_distributed_required_allowed_with_path(self, interactive_env, monkeypatch):
         client, calls = interactive_env

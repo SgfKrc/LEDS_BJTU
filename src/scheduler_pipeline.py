@@ -22,18 +22,86 @@ from config import (
 )
 # ★ #31 M2：层流水线支持的架构**单一事实来源**（此前在 4 处各写了一份 `{"qwen","qwen2"}`）
 from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
+
+
+def native_thinking_suppression_required(show_thinking: bool, model_prompt: str) -> bool:
+    """★ 2026-10-07（真机复验根因）：是否需要抑制「模型原生思考」的外露。
+
+    Route-A stage 链路此前只判 `"<think" in model_prompt[-128:]` —— 把**模板给模型的指令**
+    当成了「模型已进入思考」的证据。`qwen3-5-2b` 的 chat template 在 `enable_thinking` 非 true
+    时注入的是**已闭合**的 `'<think>\\n\\n</think>\\n\\n'`（见
+    `models/qwen3-5-2b/tokenizer_config.json` 的 `chat_template`），生成段因此只含正文、
+    永远等不到 `</think>` ⇒ 流式 token 全被吞进缓冲（真机 `tokens=0`），非流式则被
+    `_format_model_response` 判成空正文（「流水线返回空响应」）。
+
+    正确判据是「模板注入的思考块**尚未闭合**」：只有那种情况下，生成文本里的思考才需要
+    等到 `</think>` 之后再外露。
+    """
+    tail = (model_prompt or "")[-128:].lower()
+    return bool(not show_thinking and "<think" in tail and "</think>" not in tail)
+# ★ 2026-10-07（DIST-NEXT-7）：A1 relay 的隔离边界（唯一门 + 独立诊断 namespace）。
+from relay_a1_legacy import (
+    a1_isolation_status,
+    a1_production_enabled,
+    parse_relay_segment_map,
+)
 from relay_segment_client import (
     RelaySegmentClient,
     RelaySegmentError,
 )
 from relay_transport import is_loopback_host
 from scheduler_types import PreemptState, WORKER_HEARTBEAT_MAX_AGE
+from task_worker_protocol import (
+    hidden_fits_stage_frame,
+    hidden_wire_bytes,
+    max_hidden_tokens,
+    stage_payload_budget_bytes,
+)
+# ★ 2026-10-07（DIST-NEXT-3）：assignment 权威视图的相位与 reason code。
+from worker_assignment_state import (
+    PHASE_ACKED,
+    PHASE_READY,
+    REASON_CONFIG_ACKED,
+    REASON_CONFIG_CLEARED,
+    REASON_WORKER_RELEASED,
+    evaluate_assignment_consistency,
+    pushed_from_state,
+)
 from torch_runtime import loaded_torch
 
 logger = logging.getLogger("scheduler")
 
 
 RELAY_HIDDEN_WIRE_FORMAT = "qlh.relay_hidden.f32.v1"
+
+
+class LayerStageFrameTooLarge(RuntimeError):
+    """★ 2026-10-07（DIST-NEXT-2）：层段 hidden 超出单帧预算。
+
+    在 **dispatch 前**抛出（offer 尚未 reserve/execute）：超限的 hidden 装不进
+    `MAX_MESSAGE_BYTES`，继续发送只会在执行完成后触发 `message_too_large`，
+    表现为 stage 超时与回退 —— 那是过晚的契约发现，不是有效的 fail-closed。
+
+    不可恢复：换一个更小的 prompt（更少 token）或更小的模型（更少 `n_embd`）
+    才能重试；reason code 稳定，供上层直接收敛为具名失败。
+    """
+
+    code = "route_a_stage_frame_too_large"
+
+    def __init__(
+        self, *, node_id: str, wire_bytes: int, budget_bytes: int,
+        n_tokens: int, n_embd: int,
+    ) -> None:
+        self.node_id = str(node_id)
+        self.wire_bytes = int(wire_bytes)
+        self.budget_bytes = int(budget_bytes)
+        self.n_tokens = int(n_tokens)
+        self.n_embd = int(n_embd)
+        super().__init__(
+            f"{self.code}:node={self.node_id}:wire={self.wire_bytes}"
+            f":budget={self.budget_bytes}:n_tokens={self.n_tokens}"
+            f":n_embd={self.n_embd}"
+        )
 
 #: 从节点心跳的**容忍上限**（秒）。★ 2026-10-05（DIST-2）：定义上移到
 #: `scheduler_types.WORKER_HEARTBEAT_MAX_AGE`，让**容量规划**与 **readiness**
@@ -222,6 +290,114 @@ def _layer_stage_result_to_pipeline_value(
     if isinstance(token, bool) or not isinstance(token, int) or token < 0:
         raise ValueError("tail layer stage result requires token_argmax")
     return {"kind": "token", "token_argmax": token}
+
+
+def _assert_layer_stage_offer_fits_frame(
+    *, node_id: str, n_tokens: int, n_embd: int, dtype: str = "float32",
+    chunked_input: bool = False,
+) -> None:
+    """★ 2026-10-07（DIST-NEXT-2）：dispatch 前的层段 wire 大小预检。
+
+    抽出为模块级纯函数（不依赖 `Scheduler` 状态），使两侧共用同一判据并可独立单测。
+
+    ★ 2026-10-08（DIST-NEXT-2b）：`chunked_input=True` 表示目标 worker 声明了
+    `stage_chunked_input` —— 此时**不得**在此拒绝。分片发生在 provider 层
+    （`task_worker_adapter._maybe_send_stage_chunks`，先发 `chunk_count` 条 `stage_chunk`
+    再发 offer），而本预检在 provider **之前**，无条件拒绝会让分片路径**永远走不到**：
+    实测 ≈2475 tokens 的 prompt 得到 `route_a_stage_frame_too_large:…:wire=24160940`
+    而非分片。未声明分片的对端仍保持 fail-closed。
+    """
+    wire_bytes = hidden_wire_bytes(n_tokens, n_embd, dtype)
+    budget_bytes = stage_payload_budget_bytes()
+    if hidden_fits_stage_frame(n_tokens, n_embd, dtype):
+        return
+    if chunked_input:
+        # ★ 2026-10-08（DIST-NEXT-2b）：声明分片只放宽**单帧**预算。分片本身仍有总量上限
+        #   （`MAX_STAGE_CHUNKS × STAGE_CHUNK_BYTES` 原始字节），越过它必须**仍在此**
+        #   fail-closed —— 否则会在 provider 的分片计划中途才抛
+        #   （`stage_payload_too_large: payload needs N chunks, at most 64 are allowed`），
+        #   又退回成"过晚的契约发现"。
+        from task_worker_protocol import (
+            MAX_STAGE_PAYLOAD_BYTES,
+            _base64_wire_length,
+        )
+
+        chunked_wire_limit = int(_base64_wire_length(int(MAX_STAGE_PAYLOAD_BYTES)))
+        if wire_bytes <= chunked_wire_limit:
+            logger.debug(
+                "Route-A stage 帧超单帧预算但对端声明分片，交由 provider 分片发送: "
+                "node=%s wire=%dB budget=%dB n_tokens=%d",
+                node_id, wire_bytes, budget_bytes, n_tokens,
+            )
+            return
+        logger.warning(
+            "Route-A stage 分片总量超限: node=%s n_tokens=%d n_embd=%d wire=%dB "
+            "max_chunked_wire=%dB",
+            node_id, n_tokens, n_embd, wire_bytes, chunked_wire_limit,
+        )
+        raise LayerStageFrameTooLarge(
+            node_id=node_id,
+            wire_bytes=wire_bytes,
+            budget_bytes=chunked_wire_limit,
+            n_tokens=n_tokens,
+            n_embd=n_embd,
+        )
+    logger.warning(
+        "Route-A stage 帧预算不足: node=%s n_tokens=%d n_embd=%d dtype=%s "
+        "wire=%dB budget=%dB max_tokens=%d",
+        node_id, n_tokens, n_embd, dtype, wire_bytes, budget_bytes,
+        max_hidden_tokens(n_embd, dtype),
+    )
+    raise LayerStageFrameTooLarge(
+        node_id=node_id,
+        wire_bytes=wire_bytes,
+        budget_bytes=budget_bytes,
+        n_tokens=n_tokens,
+        n_embd=n_embd,
+    )
+
+
+def _node_declares_stage_chunked_input(control: Any, node_id: str) -> bool:
+    """★ 2026-10-08（DIST-NEXT-2b）：该节点是否声明 `stage_chunked_input`。
+
+    声明 ⇒ 超预算的 hidden 由 provider 切 `stage_chunk` 分片发送，预检不得提前拒绝；
+    未声明（含查询失败）⇒ 返回 False，维持 fail-closed 的既有语义。
+    """
+    if control is None:
+        return False
+    try:
+        status = control.status(role="master")
+    except Exception:
+        logger.debug("查询 task worker 分片能力失败: node=%s", node_id, exc_info=True)
+        return False
+    worker_ids = [
+        item.get("node_id")
+        for item in ((status or {}).get("workers") or [])
+        if isinstance(item, dict)
+    ]
+    for worker in (status or {}).get("workers", []) or []:
+        if not isinstance(worker, dict) or worker.get("node_id") != node_id:
+            continue
+        capabilities = worker.get("capabilities")
+        declared = (
+            isinstance(capabilities, dict)
+            and capabilities.get("stage_chunked_input") is True
+        )
+        # ★ 2026-10-08（诊断，定位后降级为 debug）：分辨「worker 不在控制面」与
+        #   「hello 没带该键」——2b 真机回归已用它确认 Android 侧 `declared=True`
+        #   且分片真实生效（`task_worker_stage_chunks_sent chunks=18`）。
+        logger.debug(
+            "event=stage_chunked_probe node=%s declared=%s caps_keys=%s worker_ids=%s",
+            node_id, declared,
+            sorted(capabilities.keys()) if isinstance(capabilities, dict) else None,
+            worker_ids,
+        )
+        return declared
+    logger.debug(
+        "event=stage_chunked_probe node=%s declared=False worker_ids=%s",
+        node_id, worker_ids,
+    )
+    return False
 
 
 class SchedulerPipelineMixin:
@@ -564,7 +740,17 @@ class SchedulerPipelineMixin:
             for node_id, expected in self._layer_config_expected.items():
                 if expected.get("release"):
                     return
-                if node_id not in self._layer_config_pushed:
+                pushed = node_id in self._layer_config_pushed
+                # ★ 2026-10-07（DIST-NEXT-3 第二步·观测）：用 assignment 权威视图校验这条
+                #   「多集合交叉判定」。**判据不变**（零行为变化）——只在两者不一致时记一条
+                #   具名事件，作为后续逐条切换读路径的证据。
+                self._observe_assignment_state_consistency(
+                    node_id, legacy_pushed=pushed, expected=expected,
+                )
+                # ★ DIST-NEXT-3 第二步：**读路径切换** —— 权威视图有该节点的 assignment 时
+                #   用它的相位判定（等价场景与旧集合完全一致；分歧场景保留旧判据，且已在
+                #   上面留下 `event=worker_assignment_state_divergence` 证据）。
+                if not self._effective_layer_config_pushed(node_id, pushed):
                     return
         for assignment in plan.get("assignments", []):
             if not isinstance(assignment, dict):
@@ -584,6 +770,116 @@ class SchedulerPipelineMixin:
                 and transaction.get("phase") == "ready"
             ):
                 self._clear_pipeline_recovery_fence()
+
+    def _observe_assignment_state_consistency(
+        self, node_id: str, *, legacy_pushed: bool, expected: dict,
+    ) -> None:
+        """★ 2026-10-07（DIST-NEXT-3 第二步）：比对权威视图与旧集合判据（**只观测**）。
+
+        不改变任何判据，只把「多集合交叉判定」与 `WorkerAssignmentState` 的分歧记成一条
+        具名事件（`event=worker_assignment_state_divergence`）——这是把读路径逐条切到
+        权威视图的前置证据（先让分歧可见，再切判据）。
+        """
+        registry = getattr(self, "_worker_assignments", None)
+        if registry is None:
+            return
+        state = registry.state(node_id)
+        verdict = evaluate_assignment_consistency(
+            state,
+            legacy_pushed=bool(legacy_pushed),
+            has_expected=isinstance(expected, dict) and bool(expected),
+        )
+        if verdict.consistent:
+            return
+        logger.warning(
+            "event=worker_assignment_state_divergence node_id=%s reason=%s "
+            "state_phase=%s assignment_id=%s legacy_pushed=%s",
+            node_id, verdict.reason_code, verdict.state_phase,
+            "" if state is None else state.assignment_id,
+            bool(legacy_pushed),
+        )
+
+    def _ensure_assignment_state(self, node_id: str, *, reason_code: str) -> None:
+        """★ 2026-10-07（DIST-NEXT-3）：ACK 到达但权威视图没有该节点时补一条 assignment。
+
+        产品路径总会先 `_publish_layer_configs()`（⇒ 已有记录）；这条兜底覆盖「本端直接
+        写入 `_layer_config_expected` 后收到 ACK」的路径（历史/夹具），使相位推进不会因为
+        「没有记录」而静默丢失 —— 否则 `_layer_config_pushed` 作为派生视图会漏掉该节点。
+        """
+        registry = getattr(self, "_worker_assignments", None)
+        if registry is None or registry.state(node_id) is not None:
+            return
+        registry.begin(node_id, reason_code=reason_code)
+
+    @property
+    def _layer_config_pushed(self) -> frozenset:
+        """★ 2026-10-07（DIST-NEXT-3）：**派生视图**，不再是事实源。
+
+        集合语义 = 「该节点已确认收到本代际层配置」，唯一来源是
+        `_worker_assignments` 的相位（`ACKED` / `READY`）。返回 `frozenset`：
+        任何遗留的 `add` / `discard` / `clear` 会立刻 `AttributeError`（fail-loud），
+        而不是静默失效 —— 这是"降级为派生视图"能安全落地的前提。
+        """
+        return frozenset(
+            node_id for node_id, state in self._worker_assignments.snapshot().items()
+            if state["phase"] in (PHASE_ACKED, PHASE_READY)
+        )
+
+    def _effective_layer_config_pushed(
+        self, node_id: str, legacy_pushed: bool,
+    ) -> bool:
+        """★ 2026-10-07（DIST-NEXT-3 第二步）：读路径切换 —— **以权威视图为准**。
+
+        返回规则（fail-closed 且零行为漂移）：
+
+        * 权威视图有该节点的 assignment ⇒ 用它的相位推导（`pushed_from_state`）；
+        * 无记录 ⇒ 沿用旧集合 `_layer_config_pushed`（不把"没有记录"当 False）；
+        * 两者**不一致** ⇒ 保留旧值并已由 `_observe_assignment_state_consistency()` 记下
+          具名分歧 —— 也就是说，分歧场景下判据不变，等日志证据足够后再收口。
+
+        注意：本方法在 `_layer_config_lock` 持锁区内被调用；registry 自身不加锁，无锁序问题。
+
+        **只收紧、不放宽**：权威视图判否（含终止态）⇒ 不再算 pushed（排除陈旧项，这正是
+        清理 `_layer_config_pushed` 残留的方向）；权威视图判真而旧集合判假时**保持旧值**
+        （放宽集合会改变 readiness 结论，需要单独的回归依据）。两种分歧都由
+        `_observe_assignment_state_consistency()` 留下具名事件。
+        """
+        registry = getattr(self, "_worker_assignments", None)
+        state = None if registry is None else registry.state(node_id)
+        authoritative = pushed_from_state(state)
+        if authoritative is None:
+            return bool(legacy_pushed)
+        if authoritative:
+            return bool(legacy_pushed)
+        return False
+
+    def _effective_layer_config_pushed_nodes(
+        self, legacy_pushed: set[str], expected_configs: dict,
+    ) -> set[str]:
+        """★ 2026-10-07（DIST-NEXT-3 第二步）：readiness 的 ready 集合 —— 权威视图优先。
+
+        规则与 `_effective_layer_config_pushed()` 一致，并保持**集合层面**的零行为漂移：
+
+        * 旧集合里、且权威视图也判 pushed ⇒ 保留（等价）；
+        * 旧集合里、但权威视图判否（陈旧项）⇒ **排除**（收紧：readiness 不再因残留的
+          `_layer_config_pushed` 而误判就绪）；
+        * 旧集合没有、但权威视图判 pushed ⇒ **不加入**（不放宽），只记一条具名分歧 ——
+          放宽集合会改变 readiness 结论，留到清理旧集合时一并切换。
+        """
+        resolved = {
+            node_id for node_id in legacy_pushed
+            if self._effective_layer_config_pushed(node_id, True)
+        }
+        registry = getattr(self, "_worker_assignments", None)
+        if registry is not None:
+            for node_id in set(expected_configs) - set(legacy_pushed):
+                if pushed_from_state(registry.state(node_id)) is True:
+                    self._observe_assignment_state_consistency(
+                        node_id,
+                        legacy_pushed=False,
+                        expected=expected_configs.get(node_id) or {},
+                    )
+        return resolved
 
     @property
     def _active_layer_config(self):
@@ -679,8 +975,64 @@ class SchedulerPipelineMixin:
                     if isinstance(worker, dict)
                     and int(worker.get("selected_version", 0) or 0) >= 2
                 }
+                # ★ 2026-10-08（真机闸门卡点）：**恢复期不得比正常路径更严**。
+                #
+                #   v3 层段 worker 的能力来自它自己的 hello（`layer_stage_dispatch_enabled`
+                #   = healthy ∧ version≥2 ∧ `layer_forward` ∧ `layer_ranges` 非空），与 legacy
+                #   层配置的「重启恢复闸门」是两回事。实测：master 重启后的恢复窗口里本分支
+                #   返回**空集** ⇒ capacity 候选缺 Y700 ⇒ 请求被判
+                #   `pipeline_layer_range_coverage_insufficient`（把"恢复中"误导成"区间覆盖不足"），
+                #   而 **1.2 秒后**恢复期一解除，**同一个请求**就 `admitted=True`
+                #   （00:47:06 / 00:47:08 的对照日志）。
+                #   这里在空集时回退到正常准入判据（三分量齐备的 worker 照常参与规划），
+                #   并记一条诊断 —— 恢复期里到底有没有可用的 v3 worker，从此可查。
+                if not admitted:
+                    status = self._task_worker_control.status(role="master")
+                    fallback_admitted = {
+                        str(worker.get("node_id", ""))
+                        for worker in status.get("workers", []) or []
+                        if isinstance(worker, dict)
+                        and worker.get("healthy")
+                        and worker.get("layer_stage_dispatch_enabled")
+                        and str(worker.get("node_id", "")) in connected_ids
+                    }
+                    logger.info(
+                        "event=stage_admission_recovery_empty raw=%s fallback=%s",
+                        sorted(admitted), sorted(fallback_admitted),
+                    )
+                    admitted = fallback_admitted
             else:
                 status = self._task_worker_control.status(role="master")
+                # ★ 2026-10-08（诊断，定位后降级）：逐 worker 打出**准入三分量**，用来回答
+                #   "为什么状态显示健康的 v3 层段 worker 仍被判 not_eligible"。capacity 候选的
+                #   白名单正取自本函数的返回值（`stage_releasable_worker_ids`），所以这里缺哪个
+                #   分量，就是候选缺它的原因。
+                for _worker in status.get("workers", []) or []:
+                    if not isinstance(_worker, dict):
+                        continue
+                    _caps = _worker.get("capabilities")
+                    _ok = (
+                        _worker.get("healthy") is True
+                        and _worker.get("layer_stage_dispatch_enabled") is True
+                        and isinstance(_caps, dict)
+                        and bool(_caps.get("layer_ranges"))
+                        and _worker.get("node_id") in connected_ids
+                    )
+                    if _ok:
+                        # 合格 ⇒ 不打日志（避免每次请求每个 worker 一条）。
+                        continue
+                    # 只有**不合格**时才记 —— 那正是"候选为什么缺它"的答案。
+                    logger.info(
+                        "event=stage_admission_rejected node=%s healthy=%s dispatch=%s "
+                        "ranges=%s in_connected=%s version=%s",
+                        _worker.get("node_id"),
+                        _worker.get("healthy"),
+                        _worker.get("layer_stage_dispatch_enabled"),
+                        (str(_caps.get("layer_ranges"))[:48]
+                         if isinstance(_caps, dict) else "n/a"),
+                        _worker.get("node_id") in connected_ids,
+                        _worker.get("selected_version"),
+                    )
                 admitted = {
                     str(worker.get("node_id", ""))
                     for worker in status.get("workers", [])
@@ -1317,6 +1669,18 @@ class SchedulerPipelineMixin:
         from task_worker_adapter import remote_provider_id
 
         raw, n_tokens, n_embd = _hidden_to_raw_f32(hidden_states)
+        # ★ 2026-10-07（DIST-NEXT-2）：**offer 前**按 `n_tokens * n_embd * dtype` 预检
+        #   wire 大小。输入与中间段输出（`hidden_out_f32`）同尺寸，所以一次预检覆盖往返；
+        #   超限时在 reserve/execute 之前以稳定 reason 结束 —— 不再让大 payload 走到
+        #   「执行完成后才 `message_too_large`」。
+        _assert_layer_stage_offer_fits_frame(
+            node_id=str(node_id), n_tokens=n_tokens, n_embd=n_embd,
+            # ★ 2026-10-08（DIST-NEXT-2b）：对端声明 `stage_chunked_input` ⇒ 超预算的
+            #   hidden 交由 provider 切 `stage_chunk` 分片发送，不在此提前拒绝。
+            chunked_input=_node_declares_stage_chunked_input(
+                getattr(self, "_task_worker_control", None), str(node_id),
+            ),
+        )
         hidden_spec = {
             "n_tokens": n_tokens,
             "n_embd": n_embd,
@@ -1409,13 +1773,21 @@ class SchedulerPipelineMixin:
             return
         with self._layer_config_lock:
             for node_id, config in configs.items():
-                self._layer_config_pushed.discard(node_id)
+                # ★ 2026-10-07（DIST-NEXT-3）：`_layer_config_pushed` 已是**派生视图** ⇒
+                #   不再直接写；`begin()` 把相位置回 `pushing`，派生集合自然不含该节点。
                 self._layer_config_acks.pop(node_id, None)
                 self._layer_config_expected[node_id] = dict(config)
                 self._layer_config_retry_state[node_id] = {
                     "attempts": 1,
                     "next_retry": time.monotonic() + 5.0,
                 }
+                # ★ 2026-10-07（DIST-NEXT-3）：每次下发都**换代际**（新 `assignment_id`）
+                #   —— 迟到的旧 ACK 因此无法冒充当前配置的就绪。
+                self._worker_assignments.begin(
+                    node_id,
+                    config_id=str(config.get("config_id", "") or ""),
+                    connection_generation=int(self._layer_config_generation),
+                )
         self._start_layer_config_retry_monitor()
         for node_id, config in configs.items():
             try:
@@ -1431,10 +1803,15 @@ class SchedulerPipelineMixin:
     def _clear_layer_config_state(self, node_id: str) -> None:
         """清除节点的层配置期望、ACK 和 ready 状态。"""
         with self._layer_config_lock:
-            self._layer_config_pushed.discard(node_id)
+            # ★ 2026-10-07（DIST-NEXT-3）：派生视图不直接写；下面的 `release()` 即清除语义。
             self._layer_config_expected.pop(node_id, None)
             self._layer_config_acks.pop(node_id, None)
             self._layer_config_retry_state.pop(node_id, None)
+            # ★ 2026-10-07（DIST-NEXT-3）：同一事实写进权威视图 —— 终止态只记**一个**
+            #   reason code，取代「多处各自推断为什么这个节点被清掉」。
+            self._worker_assignments.release(
+                node_id, reason_code=REASON_CONFIG_CLEARED,
+            )
 
 
     def _abort_pipeline_load_transaction(
@@ -1534,6 +1911,33 @@ class SchedulerPipelineMixin:
             if item.get("node_id") in master_ids
         ), None)
         try:
+            # ★ 2026-10-07：**stage-only 路径**（只有 A3 worker、没有 legacy ACK）在
+            #   `:1097-1101` 直接调用本函数，于是从来没有远端 ACK 驱动 master 的
+            #   `prepare` 阶段 ⇒ `prepare_pipeline_tokenizer()` 会因
+            #   `is_pipeline_prepared=False` 抛
+            #   `当前没有已准备的 distributed-only 流水线模型`
+            #   （实测 reason_code=`pipeline_local_commit_failed`）。
+            #   这里在 commit 前为本地节点补一次 prepare。已 prepared 时是 no-op。
+            if local_assignment is not None and not getattr(
+                self._host, "is_pipeline_prepared", False
+            ):
+                prepare_local = getattr(self._host, "prepare_pipeline_model", None)
+                local_model_path = (
+                    getattr(self._host, "_full_model_path", None)
+                    or getattr(self._host, "_model_path", None)
+                    or getattr(self._host, "model_path", None)
+                )
+                if callable(prepare_local) and local_model_path:
+                    prepare_local(
+                        model_id=str(plan.get("model_id", "") or ""),
+                        model_path=str(local_model_path),
+                        quant_type=getattr(self._host, "quant_type", None),
+                        layer_range=(
+                            int(local_assignment["start_layer"]),
+                            int(local_assignment["end_layer"]),
+                        ),
+                        model_sha256=None,
+                    )
             prepare_tokenizer = getattr(self._host, "prepare_pipeline_tokenizer", None)
             if callable(prepare_tokenizer):
                 prepare_tokenizer()
@@ -1631,7 +2035,11 @@ class SchedulerPipelineMixin:
             if not expected or expected.get("config_id") != config_id:
                 return False
             assignment = dict(expected)
-            self._layer_config_pushed.discard(node_id)
+            # ★ 2026-10-07（DIST-NEXT-3）：撤销 ready ACK = 就绪证据作废 ⇒ 相位退回 `pushing`
+            #   （保留 assignment_id / generation，迟到 ACK 仍无法冒充）。
+            self._worker_assignments.invalidate(
+                node_id, reason_code="layer_config_ack_revoked",
+            )
             self._layer_config_acks[node_id] = {
                 "node_id": node_id,
                 "config_id": config_id,
@@ -1684,7 +2092,12 @@ class SchedulerPipelineMixin:
         pending = []
         with self._layer_config_lock:
             for node_id, expected in self._layer_config_expected.items():
-                if node_id in self._layer_config_pushed:
+                # ★ 2026-10-07（DIST-NEXT-3 第二步）：重发判据同样以 assignment 权威视图为准
+                #   （只收紧）。若 `_layer_config_pushed` 残留而该 assignment 已终止，旧逻辑
+                #   会**永远跳过重发** —— 那个节点再也等不到配置，只能等下一次全量下发。
+                if self._effective_layer_config_pushed(
+                    node_id, node_id in self._layer_config_pushed,
+                ):
                     continue
                 state = self._layer_config_retry_state.setdefault(
                     node_id, {"attempts": 0, "next_retry": now}
@@ -3100,15 +3513,29 @@ class SchedulerPipelineMixin:
                     and ack_generation == int(expected.get("generation", 0) or 0)
                 )
                 self._layer_config_acks[client_id] = dict(data)
+                # ★ 2026-10-07（DIST-NEXT-3）：相位推进前先确保权威视图有这条 assignment
+                #   （产品路径由 publish 建立；本端直写 expected 的路径在这里补）。
+                self._ensure_assignment_state(
+                    client_id, reason_code="layer_config_ack",
+                )
                 if released:
                     self._layer_config_expected.pop(client_id, None)
-                    self._layer_config_pushed.discard(client_id)
                     self._layer_config_retry_state.pop(client_id, None)
+                    # ★ 2026-10-07（DIST-NEXT-3）：worker 确认释放 ⇒ 权威视图进终止态
+                    #   （派生视图随之不再包含该节点，无需单独 discard）。
+                    self._worker_assignments.release(
+                        client_id, reason_code=REASON_WORKER_RELEASED,
+                    )
                 else:
                     state = self._layer_config_retry_state.setdefault(
                         client_id, {"attempts": 0, "next_retry": 0.0}
                     )
                     state["next_retry"] = time.monotonic() + 5.0
+                    # ★ 2026-10-07（DIST-NEXT-3）：ACK 到达 ⇒ 相位前进（越级/过期换代
+                    #   会被 registry 拒绝，这正是「不是当前 assignment 的事件」的判据）。
+                    self._worker_assignments.transition(
+                        client_id, phase=PHASE_ACKED, reason_code=REASON_CONFIG_ACKED,
+                    )
                 release_ack = True
                 ready = False
                 prepared = False
@@ -3166,6 +3593,11 @@ class SchedulerPipelineMixin:
                     )
                 )
                 self._layer_config_acks[client_id] = dict(data)
+                # ★ 2026-10-07（DIST-NEXT-3）：同上，legacy 路径的 ACK 也要确保权威视图有记录
+                #   （否则相位推进会被静默丢弃，派生视图漏掉该节点）。
+                self._ensure_assignment_state(
+                    client_id, reason_code="layer_config_ack",
+                )
                 # ★ 2026-10-03：v3 层段 worker 会**明确拒绝** legacy 配置（它手上有工件、
                 #   层段由 stage offer 驱动，见 `_handle_layer_config_locked` 里的同名分流）。
                 #   这不是"未就绪"，而是"不参与这条通道" ⇒ 把它从待 ACK 集合里摘掉，
@@ -3179,8 +3611,13 @@ class SchedulerPipelineMixin:
                     == "layer_stage_worker_rejects_legacy_config"
                 ):
                     self._layer_config_expected.pop(client_id, None)
-                    self._layer_config_pushed.discard(client_id)
                     self._layer_config_retry_state.pop(client_id, None)
+                    # ★ 2026-10-07（DIST-NEXT-3）：该节点不参与 legacy 通道 ⇒ 权威视图进
+                    #   终止态（派生视图随之不含它）。
+                    self._worker_assignments.release(
+                        client_id,
+                        reason_code="layer_stage_worker_rejects_legacy_config",
+                    )
                     transaction = self._pipeline_load_transaction
                     if (
                         transaction
@@ -3213,7 +3650,11 @@ class SchedulerPipelineMixin:
                         },
                     )
                 if ready:
-                    self._layer_config_pushed.add(client_id)
+                    # ★ 2026-10-07（DIST-NEXT-3 第三步）：legacy ready ACK 推进**权威视图**；
+                    #   `_layer_config_pushed` 是派生视图，无需再单独 add。
+                    self._worker_assignments.transition(
+                        client_id, phase=PHASE_READY, reason_code=REASON_CONFIG_ACKED,
+                    )
                     self._layer_config_retry_state.pop(client_id, None)
                     transaction = self._pipeline_load_transaction
                     if (
@@ -3233,7 +3674,9 @@ class SchedulerPipelineMixin:
                             self._persist_pipeline_lifecycle_locked()
                             activated_plan = dict(active_plan)
                 elif prepared:
-                    self._layer_config_pushed.discard(client_id)
+                    # ★ 2026-10-07（DIST-NEXT-3）：派生视图不因**迟到的 prepared** 撤回 ready
+                    #   （正常流程 prepared 先于 ready；旧写法在这里 discard 会把已就绪的节点
+                    #   踢出 `pushed`，那本身是个隐患）。
                     self._layer_config_retry_state.pop(client_id, None)
                     transaction = self._pipeline_load_transaction
                     if (
@@ -3249,7 +3692,11 @@ class SchedulerPipelineMixin:
                 elif prepared_late:
                     self._layer_config_retry_state.pop(client_id, None)
                 else:
-                    self._layer_config_pushed.discard(client_id)
+                    # ★ 2026-10-07（DIST-NEXT-3）：ACK 未通过任一判据 ⇒ 就绪证据作废
+                    #   （相位退回 `pushing`），派生视图随之不含该节点。
+                    self._worker_assignments.invalidate(
+                        client_id, reason_code="layer_config_ack_rejected",
+                    )
                     state = self._layer_config_retry_state.setdefault(
                         client_id, {"attempts": 0, "next_retry": 0.0}
                     )
@@ -4333,9 +4780,13 @@ class SchedulerPipelineMixin:
         with self._nodes_lock:
             nodes_snapshot = dict(self.nodes)
         with self._layer_config_lock:
-            ready_nodes = set(self._layer_config_pushed)
             expected_configs = dict(self._layer_config_expected)
             ack_snapshot = dict(self._layer_config_acks)
+            # ★ 2026-10-07（DIST-NEXT-3 第二步）：readiness 的 ready 集合改走权威视图
+            #   （等价时与旧集合逐位一致；无记录/分歧保留旧集合值并记具名事件）。
+            ready_nodes = self._effective_layer_config_pushed_nodes(
+                set(self._layer_config_pushed), expected_configs,
+            )
         get_client_ids = getattr(self._tcp_server, "get_client_ids", None)
         connected = set(
             get_client_ids()
@@ -4783,7 +5234,11 @@ class SchedulerPipelineMixin:
                     ack = self._layer_config_acks.get(node_id, {})
                     expected_range = [node.get("start_layer"), node.get("end_layer")]
                     layer_ready = (
-                        node_id in self._layer_config_pushed
+                        # ★ 2026-10-07（DIST-NEXT-3 第三步）：与 readiness / 重发判据共用同一
+                        #   入口（只收紧）—— 陈旧 pushed 不再让节点被当成"已确认层配置"。
+                        self._effective_layer_config_pushed(
+                            node_id, node_id in self._layer_config_pushed,
+                        )
                         and ack.get("config_id") == expected.get("config_id")
                         and ack.get("layer_range") == expected_range
                         and ack.get("model_sha256") == expected.get("model_sha256")
@@ -4956,42 +5411,13 @@ class SchedulerPipelineMixin:
     def _parse_relay_segment_map(raw: str) -> dict[str, dict[str, object]]:
         """★ A1 / X 档（Y 档第二条扩层区间）：解析 `QLH_RELAY_SEGMENTS`。
 
-        条目格式：`node=role@host:port#n_embd#start-end`（`;`/`,` 分隔），
-        其中 **`start-end` 是该段认领的层区间 `[start, end)`，必填**。
-
-        校验**复用** `_normalize_relay_segment`（单一真源，避免两套判据漂移）。任何不合法、
-        或**未声明层区间**的条目**整条丢弃** —— 宁可不下发，也不下发"只带 n_embd"的半懂规格：
-        后者会让主节点无从扣除该段的层，退化成"段在已过全部层的 hidden 上重算"。
-        空配置 ⇒ `{}`（行为与接线前一致）。
+        ★ 2026-10-07（DIST-NEXT-7）：实现已迁到 `relay_a1_legacy.parse_relay_segment_map`
+        （A1 的隔离边界），判据仍复用 `_normalize_relay_segment`（单一真源）。
+        保留本静态方法名以兼容既有调用点与测试。
         """
-        result: dict[str, dict[str, object]] = {}
-        for chunk in str(raw or "").replace(",", ";").split(";"):
-            chunk = chunk.strip()
-            if not chunk or "=" not in chunk or "@" not in chunk:
-                continue
-            name, _, value = chunk.partition("=")
-            body, _, fields_text = value.partition("#")
-            role, _, host_port = body.partition("@")
-            host, _, port_text = host_port.rpartition(":")
-            fields = fields_text.split("#")
-            if len(fields) != 2:
-                continue        # 缺层区间（或多余字段）⇒ 整条丢弃
-            n_embd_text, range_text = fields
-            range_start, _, range_end = range_text.partition("-")
-            try:
-                spec = SchedulerPipelineMixin._normalize_relay_segment({
-                    "role": role.strip(),
-                    "host": host.strip(),
-                    "port": int(port_text),
-                    "n_embd": int(n_embd_text),
-                    "layer_start": int(range_start),
-                    "layer_end": int(range_end),
-                })
-            except ValueError:
-                continue
-            if name.strip() and spec is not None:
-                result[name.strip()] = spec
-        return result
+        return parse_relay_segment_map(
+            raw, SchedulerPipelineMixin._normalize_relay_segment,
+        )
 
     def _relay_segment_for_worker(self, worker_id: str,
                                   routing_preference: str = "auto") -> Optional[dict]:
@@ -5018,17 +5444,22 @@ class SchedulerPipelineMixin:
         #   直接不供给 relay 段：生产请求即使配了 `QLH_RELAY_ENABLED` /
         #   `QLH_RELAY_SEGMENTS`，也只记一份具名诊断并继续走 A3，**不做静默切换**。
         #   探针/实验要恢复 A1 行为时显式设 `QLH_RELAY_PROBE_ONLY=0`。
-        if PIPELINE_RELAY_PROBE_ONLY:
-            if not getattr(self, "_relay_probe_only_warned", False):
-                self._relay_probe_only_warned = True
-                logger.warning(
-                    "A1 relay 已从产品调度入口剔除（QLH_RELAY_PROBE_ONLY=1，默认）："
-                    "QLH_RELAY_ENABLED/QLH_RELAY_SEGMENTS 不再作为生产能力，生产请求"
-                    "继续走 A3 stage_offer_v3。需要 A1 探针行为请显式设 "
-                    "QLH_RELAY_PROBE_ONLY=0。首个受影响 worker=%s", worker_id,
-                )
-            return None
-        if not PIPELINE_RELAY_ENABLED:
+        if not a1_production_enabled(
+            probe_only=PIPELINE_RELAY_PROBE_ONLY,
+            relay_enabled=PIPELINE_RELAY_ENABLED,
+        ):
+            # ★ 2026-10-07（DIST-NEXT-7）：门集中在 `relay_a1_legacy.a1_production_enabled`；
+            #   这里只保留「为什么不供给」的两种具名表现：探针闸门（默认，一次性告警）
+            #   与总开关关闭（静默，保持既有行为）。
+            if PIPELINE_RELAY_PROBE_ONLY:
+                if not getattr(self, "_relay_probe_only_warned", False):
+                    self._relay_probe_only_warned = True
+                    logger.warning(
+                        "A1 relay 已从产品调度入口剔除（QLH_RELAY_PROBE_ONLY=1，默认）："
+                        "QLH_RELAY_ENABLED/QLH_RELAY_SEGMENTS 不再作为生产能力，生产请求"
+                        "继续走 A3 stage_offer_v3。需要 A1 探针行为请显式设 "
+                        "QLH_RELAY_PROBE_ONLY=0。首个受影响 worker=%s", worker_id,
+                    )
             return None
         if str(routing_preference or "auto") == "local_only":
             return None
@@ -5086,6 +5517,31 @@ class SchedulerPipelineMixin:
         ⚠️ 只传 `node_id` 一个位置参数：调用方（含测试与嵌入方）常注入单参 stub。
         """
         return self._relay_segment_for_worker(node_id) is not None
+
+    def get_relay_a1_status(self) -> dict:
+        """★ 2026-10-07（DIST-NEXT-7）：A1 的**独立诊断 namespace**（`relay_a1`）。
+
+        把「A1 现在能不能被调度选中」收敛成单一入口：返回开关、段配置与 relay 宿主
+        计数，其中 `production_enabled` 与 `assignment_selectable` 同源取值。生产侧
+        （health / 日志 / 测试）据此判断，而不必逐个开关去猜，也不会与 Route A 的
+        原因码混在一起。
+        """
+        cache = getattr(self, "_relay_segment_map_cache", None)
+        if cache is None:
+            cache = self._parse_relay_segment_map(PIPELINE_RELAY_SEGMENTS)
+            self._relay_segment_map_cache = cache
+        nodes = getattr(self, "nodes", {}) or {}
+        relay_hosts = [
+            node_id for node_id in nodes
+            if self._relay_segment_for_worker(node_id) is not None
+        ]
+        return a1_isolation_status(
+            probe_only=PIPELINE_RELAY_PROBE_ONLY,
+            relay_enabled=PIPELINE_RELAY_ENABLED,
+            segments_raw=PIPELINE_RELAY_SEGMENTS,
+            configured_nodes=cache,
+            relay_host_count=len(relay_hosts),
+        )
 
 
     def _wait_for_layer_result(self, task_id: str, node_ids,
@@ -5365,8 +5821,8 @@ class SchedulerPipelineMixin:
             eos_ids = {eos_token_ids}
         else:
             eos_ids = set(eos_token_ids)
-        native_thinking_prompt = bool(
-            not show_thinking and "<think" in model_prompt[-128:].lower()
+        native_thinking_prompt = native_thinking_suppression_required(
+            show_thinking, model_prompt,
         )
         suppress_native_thinking = native_thinking_prompt
         stream_buffer = ""
@@ -5483,28 +5939,34 @@ class SchedulerPipelineMixin:
                                 f"{assignment['node_id']}"
                             ),
                         }
-                    stage_result = self._execute_layer_stage_offer(
-                        node_id=assignment["node_id"],
-                        assignment=assignment,
-                        hidden_states=current_hidden,
-                        model_identity=stage_model_identity,
-                        # ★ 协议要求 `wf_` 前缀（`_WORKFLOW_ID = ^wf_[A-Za-z0-9_-]{8,96}$`）；
-                        #   Route A 原先直接传裸 `task_id`（12 位 hex），会被 offer 校验拒掉。
-                        workflow_id=f"wf_{task_id}",
-                        request_id=f"{task_id}:step:{step}",
-                        stage_id=f"{assignment['node_id']}:step:{step}",
-                        context_size=context_size,
-                        pos_base=0,
-                        want_hidden=not last_stage,
-                        # ★ 2026-10-03：层段接力必须走 **keep-head** 通道（末层输出，
-                        #   `output_norm` **之前**）—— 协议里 `extract_hidden` 是旧默认，
-                        #   会多一次 `output_norm`。传错通道会让跨机 D→L 从 decode 起
-                        #   分叉（真机实测：首 token 一致、第 3 个 token 起偏）。
-                        middle_channel="keep_head_layer_out",
-                        seq_ids=[0] * n_tokens,
-                        positions=positions,
-                        cancel_event=_cancel_event,
-                    )
+                    try:
+                        stage_result = self._execute_layer_stage_offer(
+                            node_id=assignment["node_id"],
+                            assignment=assignment,
+                            hidden_states=current_hidden,
+                            model_identity=stage_model_identity,
+                            # ★ 协议要求 `wf_` 前缀（`_WORKFLOW_ID = ^wf_[A-Za-z0-9_-]{8,96}$`）；
+                            #   Route A 原先直接传裸 `task_id`（12 位 hex），会被 offer 校验拒掉。
+                            workflow_id=f"wf_{task_id}",
+                            request_id=f"{task_id}:step:{step}",
+                            stage_id=f"{assignment['node_id']}:step:{step}",
+                            context_size=context_size,
+                            pos_base=0,
+                            want_hidden=not last_stage,
+                            # ★ 2026-10-03：层段接力必须走 **keep-head** 通道（末层输出，
+                            #   `output_norm` **之前**）—— 协议里 `extract_hidden` 是旧默认，
+                            #   会多一次 `output_norm`。传错通道会让跨机 D→L 从 decode 起
+                            #   分叉（真机实测：首 token 一致、第 3 个 token 起偏）。
+                            middle_channel="keep_head_layer_out",
+                            seq_ids=[0] * n_tokens,
+                            positions=positions,
+                            cancel_event=_cancel_event,
+                        )
+                    except LayerStageFrameTooLarge as exc:
+                        # ★ 2026-10-07（DIST-NEXT-2）：dispatch 前的不可恢复拒绝。
+                        #   具名 reason（含所需/上限字节数与维度）直接回给调用方，
+                        #   不再让请求走「发不出的 offer → 执行超时 → 回退」。
+                        return {"response": "", "error": str(exc)}
                     if last_stage:
                         if stage_result.get("kind") != "token":
                             return {"response": "", "error": "route_a_tail_missing_token"}
@@ -5517,6 +5979,15 @@ class SchedulerPipelineMixin:
                 if stage_token is None:
                     return {"response": "", "error": "route_a_stage_chain_empty"}
                 new_token_id = stage_token
+                # ★ 2026-10-07：逐 token 取证日志。此前 Route-A 生成循环**不打印任何 token**，
+                #   导致「空响应」无法区分「没生成」与「生成的全是特殊 token 被
+                #   skip_special_tokens 滤掉」。与 Android 侧（无逐 token 日志）配合时，
+                #   这是唯一能定位数值分歧的观测点。
+                logger.info(
+                    "Route-A 生成 step=%d token=%d eos=%s text=%r",
+                    step, int(new_token_id), new_token_id in eos_ids,
+                    tokenizer.decode([int(new_token_id)]),
+                )
                 if new_token_id in eos_ids:
                     break
                 generated_ids.append(new_token_id)
@@ -5579,6 +6050,14 @@ class SchedulerPipelineMixin:
             if pipeline_stack and pipeline_stack[-1].get("task_id") == task_id:
                 pipeline_stack.pop()
 
+        # ★ 2026-10-07（真机复验根因）：抑制门若一直没等到 `</think>`，循环结束时**必须**
+        #   把缓冲内容交出去 —— 否则已生成的正文既不在 SSE 事件里、也不在 response 里
+        #   （真机表现：流式 `tokens=0`、非流式「流水线返回空响应」）。放在组装 response
+        #   之前，让两条出口看到同一份文本。
+        if _stream_callback and stream_buffer:
+            _stream_callback({"token": stream_buffer})
+        stream_buffer = ""
+        suppress_native_thinking = False
         if generated_ids:
             if hasattr(input_ids, "detach"):
                 full_ids = torch.cat([
@@ -7476,6 +7955,37 @@ class SchedulerPipelineMixin:
             yield {"done": True, "error": f"完整模型恢复失败: {e}"}
             return
 
+        # A direct llama.cpp layer engine may not expose ``ensure_full_model``.
+        # Inspect its descriptor too so streaming fallback cannot execute a
+        # partial GGUF as though it were a whole model.
+        _layer_range = getattr(mgr, "layer_range", None)
+        _desc = {}
+        try:
+            _get_desc = getattr(mgr, "get_pipeline_descriptor", None)
+            if callable(_get_desc):
+                _candidate = _get_desc() or {}
+                if isinstance(_candidate, dict):
+                    _desc = _candidate
+        except Exception:  # noqa: BLE001 - unavailable descriptor stays fail-closed
+            _desc = {}
+        _partial = bool(
+            _desc.get("assignment_layer_range")
+            or _desc.get("partial_assignment")
+            or _desc.get("loaded_artifact")
+        )
+        _lm_head = _desc.get("lm_head") if "lm_head" in _desc else None
+        if _layer_range is not None or _partial or _lm_head is False:
+            self._inference_lock.release()
+            yield {
+                "done": True,
+                "error": (
+                    "refusing_full_model_fallback_with_partial_artifact: "
+                    f"layer_range={_layer_range} partial={_partial} lm_head={_lm_head};"
+                    " master holds a partial artifact; refusing full-model fallback"
+                ),
+            }
+            return
+
         max_new_tokens = kwargs.pop('max_new_tokens', 512)
         temperature = kwargs.pop('temperature', 0.7)
         top_p = kwargs.pop('top_p', 0.9)
@@ -7486,7 +7996,14 @@ class SchedulerPipelineMixin:
         engine_name = backend_id_for(mgr, default="pytorch") or "pytorch"
         try:
             model_prompt = callbacks.build_model_chat_prompt(mgr.tokenizer, messages)
-            native_thinking_prompt = "<think>" in model_prompt[-128:].lower()
+            # ★ 2026-10-07（真机复验根因，与 Route-A 同源）：判据必须是「模板注入的思考块
+            #   **尚未闭合**」。旧判据只看 `"<think>"` 是否出现，而 qwen3-5-2b 模板在
+            #   `enable_thinking` 非 true 时注入的是**已闭合**的 `'<think>\n\n</think>\n\n'`
+            #   ⇒ 生成段只含正文、永远等不到 `</think>`，正文被整段丢掉（真机实测：PyTorch
+            #   单机流式档 180s 超时且回答为空）。
+            native_thinking_prompt = native_thinking_suppression_required(
+                show_thinking, model_prompt,
+            )
         except Exception:
             native_thinking_prompt = bool(
                 engine_name == "llama_cpp"

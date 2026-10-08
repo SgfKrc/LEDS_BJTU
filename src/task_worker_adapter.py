@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import collections
 import hashlib
 import json
@@ -29,6 +30,11 @@ from task_provider import (
     StageResult,
 )
 
+from task_worker_chunks import (
+    build_stage_chunk,
+    plan_stage_payload_chunks,
+    stage_chunk_ref,
+)
 from task_worker_protocol import (
     MAX_MESSAGE_BYTES,
     PROTOCOL_VERSION,
@@ -37,12 +43,25 @@ from task_worker_protocol import (
     build_message,
     canonical_message_bytes,
     decode_message,
+    hidden_fits_stage_frame,
     negotiate_protocol_version,
     stage_input_sha256,
 )
 
 
 _MESSAGE_CACHE_LIMIT = 1024
+
+#: ★ 2026-10-07（DIST-NEXT-4b）：reservation 撤销的**单一 reason code**。
+#: 每次撤销都带其中一个值记一条 `event=task_worker_reservations_released` ——
+#: 否则「这个节点的槽位为什么被释放」在日志里说不清（审计 P0-3 要求单一 reason code）。
+RELEASE_REASON_DISCONNECTED = "worker_tcp_disconnected"
+RELEASE_REASON_HEARTBEAT_STALE = "worker_heartbeat_stale"
+RELEASE_REASON_SERVICE_RESTART = "worker_service_restarted"
+RELEASE_REASONS = (
+    RELEASE_REASON_DISCONNECTED,
+    RELEASE_REASON_HEARTBEAT_STALE,
+    RELEASE_REASON_SERVICE_RESTART,
+)
 
 
 def remote_provider_id(node_id: str) -> str:
@@ -506,6 +525,13 @@ class _PendingRemoteAttempt:
     cancel_requested: bool = False
     cancel_enqueued: bool = False
     cancel_acknowledged: bool = False
+    #: ★ 2026-10-07（DIST-NEXT-1）：「已收到取消 ACK」与「执行确实已停止」是两个
+    #: 事实。前者由 `cancel_acknowledged` 表示；后者只有对端显式回报
+    #: `execution_state == "execution_stopped"` 时才成立（缺省/旧对端 = 未证明）。
+    cancel_ack_execution_state: str = ""
+    cancel_execution_stopped: bool = False
+    #: 对端**主动**取消（本地用户取消 / Service 回收），本端并未请求。
+    cancel_remote_initiated: bool = False
     released: bool = False
     released_at: float = 0.0
 
@@ -536,6 +562,13 @@ class RemoteFullWorkerProvider:
         self._reservation_attempts: dict[str, str] = {}
         self._seen_messages: dict[str, str] = {}
         self._seen_order: collections.deque[str] = collections.deque()
+        #: ★ 2026-10-07（DIST-NEXT-1）：取消合同的分类计数。把「请求已发出」
+        #: 「ACK 已收到」「执行确证已停止」「对端主动取消」「迟到结果被吸收」
+        #: 分开统计 —— 否则「请求已取消」会被当成「执行已停止」。
+        self._cancel_ack_states: collections.Counter[str] = collections.Counter()
+        self._cancel_execution_stopped = 0
+        self._cancel_remote_initiated = 0
+        self._late_stage_responses = 0
         self._closed = False
         self._lock = threading.RLock()
         self._outbound_queue: queue.Queue[
@@ -707,6 +740,91 @@ class RemoteFullWorkerProvider:
             for model in models
         )
 
+    def _supports_stage_chunked_input(self) -> bool:
+        """对端是否声明能接收 `stage_chunk` + `hidden_ref`（默认否）。"""
+        capabilities = (self._snapshot() or {}).get("capabilities")
+        if not isinstance(capabilities, dict):
+            return False
+        return capabilities.get("stage_chunked_input") is True
+
+    def _maybe_send_stage_chunks(self, attempt: StageAttempt) -> dict[str, Any]:
+        """★ 2026-10-07（DIST-NEXT-2b）：超预算的层段 hidden 先分片发出，返回改写后的 root_input。
+
+        * 非层段 / 无内联 hidden / 未超预算 / 对端未声明能力 ⇒ **原样返回**（零行为变化）；
+        * 声明能力且超预算 ⇒ 同步发出 `chunk_count` 条 `stage_chunk`，再把 `hidden_f32`
+          换成 `hidden_ref`（`total_bytes` / `payload_sha256` 供 worker 装配校验）；
+        * 发送失败 ⇒ `ProviderExecutionError`（明确失败，不静默退回内联 —— 那会在协议层
+          抛 `message_too_large`，把「分片发不出去」的原因丢掉）。
+        """
+        request = attempt.request
+        root_input = request.root_input if isinstance(request.root_input, dict) else {}
+        encoded = root_input.get("hidden_f32")
+        if not isinstance(encoded, str):
+            return root_input
+        stage_fields = request.stage_fields or {}
+        spec = stage_fields.get("hidden_spec") or {}
+        n_tokens = int(spec.get("n_tokens", 0) or 0)
+        n_embd = int(spec.get("n_embd", 0) or 0)
+        dtype = str(spec.get("dtype", "float32") or "float32")
+        if n_tokens < 1 or n_embd < 1:
+            return root_input
+        if hidden_fits_stage_frame(n_tokens, n_embd, dtype):
+            return root_input
+        if not self._supports_stage_chunked_input():
+            # 对端不支持 ⇒ 维持内联路径（超限由 dispatch 前的预检负责拒绝）。
+            return root_input
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except Exception as exc:
+            raise ProviderExecutionError(
+                "layer stage hidden is not valid base64",
+                code="invalid_stage_input",
+                provider_id=self.provider_id,
+            ) from exc
+        try:
+            plan = plan_stage_payload_chunks(raw)
+        except WorkerProtocolError as exc:
+            raise ProviderExecutionError(
+                f"layer stage hidden cannot be chunked: {exc}",
+                code=getattr(exc, "code", "stage_payload_too_large"),
+                provider_id=self.provider_id,
+            ) from exc
+        sent_at_ms = int(time.time() * 1000)
+        for index, chunk in enumerate(plan.chunks):
+            chunk_message = build_stage_chunk(
+                workflow_id=request.workflow_id,
+                stage_id=request.stage_id,
+                attempt_id=attempt.attempt_id,
+                lease_id=attempt.lease_id,
+                lease_epoch=attempt.lease_epoch,
+                provider_id=self.provider_id,
+                chunk_index=index,
+                chunk_count=plan.chunk_count,
+                payload=chunk,
+                total_bytes=plan.total_bytes,
+                message_id=_message_id("chunk_"),
+                sent_at_ms=sent_at_ms,
+            )
+            try:
+                self._send_message(chunk_message)
+            except Exception as exc:
+                raise ProviderExecutionError(
+                    "failed to send a layer stage input chunk",
+                    code="remote_worker_disconnected",
+                    provider_id=self.provider_id,
+                    retryable=True,
+                ) from exc
+        logger.info(
+            "event=task_worker_stage_chunks_sent node_id=%s attempt_id=%s "
+            "chunks=%d bytes=%d",
+            self.node_id, attempt.attempt_id, plan.chunk_count, plan.total_bytes,
+        )
+        chunked = {
+            key: value for key, value in root_input.items() if key != "hidden_f32"
+        }
+        chunked["hidden_ref"] = stage_chunk_ref(plan)
+        return chunked
+
     def inspect(self) -> ProviderCapabilities:
         snapshot = self._snapshot()
         capabilities = snapshot.get("capabilities", {})
@@ -764,6 +882,34 @@ class RemoteFullWorkerProvider:
             available=healthy and active < max_concurrency,
             node_id=self.node_id,
         )
+
+    def cancel_diagnostics(self) -> dict[str, Any]:
+        """取消合同的分类计数（DIST-NEXT-1）。
+
+        把「收到 ACK」「执行确证已停止」「对端主动取消」「迟到结果被吸收」
+        分开统计。调用方（health / 测试 / 后续 metrics）据此区分
+        「请求已取消」与「执行已停止」，不再由单一布尔冒充。
+        """
+        with self._lock:
+            ack_states = dict(self._cancel_ack_states)
+            pending_with_cancel = sum(
+                1 for pending in self._pending.values()
+                if pending.cancel_requested
+            )
+            still_in_flight = sum(
+                1 for pending in self._pending.values()
+                if pending.cancel_requested
+                and pending.cancel_acknowledged
+                and not pending.cancel_execution_stopped
+            )
+            return {
+                "cancel_ack_execution_states": ack_states,
+                "cancel_execution_stopped_confirmed": self._cancel_execution_stopped,
+                "cancel_remote_initiated": self._cancel_remote_initiated,
+                "late_stage_responses_absorbed": self._late_stage_responses,
+                "pending_cancel_requests": pending_with_cancel,
+                "pending_cancel_ack_in_flight": still_in_flight,
+            }
 
     def supports_model_identity(
         self, model_identity: ModelIdentity, stage_type: str,
@@ -981,6 +1127,10 @@ class RemoteFullWorkerProvider:
 
         sent_at_ms = int(time.time() * 1000)
         lease_expires_at_ms = int(attempt.lease_expires_at * 1000)
+        # ★ 2026-10-07（DIST-NEXT-2b）：超帧预算的 hidden 走**有序分片**（仅当对端声明
+        #   `stage_chunked_input`）。分片必须在 offer **之前**发出：offer 只带 `hidden_ref`，
+        #   worker 收到 offer 时要求分片已齐备。未声明能力/未超预算 ⇒ 原样返回（零行为变化）。
+        root_input = self._maybe_send_stage_chunks(attempt)
         offer_payload = {
                     "workflow_id": attempt.request.workflow_id,
                     "request_id": attempt.request.request_id,
@@ -991,10 +1141,10 @@ class RemoteFullWorkerProvider:
                     "lease_epoch": attempt.lease_epoch,
                     "lease_expires_at_ms": lease_expires_at_ms,
                     "provider_id": self.provider_id,
-                    "root_input": attempt.request.root_input,
+                    "root_input": root_input,
                     "dependencies": attempt.request.dependencies,
                     "input_sha256": stage_input_sha256(
-                        attempt.request.root_input,
+                        root_input,
                         attempt.request.dependencies,
                     ),
                     "model_identity": attempt.request.model_identity.snapshot(),
@@ -1016,6 +1166,15 @@ class RemoteFullWorkerProvider:
         )
         try:
             self._send_message(offer)
+            # ★ 2026-10-08（诊断，定位后降级）：真机卡点是「18 片已发、offer 似乎从不被
+            #   worker 读到」⇒ 先确认 offer 到底有没有写出去（以及它是否已是 hidden_ref 形态）。
+            logger.info(
+                "event=task_worker_stage_offer_sent node_id=%s attempt_id=%s stage_id=%s "
+                "bytes=%d chunked=%s",
+                self.provider_id, attempt.attempt_id, attempt.request.stage_id,
+                len(json.dumps(offer, default=str).encode("utf-8")),
+                isinstance(root_input.get("hidden_ref"), dict),
+            )
         except Exception as exc:
             # A cancellation that raced with a failed offer send has no
             # remote work left to acknowledge. Mark it terminal so release()
@@ -1154,6 +1313,7 @@ class RemoteFullWorkerProvider:
                 # absorb the stale response idempotently instead of treating
                 # the peer as a protocol violator.
                 self._remember_message_locked(message)
+                self._late_stage_responses += 1
                 logger.info(
                     "event=task_worker_late_stage_response_ignored node_id=%s "
                     "message_type=%s attempt_id=%s",
@@ -1218,28 +1378,107 @@ class RemoteFullWorkerProvider:
                     provider_id=self.provider_id,
                     retryable=bool(payload["retryable"]),
                 )
+                # ★ 2026-10-07（DIST-NEXT-1d 真机复测发现）：此前只把泛化消息抛出，
+                #   worker 回传的 `error_code` / `retryable` **没有落日志** ⇒ 现场只能看到
+                #   「remote worker reported a Stage error」，无法区分是身份不匹配、预算超限
+                #   还是执行失败。这里补一条具名事件（与 cancel 路径的事件风格一致）。
+                logger.info(
+                    "event=task_worker_stage_error node_id=%s stage_id=%s attempt_id=%s "
+                    "error_code=%s retryable=%s",
+                    self.provider_id,
+                    payload.get("stage_id", "-"),
+                    payload.get("attempt_id", "-"),
+                    payload["error_code"],
+                    payload["retryable"],
+                )
                 pending.accept_event.set()
                 pending.result_event.set()
             else:
+                # ★ 2026-10-07（DIST-NEXT-1）：取消合同。
+                #   `execution_state` 可选：旧对端不带 ⇒ `unknown`（不冒充已停止）。
+                execution_state = str(payload.get("execution_state") or "unknown")
                 if not pending.cancel_requested:
-                    raise WorkerProtocolError(
-                        "Stage cancellation acknowledgement was not requested",
-                        code="unexpected_stage_cancelled",
-                        field="message_type",
+                    # 对端**主动**取消（Android 本地用户取消 / Service 回收）。
+                    # 此前一律按 `unexpected_stage_cancelled` 拒绝 ⇒ master 只能等到
+                    # 租约/步骤超时，且在 coordinator 侧看不出是谁取消的。现在收敛成
+                    # 单一 reason：该 attempt 由对端终止，本端以可重试的远端取消结束等待。
+                    pending.cancel_remote_initiated = True
+                    pending.cancel_acknowledged = True
+                    pending.cancel_ack_execution_state = execution_state
+                    pending.cancel_execution_stopped = (
+                        execution_state == "execution_stopped"
                     )
-                if pending.cancel_acknowledged:
+                    if pending.cancel_execution_stopped:
+                        self._cancel_execution_stopped += 1
+                    pending.error = ProviderExecutionError(
+                        "remote worker cancelled the Stage",
+                        code=str(
+                            payload.get("reason_code") or "remote_worker_cancelled"
+                        ),
+                        provider_id=self.provider_id,
+                        retryable=True,
+                    )
+                    pending.accept_event.set()
+                    pending.result_event.set()
+                    pending.cancel_ack_event.set()
+                    self._cancel_remote_initiated += 1
+                    self._cancel_ack_states[execution_state] += 1
+                    logger.info(
+                        "event=task_worker_stage_cancel_remote_initiated node_id=%s "
+                        "workflow_id=%s stage_id=%s attempt_id=%s reason_code=%s "
+                        "execution_state=%s",
+                        self.node_id,
+                        payload.get("workflow_id", ""),
+                        payload.get("stage_id", ""),
+                        attempt_id,
+                        payload.get("reason_code", ""),
+                        execution_state,
+                    )
                     self._remember_message_locked(message)
                     return message
+                if pending.cancel_acknowledged and not pending.cancel_execution_stopped:
+                    # 第二条 ACK 可以把「仍在执行」升级为「已停止」——这是取消合同
+                    # 允许的唯一迟到的正向更新（其余迟到响应走上面的吸收分支）。
+                    pass
+                elif pending.cancel_acknowledged:
+                    self._remember_message_locked(message)
+                    return message
+                # 一条 ACK 只证明「取消请求已送达」；只有对端显式回报
+                # `execution_stopped` 才证明「执行已停止」。
+                first_ack = not pending.cancel_acknowledged
+                previous_state = pending.cancel_ack_execution_state
                 pending.cancel_acknowledged = True
+                if execution_state != "unknown":
+                    pending.cancel_ack_execution_state = execution_state
+                if (
+                    execution_state == "execution_stopped"
+                    and not pending.cancel_execution_stopped
+                ):
+                    pending.cancel_execution_stopped = True
+                    self._cancel_execution_stopped += 1
+                if first_ack or execution_state != previous_state:
+                    self._cancel_ack_states[execution_state] += 1
                 pending.cancel_ack_event.set()
-                logger.info(
-                    "event=task_worker_stage_cancel_acknowledged node_id=%s "
-                    "workflow_id=%s stage_id=%s attempt_id=%s",
-                    self.node_id,
-                    payload.get("workflow_id", ""),
-                    payload.get("stage_id", ""),
-                    attempt_id,
-                )
+                if first_ack:
+                    logger.info(
+                        "event=task_worker_stage_cancel_acknowledged node_id=%s "
+                        "workflow_id=%s stage_id=%s attempt_id=%s execution_state=%s",
+                        self.node_id,
+                        payload.get("workflow_id", ""),
+                        payload.get("stage_id", ""),
+                        attempt_id,
+                        execution_state,
+                    )
+                elif execution_state != previous_state:
+                    logger.info(
+                        "event=task_worker_stage_cancel_execution_stopped node_id=%s "
+                        "workflow_id=%s stage_id=%s attempt_id=%s execution_state=%s",
+                        self.node_id,
+                        payload.get("workflow_id", ""),
+                        payload.get("stage_id", ""),
+                        attempt_id,
+                        execution_state,
+                    )
                 if pending.released:
                     self._pending.pop(attempt_id, None)
             self._remember_message_locked(message)
@@ -1330,7 +1569,9 @@ class RemoteFullWorkerProvider:
         if message is not None:
             self._queue_cancel_message(attempt_id, message)
 
-    def notify_disconnect(self) -> None:
+    def notify_disconnect(
+        self, *, reason_code: str = RELEASE_REASON_DISCONNECTED,
+    ) -> None:
         """对端断连：唤醒所有 pending，并**主动回收本 provider 的全部 reservation**。
 
         ★ 2026-10-05（DIST-2 要求 2：「节点掉线…必须释放 lease」）：此前这里只把
@@ -1343,6 +1584,10 @@ class RemoteFullWorkerProvider:
         `release()` 是**纯本地 dict 操作**（不向 worker 发任何消息），在断连路径上
         调用没有副作用；先唤醒 pending 再回收，顺序保证等待方先拿到
         `remote_worker_disconnected` 错误。
+
+        ★ 2026-10-07（DIST-NEXT-4b）：`reason_code` 由调用方给出（断线 / 心跳过期 /
+        服务重建），调用方据此记**单一**撤销事件；错误码本身保持
+        `remote_worker_disconnected`（等待方语义不变）。
         """
         with self._lock:
             released = []
@@ -1365,6 +1610,33 @@ class RemoteFullWorkerProvider:
         # 锁内再取会自锁）。
         for reservation_id in reservation_ids:
             self.release(reservation_id)
+        if reservation_ids:
+            logger.info(
+                "event=task_worker_reservations_released node_id=%s reason=%s "
+                "released=%d",
+                self.node_id, reason_code, len(reservation_ids),
+            )
+
+    def release_stale_reservations(self, reason_code: str) -> list[str]:
+        """★ 2026-10-07（DIST-NEXT-4b）：撤销**没有在跑 attempt** 的 reservation。
+
+        与 [notify_disconnect] 的区别：断线是「对端确定没了」⇒ 全部回收；心跳过期
+        时对端可能只是心跳线程失效、stage 仍在跑 ⇒ 只回收**已终结**（无 pending 或
+        pending 的 `result_event` 已置）的条目，避免打断 in-flight 执行。返回被撤销的
+        reservation id，供调用方按 `reason_code` 记一条单一事件。
+        """
+        with self._lock:
+            freed: list[str] = []
+            for reservation_id in list(self._reservations.keys()):
+                attempt_id = self._reservation_attempts.get(reservation_id, "")
+                pending = self._pending.get(attempt_id) if attempt_id else None
+                if pending is not None and not pending.result_event.is_set():
+                    continue        # in-flight ⇒ 交给取消/租约路径收敛
+                freed.append(reservation_id)
+        # `release()` 自带锁 ⇒ 锁外调用。
+        for reservation_id in freed:
+            self.release(reservation_id)
+        return freed
 
     def release(self, reservation_id: str) -> None:
         with self._lock:

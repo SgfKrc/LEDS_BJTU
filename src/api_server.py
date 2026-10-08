@@ -148,6 +148,15 @@ _validate_pipeline_role_switches(
 
 # 主节点用户自持 SQLite；生产运行时不再加载远端 PostgreSQL 驱动。
 import local_store as _local_store
+# ★ 2026-10-07（DIST-NEXT-8）：请求相位/终态的单一来源 —— 取消、拒绝与链路错误
+#   不再被 `fallback` 或 error 语义吞掉（详见 `src/request_outcome.py`）。
+from request_outcome import (
+    REASON_GENERATION_CANCELLED,
+    REASON_REQUEST_FAILED,
+    REASON_REQUEST_REFUSED,
+    merge_phase_metrics as merge_request_outcome,
+    request_phase_metrics as request_outcome_metrics,
+)
 import model_download_jobs
 import model_search
 from cluster_join import (
@@ -424,6 +433,7 @@ _API_AUTH_EXEMPT_PATHS = frozenset({
     "/api/cluster/join/consume",
     "/api/cluster/android/register",
     "/api/cluster/android/heartbeat",
+    "/api/cluster/quorum/voter",
 })
 
 
@@ -676,6 +686,26 @@ def _runtime_readiness_snapshot() -> dict[str, Any]:
 # 调度器（单机 / 分布式模式共用）
 scheduler: ClusterScheduler = ClusterScheduler()
 scheduler.set_control_fence(control_fence)
+# HA-ROLE-AUTO-01: explicit ``NODE_ROLE=auto`` must construct the same
+# controller used by scheduler startup. Configuration failures stay read-only;
+# they are surfaced in ``/api/cluster/my-role`` rather than becoming a static
+# master by accident.
+auto_role_runtime = None
+if NODE_ROLE == "auto":
+    try:
+        from cluster_auto_role_runtime import install_auto_role_controller
+
+        auto_role_runtime = install_auto_role_controller(scheduler, control_fence)
+    except Exception as exc:
+        logger.error(
+            "auto role wiring unavailable; scheduler will remain read-only: %s",
+            getattr(exc, "code", type(exc).__name__),
+        )
+    # ``install_auto_role_controller`` may strengthen the initially optional
+    # fence with the auto-role authority. Keep middleware and route modules on
+    # that same object, otherwise API writes would bypass the runtime fence.
+    if scheduler._control_fence is not control_fence:
+        control_fence = scheduler._control_fence
 _task_graph_runtime_lock = threading.RLock()
 
 
@@ -937,7 +967,8 @@ def _run_exclusive_model_change(
         with scheduler._inference_lock:
             with scheduler._layer_execution_lock:
                 with scheduler._layer_config_lock:
-                    scheduler._layer_config_pushed.clear()
+                    # ★ 2026-10-07（DIST-NEXT-3）：清空 assignment 权威视图（派生视图随之空）。
+                    scheduler._worker_assignments.clear()
                     scheduler._layer_config_expected.clear()
                     scheduler._layer_config_acks.clear()
                     scheduler._active_layer_config = None
@@ -2395,11 +2426,17 @@ def _augment_chat_metrics(metrics: dict | None, req: ChatRequest, **defaults) ->
     _marker = "readiness="
     if _marker in _failure_text:
         _capability_reason = _failure_text.split(_marker, 1)[1].strip()
+    # ★ 2026-10-07（DIST-NEXT-8）：把互斥终态打进摘要 —— 一行内即可区分
+    #   completed / fallback_completed / cancelled / refused / failed，
+    #   不再靠 `fallback` 布尔去猜。
+    _metrics = result.get("metrics")
+    _outcome = dict(_metrics or {}).get("outcome", "")
     logger.info(
         "event=chat_route_summary request_id=%s generation_id=%s "
         "routing_preference=%s distributed_requested=%s distributed_used=%s "
         "fallback=%s fallback_reason=%s execution_mode=%s route=%s "
         "workers_used=%s claimed_layers=%s layer_segments=%s config_id=%s "
+        "outcome=%s "
         "a1_relay_probe_only=%s relay_enabled=%s legacy_bridge_rejected=%s "
         "capability_missing_reason=%s",
         result.get("request_id", ""),
@@ -2415,6 +2452,7 @@ def _augment_chat_metrics(metrics: dict | None, req: ChatRequest, **defaults) ->
         result.get("claimed_layers", []),
         result.get("layer_segments", []),
         result.get("config_id", ""),
+        _outcome,
         PIPELINE_RELAY_PROBE_ONLY,
         PIPELINE_RELAY_ENABLED,
         "route_a_mixed_legacy_execution_bridge_not_ready" in _failure_text,
@@ -4122,7 +4160,16 @@ def _execute_chat_full(
         generated_ids = outputs[0][prompt_len:]
         raw_text = model_manager._decode_generated_ids(generated_ids, stop_sequences).strip()
 
-        native_thinking_prompt = "<think>" in prompt[-128:].lower()
+        # ★ 2026-10-07（与 Route-A 同源的真机根因）：判据必须是「模板注入的思考块**尚未闭合**」，
+        #   而不是「prompt 里出现过 `<think`」。qwen3-5-2b 模板在 `enable_thinking` 非 true 时
+        #   注入的是已闭合的 `'<think>\n\n</think>\n\n'` ⇒ 生成段只含正文，永远等不到
+        #   `</think>`，旧判据会把正文整段丢掉（判成空响应）。
+        _prompt_tail = prompt[-128:].lower()
+        native_thinking_prompt = bool(
+            not req.show_thinking
+            and "<think" in _prompt_tail
+            and "</think>" not in _prompt_tail
+        )
         parsed_text = raw_text
         if req.show_thinking and not native_thinking_prompt and "<think" not in raw_text.lower():
             parsed_text = "【思考】\n" + raw_text
@@ -4376,7 +4423,22 @@ def _auto_load_default_model():
     if _active_id:
         logger.info(f"默认模型按设备画像选择: {_active_id}")
 
-    if gguf_candidates:
+    # ★ 2026-10-07：`QLH_PREFER_PYTORCH=1` 且画像模型带 safetensors 目录时，
+    #   跳过下面的 GGUF 分支，让本机走 PyTorch（`engine=pytorch`）。
+    #   动机见 `config.PREFER_PYTORCH` 的说明：qwen3.5 的 keep-head 上游挂点在
+    #   `output_norm` 之后，llama.cpp 上游被 fail-closed 拒绝（#35），
+    #   而 GGUF 分支的优先级在 PyTorch 之前 ⇒ 必须显式让路。
+    prefer_pytorch = (
+        bool(getattr(cfg, "PREFER_PYTORCH", False))
+        and bool(_active_safetensors)
+        and os.path.isdir(_active_safetensors)
+    )
+    if prefer_pytorch:
+        logger.info(
+            f"QLH_PREFER_PYTORCH=1 ⇒ 本机优先走 PyTorch: {_active_safetensors}"
+        )
+
+    if gguf_candidates and not prefer_pytorch:
         gguf_path = gguf_candidates[0]
         engine = "llama_cpp"
         model_path = gguf_path

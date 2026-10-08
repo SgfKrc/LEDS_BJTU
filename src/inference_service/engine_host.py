@@ -3225,7 +3225,8 @@ class EngineHost:
                 with sched._inference_lock:
                     with sched._layer_execution_lock:
                         with sched._layer_config_lock:
-                            sched._layer_config_pushed.clear()
+                            # ★ 2026-10-07（DIST-NEXT-3）：清空 assignment 权威视图。
+                            sched._worker_assignments.clear()
                             sched._layer_config_expected.clear()
                             sched._layer_config_acks.clear()
                             sched._active_layer_config = None

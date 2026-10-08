@@ -146,6 +146,18 @@ class TestComputeNodeWeight:
 # compute_layer_assignment 测试
 # ================================================================
 
+def _mark_layer_config_pushed(sched, node_id: str) -> None:
+    """★ DIST-NEXT-3：测试夹具 —— 把节点标记为「已确认层配置」。
+
+    `_layer_config_pushed` 已是**派生视图**（相位 `ACKED`/`READY`），夹具不能再直接写集合；
+    这里经权威视图推进相位，语义与产品的 ready ACK 路径一致。
+    """
+    registry = sched._worker_assignments
+    if registry.state(node_id) is None:
+        registry.begin(node_id, reason_code="test_fixture")
+    registry.transition(node_id, phase="ready")
+
+
 class TestComputeLayerAssignment:
     """测试动态分层计算"""
 
@@ -2043,7 +2055,7 @@ class TestPipelineReadiness:
         sched._maybe_finish_pipeline_recovery()
         assert sched._pipeline_recovery_pending is True
 
-        sched._layer_config_pushed.add("worker-a")
+        _mark_layer_config_pushed(sched, "worker-a")
         sched._maybe_finish_pipeline_recovery()
         assert sched._pipeline_recovery_pending is False
 
@@ -5232,7 +5244,7 @@ class TestChainTopology:
         sched._layer_config_acks["client1"] = {
             "node_id": "client1", "config_id": "cfg-old", "status": "ready",
         }
-        sched._layer_config_pushed.add("client1")
+        _mark_layer_config_pushed(sched, "client1")
         sched._layer_config_retry_state["client1"] = {
             "attempts": 2, "next_retry": 0.0,
         }
@@ -5490,7 +5502,7 @@ class TestChainTopology:
             "model_type": "qwen2",
         }
         sched._layer_config_expected["client1"] = expected
-        sched._layer_config_pushed.add("client1")
+        _mark_layer_config_pushed(sched, "client1")
         sched._pipeline_active_tasks.add("task-invalid")
         sched._pipeline_task_contracts["task-invalid"] = {
             "config_id": "cfg-invalid",
@@ -6285,7 +6297,7 @@ class TestPipelineOrchestrationIntegration:
                 "model_type": "qwen2",
                 "engine": "pytorch",
             }
-            s._layer_config_pushed.add(node_id)
+            _mark_layer_config_pushed(s, node_id)
         return s
 
     def test_stale_layer_ack_does_not_make_pipeline_ready(self, sched_with_workers):

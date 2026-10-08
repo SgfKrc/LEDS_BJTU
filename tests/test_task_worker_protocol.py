@@ -36,7 +36,9 @@ def test_v1_golden_messages_round_trip_canonically(golden):
     assert golden["protocol"] == PROTOCOL_NAME
     decoded = [decode_message(message) for message in golden["messages"]]
 
-    assert {message.message_type for message in decoded} == MESSAGE_TYPES
+    # v1 golden 覆盖 v1 时代的全部类型；`stage_chunk` 是 v3 引入的大 payload 分片
+    # （DIST-NEXT-2b），不在 v1 fixture 范围内（其往返由 test_task_worker_chunks 覆盖）。
+    assert {message.message_type for message in decoded} == MESSAGE_TYPES - {"stage_chunk"}
     assert [message.snapshot() for message in decoded] == golden["messages"]
     for message in decoded:
         assert decode_message(canonical_message_bytes(message)) == message
@@ -386,3 +388,143 @@ def test_decode_normalizes_invalid_unicode_to_protocol_error():
     with pytest.raises(WorkerProtocolError) as captured:
         decode_message("\ud800")
     assert captured.value.code == "invalid_encoding"
+
+
+def test_hello_capabilities_may_advertise_unusable_artifact_reasons():
+    """★ 2026-10-07（DIST-NEXT-6）：不可用工件的结构化原因（无路径）。
+
+    fail-closed 不变：这些项**不**进 `layer_ranges`/`layer_artifacts`，只是把
+    「为什么没有该区间」以稳定 error code + 身份/区间广告出去。
+    """
+    identity_fields = {
+        "error_code": "artifact_missing",
+        "manifest": "mid.manifest.json",
+        "architecture": "qwen35",
+        "mode": "middle",
+        "layer_range": [4, 16],
+        "artifact_present": False,
+    }
+
+    def capabilities(diagnostics):
+        return {
+            "stage_types": ["layer_forward"],
+            "engines": ["llama_cpp"],
+            "models": [{
+                "model_id": "qwen35_2b_mid4_16",
+                "engine": "llama_cpp",
+                "format": "gguf",
+                "revision": "local-v1",
+                "sha256": "b" * 64,
+            }],
+            "max_concurrency": 1,
+            "layer_artifact_diagnostics": diagnostics,
+        }
+
+    def hello(diagnostics):
+        return build_message(
+            "hello",
+            {
+                "node_id": "android_worker_01",
+                "worker_kind": "android_full_worker",
+                "min_version": 1,
+                "max_version": 3,
+                "capabilities": capabilities(diagnostics),
+            },
+            message_id="msg_hello_artifactdiag1",
+            sent_at_ms=1_700_000_000_000,
+            version=3,
+        )
+
+    decoded = hello([identity_fields])
+    assert decoded.payload["capabilities"]["layer_artifact_diagnostics"] == [
+        identity_fields,
+    ]
+
+    # `layer_range = null` 合法（「读不到 manifest」还没解析出区间）
+    unreadable = {**identity_fields, "error_code": "manifest_unreadable",
+                  "layer_range": None}
+    assert hello([unreadable]).payload["capabilities"][
+        "layer_artifact_diagnostics"
+    ] == [unreadable]
+
+    # 空列表没有信息量：要么不给该键，要么给非空列表
+    with pytest.raises(WorkerProtocolError) as empty:
+        hello([])
+    assert empty.value.code == "invalid_capabilities"
+
+    # error code 值域封闭
+    with pytest.raises(WorkerProtocolError) as unknown:
+        hello([{**identity_fields, "error_code": "whatever"}])
+    assert unknown.value.code == "invalid_capabilities"
+    assert unknown.value.field == (
+        "payload.capabilities.layer_artifact_diagnostics[0].error_code"
+    )
+
+    # 键集固定：携带本地路径的额外键会被拒（广告面只带原因，不带路径）
+    with pytest.raises(WorkerProtocolError) as extra:
+        hello([{**identity_fields, "path": "/sdcard/models/x.gguf"}])
+    assert extra.value.code == "invalid_fields"
+
+    # 上限 32 条
+    with pytest.raises(WorkerProtocolError) as too_many:
+        hello([identity_fields] * 33)
+    assert too_many.value.code == "invalid_capabilities"
+
+
+_CANCEL_IDENTITY = {
+    "workflow_id": "wf_cancelremote01",
+    "stage_id": "candidate_a",
+    "attempt_id": "att_cancelremote01",
+    "lease_id": "lease_cancelremote01",
+    "lease_epoch": 1,
+}
+
+
+def _cancelled_envelope(**extra):
+    return build_message(
+        "stage_cancelled",
+        {
+            **_CANCEL_IDENTITY,
+            "provider_id": "remote_worker_01",
+            "reason_code": "coordinator_cancelled",
+            **extra,
+        },
+        message_id="msg_cancelled00000001",
+        sent_at_ms=1_700_000_000_000,
+        version=3,
+    ).snapshot()
+
+
+def test_stage_cancelled_execution_state_is_optional_and_bounded():
+    """★ 2026-10-07（DIST-NEXT-1）：取消 ACK 的执行状态可选、值域封闭。
+
+    「请求已取消」与「执行已停止」是两个事实；协议层只接受这两个具名状态，
+    旧对端（不带该字段）保持原语义。
+    """
+    legacy = decode_message(_cancelled_envelope())
+    assert legacy.payload["reason_code"] == "coordinator_cancelled"
+    assert "execution_state" not in legacy.payload
+
+    for state in ("execution_stopped", "execution_in_flight"):
+        decoded = decode_message(_cancelled_envelope(execution_state=state))
+        assert decoded.payload["execution_state"] == state
+
+    with pytest.raises(WorkerProtocolError) as captured:
+        decode_message(_cancelled_envelope(execution_state="stopped"))
+    assert captured.value.code == "unsupported_execution_state"
+    assert captured.value.field == "payload.execution_state"
+
+
+def test_stage_cancel_does_not_accept_execution_state():
+    """执行状态只属于**回程** ACK；coordinator 的取消请求不得携带它。"""
+    with pytest.raises(WorkerProtocolError) as captured:
+        build_message(
+            "stage_cancel",
+            {**_CANCEL_IDENTITY, "reason_code": "coordinator_cancelled",
+             "execution_state": "execution_stopped"},
+            message_id="msg_cancelrequest0001",
+            sent_at_ms=1_700_000_000_000,
+            version=3,
+        )
+    assert captured.value.code == "invalid_fields"
+    assert captured.value.field == "payload"

@@ -135,6 +135,8 @@ KV_COLD_MAX_BYTES = _env_int(
 
 def _normalize_node_role(value: str) -> str:
     role = (value or "master").strip().lower()
+    if role == "auto":
+        return "auto"
     if role in {"slave", "worker", "client"}:
         return "client"
     return "master"
@@ -484,6 +486,16 @@ PIPELINE_ROUTE_A_STAGE_OFFER_ENABLED = _env_bool(
     "QLH_ROUTE_A_STAGE_OFFER", True,
 )
 
+# ★ 2026-10-07：强制本机（master）走 PyTorch 上游。
+#   动机：qwen3.5 的 keep-head 上游挂点在 `output_norm` **之后**（多一次 RMSNorm，
+#   实测会让接力首步分叉）⇒ `LlamaCppEngine` 上游被 fail-closed 拒绝
+#   （docs/已知问题记录.md #35）。而 `_auto_load_default_model()` 里 GGUF **永远
+#   优先**（api_server.py 的 `if gguf_candidates:`），画像模型又自带 gguf ⇒ 无法
+#   自动落到 PyTorch。置 1 且画像模型有 safetensors 目录时，优先选该目录
+#   （`engine=pytorch`），让本机用 `model_module.forward_layers` 出 hidden。
+#   默认 0：不改变既有行为（llama 优先）。
+PREFER_PYTORCH = _env_bool("QLH_PREFER_PYTORCH", False)
+
 # 图算法智能编排阈值：节点数超过此值（>5）时自动启用最大带宽生成树 + DFS，
 # 替代纯算力权重分配；节点数 ≤ 阈值时回退到简单排序（权重比例分配）
 GRAPH_ORCHESTRATOR_THRESHOLD = 5         # 节点数 > 5 启用图算法，≤ 5 使用简单排序
@@ -607,7 +619,12 @@ AUTH_TIMESTAMP_WINDOW = 300  # ±5 分钟
 # ============================================================
 # 7. 运行模式
 # ============================================================
-RUN_MODE = "distributed"         # "single" 单机 | "distributed" 分布式
+# 运行模式：`QLH_RUN_MODE`（`single` / `distributed`）可覆盖，默认 `distributed` **不变**。
+# 用途：单机仿真/测试进程需要 `single`，否则 master 会进「强制分布式分层」并等从节点
+# 加载 ACK 直到 60 s 超时（实测 D4）。
+RUN_MODE = os.environ.get("QLH_RUN_MODE", "").strip().lower() or "distributed"
+if RUN_MODE not in ("single", "distributed"):
+    RUN_MODE = "distributed"
 LOG_LEVEL = "INFO"               # 日志级别: DEBUG | INFO | WARNING | ERROR
 LOG_DIR = os.path.join(_APP_ROOT, "logs")  # 日志文件目录（绝对路径）
 

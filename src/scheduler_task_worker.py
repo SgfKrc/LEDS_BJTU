@@ -298,6 +298,13 @@ class SchedulerTaskWorkerMixin:
             "layer_worker": layer_worker,
             # 当前**就绪、马上能跑**的层区间（与 `layer_budget` 的"承载上限"分工明确）。
             "layer_ranges": layer_ranges,
+            # ★ 2026-10-08（DIST-NEXT-2b）：声明**能接收分片 hidden**。接收侧
+            #   （`_handle_task_worker_stage_chunk` + `hidden_ref` 装配）早已实现，但此前
+            #   没有任何声明处 —— 于是 provider 的 `_maybe_send_stage_chunks` 直接跳过
+            #   分片、dispatch 前的预检按超限拒绝，大 prompt 只能 503
+            #   （实测 `route_a_stage_frame_too_large:…:wire=24160940:budget=8126464`）。
+            #   非层段 worker 不接收 hidden，故按 `layer_worker` 保守声明。
+            "stage_chunked_input": bool(layer_worker),
             "relay_middle": bool(
                 layer_worker
                 and active_layer_config
@@ -627,6 +634,83 @@ class SchedulerTaskWorkerMixin:
         self._send_task_worker_response(message.message_id, response)
 
 
+    # ------------------------------------------------------------------
+    # ★ 2026-10-07（DIST-NEXT-2b）：大 payload 分片（`stage_chunk`）
+    # ------------------------------------------------------------------
+
+    def _task_worker_chunk_assembler(self):
+        """惰性创建分片装配器（进程内一份；按 attempt_id 分区）。"""
+        assembler = getattr(self, "_task_worker_chunk_state", None)
+        if assembler is None:
+            from task_worker_chunks import StageChunkAssembler
+
+            assembler = StageChunkAssembler()
+            self._task_worker_chunk_state = assembler
+        return assembler
+
+    def _handle_task_worker_stage_chunk(self, message: WorkerMessage) -> None:
+        """接收一条 `stage_chunk`（fail-closed：重复/漂移/摘要不符/超限一律拒）。"""
+        import base64 as _b64
+
+        payload = message.payload
+        try:
+            chunk = _b64.b64decode(str(payload["payload_b64"]), validate=True)
+        except Exception as exc:
+            raise WorkerProtocolError(
+                "stage_chunk payload is not valid base64",
+                code="invalid_chunk_payload",
+                field="payload.payload_b64",
+            ) from exc
+        self._task_worker_chunk_assembler().add(
+            attempt_id=str(payload["attempt_id"]),
+            chunk_index=int(payload["chunk_index"]),
+            chunk_count=int(payload["chunk_count"]),
+            payload=chunk,
+            payload_sha256=str(payload["payload_sha256"]),
+        )
+
+    def _assemble_stage_root_input(self, offer: dict) -> dict:
+        """★ DIST-NEXT-2b：把 `hidden_ref` 的分片装配回 `hidden_f32`（fail-closed）。
+
+        内联路径（offer 直接带 `hidden_f32`）**原样返回** —— 与接线前逐字节一致；
+        分片路径则要求：分片齐备、`total_bytes` 与 spec 自洽、装配后摘要等于
+        `hidden_sha256`。任何一条不成立就以具名原因失败，不做静默降级。
+        """
+        root_input = offer.get("root_input")
+        if not isinstance(root_input, dict):
+            raise RuntimeError("层段 Stage 的 root_input 必须是对象")
+        # 非层段（`full_inference` / `aggregate`）没有 hidden 交接，原样透传。
+        if str(offer.get("stage_type") or "") != "layer_forward":
+            return root_input
+        if isinstance(root_input.get("hidden_f32"), str):
+            return root_input
+        ref = root_input.get("hidden_ref")
+        if not isinstance(ref, dict):
+            raise RuntimeError("层段 Stage 缺少 root_input.hidden_f32")
+
+        import base64 as _b64
+        import hashlib as _hashlib
+
+        assembler = self._task_worker_chunk_assembler()
+        attempt_id = str(offer["attempt_id"])
+        try:
+            raw = assembler.assemble(attempt_id)
+        except WorkerProtocolError as exc:
+            raise RuntimeError(f"层段 Stage 的分片未齐备: {exc}") from exc
+        declared = str(offer.get("hidden_sha256") or "")
+        actual = _hashlib.sha256(raw).hexdigest()
+        if declared and actual != declared:
+            raise RuntimeError(
+                f"层段 Stage 装配后的 hidden 摘要不符: {actual} != {declared}"
+            )
+        assembler.discard(attempt_id)
+        # 改写后**移除** `hidden_ref`：执行侧只应看到内联 `hidden_f32`（避免两个来源并存）。
+        assembled = {
+            key: value for key, value in root_input.items() if key != "hidden_ref"
+        }
+        assembled["hidden_f32"] = _b64.b64encode(raw).decode("ascii")
+        return assembled
+
     @staticmethod
     def _task_worker_attempt_payload(
         offer_payload: dict,
@@ -789,6 +873,10 @@ class SchedulerTaskWorkerMixin:
 
         try:
             model_identity = TaskModelIdentity(**offer["model_identity"])
+            # ★ 2026-10-07（DIST-NEXT-2b）：上游把超帧预算的 hidden 分片发送时，offer 的
+            #   `root_input` 只带 `hidden_ref`（无内联 `hidden_f32`）⇒ 在这里装配并回填，
+            #   使执行侧（`inference_service.engine_host`）无需感知分片。
+            root_input = self._assemble_stage_root_input(offer)
             request = TaskProviderStageRequest(
                 workflow_id=offer["workflow_id"],
                 request_id=offer["request_id"],
@@ -796,7 +884,7 @@ class SchedulerTaskWorkerMixin:
                 stage_type=offer["stage_type"],
                 provider_id=offer["provider_id"],
                 dependencies=offer["dependencies"],
-                root_input=offer["root_input"],
+                root_input=root_input,
                 model_identity=model_identity,
                 stage_fields={
                     key: offer[key]
@@ -1085,6 +1173,31 @@ class SchedulerTaskWorkerMixin:
                         ack.payload["accepted"],
                         ack.payload["selected_version"],
                     )
+                    # ★ 2026-10-07（DIST-NEXT-6）：把「哪些工件被判不可用、为什么」打到
+                    #   master 日志 —— 否则节点被静默剔除时这里只剩
+                    #   `layer_range_not_advertised`，看不出是缺文件、摘要不符还是架构不符。
+                    unusable_artifacts = (
+                        advertised_capabilities.get("layer_artifact_diagnostics")
+                        if isinstance(advertised_capabilities, dict) else None
+                    ) or []
+                    if unusable_artifacts:
+                        logger.warning(
+                            "event=task_worker_layer_artifact_unusable node_id=%s "
+                            "count=%d details=%s",
+                            client_id,
+                            len(unusable_artifacts),
+                            [
+                                {
+                                    "error_code": entry.get("error_code"),
+                                    "manifest": entry.get("manifest"),
+                                    "layer_range": entry.get("layer_range"),
+                                    "mode": entry.get("mode"),
+                                    "architecture": entry.get("architecture"),
+                                }
+                                for entry in unusable_artifacts
+                                if isinstance(entry, dict)
+                            ],
+                        )
                 elif message.message_type in {
                     "stage_accept", "stage_result", "stage_error",
                     "stage_cancelled",
@@ -1122,6 +1235,10 @@ class SchedulerTaskWorkerMixin:
                         refresh_requested = self._task_worker_refresh_requested
                     if refresh_requested:
                         self.refresh_task_worker_capabilities()
+                elif message.message_type == "stage_chunk":
+                    # ★ 2026-10-07（DIST-NEXT-2b）：大 payload 分片 —— 只累积，装配在
+                    #   随后的 `stage_offer` 路径完成（收到 offer 时分片应当已齐备）。
+                    self._handle_task_worker_stage_chunk(message)
                 elif message.message_type == "stage_offer":
                     duplicate, responses = self._prepare_task_worker_request(
                         message

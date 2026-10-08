@@ -31,6 +31,7 @@ import asyncio
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -90,6 +91,41 @@ def _online_node_count(api) -> int:
     )
 
 
+def _workflow_items(api) -> list:
+    """`/api/workflows` 里的 workflow 记录列表（取不到 ⇒ 空）。"""
+    try:
+        payload = api.get("/workflows")
+    except Exception:  # noqa: BLE001 - 后端不可达 ⇒ 空，由断言暴露
+        return []
+    items = payload.get("workflows") if isinstance(payload, dict) else None
+    return [item for item in (items or []) if isinstance(item, dict)]
+
+
+def _workflow_ids(api) -> set:
+    """当前全部 workflow id —— 用于「操作前后差集」定位**本次新增**的那一条。
+
+    ⚠️ 不能取 `items[0]`：`/workflows` 的首条恒为旧记录（实测三次运行都取到同一条
+    `wf_21e78e…`，而本次请求其实已产生新 workflow ⇒ 判据永远失败）。
+    """
+    return {
+        str(item.get("workflow_id"))
+        for item in _workflow_items(api)
+        if item.get("workflow_id")
+    }
+
+
+def _distributed_enabled(api) -> bool:
+    """`/api/cluster/config` 里分布式推理开关的当前值（取不到 ⇒ False）。"""
+    try:
+        payload = api.get("/cluster/config")
+    except Exception:  # noqa: BLE001 - 后端不可达 ⇒ 视为未开启，由断言暴露
+        return False
+    if not isinstance(payload, dict):
+        return False
+    switch = payload.get("distributed_inference")
+    return bool(isinstance(switch, dict) and switch.get("enabled") is True)
+
+
 def _skip_reason(api=None) -> str:
     if not _enabled():
         return "设置 QLH_RUN_DUAL_HOST_TUI=1 才运行双机物理 TUI E2E（F3 档）"
@@ -105,20 +141,171 @@ def _skip_reason(api=None) -> str:
         return f"本机 master 后端不可达（F3 需先起 api_server）: {exc}"
     if not isinstance(status, dict) or status.get("model_loaded") is not True:
         return "本机 master 未加载完整模型（F3 前置：先加载模型）"
+    # ★ 2026-10-07：层段流水线（Route-A / 任务图）要求 **PyTorch** 引擎 —— llama.cpp 只能
+    #   整模本地推理（`llama.cpp engine does not support layer-split pipeline`）。实测引擎
+    #   不对时请求会静默落到 `local_llama_cpp`：既不产生 workflow，也没有 `distributed_used`
+    #   ⇒ 档会给出**误导性失败**（"未走分布式"），而不是说明"环境没就绪"。这里补前置检查。
+    try:
+        current = api.get("/models/current")
+    except Exception:  # noqa: BLE001 - 取不到就当作未知，交给下游断言
+        current = {}
+    engine = str((current or {}).get("engine") or "").strip().lower()
+    if engine and engine != "pytorch":
+        return (f"本机 master 引擎为 {engine!r}（层段流水线需要 pytorch；llama.cpp 只能整模"
+                f"本地推理，F3 会静默落到 local_llama_cpp）")
     online = _online_node_count(api)
     if online < MIN_ONLINE_NODES:
         return (f"双机集群未就绪：online 节点 {online} < {MIN_ONLINE_NODES}"
                 f"（F3 前置：Surface 需已 /api/cluster/connect 入集群）")
-    # ⚠️ **#29（已登记）**：TUI 只传 `routing_preference`、**不传 `execution_mode`**
-    #    （`src/tui_api.py:439` 一带），而后者默认 `auto` ⇒ 请求会被**静默导向层流水线**，
-    #    既到不了任务图、也不会产生 `distributed_used` ⇒ F3 的判据无从满足。
-    #    在 #29 修好（或 TUI 侧提供 `execution_mode` 传递）之前本档只能 skip；
-    #    确认已修复后用 `QLH_TUI_E2E_EXPECT_DISTRIBUTED=1` 显式开启（届时必须真拿到判据）。
-    if (os.environ.get("QLH_TUI_E2E_EXPECT_DISTRIBUTED") or "").strip() != "1":
-        return ("已知问题 #29：TUI 未传递 execution_mode（默认 auto ⇒ 静默走层流水线），"
-                "无法请求任务图分布式、拿不到 distributed_used。"
-                "确认修复后设 QLH_TUI_E2E_EXPECT_DISTRIBUTED=1 再跑本档")
+    # ★ 2026-10-07：#29 的**发起侧**缺口已闭合 —— TUI 现在通过 `/mode task_graph` 显式传递
+    #   `execution_mode`（`tui_shared.build_interactive_request` → `tui_api.iter_chat_payloads`
+    #   → `tui_textual` 的 `/mode` 命令）。此前 TUI 只传 `routing_preference`，请求被静默导向
+    #   层流水线 ⇒ 到不了任务图、拿不到 `distributed_used`，本档只能靠
+    #   `QLH_TUI_E2E_EXPECT_DISTRIBUTED=1` 手工放行。现在默认就跑，断言必须真拿到判据。
     return ""
+
+
+def test_dual_host_tui_routed_pipeline_streams_text():
+    """★ Route-A（stage_offer_v3 层段链）的**产物级**验收：TUI 真操作 + 普通分布式流水线。
+
+    与主判据（任务图 + `distributed_used`）互补：这里**不切任务图**，只走 `/route required`
+    ⇒ 普通流水线 ⇒ 远端层段参与 ⇒ **回答非空**。普通流水线**不产生 workflow**，所以主判据
+    的取数方式在这里天然不适用（这正是"未出现新 workflow"的由来）。
+
+    这条正是「原生思考抑制判据」缺陷的产物级回归：修复前该判据把**模板给模型的指令**当成
+    「模型已进入思考」，而 `qwen3-5-2b` 模板在 `enable_thinking` 非 true 时注入的是**已闭合**
+    的思考块 ⇒ 生成段永远等不到 `</think>` ⇒ 正文被整段吞掉（流式 0 个 token 事件、非流式
+    「流水线返回空响应」）。
+    """
+    from tui_api import ApiClient
+    from tui_textual import KoakumaApp, MainScreen
+
+    control = ApiClient(host=HOST, port=PORT, timeout=120.0)
+    if not _enabled():
+        pytest.skip("设置 QLH_RUN_DUAL_HOST_TUI=1 才运行双机物理 TUI E2E（F3 档）")
+    try:
+        import textual  # noqa: F401
+    except ImportError:
+        pytest.skip("需要 textual（TUI 档）")
+    # ★ 与主判据（任务图）**不同**：Route-A 不要求 master 处于"完整模型"状态 —— 恰恰相反，
+    #   Route-A 要求 master **按层段参与**（跑起来后 `/status.model_loaded` 会变成 False，
+    #   实测因此被 `_skip_reason` 误 skip）。这里的前置只判 capacity 能否给出可用计划
+    #   （v3 语义，见 `_pipeline_capacity_ready`）。
+    capacity_ready, capacity_reason = _pipeline_capacity_ready(control)
+    if not capacity_ready:
+        pytest.skip(
+            f"Route-A 前提未满足：capacity 求解失败（{capacity_reason or 'unknown'}）；"
+            f"需先让三机层段链就绪（master 参与层段 + worker 段覆盖完整）再跑本用例")
+    # ★ 2026-10-08：**不做"实时探测请求"**。曾用一个 `POST /chat`（max_new_tokens=1）探真实
+    #   可路由性，但它本身就是一次真实的分布式请求：会让链路进入重配置/能力刷新窗口，紧随其后的
+    #   验收请求被拒（实测：探测通过后 0 秒 / 5 秒，验收请求都报
+    #   `advertised layer_ranges cannot cover …`，而同一时刻单发请求成功）。前置只保留
+    #   「`/cluster/status` 就绪 + capacity 可解」这两项**只读**检查；真跑不通时用例的失败信息
+    #   已经足够定位。
+
+    async def _main() -> str:
+        from textual.widgets import Input, Static
+
+        app = KoakumaApp(ApiClient(host=HOST, port=PORT, timeout=120.0), interval=30)
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.show_main()
+            await wait_for(pilot, lambda: isinstance(app.screen, MainScreen))
+            assert await wait_for(
+                pilot, lambda: bool(app.screen.query("#chat-pane"))), "聊天屏 #chat-pane 未挂载"
+            screen = app.screen
+
+            # 1) 分布式开关：与主判据同样的「确保开启」语义（`t` 是反转开关，不能盲目按）
+            landed = await pilot.click("#nav ListItem#nav-cluster")
+            assert landed, "点击侧栏 cluster 项未命中（`Pilot.click` 自带落点断言）"
+            await pilot.pause()
+            screen.load_cluster_aux()
+            assert await wait_for(
+                pilot, lambda: bool((screen.cluster_aux or {}).get("distributed"))), (
+                f"cluster_aux 未加载到分布式配置: {screen.cluster_aux!r}")
+            if not _distributed_enabled(control):
+                screen.action_cluster_toggle()
+                await pilot.pause()
+                await pilot.press("y")
+            assert await wait_for(
+                pilot, lambda: _distributed_enabled(control)), (
+                "分布式开关未开启（/api/cluster/config 复核失败）")
+
+            # 2) 路由偏好：/route required（**不**切任务图 ⇒ 走普通流水线）
+            pane = screen.query_one("#chat-pane")
+            assert await wait_for(pilot, lambda: bool(pane.query(Input))), "聊天输入框未挂载"
+            box = pane.query_one(Input)
+            box.value = "/route required"
+            box.focus()
+            await pilot.press("enter")
+            assert await wait_for(
+                pilot, lambda: getattr(app, "routing_preference", None)
+                == "distributed_required"), (
+                f"/route required 未生效: routing_preference="
+                f"{getattr(app, 'routing_preference', None)!r}")
+
+            # 3) 发一条真消息，等非空回答
+            box.value = PROMPT
+            box.focus()
+            await pilot.press("enter")
+
+            def _answer() -> str:
+                return _assistant_body(str(pane.query_one("#chat-log", Static).render()))
+
+            got = await wait_for(pilot, lambda: len(_answer()) >= 2, timeout=REPLY_TIMEOUT)
+            if not got:
+                raise AssertionError(
+                    f"真模型在 {REPLY_TIMEOUT:.0f}s 内未给出非空回答（Route-A 产物级判据）；"
+                    f"已渲染文本（前 400 字）: "
+                    f"{str(pane.query_one('#chat-log', Static).render())[:400]!r}")
+            return _answer()
+
+    answer = _run(_main())
+    assert len(answer) >= 2, f"回答过短: {answer!r}"
+    for marker in ("流水线返回空响应", "当前没有可用的分布式路径", "distributed_required"):
+        assert marker not in answer, f"回答里出现失败文案 {marker!r}: {answer[:200]!r}"
+
+
+def _pipeline_capacity_ready(api) -> tuple:
+    """Route-A 前提：capacity 求解能给出可用计划（**v3 语义**）。
+
+    ⚠️ **不能**用 `/cluster/status` 的 `layer_ready` —— 那是 **legacy 层配置 ACK** 的概念；
+    v3 层段 worker（`stage_offer_v3`）不走 legacy ACK，该字段恒为 `False/not_configured`
+    ⇒ 拿它做前置会让本档永远 skip（实测踩到：capacity 明明已经 `admitted=True`、
+    `assignments=[('master',0,16),(Surface,16,20),(Y700,20,24)]`，档却 skip 了）。
+
+    这里读 `/cluster/pipeline-capacity` **并叠加** `/status.pipeline.available`：
+
+    ⚠️ 只用前者不够 —— 它是**上一次求解的缓存**，会给出"上次成功"的陈旧结论（实测：档因此
+    不 skip、直接跑，然后在请求入口被拒 `pipeline workers not ready`，1.7 秒失败）。
+    真机上 Y700 每 ~37 秒主动断开重连一次（`tcp_comm: 客户端 android-21af7c52 已断开`，客户端
+    发起），落在断开窗口里的请求必然失败 ⇒ 前置必须是**实时**的。
+    """
+    try:
+        # ⚠️ 必须是 `/cluster/status`（`ApiClient.get` 会自动补 `/api` 前缀）—— 非 cluster 的
+        #    `/status` 里没有 `pipeline` 字段，误读会恒定判 `pipeline_unavailable`（实测踩到：
+        #    档一直 skip，而同一时刻 `/cluster/status` 报 `available=True reason=ready`）。
+        status = api.get("/cluster/status")
+    except Exception:  # noqa: BLE001
+        return False, "status 不可达"
+    pipeline = status.get("pipeline") if isinstance(status, dict) else None
+    if not isinstance(pipeline, dict) or pipeline.get("available") is not True:
+        return False, str((pipeline or {}).get("readiness_reason_code") or "pipeline_unavailable")
+    try:
+        payload = api.get("/cluster/pipeline-capacity")
+    except Exception:  # noqa: BLE001 - 取不到 ⇒ 未就绪
+        return False, "capacity 不可达"
+    if not isinstance(payload, dict):
+        return False, "capacity 返回异常"
+    if payload.get("admitted") is True:
+        return True, ""
+    reason_code = str(payload.get("reason_code") or "")
+    if reason_code in {
+        "pipeline_layer_range_coverage_insufficient",
+        "pipeline_distributed_capacity_insufficient",
+        "pipeline_cluster_capacity_insufficient",
+    }:
+        return False, reason_code
+    return True, ""
 
 
 def _assistant_body(text: str) -> str:
@@ -145,6 +332,8 @@ def test_dual_host_tui_distributed_end_to_end():
     reason = _skip_reason(control)
     if reason:
         pytest.skip(reason)
+    # ★ 2026-10-07：记录操作**前**已有的 workflow，稍后用差集定位本次新增项。
+    before_ids = _workflow_ids(control)
 
     async def _main():
         from textual.widgets import Input, Static
@@ -172,11 +361,20 @@ def test_dual_host_tui_distributed_end_to_end():
                 pilot, lambda: bool((screen.cluster_aux or {}).get("distributed"))), (
                 f"cluster_aux 未加载到分布式配置，无法切换: {screen.cluster_aux!r}")
 
-            # 真按 `t`（`Binding("t", "cluster_toggle")`）⇒ 弹确认框 ⇒ 按 `y` 确认
-            await pilot.press("t")
-            await pilot.pause()
-            await pilot.press("y")
-            await pilot.pause()
+            # 真按 `t`（`Binding("t", "cluster_toggle")`）⇒ 弹确认框 ⇒ 按 `y` 确认。
+            # ★ 2026-10-07 两处修正：
+            #   ① `t` 是屏幕级 binding，键盘焦点若被别的控件吃掉就**静默无效**（实测：按了
+            #      `t`、`y` 后端没收到任何 PUT，开关仍 false ⇒ 请求被 `distributed_required`
+            #      路由门拒成 `outcome=refused`）⇒ 改走屏幕动作触发同一条 UI 路径。
+            #   ② 它是**反转**开关 ⇒ 档不能盲目按（第二次运行会把已开启的开关关掉）⇒
+            #      先读后端当前值，仅在关闭时才 toggle。两次都**复核后端状态**，失败立刻暴露。
+            if not _distributed_enabled(control):
+                screen.action_cluster_toggle()
+                await pilot.pause()
+                await pilot.press("y")
+            assert await wait_for(
+                pilot, lambda: _distributed_enabled(control)), (
+                "分布式开关未开启（/api/cluster/config 复核失败）")
 
             # --- 2) 路由偏好：/route required ⇒ distributed_required ---
             pane = screen.query_one("#chat-pane")
@@ -190,6 +388,15 @@ def test_dual_host_tui_distributed_end_to_end():
                 == "distributed_required"), (
                 f"/route required 未生效: routing_preference="
                 f"{getattr(app, 'routing_preference', None)!r}")
+
+            # --- 2b) 执行模式：/mode task_graph ⇒ 显式任务图（否则拿不到 distributed_used）---
+            box.value = "/mode task_graph"
+            box.focus()
+            await pilot.press("enter")
+            assert await wait_for(
+                pilot, lambda: getattr(app, "execution_mode", None) == "task_graph"), (
+                f"/mode task_graph 未生效: execution_mode="
+                f"{getattr(app, 'execution_mode', None)!r}")
 
             # --- 3) 发一条真消息，等回答 ---
             box.value = PROMPT
@@ -206,10 +413,25 @@ def test_dual_host_tui_distributed_end_to_end():
                     f"{str(pane.query_one('#chat-log', Static).render())[:400]!r}")
 
         # --- 4) 后端视角的硬判据：这次请求真的走了分布式 ---
-        workflows = control.get("/workflows")
-        items = workflows.get("workflows") if isinstance(workflows, dict) else None
-        assert items, f"/workflows 无记录，无法判定分布式: {workflows!r}"
-        latest = items[0]
+        # ★ 2026-10-07：不取 `items[0]`（该端点首条**恒为旧记录**，实测三次运行都取到同一条
+        #   `wf_21e78e…`，而本次请求其实已产生新 workflow ⇒ 判据永远失败）。改为用
+        #   「操作前后 id 差集」定位本次新增项，并轮询等它落库（任务图是异步的）。
+        def _new_workflow():
+            for item in _workflow_items(control):
+                candidate = str(item.get("workflow_id") or "")
+                if candidate and candidate not in before_ids:
+                    return item
+            return None
+
+        deadline = time.time() + REPLY_TIMEOUT
+        latest = None
+        while latest is None and time.time() < deadline:
+            latest = _new_workflow()
+            if latest is None:
+                time.sleep(1.0)
+        assert latest is not None, (
+            f"{REPLY_TIMEOUT:.0f}s 内未出现新 workflow（操作前 {len(before_ids)} 条）"
+            f"⇒ 本次 TUI 请求没有落到任务图")
         workflow_id = str(latest.get("workflow_id") or "")
         detail = control.get(f"/workflows/{workflow_id}") if workflow_id else {}
         metrics = detail.get("metrics") if isinstance(detail, dict) else None
@@ -218,7 +440,8 @@ def test_dual_host_tui_distributed_end_to_end():
             isinstance(metrics, dict) and metrics.get("distributed_used") is True
         ), (f"本次 TUI 请求未走分布式: distributed_used="
             f"{latest.get('distributed_used')!r} / metrics="
-            f"{(metrics or {}).get('distributed_used')!r}; workflow={workflow_id!r}")
+            f"{(metrics or {}).get('distributed_used')!r}; workflow={workflow_id!r}; "
+            f"操作前 {len(before_ids)} 条 / 现在 {len(_workflow_items(control))} 条")
         assert not (latest.get("fallback") or (metrics or {}).get("fallback")), (
             f"不应发生回退: fallback={latest.get('fallback')!r} / "
             f"{(metrics or {}).get('fallback')!r}")

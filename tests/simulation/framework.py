@@ -18,6 +18,24 @@ from typing import AsyncGenerator, Dict, List, Optional, Tuple
 import httpx
 
 
+def _default_sim_model() -> str:
+    """仿真套件的默认模型：**跟随设备画像**（与产品「自动加载默认模型」同源）。
+
+    原值是已退役的 `qwen-1.8b`（本机无工件 ⇒ 后端起不来、每条请求 60 s 超时，见验收清单 D4）。
+    """
+    src = Path(__file__).resolve().parents[2] / "src"
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    try:
+        import model_config
+
+        paths = model_config.get_profile_default_model_paths()
+        model_id = str(paths.get("model_id") or "").strip()
+        return model_id or str(model_config.DEFAULT_MODEL_ID)
+    except Exception:
+        return "qwen3-0.6b"
+
+
 # ============================================================================
 # 数据类定义
 # ============================================================================
@@ -31,7 +49,7 @@ class TestConfig:
     start_master: bool = True
     start_slaves: bool = False
     slave_count: int = 0
-    model: str = "qwen-1.8b"
+    model: str = field(default_factory=_default_sim_model)
 
     # 端口配置
     master_api_port: int = 8000
@@ -123,6 +141,18 @@ class BackendManager:
         import tempfile
         return os.path.join(tempfile.gettempdir(), "qlh_simulation_backend.log")
 
+    def _sim_state_dir(self) -> Path:
+        """单机仿真的独立 state 目录（惰性创建，同一进程复用）。
+
+        主仓 `STATE_DIR` 里可能残留上次真机实验的 pipeline 状态；隔离掉它，
+        `scheduler_pipeline` 的 recovery 才不会把模型变成「分布式专用」（D4 第四层）。
+        """
+        if not hasattr(self, "_state_dir"):
+            import tempfile
+
+            self._state_dir = Path(tempfile.mkdtemp(prefix="qlh_sim_state_"))
+        return self._state_dir
+
     def __init__(self):
         self.master_process: Optional[subprocess.Popen] = None
         self.slave_processes: List[subprocess.Popen] = []
@@ -135,6 +165,7 @@ class BackendManager:
         api_port: int = 8000,
         tcp_port: int = 8888,
         startup_timeout: int = 30,
+        enable_route_a: bool = False,
     ) -> None:
         """启动主节点后端
 
@@ -150,6 +181,17 @@ class BackendManager:
         env["QLH_NODE_ROLE"] = "master"
         env["QLH_SERVER_PORT"] = str(tcp_port)
         env["QLH_API_PORT"] = str(api_port)
+        # 单机场景：`RUN_MODE=single` 并且关掉 Route-A（A3 `stage_offer_v3`）。
+        # 否则 master 会进「强制分布式分层」，把分层配置推给从节点并等加载 ACK，
+        # 直到 60 s 超时（实测 D4）；单机仿真既没有从节点，也不该等它。
+        if not enable_route_a:
+            env["QLH_ROUTE_A_STAGE_OFFER"] = "0"
+            env["QLH_RUN_MODE"] = "single"
+            # 独立的 state 目录：主仓的 `STATE_DIR` 可能残留上次真机实验持久化的
+            # pipeline 状态 ⇒ 启动时被 `scheduler_pipeline` 的 recovery 恢复 ⇒
+            # `_pipeline_model_is_prepared()` 为真 ⇒ `local_only` 命中 409、
+            # `_auto_load_default_model` 永不执行（实测 D4 的第四层根因）。
+            env["QLH_STATE_DIR"] = str(self._sim_state_dir())
 
         # 构建启动命令
         api_server_path = self.project_root / "src" / "api_server.py"
@@ -348,8 +390,17 @@ class BackendManager:
 class RequestSender:
     """HTTP 请求发送器"""
 
-    def __init__(self, base_url: str = "http://127.0.0.1:8000"):
+    def __init__(self, base_url: str = "http://127.0.0.1:8000",
+                 routing_preference: Optional[str] = None):
         self.base_url = base_url
+        # 请求级路由偏好：单机仿真设 `local_only`（见 `setup()` 写的
+        # `QLH_SIM_ROUTING_PREFERENCE`）。否则 master 会进「强制分布式分层」、
+        # 等从节点加载 ACK 直到 60 s 超时（实测 D4）。
+        self.routing_preference = (
+            routing_preference
+            if routing_preference is not None
+            else (os.environ.get("QLH_SIM_ROUTING_PREFERENCE") or None)
+        )
         self.session: Optional[httpx.AsyncClient] = None
 
     async def __aenter__(self):
@@ -388,6 +439,8 @@ class RequestSender:
             "message": message,
             "session_id": session_id,
         }
+        if self.routing_preference:
+            payload["routing_preference"] = self.routing_preference
 
         start_time = time.time()
 
@@ -739,6 +792,13 @@ class TestOrchestrator:
         print("=" * 60)
 
         self.config = config
+        # 单机场景显式声明 `local_only`：master 默认开分布式推理总闸
+        # （`config.DISTRIBUTED_INFERENCE_ENABLED` 恒 True），否则会进「强制分布式
+        # 分层」并等从节点加载 ACK 至 60 s 超时（实测 D4）。
+        if not config.start_slaves:
+            os.environ["QLH_SIM_ROUTING_PREFERENCE"] = "local_only"
+        else:
+            os.environ.pop("QLH_SIM_ROUTING_PREFERENCE", None)
 
         # 启动主节点
         if config.start_master:
@@ -747,6 +807,8 @@ class TestOrchestrator:
                 api_port=config.master_api_port,
                 tcp_port=config.master_tcp_port,
                 startup_timeout=config.startup_timeout,
+                # 有从节点（分布式场景）才开 A3；单机场景关掉，避免选入外部在线节点。
+                enable_route_a=config.start_slaves,
             )
 
         # 启动从节点

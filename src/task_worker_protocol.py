@@ -21,6 +21,28 @@ MAX_PROTOCOL_VERSION = 3
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 FULL_WORKER_KINDS = frozenset({"pc_full_worker", "android_full_worker"})
 
+#: ★ 2026-10-07（DIST-NEXT-2）：层段 hidden 的 **wire 预算**。
+#:
+#: 层段的 `root_input.hidden_f32` 与中间段的 `output.hidden_out_f32` 都是 raw 数据
+#: 经 base64 承载，而单条消息的上限是 `MAX_MESSAGE_BYTES`。**必须在 dispatch 前**按
+#: `n_tokens * n_embd * dtype` 估算，否则合法的长 prefill / 大 `n_embd` 会先通过准入、
+#: 在执行完成后才触发 `message_too_large`（过晚的契约发现，表现为 stage 超时/回退）。
+_BASE64_EXPANSION = 4 / 3
+HIDDEN_DTYPE_BYTES = {"float32": 4, "float16": 2}
+#: 帧内除 hidden 之外的余量：JSON 外壳、`layer_range`/`hidden_spec`、
+#: `seq_ids`/`positions`（n_tokens 量级）与 metadata。
+STAGE_FRAME_RESERVE_BYTES = 256 * 1024
+
+#: ★ 2026-10-07（DIST-NEXT-2b）：大 payload 的**有序分片**契约。
+#:
+#: 超单帧预算的输入（长 prefill / 大 `n_embd`）不再只能被拒：coordinator 先发
+#: `chunk_count` 条 `stage_chunk`（每条带 attempt 身份与自身摘要），再发引用它们的
+#: `stage_offer`；worker 收齐并校验后装配。三个上限都是**硬上限**：分片不能用来绕过
+#: 帧预算（总数 × 单片上限 = 装配上限）。
+MAX_STAGE_CHUNKS = 64
+STAGE_CHUNK_BYTES = 1 * 1024 * 1024
+MAX_STAGE_PAYLOAD_BYTES = MAX_STAGE_CHUNKS * STAGE_CHUNK_BYTES
+
 # Runtime profiles are part of the release capability contract.  Keep this
 # dependency-free so protocol validation can run in the slim worker process.
 RUNTIME_PROFILES = ("llama_cpp_only", "torch_cpu", "torch_cuda")
@@ -36,6 +58,8 @@ MESSAGE_TYPES = frozenset({
     "stage_error",
     "stage_cancel",
     "stage_cancelled",
+    #: ★ 2026-10-07（DIST-NEXT-2b）：大 payload 的有序分片（v3 起）。
+    "stage_chunk",
 })
 
 _MESSAGE_ID = re.compile(r"^msg_[A-Za-z0-9_-]{8,96}$")
@@ -89,6 +113,30 @@ _LAYER_FORWARD_OPTIONAL_FIELDS = {"middle_channel", "seq_ids", "positions"}
 #: * `keep_head_layer_out` —— `layer_inp` 的 `lid == n_layer` 槽位，返回**末层输出**。
 _LAYER_FORWARD_MIDDLE_CHANNELS = {"extract_hidden", "keep_head_layer_out"}
 
+#: ★ 2026-10-07（DIST-NEXT-6）：层段工件诊断的稳定 error code（与 Android
+#: `LayerArtifactDiagnostic` 同集合）。能力广告只带**不可用**项，因此不含"可用"。
+_LAYER_ARTIFACT_DIAGNOSTIC_CODES = frozenset({
+    "manifest_unreadable",
+    "manifest_invalid",
+    "source_digest_mismatch",
+    "artifact_missing",
+    "artifact_digest_mismatch",
+})
+_LAYER_ARTIFACT_DIAGNOSTIC_MAX = 32
+
+#: ★ 2026-10-07（DIST-NEXT-1）：`stage_cancelled` 的**可选**执行状态。
+#: 取消合同把「已取消」拆成两个可分别取证的事实：ACK 先到，执行可能仍在
+#: in-flight（native 层段前向不可被一次调用打断）。取值：
+#: * `execution_stopped` —— 该 attempt 的执行已确实停止（终态，可释放）；
+#: * `execution_in_flight` —— 已确认收到 `stage_cancel`，执行尚未停止。
+#: **缺省 = 旧对端**（未携带状态），按 `unknown` 记录，不改变既有语义。
+#: 与 `_LAYER_FORWARD_OPTIONAL_FIELDS` 同一机制：只在 payload 真出现时放宽精确字段校验，
+#: 避免把可选字段变成必填而破坏既有对端。
+_STAGE_CANCELLED_OPTIONAL_FIELDS = {"execution_state"}
+_STAGE_CANCELLED_EXECUTION_STATES = frozenset({
+    "execution_stopped", "execution_in_flight",
+})
+
 #: 层段 `stage_result` 的结果字段：**放在 `output` 或 `metadata` 对象内**，不扩顶层。
 #: 原因：`stage_result` 的 payload 里没有 `stage_type`，无法按类型做动态字段校验；
 #: 而 `output` / `metadata` 本就是自由对象（仅校验类型与摘要一致性），可安全承载。
@@ -129,6 +177,13 @@ _PAYLOAD_FIELDS = {
     "stage_cancel": _IDENTITY_FIELDS | {"reason_code"},
     "stage_cancelled": _IDENTITY_FIELDS | {
         "provider_id", "reason_code",
+    },
+    #: ★ 2026-10-07（DIST-NEXT-2b）：大 payload 分片（v3 起，见 `MAX_STAGE_CHUNKS`）。
+    #: `payload_b64` 是**原始字节**的 base64；`payload_sha256` 是这些字节的摘要，
+    #: 使接收端能在装配前逐片校验（装配完仍以 `stage_offer.hidden_sha256` 兜底）。
+    "stage_chunk": _IDENTITY_FIELDS | {
+        "provider_id", "chunk_index", "chunk_count", "payload_b64",
+        "payload_sha256", "total_bytes",
     },
 }
 _PAYLOAD_FIELDS_V2 = {
@@ -396,6 +451,78 @@ def _validate_layer_budget(value: Any) -> None:
         )
 
 
+def _validate_layer_artifact_diagnostics(value: Any) -> None:
+    """★ 2026-10-07（DIST-NEXT-6）：校验不可用层段工件的诊断广告。
+
+    键集固定、**不含本地路径**（路径只留在设备日志与本地诊断）；这样主节点能看到
+    「哪个区间为什么不可用」，而不是只看到 `layer_range_not_advertised`。
+    """
+    field = "payload.capabilities.layer_artifact_diagnostics"
+    if (
+        not isinstance(value, list)
+        or not value
+        or len(value) > _LAYER_ARTIFACT_DIAGNOSTIC_MAX
+    ):
+        raise _error(
+            "invalid_capabilities", field,
+            "layer_artifact_diagnostics must be a non-empty list with at most "
+            f"{_LAYER_ARTIFACT_DIAGNOSTIC_MAX} entries",
+        )
+    for index, entry in enumerate(value):
+        item_field = f"{field}[{index}]"
+        entry = _require_object(entry, item_field)
+        _require_exact_fields(
+            entry,
+            {
+                "error_code", "manifest", "architecture", "mode",
+                "layer_range", "artifact_present",
+            },
+            item_field,
+        )
+        error_code = _require_string(
+            entry["error_code"], f"{item_field}.error_code",
+            pattern=_SAFE_CODE, max_length=64,
+        )
+        if error_code not in _LAYER_ARTIFACT_DIAGNOSTIC_CODES:
+            raise _error(
+                "invalid_capabilities", f"{item_field}.error_code",
+                "error_code must be one of "
+                + ", ".join(sorted(_LAYER_ARTIFACT_DIAGNOSTIC_CODES)),
+            )
+        _require_string(entry["manifest"], f"{item_field}.manifest", pattern=_SAFE_ID)
+        _require_string(
+            entry["architecture"], f"{item_field}.architecture",
+            pattern=_SAFE_ID, allow_empty=True, max_length=64,
+        )
+        mode = _require_string(
+            entry["mode"], f"{item_field}.mode",
+            pattern=_SAFE_ID, allow_empty=True, max_length=32,
+        )
+        if mode and mode not in _LAYER_SEGMENT_MODES:
+            raise _error(
+                "invalid_capabilities", f"{item_field}.mode",
+                "mode must be empty or one of head, middle, tail",
+            )
+        _require_bool(entry["artifact_present"], f"{item_field}.artifact_present")
+        layer_range = entry["layer_range"]
+        if layer_range is None:
+            continue
+        if (
+            not isinstance(layer_range, list)
+            or len(layer_range) != 2
+            or any(
+                isinstance(bound, bool) or not isinstance(bound, int)
+                for bound in layer_range
+            )
+            or layer_range[0] < 0
+            or layer_range[1] <= layer_range[0]
+        ):
+            raise _error(
+                "invalid_capabilities", f"{item_field}.layer_range",
+                "layer_range must be null or a non-empty [start, end) integer range",
+            )
+
+
 def _validate_capabilities(value: Any, *, version: int) -> None:
     capabilities = _require_object(value, "payload.capabilities")
     expected_fields = {"stage_types", "engines", "models", "max_concurrency"}
@@ -443,6 +570,18 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     # node-level ``segment_mode`` cannot describe that safely.
     if "layer_artifacts" in capabilities:
         expected_fields.add("layer_artifacts")
+    # ★ 2026-10-07（DIST-NEXT-6）：不可用层段工件的结构化原因（可选，向后兼容）。
+    #   广告侧只带 error code 与身份/区间，**不含本地路径**。与其余可选键同样
+    #   按「出现才允许」处理 —— 两侧必须同时放行，否则 hello 自校验失败后
+    #   连接建立即 0.7s 静默断开（`segment_mode` 那次实测的坑）。
+    if "layer_artifact_diagnostics" in capabilities:
+        expected_fields.add("layer_artifact_diagnostics")
+    # ★ 2026-10-07（DIST-NEXT-2b）：大 payload 分片接收能力（可选，默认关）。
+    #   只有声明 `stage_chunked_input == true` 的 worker 才会收到 `stage_chunk` +
+    #   `stage_offer.root_input.hidden_ref`；未声明者继续走内联 hidden（由 DIST-NEXT-2a
+    #   的 dispatch 前预检负责拒绝超预算请求）。两侧必须同时放行。
+    if "stage_chunked_input" in capabilities:
+        expected_fields.add("stage_chunked_input")
     _require_exact_fields(
         capabilities,
         expected_fields,
@@ -605,6 +744,15 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
                 "invalid_capabilities", "payload.capabilities.segment_mode",
                 "node-level segment_mode must agree with every layer_artifact",
             )
+    if "layer_artifact_diagnostics" in capabilities:
+        _validate_layer_artifact_diagnostics(
+            capabilities["layer_artifact_diagnostics"],
+        )
+    if "stage_chunked_input" in capabilities:
+        _require_bool(
+            capabilities["stage_chunked_input"],
+            "payload.capabilities.stage_chunked_input",
+        )
     engines = capabilities["engines"]
     if not isinstance(engines, list) or not engines or any(
         value not in _SUPPORTED_ENGINES
@@ -765,6 +913,15 @@ def _validate_payload(
         # ★ 2026-09-23：**可选**层段字段只在 payload 里**真的出现**时放宽 —— 精确校验是双向的，
         #   提前并入会把它们变成必填、破坏既有对端（实测踩到）。
         required = required | (_LAYER_FORWARD_OPTIONAL_FIELDS & set(payload))
+    # ★ 2026-10-07（DIST-NEXT-1）：取消 ACK 的执行状态同样是**可选**字段。
+    #   ⚠️ 限定 `version >= 3`：v1/v2 的字段表里没有它，若不加判定，v2 对端带字段
+    #      会静默通过而不是稳定的 `invalid_fields`。
+    if (
+        message_type == "stage_cancelled"
+        and version >= 3
+        and isinstance(payload, Mapping)
+    ):
+        required = required | (_STAGE_CANCELLED_OPTIONAL_FIELDS & set(payload))
     _require_exact_fields(payload, required, "payload")
     if message_type == "hello":
         _require_string(payload["node_id"], "payload.node_id", pattern=_SAFE_ID)
@@ -959,11 +1116,75 @@ def _validate_payload(
             max_length=64,
         )
         _require_bool(payload["retryable"], "payload.retryable")
+    elif message_type == "stage_chunk":
+        # ★ 2026-10-07（DIST-NEXT-2b）：分片的形状与硬上限。顺序语义（不得乱序、
+        #   不得重复、集齐才装配）由接收端状态机 `task_worker_chunks.StageChunkAssembler`
+        #   保证 —— 协议层只拒绝「单条就不合法」的分片。
+        if version < 3:
+            raise _error(
+                "unsupported_message_type", "message_type",
+                "stage_chunk requires protocol v3 or newer",
+            )
+        chunk_count = _require_int(
+            payload["chunk_count"], "payload.chunk_count", minimum=1,
+        )
+        if chunk_count > MAX_STAGE_CHUNKS:
+            raise _error(
+                "chunk_count_out_of_range", "payload.chunk_count",
+                f"chunk_count must be <= {MAX_STAGE_CHUNKS}",
+            )
+        chunk_index = _require_int(
+            payload["chunk_index"], "payload.chunk_index", minimum=0,
+        )
+        if chunk_index >= chunk_count:
+            raise _error(
+                "chunk_index_out_of_range", "payload.chunk_index",
+                "chunk_index must be less than chunk_count",
+            )
+        total_bytes = _require_int(
+            payload["total_bytes"], "payload.total_bytes", minimum=1,
+        )
+        if total_bytes > MAX_STAGE_PAYLOAD_BYTES:
+            raise _error(
+                "stage_payload_too_large", "payload.total_bytes",
+                f"total_bytes must be <= {MAX_STAGE_PAYLOAD_BYTES}",
+            )
+        chunk = payload["payload_b64"]
+        if not isinstance(chunk, str) or not chunk:
+            raise _error(
+                "invalid_string", "payload.payload_b64",
+                "payload.payload_b64 must be a non-empty string",
+            )
+        # 单片上限：把 base64 字符数换算回 raw 字节（`±2` 是 padding 的量化误差；
+        # **精确**判定在装配器 `StageChunkAssembler.add`，那里按真实字节数比较）。
+        approx_raw_bytes = 3 * (-(-len(chunk) // 4))
+        if approx_raw_bytes > STAGE_CHUNK_BYTES + 2:
+            raise _error(
+                "chunk_too_large", "payload.payload_b64",
+                f"a single chunk must not exceed {STAGE_CHUNK_BYTES} raw bytes",
+            )
+        _require_string(
+            payload["payload_sha256"], "payload.payload_sha256", pattern=_SHA256,
+        )
     else:
         _require_string(
             payload["reason_code"], "payload.reason_code", pattern=_SAFE_CODE,
             max_length=64,
         )
+        # ★ 2026-10-07（DIST-NEXT-1）：取消 ACK 的**执行状态**（可选）。
+        #   存在的目的是让 master 不把「请求已取消」当成「执行已停止」；
+        #   因此值域必须封闭（fail-closed），未知状态一律拒收而不是照抄。
+        if message_type == "stage_cancelled" and "execution_state" in payload:
+            state = _require_string(
+                payload["execution_state"], "payload.execution_state",
+                max_length=32,
+            )
+            if state not in _STAGE_CANCELLED_EXECUTION_STATES:
+                raise _error(
+                    "unsupported_execution_state", "payload.execution_state",
+                    "execution_state must be one of "
+                    + ", ".join(sorted(_STAGE_CANCELLED_EXECUTION_STATES)),
+                )
 
 
 def validate_message(value: Mapping[str, Any]) -> WorkerMessage:
@@ -1100,3 +1321,89 @@ def worker_protocol_status(
             "admission_state", "n2_4_experiment_disabled"
         ),
     }
+
+
+def _base64_wire_length(raw_bytes: int) -> int:
+    """标准 base64 编码后的字符数：`4 × ceil(n / 3)`。
+
+    ⚠️ 不要用 `ceil(n × 4/3)` 近似：对 1 MiB 这类 n 会少算 2 个字符，
+    使「刚好一片」的分片被误判为超限（实测踩到）。
+    """
+    count = int(raw_bytes)
+    return 4 * (-(-count // 3))
+
+
+def hidden_wire_bytes(
+    n_tokens: int, n_embd: int, dtype: str = "float32",
+) -> int:
+    """层段 hidden 在 JSON 帧里占用的字节数（raw + base64 膨胀）。
+
+    ★ 2026-10-07（DIST-NEXT-2）：dispatch 前的**唯一** wire 大小来源。协议两侧
+    （主仓 Python 与 `android` 的 `TaskWorkerProtocol`）用同一公式与同一余量常量。
+    """
+    if dtype not in HIDDEN_DTYPE_BYTES:
+        raise _error(
+            "unsupported_hidden_dtype", "hidden_spec.dtype",
+            "hidden dtype must be one of "
+            + ", ".join(sorted(HIDDEN_DTYPE_BYTES)),
+        )
+    tokens = int(n_tokens)
+    embd = int(n_embd)
+    if tokens < 1 or embd < 1:
+        raise _error(
+            "invalid_hidden_spec", "hidden_spec",
+            "hidden_spec.n_tokens/n_embd must be positive",
+        )
+    raw_bytes = tokens * embd * HIDDEN_DTYPE_BYTES[dtype]
+    return _base64_wire_length(raw_bytes)
+
+
+def stage_payload_budget_bytes(
+    *, max_message_bytes: int = MAX_MESSAGE_BYTES,
+) -> int:
+    """单条 stage 消息里可承载的 hidden 预算（已扣除帧内其它字段的余量）。"""
+    limit = int(max_message_bytes)
+    if limit <= STAGE_FRAME_RESERVE_BYTES:
+        raise _error(
+            "invalid_message_limit", "message",
+            "max_message_bytes must exceed the frame reserve",
+        )
+    return limit - STAGE_FRAME_RESERVE_BYTES
+
+
+def hidden_fits_stage_frame(
+    n_tokens: int,
+    n_embd: int,
+    dtype: str = "float32",
+    *,
+    max_message_bytes: int = MAX_MESSAGE_BYTES,
+) -> bool:
+    """该 hidden 能否装进单帧（不装得下就必须在 dispatch 前拒绝）。"""
+    return hidden_wire_bytes(n_tokens, n_embd, dtype) <= stage_payload_budget_bytes(
+        max_message_bytes=max_message_bytes,
+    )
+
+
+def max_hidden_tokens(
+    n_embd: int,
+    dtype: str = "float32",
+    *,
+    max_message_bytes: int = MAX_MESSAGE_BYTES,
+) -> int:
+    """给定额度下每帧可承载的最大 token 数（诊断与日志用）。"""
+    if dtype not in HIDDEN_DTYPE_BYTES:
+        raise _error(
+            "unsupported_hidden_dtype", "hidden_spec.dtype",
+            "hidden dtype must be one of "
+            + ", ".join(sorted(HIDDEN_DTYPE_BYTES)),
+        )
+    embd = int(n_embd)
+    if embd < 1:
+        raise _error(
+            "invalid_hidden_spec", "hidden_spec.n_embd",
+            "hidden_spec.n_embd must be positive",
+        )
+    per_token = embd * HIDDEN_DTYPE_BYTES[dtype] * _BASE64_EXPANSION
+    return int(stage_payload_budget_bytes(
+        max_message_bytes=max_message_bytes,
+    ) // per_token)
