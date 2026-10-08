@@ -784,10 +784,16 @@ class SchedulerPipelineMixin:
         if registry is None:
             return
         state = registry.state(node_id)
+        # ★ 2026-10-08（DIST-1 推进）：把第三个旧集合 `_layer_config_acks` 也纳入比对
+        #   （此前只比 `pushed` 与 `expected`）—— 它同样是"谁已确认收到本代际配置"的
+        #   推断来源，理应一起走向权威视图。仍是**只观测**，不改判据。
+        acked = getattr(self, "_layer_config_acks", None)
+        has_ack = isinstance(acked, dict) and node_id in acked
         verdict = evaluate_assignment_consistency(
             state,
             legacy_pushed=bool(legacy_pushed),
             has_expected=isinstance(expected, dict) and bool(expected),
+            has_ack=has_ack,
         )
         if verdict.consistent:
             return

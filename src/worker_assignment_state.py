@@ -325,14 +325,20 @@ def evaluate_assignment_consistency(
     *,
     legacy_pushed: bool,
     has_expected: bool,
+    has_ack: bool = False,
 ) -> AssignmentConsistency:
-    """把「权威视图」与「`_layer_config_expected` / `_layer_config_pushed`」对照。
+    """把「权威视图」与 `_layer_config_expected` / `_layer_config_pushed` / `_layer_config_acks` 对照。
 
     刻意**只判等价关系**，不决定任何行为：读路径切换前，先让真实分歧在日志里可见
     （`event=worker_assignment_state_divergence`），而不是继续靠多集合各自推断。
+
+    ★ 2026-10-08（DIST-1 推进）：把 **`_layer_config_acks`** 也纳入观测 —— 它是第三个
+    「谁已确认收到本代际配置」的旧集合，此前**未参与**一致性比对。`has_ack=True` 而
+    权威视图无状态，与 `has_expected=True` 是同一类分歧（"旧集合说有、权威视图没有"），
+    故复用 `DIVERGENCE_STATE_MISSING`；这不改变任何判据，只是让该分歧也可见。
     """
     if state is None:
-        if has_expected:
+        if has_expected or has_ack:
             return AssignmentConsistency(
                 consistent=False, reason_code=DIVERGENCE_STATE_MISSING,
             )
