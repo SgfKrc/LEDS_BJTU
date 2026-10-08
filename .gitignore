@@ -239,6 +239,7 @@ scripts/*
 !scripts/xframe6_recursion_report.py
 !scripts/xframe_reduction_order_report.py
 !scripts/xframe_layer_range_equivalence.py
+!scripts/xframe_dl_relay_positions.py
 !scripts/relay_ssh_tunnel.py
 !scripts/relay_y700_build.sh
 !scripts/edge_import_audit.py
