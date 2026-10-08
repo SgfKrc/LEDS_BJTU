@@ -2385,6 +2385,24 @@ def _chat_origin(req: ChatRequest) -> str:
     return "web_http"
 
 
+def parse_pipeline_readiness(reason_text: str) -> dict:
+    """从失败原因文本里解析**结构化**的 pipeline readiness（DIST-4 第二句要求）。
+
+    文本形如：`pipeline_failed_then_local_pytorch: … | readiness=<code>: <reason>`
+    ⇒ 返回 `{"reason_code": …, "reason": …}`；无该标记时返回 `{}`。
+
+    抽成模块级纯函数，使该判据可脱离请求上下文单测（与 DIST-NEXT-8 的
+    `request_outcome.request_phase_metrics` 同一思路）。
+    """
+    text = str(reason_text or "")
+    marker = "readiness="
+    if marker not in text:
+        return {}
+    tail = text.split(marker, 1)[1].strip()
+    code, _, reason = tail.partition(":")
+    return {"reason_code": code.strip(), "reason": reason.strip()}
+
+
 def _augment_chat_metrics(metrics: dict | None, req: ChatRequest, **defaults) -> dict:
     """补齐统一聊天 metrics 字段，不覆盖调度器已给出的真实执行信息。"""
     result = dict(metrics or {})
@@ -2426,6 +2444,15 @@ def _augment_chat_metrics(metrics: dict | None, req: ChatRequest, **defaults) ->
     _marker = "readiness="
     if _marker in _failure_text:
         _capability_reason = _failure_text.split(_marker, 1)[1].strip()
+    # ★ 2026-10-08（DIST-4 第二句要求）：把**结构化**的 pipeline readiness 写回**响应 metrics**。
+    #   此前只把 `reason_code` 拼进 `fallback_reason` 字符串（见 `_execute_chat_full` 的失败分支）
+    #   ⇒ 响应体里没有结构化字段，调用方无法从单条响应判断「为什么没走分布式」。
+    #   现在补 `pipeline_readiness`（`reason_code` + `reason`）与 `pipeline_failure_reason`，
+    #   与 DIST-NEXT-8 的 `outcome` 并列 —— 单条响应即可重建失败归因。
+    _readiness = parse_pipeline_readiness(_failure_text)
+    if _readiness:
+        result.setdefault("pipeline_readiness", _readiness)
+        result.setdefault("pipeline_failure_reason", _failure_text)
     # ★ 2026-10-07（DIST-NEXT-8）：把互斥终态打进摘要 —— 一行内即可区分
     #   completed / fallback_completed / cancelled / refused / failed，
     #   不再靠 `fallback` 布尔去猜。

@@ -106,3 +106,27 @@ def test_reason_codes_are_stable_and_greppable():
     assert REASON_GENERATION_CANCELLED == "generation_cancelled"
     assert REASON_REQUEST_FAILED == "request_failed"
     assert REASON_REQUEST_REFUSED == "request_refused"
+
+
+def test_parse_pipeline_readiness_extracts_structured_fields():
+    """DIST-4 第二句要求：响应 metrics 里要有**结构化**的 pipeline readiness。"""
+    import api_server
+
+    text = (
+        "pipeline_failed_then_local_pytorch: workers not ready "
+        "| readiness=worker_stage_offer_not_ready: worker did not accept the offer"
+    )
+    assert api_server.parse_pipeline_readiness(text) == {
+        "reason_code": "worker_stage_offer_not_ready",
+        "reason": "worker did not accept the offer",
+    }
+
+    # 无标记 ⇒ 空 dict（不得凭空造字段）
+    assert api_server.parse_pipeline_readiness("local_llama_cpp: engine mismatch") == {}
+    assert api_server.parse_pipeline_readiness("") == {}
+    assert api_server.parse_pipeline_readiness(None) == {}
+
+    # reason 里含冒号时只切第一个 ⇒ 其余保留
+    parsed = api_server.parse_pipeline_readiness("x | readiness=code_a: a: b")
+    assert parsed["reason_code"] == "code_a"
+    assert parsed["reason"] == "a: b"
