@@ -2385,6 +2385,17 @@ def _chat_origin(req: ChatRequest) -> str:
     return "web_http"
 
 
+def should_prefer_pytorch(prefer_flag: object, safetensors_path: object) -> bool:
+    """`QLH_PREFER_PYTORCH` 让路的判据（`#54`，纯函数，可单测）。
+
+    为真需同时满足三项：配置位为真、画像模型有 safetensors 目录、且该目录**存在**。
+    动机见 `config.PREFER_PYTORCH`：qwen3.5 的 keep-head 上游挂点在 `output_norm` 之后，
+    llama.cpp 上游被 fail-closed 拒绝（`#35`），而 GGUF 分支的优先级在 PyTorch 之前
+    ⇒ 必须显式让路，否则本机会落到 llama.cpp 而拿不到该模型。
+    """
+    return bool(prefer_flag) and bool(safetensors_path) and os.path.isdir(safetensors_path)
+
+
 def parse_pipeline_readiness(reason_text: str) -> dict:
     """从失败原因文本里解析**结构化**的 pipeline readiness（DIST-4 第二句要求）。
 
@@ -4455,10 +4466,8 @@ def _auto_load_default_model():
     #   动机见 `config.PREFER_PYTORCH` 的说明：qwen3.5 的 keep-head 上游挂点在
     #   `output_norm` 之后，llama.cpp 上游被 fail-closed 拒绝（#35），
     #   而 GGUF 分支的优先级在 PyTorch 之前 ⇒ 必须显式让路。
-    prefer_pytorch = (
-        bool(getattr(cfg, "PREFER_PYTORCH", False))
-        and bool(_active_safetensors)
-        and os.path.isdir(_active_safetensors)
+    prefer_pytorch = should_prefer_pytorch(
+        getattr(cfg, "PREFER_PYTORCH", False), _active_safetensors,
     )
     if prefer_pytorch:
         logger.info(
