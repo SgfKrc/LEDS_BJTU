@@ -1383,8 +1383,14 @@ class RemoteFullWorkerProvider:
                         code="duplicate_stage_response",
                         field="message_type",
                     )
+                # ★ 2026-10-09（稳定性 #73）：带上 worker 回传的 `reason`（新增字段；
+                #   老 worker 不带 ⇒ 退化为原文案，兼容）。否则真因（例如 hidden 维度不匹配
+                #   `[2048]` vs `(33, 896)`）会在顶层被吞掉，用户只看到「禁止整模回退」
+                #   这类与真因无关的二次错误，换模型也修不好。
+                _stage_reason = str(payload.get("reason") or "").strip()
                 pending.error = ProviderExecutionError(
-                    "remote worker reported a Stage error",
+                    "remote worker reported a Stage error"
+                    + (f": {_stage_reason[:200]}" if _stage_reason else ""),
                     code=payload["error_code"],
                     provider_id=self.provider_id,
                     retryable=bool(payload["retryable"]),

@@ -967,9 +967,15 @@ class SchedulerTaskWorkerMixin:
             error_payload = self._task_worker_attempt_payload(
                 offer, provider_id=expected_provider,
             )
+            # ★ 2026-10-09（稳定性 #73）：把异常文本**带出去**。此前 `stage_error` 只传
+            #   `error_code`/`retryable`，master 侧一律显示「remote worker reported a Stage error」
+            #   ⇒ 真因（例：`ValueError: hidden 形状应为 [n_tokens, 2048]，实际 (33, 896)`）
+            #   只留在 worker 本地日志里，用户端完全看不到、无从修复。
+            #   新增 `reason` 字段是**向后兼容**的：老 master 只读 `error_code`/`retryable`。
             error_payload.update({
                 "error_code": error_code,
                 "retryable": error_code == "lease_expired",
+                "reason": f"{type(exc).__name__}: {exc}"[:200],
             })
             try:
                 response = build_task_worker_message(

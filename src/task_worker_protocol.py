@@ -201,6 +201,12 @@ _PAYLOAD_FIELDS_V2 = {
 #: 自由的 `output` / `metadata` 对象内（见 `_LAYER_FORWARD_RESULT_FIELDS` 的说明）。
 _PAYLOAD_FIELDS_V3 = {
     **_PAYLOAD_FIELDS_V2,
+    # ★ 2026-10-09（稳定性 #73）：`stage_error` 增加**可选** `reason`（worker 的异常文本），
+    #   让 master / 用户端能看到真因（例：`ValueError: hidden 形状应为 [n_tokens, 2048]，
+    #   实际 (33, 896)`），而不是只剩一句「remote worker reported a Stage error」。
+    #   接收端对 stage_error 只做正向校验、**不拒绝未知字段**（见 `_validate_payload`）
+    #   ⇒ 老 master 收到新 worker 的消息时会忽略该字段，天然向后兼容。
+    "stage_error": _PAYLOAD_FIELDS_V2["stage_error"] | {"reason"},
 }
 
 
