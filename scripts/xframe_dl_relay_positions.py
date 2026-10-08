@@ -131,7 +131,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--gen-steps", type=int, default=160, help="贪心生成的 token 数（决定位置数）")
     ap.add_argument("--n-ctx", type=int, default=1024)
     ap.add_argument("--threads", type=int, default=8)
-    ap.add_argument("--shim", help="keep-head shim 路径（下游仅用 LlamaCppEngine，通常不需要）")
+    ap.add_argument("--shim", help="keep-head shim 路径（--upstream llama 时的上游通道）")
+    ap.add_argument(
+        "--upstream", choices=["pytorch", "llama"], default="pytorch",
+        help="上游由谁算：pytorch=主仓 `ModelManager` 层段（默认，**跨框架** D→L）；"
+             "llama=主仓 `KeepHeadUpstream` 裁层件（**同框架** L→L，需 --head-artifact）",
+    )
+    ap.add_argument("--head-artifact", help="上游裁层件（保留前 K 层），配合 --upstream llama")
     ap.add_argument("--out", help="把报告写成 JSON")
     args = ap.parse_args(argv)
 
@@ -177,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
                          "ref_top1": top1, "ref_argmax": am, "selfcheck": selfcheck})
         print(f"[A] {prompt[:36]!r}: seq={len(seq)} 自检一致率={selfcheck:.4f}", flush=True)
 
-    # ---- 阶段 B：主仓引擎——PyTorch 上游 → llama.cpp 下游 ----
+    # ---- 阶段 B：主仓引擎——上游（PyTorch 层段 或 llama.cpp 裁层件）→ llama.cpp 下游 ----
     import config as cfg
     import model_module
 
@@ -188,13 +194,24 @@ def main(argv: list[str] | None = None) -> int:
     import torch
     from llama_engine import LlamaCppEngine
 
-    if args.shim:
-        os.environ["QLH_KEEP_HEAD_SHIM"] = args.shim
+    # shim 路径解析：显式参数 > 环境变量 > 仓库默认构建产物（`KeepHeadUpstream` 需要显式路径）
+    shim_path = args.shim or os.environ.get("QLH_KEEP_HEAD_SHIM", "").strip()
+    if not shim_path:
+        shim_path = str(_ROOT / "build" / "keephead" / "build-cpu" / "bin" / "qlh_keep_head.dll")
+    os.environ["QLH_KEEP_HEAD_SHIM"] = shim_path
 
-    mgr = model_module.ModelManager()
-    mgr.load_layer_range(0, args.k, has_embedding=True, has_lm_head=False,
-                         model_path=str(hf_dir))
-    device = mgr.get_device()
+    head_path = pathlib.Path(args.head_artifact) if args.head_artifact else None
+    mgr = None
+    device = None
+    if args.upstream == "pytorch":
+        mgr = model_module.ModelManager()
+        mgr.load_layer_range(0, args.k, has_embedding=True, has_lm_head=False,
+                             model_path=str(hf_dir))
+        device = mgr.get_device()
+    elif head_path is None or not head_path.exists():
+        print(f"SKIP: --upstream llama 需要存在 --head-artifact（实得 {args.head_artifact!r}）")
+        return 0
+
     engine = LlamaCppEngine()
     engine.load_model(model_path=str(cut), n_ctx=args.n_ctx, n_threads=args.threads, n_seq_max=1)
     if not engine.is_loaded:
@@ -202,6 +219,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     report = {"mode": "dl-relay-positions", "hf_dir": str(hf_dir), "k": args.k,
+              "upstream": args.upstream, "head_artifact": str(head_path) if head_path else None,
               "whole_gguf": str(whole), "cut_artifact": str(cut),
               "gen_steps": args.gen_steps, "rows": []}
 
@@ -212,14 +230,26 @@ def main(argv: list[str] | None = None) -> int:
         _ctx = getattr(getattr(engine, "_model", None), "_ctx", None)
         if _ctx is not None and hasattr(_ctx, "kv_cache_clear"):
             _ctx.kv_cache_clear()
-        with torch.no_grad():
-            out = mgr.forward_layers(
-                input_ids=torch.tensor([seq], dtype=torch.long, device=device),
-                past_key_values=None, use_cache=False,
-            )
-        hidden = out["hidden_states"]
-        hidden = hidden[0] if hidden.ndim == 3 else hidden
-        hidden = hidden.to(torch.float32).cpu().numpy()
+        if args.upstream == "pytorch":
+            with torch.no_grad():
+                out = mgr.forward_layers(
+                    input_ids=torch.tensor([seq], dtype=torch.long, device=device),
+                    past_key_values=None, use_cache=False,
+                )
+            hidden = out["hidden_states"]
+            hidden = hidden[0] if hidden.ndim == 3 else hidden
+            hidden = hidden.to(torch.float32).cpu().numpy()
+        else:
+            # 同框架 L→L：上游也是 llama.cpp 裁层件（整段喂入；每序列新建实例避免 KV 串味）
+            from llama_keep_head import KeepHeadUpstream
+
+            up = KeepHeadUpstream(shim_path, str(head_path), mode="nextn",
+                                  n_ctx=args.n_ctx, n_threads=args.threads)
+            try:
+                hidden = np.asarray(up.forward_tokens_to_hidden(seq, n_past=0),
+                                    dtype=np.float32)
+            finally:
+                up.close()
         logits = engine.forward_layers_from_hidden(hidden, n_past=0, all_logits=True)
         if logits is None:
             print(f"[B] {item['prompt'][:36]!r}: 下游返回 None ⇒ 跳过")
