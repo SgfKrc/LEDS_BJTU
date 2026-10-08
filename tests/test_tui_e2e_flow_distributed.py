@@ -327,7 +327,18 @@ def _assistant_body(text: str) -> str:
 
 
 def test_dual_host_tui_distributed_end_to_end():
-    """★ F3 主判据：**TUI 真操作** ⇒ 真分布式执行 ⇒ `distributed_used=true`。
+    """★ F3 主判据（**任务图档**，默认不跑）：**TUI 真操作** ⇒ 任务图执行 ⇒ `distributed_used=true`。
+
+    ⚠️ 2026-10-08 更正（用户裁定）：**任务图需要整模加载，优先级低于层段（Route-A）路径，
+    产品正常情况下不放开它**。因此本档默认 skip —— 它失败只说明"没走任务图"，**不代表
+    分布式不可用**（层段路径才是默认路径）。层段侧的主判据见
+    `test_dual_host_tui_routed_pipeline_streams_text`。
+
+    实测反例（当作证据留档）：TUI 内 `/mode task_graph` 生效（`app.execution_mode
+    == "task_graph"` 断言通过），但同一请求的后端日志走的是 Route-A
+    （`Route-A 分配原始: raw=[('master',0,20,20,None),('android-21af7c52',20,24,4,
+    'stage_offer_v3')]` + 逐 step handoff）⇒ 不产生 workflow。这与"任务图优先级低"
+    一致，**不是缺陷**。
 
     操作序列（全部走 TUI，不绕过 UI 直调 `/api/chat`）：
     1. 验证集群已就绪（≥2 节点 online）—— 不就绪直接 skip（不虚构）；
@@ -339,6 +350,12 @@ def test_dual_host_tui_distributed_end_to_end():
     """
     from tui_api import ApiClient
     from tui_textual import KoakumaApp, MainScreen
+
+    if (os.environ.get("QLH_TUI_E2E_EXPECT_TASK_GRAPH") or "").strip() != "1":
+        pytest.skip(
+            "任务图需整模加载、优先级低于层段路径（产品正常不放开）⇒ 本档默认不跑；"
+            "要显式验证任务图路径请设 QLH_TUI_E2E_EXPECT_TASK_GRAPH=1。"
+            "分布式主判据请走层段档 test_dual_host_tui_routed_pipeline_streams_text")
 
     control = ApiClient(host=HOST, port=PORT, timeout=120.0)
     reason = _skip_reason(control)
