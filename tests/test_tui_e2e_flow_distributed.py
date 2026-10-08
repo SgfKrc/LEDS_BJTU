@@ -139,8 +139,20 @@ def _skip_reason(api=None) -> str:
         status = api.get("/status")
     except Exception as exc:  # noqa: BLE001
         return f"本机 master 后端不可达（F3 需先起 api_server）: {exc}"
-    if not isinstance(status, dict) or status.get("model_loaded") is not True:
-        return "本机 master 未加载完整模型（F3 前置：先加载模型）"
+    # ★ 2026-10-08：**不得用 `model_loaded` 当"就绪"判据**。
+    #   Route-A 层段模式下 master 按层段参与，`model_loaded` 会被**合法地**置 False
+    #   （语义见本文件 Route-A 用例的注记与 `routes_models.get_current_model`；
+    #   `/status.model_loaded` 与 `/models/current.loaded` 同源，都读 `model_host.model_loaded`）。
+    #   实测后果：先跑本文件的 Route-A 用例、再跑本用例时，跑前 `loaded=True`、跑完 `False`
+    #   ⇒ 本用例被**误 skip**（理由写"未加载完整模型"，指向了错误的修复方向）。
+    #   改判**可路由性**：capacity 能给出可用计划（v3 语义）即视为就绪，与"master 是整模
+    #   还是层段"无关；只有 capacity 也求不出来时才退回 `model_loaded` 兜底。
+    capacity_ready, capacity_reason = _pipeline_capacity_ready(api)
+    if not capacity_ready and (
+        not isinstance(status, dict) or status.get("model_loaded") is not True
+    ):
+        return ("F3 前置未满足：capacity 求不出可用计划"
+                f"（{capacity_reason or 'unknown'}），且本机 master 未加载完整模型")
     # ★ 2026-10-07：层段流水线（Route-A / 任务图）要求 **PyTorch** 引擎 —— llama.cpp 只能
     #   整模本地推理（`llama.cpp engine does not support layer-split pipeline`）。实测引擎
     #   不对时请求会静默落到 `local_llama_cpp`：既不产生 workflow，也没有 `distributed_used`
