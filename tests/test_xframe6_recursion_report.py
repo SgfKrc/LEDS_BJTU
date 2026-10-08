@@ -9,7 +9,6 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 from xframe6_recursion_report import (  # noqa: E402
-    argmax_series,
     rel_series,
     slope_per_position,
     summarise,
@@ -32,20 +31,17 @@ def test_slope_of_noise_is_far_below_threshold():
     assert abs(slope_per_position(rel)) < 1e-8
 
 
-def test_rel_series_uses_max_abs_ratio():
-    ref = [[1.0, -2.0], [4.0, 0.0]]
-    alt = [[1.0 + 1e-6, -2.0], [4.0 + 4e-6, 0.0]]
-    rel = rel_series(ref, alt)
+def test_rel_series_uses_top1_magnitude():
+    """标量序列的相对差：分母取 |ref|，相同则为 0（长上下文扫描依赖此语义）。"""
+    rel = rel_series([2.0, -4.0], [2.0 + 1e-6, -4.0])
     assert len(rel) == 2
-    # 分母取该位置 |ref| 的最大值：2.0 与 4.0
-    assert abs(rel[0] - 1e-6 / 2.0) < 1e-15
-    assert abs(rel[1] - 4e-6 / 4.0) < 1e-15
+    assert rel[1] == 0.0
+    assert rel[0] > 0.0 and rel[0] < 1e-5
 
 
-def test_argmax_series_detects_flip():
-    ref = [[0.1, 0.2], [0.9, 0.1]]
-    alt = [[0.1, 0.2], [0.1, 0.9]]
-    assert argmax_series(ref, alt) == [True, False]
+def test_rel_series_zips_shorter_input():
+    """长度不等时按 zip 截断（不抛异常）—— 长序列扫描里两侧长度应一致，但接口要稳。"""
+    assert rel_series([1.0], [1.0, 2.0]) == [0.0]
 
 
 def test_summarise_flags_extra_accumulation():

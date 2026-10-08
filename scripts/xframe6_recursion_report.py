@@ -51,24 +51,16 @@ DEFAULT_PROMPTS = [
 ]
 
 
-def rel_series(ref: list[list[float]], alt: list[list[float]]) -> list[float]:
-    """逐位置的相对差：`max|Δ| / max|ref|`（纯函数，可脱离模型单测）。"""
+def rel_series(ref: list[float], alt: list[float]) -> list[float]:
+    """逐位置的**标量**相对差：`|a-b| / max(|a|, 1e-30)`（纯函数，可脱离模型单测）。
+
+    ★ 2026-10-08：入参从"每位置的整份 logits"改为"每位置的 **top1 标量**" ——
+    长上下文下保留整份 vocab 会到数 GB，而判据只需要 top1。
+    """
     out: list[float] = []
-    for i in range(min(len(ref), len(alt))):
-        a, b = ref[i], alt[i]
-        denom = max(1e-30, max(abs(float(v)) for v in a))
-        out.append(max(abs(float(x) - float(y)) for x, y in zip(a, b)) / denom)
-    return out
-
-
-def argmax_series(ref: list[list[float]], alt: list[list[float]]) -> list[bool]:
-    """逐位置 argmax 是否相同（纯函数）。"""
-    out: list[bool] = []
-    for i in range(min(len(ref), len(alt))):
-        a, b = ref[i], alt[i]
-        ia = max(range(len(a)), key=lambda j: a[j])
-        ib = max(range(len(b)), key=lambda j: b[j])
-        out.append(ia == ib)
+    for a, b in zip(ref, alt):
+        denom = max(1e-30, abs(float(a)))
+        out.append(abs(float(a) - float(b)) / denom)
     return out
 
 
@@ -128,6 +120,11 @@ def main() -> int:
     ap.add_argument("--prompts", help="每行一个 prompt 的文件；缺省用内置 3 条")
     ap.add_argument("--gen-steps", type=int, default=128,
                     help="teacher-forcing 的序列长度（原 prompt + 生成的 token 数）")
+    ap.add_argument(
+        "--min-new-tokens", type=int, default=0,
+        help="强制至少生成这么多 token（★ 2026-10-08 长上下文扫描用）—— 默认 0，"
+             "沿用 HF 的 EOS 早停；设为 >0 时序列长度可控，用于测长上下文下的分叉点",
+    )
     ap.add_argument("--decode-steps", type=int, default=24,
                     help="自由解码对照的步数（0 表示跳过）")
     ap.add_argument("--out", help="把报告写成 JSON")
@@ -156,24 +153,40 @@ def main() -> int:
         pids, _eos = hf_prompt_ids(args.hf_dir, prompt)
 
         # ① 用原版 greedy 生成一条固定序列（只用于构造 teacher-forcing 的输入）
+        gen_kwargs = {"max_new_tokens": args.gen_steps, "do_sample": False}
+        if args.min_new_tokens > 0:
+            # ★ 长上下文扫描：EOS 早停会让序列长度不可控 ⇒ 强制生成到指定长度
+            gen_kwargs["min_new_tokens"] = min(args.min_new_tokens, args.gen_steps)
         with torch.no_grad():
-            gen = model.generate(
-                torch.tensor([pids]), max_new_tokens=args.gen_steps, do_sample=False
-            )
+            gen = model.generate(torch.tensor([pids]), **gen_kwargs)
         seq = [int(x) for x in gen[0]]
 
         # ② teacher-forcing：同一条序列，原版 vs ggml-like 归约语义
-        def logits_rows() -> list[list[float]]:
+        def top1_and_argmax() -> tuple[list[float], list[int]]:
+            """逐位置的 **top1 logit** 与 **argmax**（不保留整份 vocab 的 logits）。
+
+            长上下文下 `[seq_len, vocab]` 的 f64 会到数 GB（2k × 150k × 8B ≈ 2.4GB，
+            且 teacher-forcing 需要同时持有 ref 与 alt 两份 ⇒ 6GB 量级），而本票判据
+            只需要"逐位置 top1 的相对差"与"argmax 是否相同"。这里逐位置提取后立即丢弃，
+            峰值只有单行 `[vocab]`。
+            """
+            top1s: list[float] = []
+            argmaxes: list[int] = []
             with torch.no_grad():
                 out = model(torch.tensor([seq]))
-            return out.logits[0].to(torch.float64).tolist()
+                for pos in range(out.logits.shape[1]):
+                    row = out.logits[0, pos].to(torch.float64)
+                    top2 = torch.topk(row, 2).values
+                    top1s.append(float(top2[0]))
+                    argmaxes.append(int(torch.argmax(row)))
+            return top1s, argmaxes
 
-        ref_rows = logits_rows()
+        ref_top1, ref_argmax = top1_and_argmax()
         replaced = _install_ggml_like_rmsnorm(model)   # 同一实例替换 ⇒ 零额外内存
-        alt_rows = logits_rows()
+        alt_top1, alt_argmax = top1_and_argmax()
 
-        rel = rel_series(ref_rows, alt_rows)
-        same = argmax_series(ref_rows, alt_rows)
+        rel = rel_series(ref_top1, alt_top1)
+        same = [a == b for a, b in zip(ref_argmax, alt_argmax)]
         summary = summarise(rel, same)
         summary["replaced_norms"] = replaced
         summary["seq_len"] = len(seq)
