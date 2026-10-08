@@ -263,18 +263,60 @@ def test_dual_host_tui_routed_pipeline_streams_text():
             def _answer() -> str:
                 return _assistant_body(str(pane.query_one("#chat-log", Static).render()))
 
+            def _status() -> str:
+                return str(pane.query_one("#chat-status", Static).render())
+
             got = await wait_for(pilot, lambda: len(_answer()) >= 2, timeout=REPLY_TIMEOUT)
             if not got:
                 raise AssertionError(
                     f"真模型在 {REPLY_TIMEOUT:.0f}s 内未给出非空回答（Route-A 产物级判据）；"
                     f"已渲染文本（前 400 字）: "
                     f"{str(pane.query_one('#chat-log', Static).render())[:400]!r}")
-            return _answer()
+            # ★ 2026-10-08：等**状态行**落到 done 事件的 metrics —— 它是本条请求唯一
+            #   用户可见的分布式证据（`format_metrics` 输出含 `tok/s` 即为 metrics 已渲染）。
+            status_landed = await wait_for(
+                pilot, lambda: "tok/s" in _status() or "分布式" in _status(),
+                timeout=REPLY_TIMEOUT)
+            return _answer(), _status(), status_landed
 
-    answer = _run(_main())
+    answer, status_text, status_landed = _run(_main())
     assert len(answer) >= 2, f"回答过短: {answer!r}"
     for marker in ("流水线返回空响应", "当前没有可用的分布式路径", "distributed_required"):
         assert marker not in answer, f"回答里出现失败文案 {marker!r}: {answer[:200]!r}"
+
+    # --- ★ 2026-10-08：**分布式硬判据落在层段（Route-A）路径上** ---
+    # 背景（本轮更正）：任务图需整模加载、优先级低于层段路径，产品正常不放开 ⇒
+    # 「拿 workflow + distributed_used」那条判据天然不适用于默认路径，本档才是默认路径的主判据。
+    # 此前本档只断言"回答非空"⇒ 请求被静默回退本地也能过（实测那种情况回答同样非空）。
+    assert status_landed, (
+        f"状态行未落到 metrics（{REPLY_TIMEOUT:.0f}s）⇒ 无法判定分布式是否生效；"
+        f"状态行: {status_text!r}")
+    assert "分布式 ✓" in status_text, (
+        f"TUI 状态行未显示分布式生效 —— 请求可能被静默回退本地。状态行: {status_text!r}")
+    evidence = re.search(r"段·层\s*(\d+)-(\d+)", status_text)
+    assert evidence is not None, (
+        f"状态行缺少**承层证据**（远端实际承了哪段层）⇒ 无法核验'不是本地假装分布式'。"
+        f"状态行: {status_text!r}")
+    seg_start, seg_end = int(evidence.group(1)), int(evidence.group(2))
+    assert seg_start < seg_end, (
+        f"状态行承层区间非法: {seg_start}-{seg_end}；状态行: {status_text!r}")
+    # 交叉核验（防"本地假装分布式"）：UI 声称的承层区间必须与 capacity 规划的**远端**段有交叠。
+    # 若这次其实是本地整模在跑，段会落在 master 自己的区间上、与远端段不相交 ⇒ 这里会红。
+    capacity = control.get("/cluster/pipeline-capacity") or {}
+    remote_ranges = [
+        (int(item.get("start_layer")), int(item.get("end_layer")))
+        for item in (capacity.get("assignments") or [])
+        if str(item.get("node_id")) != "master"
+        and item.get("start_layer") is not None and item.get("end_layer") is not None
+    ]
+    assert remote_ranges, (
+        f"capacity 未给出任何远端段 ⇒ 无从核验'不是本地假装分布式'；capacity: "
+        f"{ {k: capacity.get(k) for k in ('admitted', 'status', 'reason_code', 'assignments')} }")
+    assert any(
+        not (seg_end <= start or seg_start >= end) for start, end in remote_ranges
+    ), (
+        f"状态行承层区间 {seg_start}-{seg_end} 与 capacity 的远端段 {remote_ranges} **无交叠** "
+        f"⇒ UI 声称的分布式与规划不符（疑似本地整模在跑）。状态行: {status_text!r}")
 
 
 def _pipeline_capacity_ready(api) -> tuple:
