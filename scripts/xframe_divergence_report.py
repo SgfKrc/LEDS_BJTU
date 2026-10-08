@@ -56,13 +56,16 @@ def hf_prompt_ids(hf_dir: str, prompt: str) -> tuple[list[int], int | None]:
     return list(tok(text, add_special_tokens=False)["input_ids"]), tok.eos_token_id
 
 
-def _install_ggml_like_rmsnorm(model: Any) -> int:
+def _install_ggml_like_rmsnorm(model: Any, predicate: Any = None) -> int:
     """把模型里所有 RMSNorm 换成「复刻 ggml 语义」的版本，返回替换个数。
+
+    ★ 2026-10-08：新增可选 `predicate(类名) -> bool`，用于**按类分档替换**
+    （诊断「是哪一类 RMSNorm 引入差异」时用）。默认 `None` ⇒ 全部替换，语义不变。
 
     依据（见 `docs/跨框架接力数值差异机理-2026-10-05.md` §9 与 KT 文档的源码核对）：
     ggml 的 `ggml_rms_norm` 用 **`double`（`ggml_float`）累加**，而 HF/torch 的
-    `Qwen2RMSNorm` 在输入 dtype（f32）上累加 —— 这是一个**精度类**差异，且位于放大链的
-    **种子**位置（embedding 2.7e-8 → attn_norm 2.0e-6，放大约 72×）。
+    对应实现（`Qwen2RMSNorm` / `Qwen3_5RMSNorm` / `Qwen3_5RMSNormGated`）在输入
+    dtype（f32）上累加 —— 这是一个**精度类**差异，且位于放大链的**种子**位置。
 
     本函数只做这一项对齐实验，用于判定「把归一化这一环钉死后，首分歧是否推迟」。
     """
@@ -70,22 +73,30 @@ def _install_ggml_like_rmsnorm(model: Any) -> int:
 
     def make_forward(norm: Any):
         eps = float(getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-6)))
+        # ★ 2026-10-08（真模型定位的第二处、也是主因）：**权重语义必须按类分档**。
+        #   HF 的 `Qwen3_5RMSNorm`（`modeling_qwen3_5.py:845/854`，参见 PR #29402 注释）
+        #   把 `weight` 初始化成 **zeros**，前向里用 **`1.0 + weight`**；而
+        #   `Qwen3_5RMSNormGated` / `Qwen2RMSNorm` 用 `weight` 本身（ones 初始化）。
+        #   本工具此前统一 `* weight` ⇒ 在 Qwen3.5 上等于把输出乘了 ≈0：
+        #   teacher-forcing 实测逐位置 `max_rel = 1.41`、argmax 全错（0/60）。
+        #   ⇒ 这也意味着 XFRAME-2 的「RMSNorm 逐 bit 相同」结论**从未在 Qwen3.5 上验证过**。
+        scales_with_one_plus_weight = type(norm).__name__ == "Qwen3_5RMSNorm"
 
         def forward(hidden_states, *args, **kwargs):
-            # ★ 2026-10-08（XFRAME-6 真模型复验暴露的缺陷）：原实现签名只有
+            # ★ 2026-10-08（XFRAME-6 真模型复验暴露的缺陷之一）：原实现签名只有
             #   `forward(hidden_states)`，而 Qwen3.5 的 `Qwen3_5RMSNormGated.forward(
-            #   hidden_states, gate)` 是**两个**参数 ⇒ 在 hybrid 模型上直接 `TypeError`
-            #   ⇒ 该开关**从未**在 Qwen3.5 上跑通过（XFRAME-2 的「RMSNorm 逐 bit 相同」
-            #   结论因此只覆盖了非 gated 模型）。这里修成**语义等价**的替换：
+            #   hidden_states, gate)` 是**两个**参数 ⇒ 在 hybrid 模型上直接 `TypeError`。
+            #   这里修成**语义等价**的替换：
             #   ① ggml 的归一化语义（double 累加 Σx² + `1/sqrt`）；
-            #   ② **保留原版 gate 语义**（norm-before-gate：先归一化乘 weight，再乘激活后的 gate）。
+            #   ② **按类保留权重语义**（`weight` 或 `1 + weight`）；
+            #   ③ **保留 gate 语义**（若有 gate：norm-before-gate，乘激活后的 gate）。
             gate = args[0] if args else kwargs.get("gate")
             x = hidden_states.to(torch.float64)
             var = (x * x).mean(-1, keepdim=True)
             normalized = x * (1.0 / torch.sqrt(var + eps))
-            out = normalized.to(hidden_states.dtype) * norm.weight
+            scale = (1.0 + norm.weight) if scales_with_one_plus_weight else norm.weight
+            out = normalized.to(hidden_states.dtype) * scale
             if gate is not None:
-                activation = getattr(norm, "activation", "silu")
                 act = torch.nn.functional.silu(gate.to(torch.float32))
                 out = out * act.to(out.dtype)
             return out
@@ -95,7 +106,11 @@ def _install_ggml_like_rmsnorm(model: Any) -> int:
     count = 0
     for module in model.modules():
         cls_name = type(module).__name__
-        if "RMSNorm" in cls_name and hasattr(module, "weight"):
+        if (
+            "RMSNorm" in cls_name
+            and hasattr(module, "weight")
+            and (predicate is None or bool(predicate(cls_name)))
+        ):
             module.forward = make_forward(module)
             count += 1
     return count
