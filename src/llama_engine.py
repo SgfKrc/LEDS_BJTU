@@ -32,6 +32,9 @@ from __future__ import annotations
 import logging
 import hashlib
 import json
+
+# ★ 2026-10-08（#53）：keep-head shim 的定位与 worker 侧共用同一事实源。
+from keep_head_shim import missing_shim_hint, resolve_keep_head_shim
 import math
 import os
 import re
@@ -1974,18 +1977,17 @@ class LlamaCppEngine:
         self._keep_head = None
         self._keep_head_key = key
 
-        shim = os.environ.get("QLH_KEEP_HEAD_SHIM", "").strip()
+        # ★ 2026-10-08（#53）：定位收敛到 `keep_head_shim.resolve_keep_head_shim()` ——
+        #   与本模块此前内联的推导等价（环境变量 > 仓库默认构建产物），
+        #   但**两侧共用同一事实源**，避免 worker 侧只读环境变量而 master 侧能推导。
+        shim = resolve_keep_head_shim()
         if not shim:
             # shim 本体是 `qlh_keep_head.dll`（`qlh_kh_*` 入口在它里面）；同目录的
             # `libllama.dll` 只是它依赖的**带补丁** llama.cpp，不是 shim。
-            candidate = (Path(__file__).resolve().parent.parent
-                         / "build" / "keephead" / "build-cpu" / "bin" / "qlh_keep_head.dll")
-            if candidate.is_file():
-                shim = str(candidate)
-        if not shim:
             logger.error(
-                "keep-head 上游不可用：未找到 shim（可设 QLH_KEEP_HEAD_SHIM）；"
-                "拒绝交付语义不兼容的 embeddings hidden（docs/已知问题记录.md #35）")
+                "keep-head 上游不可用：%s；"
+                "拒绝交付语义不兼容的 embeddings hidden（docs/已知问题记录.md #35）",
+                missing_shim_hint())
             return None
         # ★ 2026-10-07：**删除了此前的 `qwen3*` 无条件拒绝判据**。
         #   旧判据依据「`nextn` 导出末层输出，各架构 `t_h_nextn` 挂点不同（qwen2 在
