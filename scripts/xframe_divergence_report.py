@@ -71,12 +71,24 @@ def _install_ggml_like_rmsnorm(model: Any) -> int:
     def make_forward(norm: Any):
         eps = float(getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-6)))
 
-        def forward(hidden_states):
-            # ggml 语义：以 double 累加 Σx²，取 1/sqrt(mean+eps)，最后再乘 weight。
+        def forward(hidden_states, *args, **kwargs):
+            # ★ 2026-10-08（XFRAME-6 真模型复验暴露的缺陷）：原实现签名只有
+            #   `forward(hidden_states)`，而 Qwen3.5 的 `Qwen3_5RMSNormGated.forward(
+            #   hidden_states, gate)` 是**两个**参数 ⇒ 在 hybrid 模型上直接 `TypeError`
+            #   ⇒ 该开关**从未**在 Qwen3.5 上跑通过（XFRAME-2 的「RMSNorm 逐 bit 相同」
+            #   结论因此只覆盖了非 gated 模型）。这里修成**语义等价**的替换：
+            #   ① ggml 的归一化语义（double 累加 Σx² + `1/sqrt`）；
+            #   ② **保留原版 gate 语义**（norm-before-gate：先归一化乘 weight，再乘激活后的 gate）。
+            gate = args[0] if args else kwargs.get("gate")
             x = hidden_states.to(torch.float64)
             var = (x * x).mean(-1, keepdim=True)
             normalized = x * (1.0 / torch.sqrt(var + eps))
-            return (normalized.to(hidden_states.dtype) * norm.weight)
+            out = normalized.to(hidden_states.dtype) * norm.weight
+            if gate is not None:
+                activation = getattr(norm, "activation", "silu")
+                act = torch.nn.functional.silu(gate.to(torch.float32))
+                out = out * act.to(out.dtype)
+            return out
 
         return forward
 
@@ -128,17 +140,25 @@ def _install_noise_injector(model: Any, layer_idx: int, rel_sigma: float,
 
 def hf_greedy(hf_dir: str, input_ids: list[int], max_new_tokens: int,
               rmsnorm: str = "hf", noise_layer: int | None = None,
-              noise_sigma: float = 0.0) -> dict[str, Any]:
+              noise_sigma: float = 0.0, dtype: str = "float32") -> dict[str, Any]:
     """HF transformers 贪心解码；返回生成的 token id 与每步的 top1−top2 margin。
 
     `rmsnorm="ggml-like"` 时把模型内所有 RMSNorm 换成复刻 ggml 语义的版本
     （double 累加 + `1/sqrt`），用于 XFRAME-2 的「钉死归一化这一环」实验。
+
+    ★ 2026-10-08（XFRAME-5/6 复验）：`dtype="float64"` 让**整个左引擎在 f64 下累加**
+    （权重与激活在计算时按双精度参与），用于判定两件事：① 换累加数域后「归约顺序差异」
+    是否**结构性消失**（XFRAME-5 的机理对照）；② **递推**（多步解码）是否把误差阶从
+    `O(√N)`/`O(K·ε)` 抬成额外不可消除项（XFRAME-6）。
+    ⚠️ 这一档是**机理证明**用的对照，**不是生产配置** —— f64 在 CPU/移动端吞吐显著下降
+    且必须两侧同改（见票面「XFRAME-5 落地判断」）。
     """
     import torch
     from transformers import AutoModelForCausalLM
 
+    torch_dtype = torch.float64 if dtype == "float64" else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
-        hf_dir, dtype=torch.float32, attn_implementation="eager",
+        hf_dir, dtype=torch_dtype, attn_implementation="eager",
         trust_remote_code=False,
     ).eval()
     if rmsnorm == "ggml-like":
@@ -156,10 +176,14 @@ def hf_greedy(hf_dir: str, input_ids: list[int], max_new_tokens: int,
         )
     gen_ids = [int(x) for x in out.sequences[0][ids_t.shape[1]:]]
     margins = []
+    top1_logits = []
     for step in out.scores:
-        top2 = torch.topk(step[0].float(), 2).values
-        margins.append(round(float(top2[0] - top2[1]), 4))
-    return {"ids": gen_ids, "margins": margins}
+        # 用 f64 取标量，避免比较两侧数值时被 f32 截断掩盖差异（XFRAME-6 要比"误差随步数"）。
+        row = step[0].to(torch.float64)
+        top2 = torch.topk(row, 2).values
+        margins.append(round(float(top2[0] - top2[1]), 6))
+        top1_logits.append(round(float(top2[0]), 6))
+    return {"ids": gen_ids, "margins": margins, "top1_logits": top1_logits}
 
 
 def llama_greedy(gguf: str, input_ids: list[int], max_new_tokens: int) -> dict[str, Any]:
@@ -473,6 +497,12 @@ def main() -> int:
                     help="敏感度探针：在 HF 的该层输出注入相对噪声（需配合 --noise-sigma）")
     ap.add_argument("--noise-sigma", type=float, default=0.0,
                     help="敏感度探针：相对噪声幅度（按该张量 |x| 均值缩放）")
+    ap.add_argument(
+        "--hf-dtype", choices=["float32", "float64"], default="float32",
+        help="左引擎（HF）的累加数域：float32=默认；float64=整模 f64 累加 —— "
+             "用于 XFRAME-5「换累加数域是否结构性消除归约顺序差异」与 XFRAME-6"
+             "「递推是否引入额外不可消除项」的机理对照（非生产配置）",
+    )
     args = ap.parse_args()
 
     prompts = DEFAULT_PROMPTS
@@ -505,7 +535,8 @@ def main() -> int:
             left_name, right_name = "llama_cpp_whole", "llama_cpp_relay"
         else:
             left = hf_greedy(args.hf_dir, pids, args.max_new_tokens, rmsnorm=args.hf_rmsnorm,
-                             noise_layer=args.noise_layer, noise_sigma=args.noise_sigma)
+                             noise_layer=args.noise_layer, noise_sigma=args.noise_sigma,
+                             dtype=args.hf_dtype)
             right = llama_greedy(args.gguf, pids, args.max_new_tokens)
             left_name, right_name = "hf_transformers", "llama_cpp"
 
@@ -545,6 +576,7 @@ def main() -> int:
         "right": "llama_cpp_relay" if args.same_engine else "llama_cpp",
         "relay_segments": relay_segments if args.same_engine else None,
         "hf_rmsnorm": args.hf_rmsnorm,
+        "hf_dtype": args.hf_dtype,
         "noise_layer": args.noise_layer,
         "noise_sigma": args.noise_sigma,
         "prompts": total,
