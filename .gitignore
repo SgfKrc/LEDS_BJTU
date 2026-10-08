@@ -241,6 +241,8 @@ scripts/*
 !scripts/xframe_layer_range_equivalence.py
 !scripts/xframe_dl_relay_positions.py
 !scripts/gguf_dequant_to_hf.py
+!scripts/xframe_actquant_report.py
+!scripts/gguf_tensor_diff.py
 !scripts/relay_ssh_tunnel.py
 !scripts/relay_y700_build.sh
 !scripts/edge_import_audit.py
