@@ -2427,6 +2427,13 @@ def _augment_chat_metrics(metrics: dict | None, req: ChatRequest, **defaults) ->
     result.setdefault("client_app_variant", req.client_app_variant or "")
     result.setdefault("serving_node_id", scheduler.get_effective_node_id())
     result.setdefault("distributed_requested", scheduler.get_distributed_inference_enabled())
+    # ★ 2026-10-08：把**请求侧意图**也放进 metrics。此前 `routing_preference` 只存在于
+    #   响应顶层（`result`），TUI/安卓端拿到的 `metrics` 里没有它 ⇒ 界面**无法判断
+    #   "用户是否要求了分布式"**，只能看全局开关 `distributed_requested`。后果：用户用
+    #   `/route required`（或 preferred）要求分布式、而全局开关恰好关着时，`distributed_requested`
+    #   为 False ⇒ "已请求分布式，实际本地"这条提示**不会出现**，界面完全静默
+    #   （与"核心功能保证分布式一致性、交互时却违反且不提示"一致）。
+    result.setdefault("routing_preference", getattr(req, "routing_preference", "") or "")
     result.setdefault("distributed_used", False)
     result.setdefault("fallback", False)
     result.setdefault("fallback_reason", "")

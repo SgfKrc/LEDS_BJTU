@@ -237,6 +237,25 @@ def load_local_chat_image(path_value: str) -> Dict[str, Any]:
 # metrics 格式化（done 事件）
 # ============================================================
 
+#: 请求侧要求分布式的 `routing_preference` 取值（见 `ChatRequest.routing_preference`）。
+_DISTRIBUTED_REQUEST_PREFS = frozenset({"distributed_preferred", "distributed_required"})
+
+
+def _distributed_was_requested(metrics: Dict[str, Any]) -> bool:
+    """本次请求**是否要求过分布式**（请求侧意图 或 全局开关，任一为真）。
+
+    ★ 2026-10-08：此前只看 `distributed_requested`（= 全局开关 `distributed_inference`）。
+    用户用 `/route required` 要求分布式、而全局开关恰好关着时它是 `False` ⇒
+    「已请求分布式，实际本地」这条提示**不出现**、界面完全静默。
+
+    请求侧意图由 `metrics["routing_preference"]` 承载（`api_server._augment_chat_metrics`
+    写入；此前它只在响应顶层、进不了界面）。
+    """
+    if metrics.get("distributed_requested"):
+        return True
+    return str(metrics.get("routing_preference") or "").strip().lower() in _DISTRIBUTED_REQUEST_PREFS
+
+
 def _distributed_evidence(metrics: Dict[str, Any]) -> str:
     """远端**实际承了哪段层**的短证据串（无证据则空串）。
 
@@ -302,7 +321,7 @@ def format_metrics(
         parts.append(f"⚠️ 回退: {metrics.get('fallback_reason', '未知')}")
     if metrics.get("distributed_used"):
         parts.append(f"分布式 ✓{_distributed_evidence(metrics)}")
-    elif metrics.get("distributed_requested"):
+    elif _distributed_was_requested(metrics):
         parts.append("⚠️ 已请求分布式，实际本地")
     elif "distributed_used" in metrics:
         parts.append("⚠️ 本地执行（未用分布式）")

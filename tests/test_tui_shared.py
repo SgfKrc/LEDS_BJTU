@@ -179,6 +179,36 @@ class TestFormatMetrics:
         assert format_metrics({"engine": "llama_cpp", "execution_mode": "local"}) == (
             "llama_cpp · local")
 
+    def test_request_side_intent_alone_triggers_the_warning(self):
+        """★ 2026-10-08：**只看请求侧意图**也必须提示。
+
+        场景（实测的静默缺口）：用户用 `/route required` 要求分布式，但全局开关
+        `distributed_inference` 恰好关着 ⇒ `distributed_requested` 为 False，若只看它
+        则界面**什么都不显示**，用户以为在分布式跑。现按 `routing_preference` 兜住。
+        """
+        text = format_metrics(
+            {"engine": "pytorch", "execution_mode": "local",
+             "distributed_requested": False, "distributed_used": False,
+             "routing_preference": "distributed_required"},
+        )
+        assert "已请求分布式，实际本地" in text
+
+    def test_preferred_route_also_counts_as_requesting_distributed(self):
+        text = format_metrics(
+            {"engine": "pytorch", "execution_mode": "local",
+             "distributed_used": False, "routing_preference": "distributed_preferred"},
+        )
+        assert "已请求分布式，实际本地" in text
+
+    def test_auto_route_does_not_claim_distributed_was_requested(self):
+        """`auto` 不是分布式意图 ⇒ 不得声称"已请求分布式"。"""
+        text = format_metrics(
+            {"engine": "pytorch", "execution_mode": "local",
+             "distributed_used": False, "routing_preference": "auto"},
+        )
+        assert "已请求分布式" not in text
+        assert "本地执行" in text
+
     def test_history_not_committed(self):
         text = format_metrics({}, history_committed=False)
         assert "历史未提交" in text
