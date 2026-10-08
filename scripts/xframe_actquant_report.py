@@ -38,13 +38,19 @@ import sys
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-#: 被测模块的**层内后缀**（覆盖 attn 与 mlp 两种形状）；前缀由 `_find_layers_prefix` 探测
-_TARGET_SUFFIXES = [
-    ("self_attn.q_proj", "q_proj"),
-    ("self_attn.o_proj", "o_proj"),
-    ("mlp.down_proj", "down_proj"),
-    ("mlp.gate_proj", "gate_proj"),
-]
+#: 探测不到显式目标时，取每层**参数量最大**的前 N 个 `nn.Linear`
+DEFAULT_PER_LAYER = 4
+
+
+def select_targets(candidates: list[tuple[str, int]], per_layer: int = DEFAULT_PER_LAYER) -> list[str]:
+    """从 `(点分名, 参数量)` 里按参数量降序取前 `per_layer` 个（纯函数，名字定序保证确定性）。
+
+    为什么按参数量而不是按名字：不同架构的层内模块名不同（Qwen2 是 `self_attn.q_proj`，
+    Qwen3.5 的 linear-attention 层是 `linear_attn.in_proj_qkv`），按名字匹配会漏；
+    按参数量能稳定选到"承载大部分计算"的那些矩阵。
+    """
+    ordered = sorted(candidates, key=lambda item: (-item[1], item[0]))
+    return [name for name, _n in ordered[:per_layer]]
 
 
 def _find_layers_prefix(model) -> str | None:
@@ -112,7 +118,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--prompt", default="Explain in one short sentence why floating point "
                                         "addition is not associative.")
     ap.add_argument("--targets", default=None,
-                    help="逗号分隔的 `dotted.path=label`；缺省用内置 4 个 attn/mlp 模块")
+                    help="逗号分隔的 `dotted.path=label`；缺省按 `--layers` 自动探测（取每层参数量最大的前 N 个 nn.Linear）")
+    ap.add_argument("--layers", default="0,3",
+                    help="自动探测目标的层索引（逗号分隔，默认 0,3）。层内模块名随层类型而变"
+                         "（Qwen2 全是 `self_attn`；Qwen3.5 的 0/1/2 是 `linear_attn`、3 是全注意力）"
+                         "⇒ 取两个层以覆盖不同层类型")
+    ap.add_argument("--per-layer", type=int, default=DEFAULT_PER_LAYER,
+                    help=f"每层取参数量最大的前 N 个 Linear（默认 {DEFAULT_PER_LAYER}）")
     ap.add_argument("--out", help="把结果写成 JSON")
     args = ap.parse_args(argv)
 
@@ -142,13 +154,23 @@ def main(argv: list[str] | None = None) -> int:
         str(model_dir), dtype=torch.float32, trust_remote_code=False).eval()
 
     if targets is None:
+        import torch
+
         prefix = _find_layers_prefix(model)
         if prefix is None:
             print("SKIP: 探测不到 text transformer 的 `layers` 路径 —— 请用 --targets 显式给出")
             return 0
         print(f"[layers prefix] {prefix}")
-        targets = [(f"{prefix}.0.{suffix}", f"L0.{label}") for suffix, label in _TARGET_SUFFIXES]
-        targets.append((f"{prefix}.8.mlp.gate_proj", "L8.gate_proj"))
+        targets = []
+        for idx in [int(x) for x in str(args.layers).split(",") if x.strip()]:
+            layer = _locate(model, f"{prefix}.{idx}")
+            candidates = [(n, m.weight.numel()) for n, m in layer.named_modules()
+                          if isinstance(m, torch.nn.Linear)]
+            for name in select_targets(candidates, args.per_layer):
+                targets.append((f"{prefix}.{idx}.{name}", f"L{idx}.{name.split('.')[-1]}"))
+    if not targets:
+        print("SKIP: 未发现可测的 nn.Linear —— 请用 --targets 显式给出")
+        return 0
 
     captured: dict[str, object] = {}
     hooks = []

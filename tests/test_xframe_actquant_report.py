@@ -12,7 +12,23 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
-from xframe_actquant_report import q8_0_quant, rel  # noqa: E402
+from xframe_actquant_report import q8_0_quant, rel, select_targets  # noqa: E402
+
+
+def test_select_targets_prefers_larger_matrices():
+    cands = [("a.small", 100), ("b.big", 10_000), ("c.mid", 5_000)]
+    assert select_targets(cands, 2) == ["b.big", "c.mid"]
+
+
+def test_select_targets_is_deterministic_on_ties():
+    # 参数量相同 ⇒ 按名字定序（避免每次跑测到不同目标）
+    cands = [("z", 10), ("a", 10), ("m", 10)]
+    assert select_targets(cands, 2) == ["a", "m"]
+
+
+def test_select_targets_handles_fewer_candidates_than_requested():
+    assert select_targets([("only", 5)], 4) == ["only"]
+    assert select_targets([], 4) == []
 
 
 def test_q8_0_quant_is_blockwise_and_uses_f16_scale():
