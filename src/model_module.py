@@ -79,6 +79,12 @@ from koakuma_engine import backend_capabilities, select_backend
 
 import model_config as mc
 
+try:  # ⚠️ **必须平铺导入**：`relay_precision` 带**进程级状态**（两侧档位登记 + 判据缓存）；
+    #    若这里用 `src.relay_precision` 而别处用 `relay_precision`，Python 会当成两个模块 ⇒
+    #    状态各存一份、登记互不可见、对齐检查永不触发（与 `llama_engine` 同规）。
+    from relay_precision import note_upstream_precision as _note_upstream_precision
+except ImportError:  # pragma: no cover - 兜底：极少数以 `src` 为根的导入场景
+    from src.relay_precision import note_upstream_precision as _note_upstream_precision
 logger = logging.getLogger(__name__)
 
 #: 匹配 `<root>layers.<i>.` 形式的权重 key（Qwen 系各包装器共用该形态）。
@@ -1712,6 +1718,13 @@ class ModelManager:
             mgr.load_layer_range(16, 24, has_embedding=False, has_lm_head=True)
         """
         import torch.nn as nn
+
+        # ★ 2026-10-08：登记**上游层段**的量化档，供两侧精度对齐诊断（见 `src/relay_precision.py`）。
+        #    只记录，**不改变任何加载行为**；优先级：路径标记（`*-f16-dequant` 等）> `quant_type` 意图。
+        _note_upstream_precision(
+            model_path=model_path or self._full_model_path or self._model_path or MODEL_PATH,
+            quant_type=quant_type or QUANT_TYPE,
+        )
 
         # Resolve the active model before validating the assignment. DeepSeek
         # has 28 layers while the legacy Qwen project default has 24, and the

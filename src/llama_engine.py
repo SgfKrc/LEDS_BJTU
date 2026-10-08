@@ -44,6 +44,44 @@ from ctypes import byref
 from pathlib import Path
 from typing import Optional, Dict, Any, Iterator, List
 
+# ⚠️ **必须平铺导入**（与 `keep_head_shim` 同规）：`relay_precision` 带**进程级状态**
+#    （两侧档位登记 + 判据缓存）。若这里写 `from src.relay_precision import ...`，
+#    而别处用 `from relay_precision import ...`，Python 会把它们当成**两个模块**，
+#    状态各存一份 ⇒ 登记互不可见、检查永不触发（实测踩过，静默失效）。
+from relay_precision import (
+    RelayPrecisionMismatch as _RelayPrecisionMismatch,
+    check_relay_precision as _check_relay_precision,
+    note_downstream_precision as _note_downstream_precision,
+)
+
+
+def _note_relay_downstream_precision(engine) -> None:
+    """登记**下游裁层工件**的量化档并检查两侧精度对齐（2026-10-08）。
+
+    档位取 GGUF 的 `general.file_type`（**权威**，实测 `'1'`=f16、`'15'`=Q4_K_M），
+    退化时才看路径标记/`quant_type`。
+
+    ★ 只**记录**：默认 WARN 一次（按档位对去重），`QLH_RELAY_PRECISION_STRICT=1` 才 fail-loud。
+    **不改变任何路由或准入语义**；判据来源与数值见 `src/relay_precision.py`。
+    ⚠️ 除 `RelayPrecisionMismatch`（严格模式的**故意** fail-loud）外，一切异常都吞掉 ——
+    精度诊断绝不能影响推理本身。
+    """
+    try:
+        metadata = {}
+        model = getattr(engine, "_model", None)
+        if model is not None:
+            metadata = getattr(model, "metadata", None) or {}
+        _note_downstream_precision(
+            metadata=metadata,
+            model_path=getattr(engine, "_model_path", None),
+            quant_type=getattr(engine, "_quant_type", None),
+        )
+        _check_relay_precision(logger=logging.getLogger(__name__))
+    except _RelayPrecisionMismatch:
+        raise
+    except Exception:  # noqa: BLE001 - 诊断路径绝不影响推理
+        pass
+
 logger = logging.getLogger(__name__)
 
 # 默认推荐量化类型 → GGUF 文件名
@@ -2166,6 +2204,8 @@ class LlamaCppEngine:
         """
         if not self.is_loaded:
             return None
+        # ★ 2026-10-08：登记下游工件量化档 + 检查两侧精度对齐（默认只 WARN，不拦截）。
+        _note_relay_downstream_precision(self)
         import ctypes
 
         import numpy as np
