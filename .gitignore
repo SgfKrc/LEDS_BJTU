@@ -237,6 +237,7 @@ scripts/*
 !scripts/relay_artifact_manifest.py
 !scripts/xframe_divergence_report.py
 !scripts/xframe6_recursion_report.py
+!scripts/xframe_reduction_order_report.py
 !scripts/relay_ssh_tunnel.py
 !scripts/relay_y700_build.sh
 !scripts/edge_import_audit.py
