@@ -137,6 +137,48 @@ class TestFormatMetrics:
         )
         assert "已请求分布式，实际本地" in text
 
+    def test_distributed_used_true_is_shown_with_evidence(self):
+        """★ 2026-10-08：真分布式必须**显式**显示 + 承层证据。
+
+        旧规则下 `distributed_used=True` 与「metrics 里根本没这个字段」渲染结果
+        完全一样 ⇒ 用户只能靠吞吐速度猜是不是分布式。
+        """
+        text = format_metrics(
+            {"engine": "distributed_pipeline",
+             "execution_mode": "route_a_stage_offer_v3",
+             "distributed_requested": True, "distributed_used": True,
+             "layer_segments": [[8, 15], [16, 23]]},
+        )
+        assert "分布式 ✓" in text
+        assert "2 段·层 8-23" in text
+
+    def test_distributed_used_false_is_explicit_not_silent(self):
+        """★ 静默回退对策：后端**明确**给了 `distributed_used=False` 就必须说"本地执行"。
+
+        这一条正是「整模回退伪装成普通本地推理」在 UI 上的对策：`execution_mode`
+        可能仍显示得像分布式，只有这个字段能戳破。
+        """
+        text = format_metrics(
+            {"engine": "pytorch", "execution_mode": "local", "distributed_used": False,
+             "fallback": True,
+             "fallback_reason": "pipeline_failed_then_local_pytorch: model_identity_mismatch"},
+        )
+        assert "本地执行" in text
+        assert "model_identity_mismatch" in text
+
+    def test_claimed_layers_used_when_no_segments(self):
+        text = format_metrics({"distributed_used": True, "claimed_layers": [4, 19]})
+        assert "层 4-19" in text
+
+    def test_workers_used_as_evidence_fallback(self):
+        text = format_metrics({"distributed_used": True, "workers_used": ["y700-1"]})
+        assert "1 个 worker" in text
+
+    def test_no_distributed_field_keeps_footer_unchanged(self):
+        """没有该字段时**不得**擅自宣称本地（旧行为保持）。"""
+        assert format_metrics({"engine": "llama_cpp", "execution_mode": "local"}) == (
+            "llama_cpp · local")
+
     def test_history_not_committed(self):
         text = format_metrics({}, history_committed=False)
         assert "历史未提交" in text

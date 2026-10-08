@@ -237,6 +237,33 @@ def load_local_chat_image(path_value: str) -> Dict[str, Any]:
 # metrics 格式化（done 事件）
 # ============================================================
 
+def _distributed_evidence(metrics: Dict[str, Any]) -> str:
+    """远端**实际承了哪段层**的短证据串（无证据则空串）。
+
+    为什么需要（2026-10-08）：`execution_mode=route_a_stage_offer_v3` 只说明**选了哪条
+    路由协议**，不证明远端真的执行了 —— 两者在旧 footer 里长得一模一样，于是用户只能
+    靠「吞吐变慢」反推是不是分布式。这里把 metrics 里已有的承层事实（`layer_segments`
+    / `claimed_layers` / `workers_used`，见 `scheduler_pipeline` 的 route A metrics）
+    压成一段短串，让「分布式」可核验而不是仅声明。
+    """
+    segments = metrics.get("layer_segments")
+    if isinstance(segments, (list, tuple)) and segments:
+        try:
+            return f"（{len(segments)} 段·层 {int(segments[0][0])}-{int(segments[-1][1])}）"
+        except (TypeError, ValueError, IndexError):
+            return f"（{len(segments)} 段）"
+    claimed = metrics.get("claimed_layers")
+    if isinstance(claimed, (list, tuple)) and len(claimed) == 2:
+        try:
+            return f"（层 {int(claimed[0])}-{int(claimed[1])}）"
+        except (TypeError, ValueError):
+            pass
+    workers = metrics.get("workers_used")
+    if isinstance(workers, (list, tuple)) and workers:
+        return f"（{len(workers)} 个 worker）"
+    return ""
+
+
 def format_metrics(
     metrics: Optional[Dict[str, Any]] = None,
     *,
@@ -246,6 +273,16 @@ def format_metrics(
 
     展示规则（§9.5）：只读取完成事件中的实际字段；fallback 必须展示原因；
     history_committed=false 必须提示。
+
+    ★ 2026-10-08（分布式可核验）：`distributed_used` **无论真假都要显式呈现**。
+    旧规则只在「请求了分布式但没用」时才提示，于是下面三种情况在界面上**完全一样**：
+    ① 真的分布式；② 请求了但静默退回本地；③ 请求根本没带分布式意图 —— 用户只能靠
+    吞吐速度猜（实测反馈：跑通一次却无法确认是不是真分布式）。现在：
+
+    * `distributed_used=True` ⇒ `分布式 ✓` ＋ 承层证据（远端实际承了哪段层）；
+    * 请求了但没用 ⇒ `⚠️ 已请求分布式，实际本地`（保留原措辞）；
+    * 后端**明确**给了 `distributed_used=False` ⇒ `⚠️ 本地执行（未用分布式）`
+      —— 这一条正是「整模回退伪装成普通本地推理」在 UI 上的对策。
     """
     metrics = metrics or {}
     parts: List[str] = []
@@ -263,8 +300,12 @@ def format_metrics(
             parts.append(f"{tok_s} tok/s")
     if metrics.get("fallback"):
         parts.append(f"⚠️ 回退: {metrics.get('fallback_reason', '未知')}")
-    if metrics.get("distributed_requested") and not metrics.get("distributed_used"):
-        parts.append("已请求分布式，实际本地")
+    if metrics.get("distributed_used"):
+        parts.append(f"分布式 ✓{_distributed_evidence(metrics)}")
+    elif metrics.get("distributed_requested"):
+        parts.append("⚠️ 已请求分布式，实际本地")
+    elif "distributed_used" in metrics:
+        parts.append("⚠️ 本地执行（未用分布式）")
     if history_committed is False:
         parts.append("历史未提交")
     return " · ".join(parts)
