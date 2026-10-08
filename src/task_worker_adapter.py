@@ -1205,6 +1205,11 @@ class RemoteFullWorkerProvider:
                 max(0.001, float(attempt.accept_timeout_seconds)),
             ),
         )
+        # ★ 2026-10-09（接口税量化 · 方向2）：把一次 stage 往返拆成「发出→accept」与
+        #   「accept→result」两段。此前只有 stage 总耗时（docs #62 的 `s`），无法分辨
+        #   固定开销落在哪一次往返上，也无法验证 WiFi lock 是否真的压低了层段 RTT。
+        #   短字段名（`a=`/`r=`）：master.log 的 stdout 重定向会把每行截断在 ~119 字符。
+        _t_send = time.perf_counter()
         try:
             self._wait(
                 pending.accept_event,
@@ -1227,6 +1232,7 @@ class RemoteFullWorkerProvider:
                 code="remote_stage_not_accepted",
                 provider_id=self.provider_id,
             )
+        _t_accept = time.perf_counter()
         try:
             self._wait(
                 pending.result_event,
@@ -1243,6 +1249,11 @@ class RemoteFullWorkerProvider:
             if exc.code in ("provider_cancelled", "lease_expired"):
                 self.cancel(attempt.attempt_id)
             raise
+        logger.info(
+            "perf2 a=%.0f r=%.0f",
+            (_t_accept - _t_send) * 1000.0,
+            (time.perf_counter() - _t_accept) * 1000.0,
+        )
         if pending.result is None:
             raise ProviderExecutionError(
                 "remote worker returned no Stage result",
