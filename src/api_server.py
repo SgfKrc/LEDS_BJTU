@@ -4004,6 +4004,30 @@ def _execute_chat_full(
     if req.routing_preference == "distributed_required":
         raise HTTPException(503, "distributed_required 执行失败：当前引擎未完成分布式流水线")
 
+    # ---- 流水线失败 ⇒ 整模回退守卫（★ 2026-10-09：**引擎无关**）----
+    #   ★ 原先只覆盖 llama.cpp / 孤岛（下面那个分支），PyTorch 路径漏了 ⇒ pipeline 尝试
+    #   失败后会**静默坠入整模**：`ensure_full_model()` 对 distributed-only 模型抛
+    #   RuntimeError，随后被函数尾部的 `except Exception` 泛化成
+    #   `500 推理失败: 当前模型以分布式专用模式准备…`，真实原因（`pipeline_failure_reason`）
+    #   在响应里彻底丢失。实测代价：64-token 请求 duration 仅 2779ms、没有任何 Route-A
+    #   prefill 却报 500，排查时把"为什么没走分布式"误导成了"路由判据问题"（实际与
+    #   max_new_tokens 无关）。这里把它提到引擎分支之前，失败即**具名 503**。
+    if pipeline_attempted:
+        ensure_full_guard = getattr(model_manager, "ensure_full_model", None)
+        if not callable(ensure_full_guard):
+            raise HTTPException(
+                503,
+                "分布式流水线失败且当前引擎不提供整模回退校验",
+            )
+        try:
+            ensure_full_guard()
+        except Exception as exc:
+            raise HTTPException(
+                503,
+                "分布式流水线失败（原因: "
+                f"{pipeline_failure_reason or '未记录'}），整模回退已拒绝: {exc}",
+            ) from exc
+
     # ---- llama.cpp / 孤岛引擎路径（整请求推理，不参与层拆分）----
     if backend_id_for(model_manager) in ("llama_cpp", "island"):
         if pipeline_attempted:
