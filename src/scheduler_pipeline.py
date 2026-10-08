@@ -1679,12 +1679,22 @@ class SchedulerPipelineMixin:
         #   wire 大小。输入与中间段输出（`hidden_out_f32`）同尺寸，所以一次预检覆盖往返；
         #   超限时在 reserve/execute 之前以稳定 reason 结束 —— 不再让大 payload 走到
         #   「执行完成后才 `message_too_large`」。
+        # ★ 2026-10-09（接口税）：`chunked_input` 探测内含 `control.status(role="master")` 的
+        #   **全量 worker capabilities 深拷贝**，而此前每步每段都无条件执行 —— decode 每步
+        #   hidden 仅 ~11.5KB，远低于 8.1MB 单帧预算 ⇒ 探测结果必然用不上（白付深拷贝）。
+        #   改为只在实际超预算时才查询；fits 时 `_assert_layer_stage_offer_fits_frame` 本就
+        #   提前 return（不看该参数），故**语义完全等价**。
+        _fits_single_frame = hidden_fits_stage_frame(n_tokens, n_embd, "float32")
         _assert_layer_stage_offer_fits_frame(
             node_id=str(node_id), n_tokens=n_tokens, n_embd=n_embd,
             # ★ 2026-10-08（DIST-NEXT-2b）：对端声明 `stage_chunked_input` ⇒ 超预算的
             #   hidden 交由 provider 切 `stage_chunk` 分片发送，不在此提前拒绝。
-            chunked_input=_node_declares_stage_chunked_input(
-                getattr(self, "_task_worker_control", None), str(node_id),
+            chunked_input=(
+                False
+                if _fits_single_frame
+                else _node_declares_stage_chunked_input(
+                    getattr(self, "_task_worker_control", None), str(node_id),
+                )
             ),
         )
         hidden_spec = {
