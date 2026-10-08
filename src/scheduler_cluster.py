@@ -1905,7 +1905,8 @@ class SchedulerClusterMixin:
             return None
 
 
-    def _snapshot_nodes(self, network_path: dict | None = None) -> dict:
+    def _snapshot_nodes(self, network_path: dict | None = None, *,
+                        capacity: Optional[dict] = None) -> dict:
         with self._nodes_lock:
             snapshot = {
                 node_id: info.to_dict()
@@ -1922,14 +1923,125 @@ class SchedulerClusterMixin:
                 )
                 if target_id is not None:
                     snapshot[target_id]["network_path"] = network_path
-            return snapshot
+
+        # ★ 2026-10-08 第 4 条静默路径：`state=online` 只说明心跳在发，不说明该节点
+        #   在流水线里干活（Y700 重装清空 DataStore 后即如此：online 但 capacity 的
+        #   `worker_count=0`、它只在 `control_only_nodes` 里）。这里把"是否参与"与
+        #   "被排除的原因"一并投影到节点上，避免必须交叉 /cluster/nodes 与
+        #   /cluster/pipeline-capacity 两个端点才能看出它其实没在干活。
+        capacity = capacity if capacity is not None else self._pipeline_capacity_status_snapshot()
+        participating = set(capacity.get("participating_node_ids") or ())
+        control_only = set(capacity.get("control_only_nodes") or ())
+        admitted = capacity.get("admitted")
+        plan_reason = str(capacity.get("reason_code", "") or "")
+        for node_id, item in snapshot.items():
+            is_participating = node_id in participating
+            item["pipeline_participating"] = is_participating
+            if is_participating:
+                exclusion_reason = ""
+            elif node_id in control_only:
+                exclusion_reason = "capacity_plan_control_only"
+            elif admitted is False:
+                exclusion_reason = plan_reason or "capacity_plan_rejected"
+            elif admitted is None:
+                exclusion_reason = "capacity_plan_unknown"
+            else:
+                exclusion_reason = "capacity_plan_unassigned"
+            item["pipeline_exclusion_reason"] = exclusion_reason
+        return snapshot
+
+    def _pipeline_capacity_status_snapshot(self) -> dict:
+        """Project the current pipeline capacity decision onto the status API.
+
+        The cached decision (active plan, else the in-flight load transaction)
+        wins, so a poller never disturbs admission state. When nothing is
+        cached it asks the solver once — the same call behind
+        ``/api/cluster/pipeline-capacity``, measured side-effect-free at
+        ~20 ms — because reporting ``unknown`` whenever the cache is cold would
+        hide the very "why" this projection exists to expose.
+        """
+        with self._layer_config_lock:
+            active = (
+                dict(self._active_pipeline_capacity_plan)
+                if self._active_pipeline_capacity_plan else None
+            )
+            transaction = self._pipeline_load_transaction
+            transaction_plan: Optional[dict] = None
+            transaction_snapshot: Optional[dict] = None
+            if transaction:
+                transaction_plan = dict(transaction.get("plan", {}) or {})
+                transaction_snapshot = {
+                    "transaction_phase": str(transaction.get("phase", "") or ""),
+                    "prepared_node_count": len(transaction.get("prepared_nodes", set()) or ()),
+                    "ready_node_count": len(transaction.get("ready_nodes", set()) or ()),
+                    "worker_count": len(transaction.get("worker_ids", set()) or ()),
+                }
+
+        plan: Optional[dict] = None
+        if active:
+            plan = active
+        elif transaction_plan:
+            transaction_plan.update(transaction_snapshot or {})
+            plan = transaction_plan
+        if not plan:
+            try:
+                solved = self.get_pipeline_capacity_plan()
+            except Exception:
+                logger.warning(
+                    "event=pipeline_capacity_status_projection_failed", exc_info=True
+                )
+                solved = None
+            if isinstance(solved, dict) and solved:
+                plan = dict(solved)
+
+        if not plan:
+            return {
+                "status": "unknown",
+                "admitted": None,
+                "reason_code": "pipeline_capacity_not_computed",
+                "reason": "",
+                "participating_node_ids": [],
+                "control_only_nodes": [],
+                "worker_count": 0,
+                "prepared_node_count": 0,
+                "ready_node_count": 0,
+                "transaction_phase": "",
+                "require_distributed": False,
+            }
+
+        assignments = plan.get("assignments") or []
+        participating = [
+            str(item.get("node_id", ""))
+            for item in assignments
+            if isinstance(item, dict) and item.get("node_id")
+        ]
+        return {
+            "status": str(plan.get("status", "") or ""),
+            "admitted": plan.get("admitted") is True,
+            "reason_code": str(plan.get("reason_code", "") or ""),
+            "reason": str(plan.get("reason", "") or ""),
+            "plan_id": str(plan.get("plan_id", "") or ""),
+            "participating_node_ids": participating,
+            "participating_node_count": int(
+                plan.get("participating_node_count", len(participating)) or 0
+            ),
+            "control_only_nodes": [
+                str(item) for item in (plan.get("control_only_nodes") or ())
+            ],
+            "worker_count": int(plan.get("worker_count", 0) or 0),
+            "prepared_node_count": int(plan.get("prepared_node_count", 0) or 0),
+            "ready_node_count": int(plan.get("ready_node_count", 0) or 0),
+            "transaction_phase": str(plan.get("transaction_phase", "") or ""),
+            "require_distributed": bool(plan.get("require_distributed", False)),
+        }
 
 
     def get_status(self) -> dict:
         """获取系统整体状态（含节点详情和 TCP 连接信息）"""
         self._refresh_http_client_states()
         network_path = self._get_local_network_path_view()
-        node_status = self._snapshot_nodes(network_path)
+        capacity_snapshot = self._pipeline_capacity_status_snapshot()
+        node_status = self._snapshot_nodes(network_path, capacity=capacity_snapshot)
 
         current_task = None
         if self._current_task:
@@ -1980,6 +2092,7 @@ class SchedulerClusterMixin:
             "tcp_client": tcp_client_info,
             "nodes_ready": self.check_nodes_ready(),
             "pipeline": pipeline_info,
+            "pipeline_capacity": capacity_snapshot,
             "qwen3_pipeline_dry_run": self.get_qwen3_pipeline_dry_run_status(),
             "pipeline_queue": queue_info,
         }

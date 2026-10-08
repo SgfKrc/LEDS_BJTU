@@ -1368,6 +1368,10 @@ class NodeDetail(BaseModel):
     error_count: int = 0
     is_available: bool = False
     network_path: Optional[dict] = None
+    # 「在线但不干活」可见化：state=online 只代表心跳还在，这两个字段说明该节点
+    # 是否真的落在流水线容量计划里，以及没落进去时的原因码。
+    pipeline_participating: bool = False
+    pipeline_exclusion_reason: str = ""
 
 
 class ClusterStatus(BaseModel):
@@ -1377,6 +1381,8 @@ class ClusterStatus(BaseModel):
     current_task: Optional[dict] = None
     tcp_server: Optional[dict] = None
     pipeline: Optional[dict] = None
+    # 只读投影：容量决策（admitted / reason_code / participating / control_only / worker_count）。
+    pipeline_capacity: Optional[dict] = None
     pipeline_queue: Optional[dict] = None
     network_path: Optional[dict] = None
 
