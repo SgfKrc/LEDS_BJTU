@@ -182,6 +182,85 @@ def _segment_bytes(
     return total
 
 
+# --------------------------------------------------------------------------- 分段收益账
+#: ★ 2026-10-09（③）：以下默认值**全部来自实测**（见 `docs/已知问题记录.md` #70/#71/#72）：
+#:   - master（RTX 4060，GPU）16 层 ≈ 49ms ⇒ **3.06 ms/层**
+#:   - Surface（Intel 集显轻薄本）：单段 53ms，减 2×3ms 往返 ⇒ **11.75 ms/层**；RTT **3ms**
+#:   - Y700（Android + llama.cpp）：单段 84ms，减 2×19ms 往返 ⇒ **11.5 ms/层**；RTT **19ms**
+#: 这些数字是"要不要把层分出去"的唯一依据，不要凭感觉改。
+MEASURED_MASTER_MS_PER_LAYER = 3.06
+MEASURED_TABLET_MS_PER_LAYER = 11.75
+MEASURED_TABLET_RTT_MS = 3.0
+MEASURED_ANDROID_MS_PER_LAYER = 11.5
+MEASURED_ANDROID_RTT_MS = 19.0
+#: 一次 stage 的固定往返**次数**：offer→accept、accept→result（实测 `perf2`，见 #70）。
+STAGE_ROUND_TRIPS = 2
+
+
+@dataclass(frozen=True)
+class SegmentEconomics:
+    """把 `n_layers` 交给某设备作为**独立段**的账。
+
+    判据（由实测分解推出）：一次 stage 要付 `STAGE_ROUND_TRIPS` 次跨机往返，故
+
+        值得 ⟺ n·c_master > STAGE_ROUND_TRIPS·rtt + n·c_device
+        ⟹ n > STAGE_ROUND_TRIPS·rtt / (c_master − c_device)   （仅当 c_master > c_device 有解）
+
+    ⇒ **若该设备单层耗时不低于 master，则任何层数都不值得** —— 它不该参与逐 token 分段，
+    它的价值在**容量**（把装不下的模型切开），不在**速度**。这正是实测"去掉一个段 +49%"的成因。
+
+    ⚠️ 边界：这些 `c_*` 是**单请求、单 token**（batch=1）的值；合批后往返税与 `c_master`
+    都摊到 N 个请求上，不等式必须重算（见 #66/#70）。
+    """
+
+    n_layers: int
+    c_master_ms: float = MEASURED_MASTER_MS_PER_LAYER
+    c_device_ms: float = MEASURED_ANDROID_MS_PER_LAYER
+    rtt_ms: float = MEASURED_ANDROID_RTT_MS
+    round_trips: int = STAGE_ROUND_TRIPS
+
+    @property
+    def saved_ms(self) -> float:
+        """留在 master 上要花的时间。"""
+        return float(self.n_layers) * float(self.c_master_ms)
+
+    @property
+    def cost_ms(self) -> float:
+        """分出去要付的时间：固定往返税 + 对端自己算。"""
+        return (
+            float(self.round_trips) * float(self.rtt_ms)
+            + float(self.n_layers) * float(self.c_device_ms)
+        )
+
+    @property
+    def net_ms(self) -> float:
+        """净收益（正=值得分出去）。"""
+        return self.saved_ms - self.cost_ms
+
+    @property
+    def worthwhile(self) -> bool:
+        """严格大于 0 才算值得（恰好打平不值得——多一次往返就亏）。"""
+        return self.net_ms > 0.0
+
+    @property
+    def min_layers(self) -> float | None:
+        """达到盈亏平衡所需的最少层数；该设备**注定不划算**时返回 `None`。"""
+        gain = float(self.c_master_ms) - float(self.c_device_ms)
+        if gain <= 0.0:
+            return None
+        return float(self.round_trips) * float(self.rtt_ms) / gain
+
+
+def segment_worthwhile(
+    n_layers: int,
+    c_master_ms: float = MEASURED_MASTER_MS_PER_LAYER,
+    c_device_ms: float = MEASURED_ANDROID_MS_PER_LAYER,
+    rtt_ms: float = MEASURED_ANDROID_RTT_MS,
+) -> bool:
+    """便捷判据：把 `n_layers` 交给该设备是否值得（细节见 `SegmentEconomics`）。"""
+    return SegmentEconomics(n_layers, c_master_ms, c_device_ms, rtt_ms).worthwhile
+
+
 def legal_cuts(total_layers: int, *, cut_multiple: int = 1,
                min_layers_per_segment: int = 1) -> tuple[int, ...]:
     """合法切点集合：满足步长约束、且切点两侧都留够层数。
