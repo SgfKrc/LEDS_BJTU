@@ -5900,6 +5900,12 @@ class SchedulerPipelineMixin:
                     import numpy as _np
 
                     local_input_ids = _np.array([[new_token_id]], dtype=_np.int64)
+                # ★ 2026-10-09（接口税量化）：per-step 分解打点。此前只有三段**近似**值
+                #   （相邻日志时间戳之差）—— 无法区分「master 本地算」与「等对端」，
+                #   于是 54.5ms 的 master 段里到底多少是 GPU→CPU 同步纯属猜测。
+                #   这三个时间戳把一步拆成：fwd（本地层前向）/ hidden（GPU→CPU 同步 +
+                #   形状整理）/ stage（全部层段 offer，含网络往返 + 对端计算）。
+                _perf_t_fwd = time.perf_counter()
                 local_result = mgr.forward_layers(
                     input_ids=local_input_ids,
                     attention_mask=attention_mask if is_prefill else None,
@@ -5907,6 +5913,7 @@ class SchedulerPipelineMixin:
                     use_cache=True,
                     apply_lm_head=False,
                 )
+                _perf_t_hid = time.perf_counter()
                 if local_result.get("cache") is not None or local_result.get("past_key_values"):
                     with self._kv_cache_lock:
                         self._kv_cache[task_id] = _prefer_cache_state(local_result)
@@ -5938,6 +5945,7 @@ class SchedulerPipelineMixin:
                     else [prompt_len + step - 1] * n_tokens
                 )
                 current_hidden = hidden
+                _perf_t_stage = time.perf_counter()
                 stage_token = None
                 for index, assignment in enumerate(stage_nodes):
                     last_stage = index == len(stage_nodes) - 1
@@ -5992,6 +6000,17 @@ class SchedulerPipelineMixin:
                             return {"response": "", "error": "route_a_middle_missing_hidden"}
                         current_hidden = stage_result["hidden_states"]
                         n_tokens = int(current_hidden.shape[0])
+                _perf_t_end = time.perf_counter()
+                # ★ 短格式：master.log 的每条消息在**写入端被截断到 ~119 字符**
+                #   （实测：`Route-A stage handoff:` 也正好停在 119）⇒ 时间戳 + `request_id=`
+                #   已占 75 字符，长字段会整段丢失。故这里用 `f=/h=/s=` 短名 + 整数毫秒。
+                logger.info(
+                    "perf step=%d f=%.0f h=%.0f s=%.0f",
+                    step,
+                    (_perf_t_hid - _perf_t_fwd) * 1000.0,
+                    (_perf_t_stage - _perf_t_hid) * 1000.0,
+                    (_perf_t_end - _perf_t_stage) * 1000.0,
+                )
                 if stage_token is None:
                     return {"response": "", "error": "route_a_stage_chain_empty"}
                 new_token_id = stage_token
