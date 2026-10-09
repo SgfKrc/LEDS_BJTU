@@ -269,6 +269,50 @@ def _manifest(identity: dict, k: int | None, dst: Path, kept: int, dropped: int,
     return result
 
 
+#: llama.cpp 要求**长度等于层数**的"按层数组"KV —— 裁层后必须同步裁剪，否则加载失败。
+#: （`#67` 缺口 ⑩：`_copy_kv` 对 ARRAY 是原样复制，长度不符会 throw。）
+_PER_LAYER_ARRAY_SUFFIXES = ("attention.recurrent_layers",)
+
+
+def _per_layer_array_overrides(reader, identity: dict, *, k: int | None = None,
+                               end: int | None = None,
+                               keep_head: int | None = None) -> tuple[dict, list]:
+    """★ `#67` 缺口 ⑩：按层数组型 KV 的**重写 + fail-closed 校验**。
+
+    llama.cpp 对这类 KV 要求长度 == 该模型层数；裁层后若仍原样复制，长度就不符。
+    这里按**与张量裁层完全相同的口径**取子数组（head ⇒ `[:N]`；tail/middle ⇒ `[k:end)`），
+    并在源长度不等于层数时**拒绝**（源不可信，绝不放行坏工件）。
+    """
+    overrides: dict = {}
+    problems: list[str] = []
+    n_layer = int(identity.get("n_layer") or 0)
+    if keep_head is not None:
+        lo, hi = 0, int(keep_head)
+    else:
+        lo = int(k or 0)
+        hi = int(end) if end is not None else n_layer
+    for name, field in reader.fields.items():
+        if not any(name.endswith(suffix) for suffix in _PER_LAYER_ARRAY_SUFFIXES):
+            continue
+        try:
+            value = list(field.contents())
+        except Exception as exc:  # noqa: BLE001 - 统一收成 problem
+            problems.append(f"按层数组 KV {name} 读取失败: {exc}")
+            continue
+        if len(value) != n_layer:
+            problems.append(
+                f"按层数组 KV {name} 长度={len(value)} ≠ 源模型层数 n_layer={n_layer}"
+                " —— llama.cpp 要求两者相等；原样复制到裁层工件会导致加载失败（源不可信）"
+            )
+            continue
+        sliced = value[lo:hi]
+        if len(sliced) != hi - lo:
+            problems.append(f"按层数组 KV {name} 裁剪异常: 期望 {hi - lo} 项，实得 {len(sliced)}")
+            continue
+        overrides[name] = sliced
+    return overrides, problems
+
+
 def _copy_kv(gguf, reader, writer, overrides: dict) -> int:
     def infer_type(value):
         if isinstance(value, bool):
@@ -401,6 +445,12 @@ def main() -> int:
     # ★ `#67`-③：层类型序列逐位校验（可选，给了 --hf-config 才做）。
     if args.hf_config:
         problems += _validate_layer_types(identity, Path(args.hf_config))
+    # ★ `#67`-⑩：按层数组型 KV（如 attention.recurrent_layers）。
+    #   校验放在 dry-run 之前 ⇒ `--dry-run` 也能提前发现这类坏源，而不是等到写出工件。
+    per_layer_overrides, per_layer_problems = _per_layer_array_overrides(
+        reader, identity, k=args.k, end=args.end, keep_head=args.keep_head,
+    )
+    problems += per_layer_problems
     keep, drop = _plan_tensors(reader, args.k, end=args.end, keep_head=args.keep_head)
     mode = _cut_mode(args.k, args.end, args.keep_head)
     if mode == "head":
@@ -442,6 +492,8 @@ def main() -> int:
     writer = gguf.GGUFWriter(str(dst), identity["architecture"])
     bc_name = f"{identity['architecture']}.block_count"
     overrides = {bc_name: kept_block_count}
+    # ★ `#67`-⑩：按层数组型 KV 已按同一口径裁剪 ⇒ 在此合并覆盖（原样复制会长度不符）。
+    overrides.update(per_layer_overrides)
     # ★ 2026-09-27：MTP（nextn）层是**原模型的最后一层**（实测 `qwen35-2b` 的 MTP tensor
     #   名为 `blk.24.nextn.*`，而 `block_count=25`）⇒ **只要它被裁掉/被截断，
     #   `nextn_predict_layers` 就必须归 0**。否则 llama.cpp 会把**最后一个普通层**当成 MTP 层、
