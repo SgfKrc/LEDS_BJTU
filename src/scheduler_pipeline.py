@@ -7747,7 +7747,11 @@ class SchedulerPipelineMixin:
         "pipeline_capacity_nodes_unavailable": "当前没有满足条件的可用节点",
         "pipeline_segment_contract_unsatisfied": "层段契约不满足（声明区间与所需区间不符）",
         "pipeline_layer_range_coverage_insufficient": "各节点声明的层区间覆盖不足",
-        "node_capacity_unavailable": "节点容量不足（内存/显存）",
+        "pipeline_capacity_single_node_insufficient": (
+            "区间被约束后，没有任何单个节点能在自己的空闲内存里装下所属层段"
+            "（总容量够，但切分后单节点不够 ⇒ 检查各节点空闲内存/降低精度）"
+        ),
+        "pipeline_distributed_capacity_insufficient": "分布式各节点总容量不足",        "node_capacity_unavailable": "节点容量不足（内存/显存）",
         "pipeline_capacity_rejected": "集群容量准入被拒",
         "pipeline_reshard_capacity_insufficient": "重新分片后容量不足",
         "model_identity_mismatch": "参与节点的模型身份不一致（算子/工件不匹配）",
