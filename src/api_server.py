@@ -987,6 +987,15 @@ def _run_exclusive_model_change(
                 try:
                     return change()
                 finally:
+                    # ★ 2026-10-09（稳定性 #73-④）：模型切换（无论成败）之后，必须把**失败态**的
+                    #   流水线加载事务复位 —— 否则它会一直停在 `aborted`/`rejected`，让
+                    #   `_synchronize_pipeline_workers_for_request` 永久判 not ready。
+                    #   实测复现：切到 GGUF 模型（master 引擎不支持）⇒ 事务 `aborted` ⇒ **之后
+                    #   每个请求都 503，连切回正确模型、甚至重启后端都无效**。
+                    #   只复位失败态；`committed` / `committing_local` 等正常态不动。
+                    _tx = getattr(scheduler, "_pipeline_load_transaction", None)
+                    if isinstance(_tx, dict) and str(_tx.get("phase") or "") in {"aborted", "rejected"}:
+                        scheduler._pipeline_load_transaction = None
                     _refresh_pipeline_layer_config()
                     if transition_started:
                         end_transition = getattr(

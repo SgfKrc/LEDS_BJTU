@@ -5114,7 +5114,15 @@ class SchedulerPipelineMixin:
                     transaction = self._pipeline_load_transaction or {}
                     phase = str(transaction.get("phase", "") or "")
                     plan = transaction.get("plan") or {}
-                if phase in {"rejected", "aborted", "invalidated"}:
+                if phase in {"rejected", "aborted"}:
+                    # ★ 2026-10-09（稳定性 #73-④）：**把 `invalidated` 从"不可恢复"里摘出来**。
+                    #   `invalidated` 是「模型被替换、事务正常作废」的标记（见 api_server 的
+                    #   `_invalidate_pipeline_load_transaction(reason_code="pipeline_model_changed")`），
+                    #   它**必须允许重新提交** —— 否则实测会出现：切一次模型（尤其切到 GGUF 这类
+                    #   master 引擎不支持的格式）后事务停在失败态，**之后每个请求都 503，连切回
+                    #   正确模型、甚至重启后端都无效**。
+                    #   而 `rejected`（本次容量计划不成立）与 `aborted`（本地提交失败）仍保持
+                    #   fail-closed；它们由模型切换路径的清理逻辑负责复位。
                     return {
                         **readiness,
                         "ready": False,
