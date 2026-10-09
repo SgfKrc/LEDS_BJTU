@@ -7736,6 +7736,71 @@ class SchedulerPipelineMixin:
                 self.pipeline_queue._current_task_id = None
 
 
+    # ★ 2026-10-09（#78 缺口 2）：`reason_code` → 用户可读的中文说明。
+    #   容量求解器给出的 code 是给机器看的（如 `pipeline_capacity_workers_unavailable`），
+    #   直接抛给用户等于没抛；这里补一层人话，让 UI 能自助诊断。
+    _PIPELINE_REASON_HINT = {
+        "pipeline_capacity_workers_unavailable": (
+            "没有可用的分层 worker（从节点未连上，或未声明/未通过校验层段工件）"
+        ),
+        "pipeline_distributed_workers_unavailable": "分布式放置至少需要两个可用节点",
+        "pipeline_capacity_nodes_unavailable": "当前没有满足条件的可用节点",
+        "pipeline_segment_contract_unsatisfied": "层段契约不满足（声明区间与所需区间不符）",
+        "pipeline_layer_range_coverage_insufficient": "各节点声明的层区间覆盖不足",
+        "node_capacity_unavailable": "节点容量不足（内存/显存）",
+        "pipeline_capacity_rejected": "集群容量准入被拒",
+        "pipeline_reshard_capacity_insufficient": "重新分片后容量不足",
+        "model_identity_mismatch": "参与节点的模型身份不一致（算子/工件不匹配）",
+        "pipeline_model_changed": "流水线准备期间模型被切换",
+    }
+
+    def _pipeline_unavailable_diagnostic(self) -> tuple:
+        """返回 `(reason_code, 人类可读说明)`，用于把「流水线不可用」的真实原因透给调用方/UI。
+
+        ★ 2026-10-09（#78 缺口 2）：此前回退路径只吐一句**硬编码**文案
+        「当前模型仅以分布式流水线模式准备，禁止整模回退；请等待从节点就绪」——
+        真因（如 `pipeline_capacity_workers_unavailable` = 从节点未声明工件）只留在
+        logcat 里，用户无从自助诊断。现在把容量求解器给出的 `reason_code` / `reason` /
+        `excluded_nodes` 一并带出去。
+        """
+        code = ""
+        parts = []
+        excluded = []
+        try:
+            txn = self._pipeline_load_transaction or {}
+            code = str(txn.get("reason_code") or "")
+            plan = txn.get("plan") if isinstance(txn.get("plan"), dict) else {}
+            if not code:
+                plan = plan or {}
+            reason_text = str(plan.get("reason") or "")
+            excluded = list(plan.get("excluded_nodes") or [])
+        except Exception:  # pragma: no cover - 诊断路径绝不抛
+            reason_text = ""
+            excluded = []
+        if not code:
+            active = getattr(self, "_active_pipeline_capacity_plan", None)
+            if isinstance(active, dict):
+                code = str(active.get("reason_code") or "")
+                reason_text = str(active.get("reason") or "") or reason_text
+                excluded = list(active.get("excluded_nodes") or []) or excluded
+        if not code:
+            return "", ""
+        hint = self._PIPELINE_REASON_HINT.get(code, "")
+        for item in (hint, reason_text):
+            if item:
+                parts.append(item)
+        if excluded:
+            preview = []
+            for node in excluded[:4]:
+                if isinstance(node, dict):
+                    nid = node.get("node_id") or node.get("id") or "?"
+                    why = node.get("reason") or node.get("reason_code") or ""
+                    preview.append(f"{nid}({why})" if why else str(nid))
+                else:
+                    preview.append(str(node))
+            parts.append("被排除的节点: " + ", ".join(preview))
+        return code, "；".join(parts)
+
     def _run_full_model_inference(self, prompt: str,
                                    max_new_tokens: int = 512,
                                    temperature: float = 0.7,
@@ -7750,12 +7815,27 @@ class SchedulerPipelineMixin:
         """
         mgr = self._host
         if mgr and getattr(mgr, "is_pipeline_prepared", False):
+            # ★ 2026-10-09（#78 缺口 2）：附上真实 `reason_code` + 人话说明 + 被排除的节点。
+            #   此前这里只吐硬编码文案，真因（如从节点未声明工件）只在 logcat 里，
+            #   用户看到「请等待从节点就绪」无从判断到底缺什么。
+            _code, _detail = "", ""
+            try:
+                _code, _detail = self._pipeline_unavailable_diagnostic()
+            except Exception:  # pragma: no cover - 诊断失败不影响主流程
+                pass
+            _suffix = ""
+            if _code:
+                _suffix = f"（原因: {_code}"
+                if _detail:
+                    _suffix += f" —— {_detail}"
+                _suffix += "）"
             return {
                 "response": "",
                 "error": (
                     "当前模型仅以分布式流水线模式准备，禁止整模回退；"
-                    "请等待从节点就绪或显式执行普通模型加载"
+                    "请等待从节点就绪或显式执行普通模型加载" + _suffix
                 ),
+                "reason_code": _code or "pipeline_full_model_fallback_forbidden",
             }
         if not mgr or not mgr.is_loaded:
             return {"response": "", "error": "模型未加载"}
@@ -7970,12 +8050,25 @@ class SchedulerPipelineMixin:
 
         mgr = self._host
         if mgr and getattr(mgr, "is_pipeline_prepared", False):
+            # ★ 2026-10-09（#78 缺口 2）：与非流式路径同样附上真实 reason_code + 人话说明。
+            _code, _detail = "", ""
+            try:
+                _code, _detail = self._pipeline_unavailable_diagnostic()
+            except Exception:  # pragma: no cover - 诊断失败不影响主流程
+                pass
+            _suffix = ""
+            if _code:
+                _suffix = f"（原因: {_code}"
+                if _detail:
+                    _suffix += f" —— {_detail}"
+                _suffix += "）"
             yield {
                 "done": True,
                 "error": (
                     "当前模型仅以分布式流水线模式准备，禁止整模回退；"
-                    "请等待从节点就绪或显式执行普通模型加载"
+                    "请等待从节点就绪或显式执行普通模型加载" + _suffix
                 ),
+                "reason_code": _code or "pipeline_full_model_fallback_forbidden",
             }
             return
         if not mgr or not mgr.is_loaded:
