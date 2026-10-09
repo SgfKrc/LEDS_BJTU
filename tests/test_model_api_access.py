@@ -20,7 +20,12 @@ def _request(host: str):
     return SimpleNamespace(client=SimpleNamespace(host=host))
 
 
-def test_model_api_defaults_to_loopback_only():
+def test_model_api_defaults_to_loopback_only(monkeypatch):
+    # ★ 2026-10-09（脆性修复）：本机会为 **tailscale 协作**配 `QLH_MODEL_API_TRUSTED_CIDRS`
+    #   （实测值 `100.64.0.0/10,fd7a:115c:a1e0::/48`），此时 `100.64.x` 属于"**显式受信**"
+    #   ⇒ 该断言就会失败。本用例验的是**默认（未配置任何 CIDR）**时的行为，因此必须**隔离环境**
+    #   —— 否则它会依赖"跑测试的机器有没有配过这个变量"，属于脆性测试（换网/加 tailscale 就红）。
+    monkeypatch.delenv("QLH_MODEL_API_TRUSTED_CIDRS", raising=False)
     assert is_model_api_source_trusted(_request("127.0.0.1")) is True
     assert is_model_api_source_trusted(_request("100.64.10.20")) is False
     assert is_model_api_source_trusted(SimpleNamespace(client=None)) is False

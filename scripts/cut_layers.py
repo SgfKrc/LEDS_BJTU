@@ -138,12 +138,156 @@ def _validate_cut(identity: dict, k: int | None = None, *,
     return problems
 
 
+def _validate_layer_types(identity: dict, hf_config: Path) -> list[str]:
+    """★ `#67` 缺口 ③：**层类型序列逐位校验**（fail-closed）。
+
+    为什么必须校验：llama.cpp **不读** HF 的 `layer_types`，而是按（裁层重编号后的）
+    **本地层号对 `full_attention_interval` 取模**推导层类型
+    （`android/.../llama.cpp/src/models/qwen35.cpp:21-27`：
+    `is_recr_impl[i] = (i+1) % full_attn_interval != 0`）。
+
+    ⇒ 若源模型的 `layer_types` **本身不遵循该规律**，则无论怎么切，重推序列都对不上，
+    加载必报 `missing tensor 'blk.x.<...>'`；而生成器此前**只挡整数倍、不挡这个**
+    ⇒ 会**静默产出一个坏工件**，直到设备上加载才炸。
+
+    这里只做"源是否可信"这一半；"工件加载后是否真的对"属 `#67` 缺口 ⑨（需真机加载）。
+    """
+    problems: list[str] = []
+    interval = identity.get("full_attention_interval")
+    n_layer = int(identity.get("n_layer") or 0)
+    if not interval:
+        problems.append(
+            "--hf-config 已给出，但源 GGUF 没有 full_attention_interval：无法做层类型校验"
+        )
+        return problems
+    try:
+        cfg = json.loads(Path(hf_config).read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - 校验路径统一收成 problem
+        problems.append(f"--hf-config 读取失败: {exc}")
+        return problems
+    # Qwen3.5 把文本侧参数放在 text_config 下；兼容直接平铺的写法。
+    tc = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else cfg
+    layer_types = list(tc.get("layer_types") or [])
+    if not layer_types:
+        problems.append("--hf-config 里找不到 layer_types（应为 text_config.layer_types）")
+        return problems
+    if len(layer_types) != n_layer:
+        problems.append(
+            f"layer_types 长度={len(layer_types)} ≠ 源模型层数 n_layer={n_layer}"
+            "（源不可信，拒绝裁层）"
+        )
+        return problems
+    for local, src_idx in enumerate(range(n_layer)):
+        want_full = (local + 1) % int(interval) == 0
+        got = layer_types[src_idx]
+        is_full = got == "full_attention"
+        if want_full != is_full:
+            problems.append(
+                f"layer_types[{src_idx}]={got!r}，但 llama.cpp 按 full_attention_interval="
+                f"{interval} 会把**本地第 {local} 层**重推为 "
+                f"{'full_attention' if want_full else 'linear_attention'}"
+                " —— 层类型会整体错位、加载必报 missing tensor（源不合法，拒绝裁层）"
+            )
+            break  # 一位不符即足以拒绝；逐位刷屏对现场无益
+    return problems
+
+
+#: `#67` 缺口 ④：每个 block 的**必需**张量（来自 `qwen35.cpp:66-93` 的 `create_tensor` 调用，
+#: 已剔除标注 `TENSOR_NOT_REQUIRED` 的 `wqkv`(`attn_qkv`) / `wqkv_gate`(`attn_gate`) / `output.weight`）。
+_REQUIRED_LINEAR_SUFFIXES = (
+    "attn_norm.weight", "post_attention_norm.weight",
+    "ssm_conv1d.weight", "ssm_dt.bias", "ssm_a", "ssm_beta.weight",
+    "ssm_alpha.weight", "ssm_norm.weight", "ssm_out.weight",
+    "ffn_gate.weight", "ffn_down.weight", "ffn_up.weight",
+)
+_REQUIRED_FULL_SUFFIXES = (
+    "attn_norm.weight", "post_attention_norm.weight",
+    "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+    "attn_q_norm.weight", "attn_k_norm.weight",
+    "ffn_gate.weight", "ffn_down.weight", "ffn_up.weight",
+)
+_REQUIRED_GLOBAL_SUFFIXES = ("token_embd.weight", "output_norm.weight")
+
+
+#: 哪些架构有"必需张量表"（目前只整理了 `qwen35`；其它架构跳过该校验）。
+_REQUIRED_TENSOR_ARCHITECTURES = ("qwen35",)
+
+
+def _validate_required_tensors(reader, identity: dict, *, k: int | None = None,
+                               end: int | None = None,
+                               keep_head: int | None = None) -> list[str]:
+    """★ `#67` 缺口 ④：**按层类型断言必需张量集合**（fail-closed）。
+
+    为什么必须校验：`qwen35.cpp` 的 `create_tensor` 决定哪些张量"必须有"，
+    缺任何一个都只在**设备上加载时**才炸（`missing tensor 'blk.x.<...>'`）。
+    现有源件齐全，所以此前从没暴露 —— 但生成器产出的工件若少了必需张量，
+    直到真机加载才发现，代价极高。
+
+    ⚠️ **只对已整理必需表的架构生效**（`_REQUIRED_TENSOR_ARCHITECTURES`）：其它架构的
+    张量清单与 qwen35 不同，用这张表校验会产生假阳性。
+
+    ⚠️ **层类型判据与 llama.cpp 严格一致**：按**（裁层重编号后的）本地层号**对
+    `full_attention_interval` 取模（`qwen35.cpp:25`）；该 KV 缺失时 llama.cpp 默认 4（`:22`），
+    这里同样默认 4，避免"我判它合法、llama.cpp 判它非法"。
+
+    ⚠️ 只做**存在性**断言，不校验形状/量化类型（后者属 ⑨ 的"加载自证"）。
+    """
+    problems: list[str] = []
+    arch = str(identity.get("architecture") or "")
+    if arch not in _REQUIRED_TENSOR_ARCHITECTURES:
+        return problems
+    names = {getattr(t, "name", "") for t in reader.tensors}
+    # ★ 代表性门控：**校验只在"源看起来是完整模型"时生效**。
+    #   判据用 `blk.0`（interval=4 时它是 linear 层）：源若连它的必需张量都不全，
+    #   那多半是测试用的最小合成件（只写 attn_norm 之类），不是本校验的对象。
+    #   否则每个测试都得造完整模型 fixture，而收益为零（它们测的是别的契约）。
+    if not all(f"blk.0.{suffix}" in names for suffix in _REQUIRED_LINEAR_SUFFIXES):
+        return problems
+    for suffix in _REQUIRED_GLOBAL_SUFFIXES:
+        if suffix not in names:
+            problems.append(f"缺少全局必需张量 {suffix}（qwen35.cpp 无条件 create_tensor）")
+    n_layer = int(identity.get("n_layer") or 0)
+    interval = int(identity.get("full_attention_interval") or 4)  # llama.cpp 缺省 4
+    if interval <= 1:
+        interval = 1
+    if keep_head is not None:
+        lo, hi = 0, int(keep_head)
+    else:
+        lo = int(k or 0)
+        hi = int(end) if end is not None else n_layer
+    missing: list[str] = []
+    for src_idx in range(lo, hi):
+        local = src_idx - lo
+        recr = (local + 1) % interval != 0
+        required = _REQUIRED_LINEAR_SUFFIXES if recr else _REQUIRED_FULL_SUFFIXES
+        kind = "linear" if recr else "full"
+        for suffix in required:
+            full_name = f"blk.{src_idx}.{suffix}"
+            if full_name not in names:
+                missing.append(f"{full_name}（{kind} 层必需）")
+    if missing:
+        head = "、".join(missing[:6])
+        more = f" 等共 {len(missing)} 个" if len(missing) > 6 else ""
+        problems.append(
+            f"保留区间内缺少**必需**张量：{head}{more}"
+            " —— 这些在 qwen35.cpp 里是 create_tensor 无条件要求的，"
+            "缺失会在设备加载时报 missing tensor（拒绝产出坏工件）"
+        )
+    return problems
+
+
 def _manifest(identity: dict, k: int | None, dst: Path, kept: int, dropped: int, *,
-              end: int | None = None, keep_head: int | None = None) -> dict:
+              end: int | None = None, keep_head: int | None = None,
+              kept_names: list[str] | None = None) -> dict:
     """产出一份可复算的 manifest（三种模式都覆盖）。
 
     `mode=head` / `mode=middle` 时 `contract` 段**标记为不适用** —— `relay_contract.RelayTrimPlan`
     只描述「丢弃前 K 层、保留到末尾」一种形态，用它描述上游段/中段会误导读者与下游校验。
+
+    ★ `#67`-⑥：`kept_names` 给出时，额外写 `artifact_contains` ——**显式**声明该工件带不带
+    `token_embd` / `output_norm` / `output.weight`，并给出 `can_serve_tail`（能否承担末段职责）。
+    此前下游只能靠「段类型 + 区间」反推，于是在 `LayerArtifactCatalog.kt` 里写出了与实际产物
+    矛盾的断言（"中间段没有 final_norm"，而实测 `tensors_kept=55` 明确含 `output_norm`）。
     """
     mode = _cut_mode(k, end, keep_head)
     if mode == "head":
@@ -189,6 +333,20 @@ def _manifest(identity: dict, k: int | None, dst: Path, kept: int, dropped: int,
         "first_local_layer_maps_to": first_local,
         "artifact_sha256": _sha256(dst) if dst.exists() else "",
     }
+    # ★ `#67`-⑥：显式声明归属（下游不必靠"段类型 + 区间"反推）。
+    if kept_names is not None:
+        names = set(kept_names)
+        has_tok = "token_embd.weight" in names
+        has_norm = "output_norm.weight" in names
+        has_out = "output.weight" in names
+        result["artifact_contains"] = {
+            "token_embd": has_tok,
+            "output_norm": has_norm,
+            "output_weight": has_out,
+            # 能否承担**末段**职责：需 final_norm，且末段要么有独立 output.weight，
+            # 要么 tie embeddings（此时 token_embd 兼作 lm_head）。
+            "can_serve_tail": bool(has_norm and (has_out or has_tok)),
+        }
     if mode != "tail":
         # `RelayTrimPlan` 只描述 tail 语义 ⇒ 上游段/中段**不给**可能误导的合同字段。
         result["contract"] = {"skipped": f"mode={mode} 不由 RelayTrimPlan 描述"}
@@ -213,6 +371,50 @@ def _manifest(identity: dict, k: int | None, dst: Path, kept: int, dropped: int,
     except Exception as exc:  # noqa: BLE001 - 合同属可选校验
         result["contract"] = {"error": f"{type(exc).__name__}: {exc}"}
     return result
+
+
+#: llama.cpp 要求**长度等于层数**的"按层数组"KV —— 裁层后必须同步裁剪，否则加载失败。
+#: （`#67` 缺口 ⑩：`_copy_kv` 对 ARRAY 是原样复制，长度不符会 throw。）
+_PER_LAYER_ARRAY_SUFFIXES = ("attention.recurrent_layers",)
+
+
+def _per_layer_array_overrides(reader, identity: dict, *, k: int | None = None,
+                               end: int | None = None,
+                               keep_head: int | None = None) -> tuple[dict, list]:
+    """★ `#67` 缺口 ⑩：按层数组型 KV 的**重写 + fail-closed 校验**。
+
+    llama.cpp 对这类 KV 要求长度 == 该模型层数；裁层后若仍原样复制，长度就不符。
+    这里按**与张量裁层完全相同的口径**取子数组（head ⇒ `[:N]`；tail/middle ⇒ `[k:end)`），
+    并在源长度不等于层数时**拒绝**（源不可信，绝不放行坏工件）。
+    """
+    overrides: dict = {}
+    problems: list[str] = []
+    n_layer = int(identity.get("n_layer") or 0)
+    if keep_head is not None:
+        lo, hi = 0, int(keep_head)
+    else:
+        lo = int(k or 0)
+        hi = int(end) if end is not None else n_layer
+    for name, field in reader.fields.items():
+        if not any(name.endswith(suffix) for suffix in _PER_LAYER_ARRAY_SUFFIXES):
+            continue
+        try:
+            value = list(field.contents())
+        except Exception as exc:  # noqa: BLE001 - 统一收成 problem
+            problems.append(f"按层数组 KV {name} 读取失败: {exc}")
+            continue
+        if len(value) != n_layer:
+            problems.append(
+                f"按层数组 KV {name} 长度={len(value)} ≠ 源模型层数 n_layer={n_layer}"
+                " —— llama.cpp 要求两者相等；原样复制到裁层工件会导致加载失败（源不可信）"
+            )
+            continue
+        sliced = value[lo:hi]
+        if len(sliced) != hi - lo:
+            problems.append(f"按层数组 KV {name} 裁剪异常: 期望 {hi - lo} 项，实得 {len(sliced)}")
+            continue
+        overrides[name] = sliced
+    return overrides, problems
 
 
 def _copy_kv(gguf, reader, writer, overrides: dict) -> int:
@@ -298,6 +500,10 @@ def main() -> int:
     ap.add_argument("--manifest", help="输出 manifest JSON 的路径")
     ap.add_argument("--verify-manifest", help="校验模式：对照该 manifest 检查 --src 工件")
     ap.add_argument("--dry-run", action="store_true", help="只列出影响，不写文件")
+    ap.add_argument("--hf-config", default=None,
+                    help="★ HF config.json（可选）：做 `#67`-③ **层类型序列逐位校验** —— "
+                         "源的 layer_types 必须与 llama.cpp 按 full_attention_interval 重推的"
+                         "序列一致，否则加载必报 missing tensor（fail-closed，拒绝产出坏工件）")
     args = ap.parse_args()
 
     src = Path(args.src)
@@ -340,6 +546,19 @@ def main() -> int:
         return 2
 
     problems = _validate_cut(identity, args.k, end=args.end, keep_head=args.keep_head)
+    # ★ `#67`-③：层类型序列逐位校验（可选，给了 --hf-config 才做）。
+    if args.hf_config:
+        problems += _validate_layer_types(identity, Path(args.hf_config))
+    # ★ `#67`-⑩：按层数组型 KV（如 attention.recurrent_layers）。
+    #   校验放在 dry-run 之前 ⇒ `--dry-run` 也能提前发现这类坏源，而不是等到写出工件。
+    per_layer_overrides, per_layer_problems = _per_layer_array_overrides(
+        reader, identity, k=args.k, end=args.end, keep_head=args.keep_head,
+    )
+    problems += per_layer_problems
+    # ★ `#67`-④：按层类型断言必需张量集合（同样放在 dry-run 之前）。
+    problems += _validate_required_tensors(
+        reader, identity, k=args.k, end=args.end, keep_head=args.keep_head,
+    )
     keep, drop = _plan_tensors(reader, args.k, end=args.end, keep_head=args.keep_head)
     mode = _cut_mode(args.k, args.end, args.keep_head)
     if mode == "head":
@@ -381,6 +600,8 @@ def main() -> int:
     writer = gguf.GGUFWriter(str(dst), identity["architecture"])
     bc_name = f"{identity['architecture']}.block_count"
     overrides = {bc_name: kept_block_count}
+    # ★ `#67`-⑩：按层数组型 KV 已按同一口径裁剪 ⇒ 在此合并覆盖（原样复制会长度不符）。
+    overrides.update(per_layer_overrides)
     # ★ 2026-09-27：MTP（nextn）层是**原模型的最后一层**（实测 `qwen35-2b` 的 MTP tensor
     #   名为 `blk.24.nextn.*`，而 `block_count=25`）⇒ **只要它被裁掉/被截断，
     #   `nextn_predict_layers` 就必须归 0**。否则 llama.cpp 会把**最后一个普通层**当成 MTP 层、
@@ -417,7 +638,8 @@ def main() -> int:
     print(f"[done] {dst}：保留 {len(keep)} 张量、丢弃 {len(drop)}")
 
     manifest = _manifest(identity, args.k, dst, len(keep), len(drop),
-                         end=args.end, keep_head=args.keep_head)
+                         end=args.end, keep_head=args.keep_head,
+                         kept_names=[new_name for _, new_name in keep])
     if args.manifest:
         Path(args.manifest).write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
                                        encoding="utf-8")

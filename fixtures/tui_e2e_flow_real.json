@@ -1,0 +1,85 @@
+{
+  "schema": "qlh.tui.e2e.flow.v1",
+  "title": "QLH TUI 端到端 flow（F3 档：真后端 + 真模型 + 真分布式层段）",
+  "plan": "docs/TUI端到端flow测试与答辩演示复用计划-2026-09-24.md",
+  "ticket": "CORE-TUI-E2E-01",
+  "tier": "F3",
+  "topology": "dual_host_physical",
+  "physical_dual_host": true,
+  "real_model_loaded": true,
+  "topology_note": "真后端（默认 127.0.0.1:8000，可用 QLH_TUI_E2E_REAL_HOST/PORT 覆盖）+ 真模型；若集群有 worker 则走真分布式层段。★ 判据包含「回复非空且不含后端错误文案」—— 这正是本档存在的理由：F1/DA 档用假后端，永远打不出真分布式，也抓不到「看着像成功、实际被拒且报错被藏起来」（见 docs/已知问题记录 #73）。",
+  "exit_codes": {
+    "assert": {"0": "全通过", "1": "有断言失败", "2": "环境缺失（等价 skip，不判失败）"},
+    "demo": {"0": "全 PASS", "1": "有 FAIL", "2": "环境缺失", "3": "有 DEGRADED"}
+  },
+  "nav_ids": [
+    "nav-chat", "nav-status", "nav-models", "nav-cluster", "nav-nodes",
+    "nav-queue", "nav-logs", "nav-device", "nav-settings", "nav-api"
+  ],
+  "steps": [
+    {
+      "id": "boot_real_backend",
+      "caption": "启动外壳 → 主界面（真后端，非 FakeApi）",
+      "actions": [
+        {"kind": "new_app", "api": "real"},
+        {"kind": "enter_main"}
+      ],
+      "expect": [
+        {"kind": "screen_is_main"},
+        {"kind": "nav_count", "value": 10},
+        {"kind": "page", "value": "page-chat"},
+        {"kind": "nav_index", "value": 0}
+      ]
+    },
+    {
+      "id": "status_screen_renders",
+      "caption": "状态屏可渲染（真后端下读 /api/status 不崩）",
+      "actions": [
+        {"kind": "click_nav", "page": "status"}
+      ],
+      "expect": [
+        {"kind": "page", "value": "page-status"},
+        {"kind": "nav_index", "value": 1}
+      ]
+    },
+    {
+      "id": "real_chat_not_rejected",
+      "caption": "聊天屏：发真消息 → 等回复 → 缓冲区非空且不含后端错误/拒绝文案（#73-①③）",
+      "actions": [
+        {"kind": "click_nav", "page": "chat"},
+        {"kind": "send_chat", "text": "你好，请只回答两个字：收到", "timeout": 300, "settle": 3}
+      ],
+      "expect": [
+        {"kind": "chat_reply",
+         "not_contains": [
+           "后端错误",
+           "禁止整模回退",
+           "分布式流水线失败",
+           "推理失败",
+           "Traceback",
+           "remote worker reported a Stage error",
+           "hidden 形状应为"
+         ]}
+      ]
+    },
+    {
+      "id": "long_reply_not_truncated",
+      "caption": "③ 生成不完整：清历史后发长回答 prompt → 回复应成型（≥200 字）且不含错误（用户截图实证的「中途截断」回归位）",
+      "actions": [
+        {"kind": "chat_command", "text": "/clear"},
+        {"kind": "send_chat", "text": "请详细列举你能做的十件事，每件用一句话说明", "timeout": 600, "settle": 4}
+      ],
+      "expect": [
+        {"kind": "chat_reply",
+         "min_chars": 200,
+         "not_contains": [
+           "后端错误",
+           "禁止整模回退",
+           "分布式流水线失败",
+           "推理失败",
+           "Traceback"
+         ]}
+      ]
+    }
+  ]
+}

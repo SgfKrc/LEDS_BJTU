@@ -32,6 +32,9 @@ from __future__ import annotations
 import logging
 import hashlib
 import json
+
+# ★ 2026-10-08（#53）：keep-head shim 的定位与 worker 侧共用同一事实源。
+from keep_head_shim import missing_shim_hint, resolve_keep_head_shim
 import math
 import os
 import re
@@ -40,6 +43,44 @@ import time
 from ctypes import byref
 from pathlib import Path
 from typing import Optional, Dict, Any, Iterator, List
+
+# ⚠️ **必须平铺导入**（与 `keep_head_shim` 同规）：`relay_precision` 带**进程级状态**
+#    （两侧档位登记 + 判据缓存）。若这里写 `from src.relay_precision import ...`，
+#    而别处用 `from relay_precision import ...`，Python 会把它们当成**两个模块**，
+#    状态各存一份 ⇒ 登记互不可见、检查永不触发（实测踩过，静默失效）。
+from relay_precision import (
+    RelayPrecisionMismatch as _RelayPrecisionMismatch,
+    check_relay_precision as _check_relay_precision,
+    note_downstream_precision as _note_downstream_precision,
+)
+
+
+def _note_relay_downstream_precision(engine) -> None:
+    """登记**下游裁层工件**的量化档并检查两侧精度对齐（2026-10-08）。
+
+    档位取 GGUF 的 `general.file_type`（**权威**，实测 `'1'`=f16、`'15'`=Q4_K_M），
+    退化时才看路径标记/`quant_type`。
+
+    ★ 只**记录**：默认 WARN 一次（按档位对去重），`QLH_RELAY_PRECISION_STRICT=1` 才 fail-loud。
+    **不改变任何路由或准入语义**；判据来源与数值见 `src/relay_precision.py`。
+    ⚠️ 除 `RelayPrecisionMismatch`（严格模式的**故意** fail-loud）外，一切异常都吞掉 ——
+    精度诊断绝不能影响推理本身。
+    """
+    try:
+        metadata = {}
+        model = getattr(engine, "_model", None)
+        if model is not None:
+            metadata = getattr(model, "metadata", None) or {}
+        _note_downstream_precision(
+            metadata=metadata,
+            model_path=getattr(engine, "_model_path", None),
+            quant_type=getattr(engine, "_quant_type", None),
+        )
+        _check_relay_precision(logger=logging.getLogger(__name__))
+    except _RelayPrecisionMismatch:
+        raise
+    except Exception:  # noqa: BLE001 - 诊断路径绝不影响推理
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -1974,18 +2015,17 @@ class LlamaCppEngine:
         self._keep_head = None
         self._keep_head_key = key
 
-        shim = os.environ.get("QLH_KEEP_HEAD_SHIM", "").strip()
+        # ★ 2026-10-08（#53）：定位收敛到 `keep_head_shim.resolve_keep_head_shim()` ——
+        #   与本模块此前内联的推导等价（环境变量 > 仓库默认构建产物），
+        #   但**两侧共用同一事实源**，避免 worker 侧只读环境变量而 master 侧能推导。
+        shim = resolve_keep_head_shim()
         if not shim:
             # shim 本体是 `qlh_keep_head.dll`（`qlh_kh_*` 入口在它里面）；同目录的
             # `libllama.dll` 只是它依赖的**带补丁** llama.cpp，不是 shim。
-            candidate = (Path(__file__).resolve().parent.parent
-                         / "build" / "keephead" / "build-cpu" / "bin" / "qlh_keep_head.dll")
-            if candidate.is_file():
-                shim = str(candidate)
-        if not shim:
             logger.error(
-                "keep-head 上游不可用：未找到 shim（可设 QLH_KEEP_HEAD_SHIM）；"
-                "拒绝交付语义不兼容的 embeddings hidden（docs/已知问题记录.md #35）")
+                "keep-head 上游不可用：%s；"
+                "拒绝交付语义不兼容的 embeddings hidden（docs/已知问题记录.md #35）",
+                missing_shim_hint())
             return None
         # ★ 2026-10-07：**删除了此前的 `qwen3*` 无条件拒绝判据**。
         #   旧判据依据「`nextn` 导出末层输出，各架构 `t_h_nextn` 挂点不同（qwen2 在
@@ -2164,6 +2204,8 @@ class LlamaCppEngine:
         """
         if not self.is_loaded:
             return None
+        # ★ 2026-10-08：登记下游工件量化档 + 检查两侧精度对齐（默认只 WARN，不拦截）。
+        _note_relay_downstream_precision(self)
         import ctypes
 
         import numpy as np

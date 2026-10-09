@@ -139,8 +139,20 @@ def _skip_reason(api=None) -> str:
         status = api.get("/status")
     except Exception as exc:  # noqa: BLE001
         return f"本机 master 后端不可达（F3 需先起 api_server）: {exc}"
-    if not isinstance(status, dict) or status.get("model_loaded") is not True:
-        return "本机 master 未加载完整模型（F3 前置：先加载模型）"
+    # ★ 2026-10-08：**不得用 `model_loaded` 当"就绪"判据**。
+    #   Route-A 层段模式下 master 按层段参与，`model_loaded` 会被**合法地**置 False
+    #   （语义见本文件 Route-A 用例的注记与 `routes_models.get_current_model`；
+    #   `/status.model_loaded` 与 `/models/current.loaded` 同源，都读 `model_host.model_loaded`）。
+    #   实测后果：先跑本文件的 Route-A 用例、再跑本用例时，跑前 `loaded=True`、跑完 `False`
+    #   ⇒ 本用例被**误 skip**（理由写"未加载完整模型"，指向了错误的修复方向）。
+    #   改判**可路由性**：capacity 能给出可用计划（v3 语义）即视为就绪，与"master 是整模
+    #   还是层段"无关；只有 capacity 也求不出来时才退回 `model_loaded` 兜底。
+    capacity_ready, capacity_reason = _pipeline_capacity_ready(api)
+    if not capacity_ready and (
+        not isinstance(status, dict) or status.get("model_loaded") is not True
+    ):
+        return ("F3 前置未满足：capacity 求不出可用计划"
+                f"（{capacity_reason or 'unknown'}），且本机 master 未加载完整模型")
     # ★ 2026-10-07：层段流水线（Route-A / 任务图）要求 **PyTorch** 引擎 —— llama.cpp 只能
     #   整模本地推理（`llama.cpp engine does not support layer-split pipeline`）。实测引擎
     #   不对时请求会静默落到 `local_llama_cpp`：既不产生 workflow，也没有 `distributed_used`
@@ -251,18 +263,60 @@ def test_dual_host_tui_routed_pipeline_streams_text():
             def _answer() -> str:
                 return _assistant_body(str(pane.query_one("#chat-log", Static).render()))
 
+            def _status() -> str:
+                return str(pane.query_one("#chat-status", Static).render())
+
             got = await wait_for(pilot, lambda: len(_answer()) >= 2, timeout=REPLY_TIMEOUT)
             if not got:
                 raise AssertionError(
                     f"真模型在 {REPLY_TIMEOUT:.0f}s 内未给出非空回答（Route-A 产物级判据）；"
                     f"已渲染文本（前 400 字）: "
                     f"{str(pane.query_one('#chat-log', Static).render())[:400]!r}")
-            return _answer()
+            # ★ 2026-10-08：等**状态行**落到 done 事件的 metrics —— 它是本条请求唯一
+            #   用户可见的分布式证据（`format_metrics` 输出含 `tok/s` 即为 metrics 已渲染）。
+            status_landed = await wait_for(
+                pilot, lambda: "tok/s" in _status() or "分布式" in _status(),
+                timeout=REPLY_TIMEOUT)
+            return _answer(), _status(), status_landed
 
-    answer = _run(_main())
+    answer, status_text, status_landed = _run(_main())
     assert len(answer) >= 2, f"回答过短: {answer!r}"
     for marker in ("流水线返回空响应", "当前没有可用的分布式路径", "distributed_required"):
         assert marker not in answer, f"回答里出现失败文案 {marker!r}: {answer[:200]!r}"
+
+    # --- ★ 2026-10-08：**分布式硬判据落在层段（Route-A）路径上** ---
+    # 背景（本轮更正）：任务图需整模加载、优先级低于层段路径，产品正常不放开 ⇒
+    # 「拿 workflow + distributed_used」那条判据天然不适用于默认路径，本档才是默认路径的主判据。
+    # 此前本档只断言"回答非空"⇒ 请求被静默回退本地也能过（实测那种情况回答同样非空）。
+    assert status_landed, (
+        f"状态行未落到 metrics（{REPLY_TIMEOUT:.0f}s）⇒ 无法判定分布式是否生效；"
+        f"状态行: {status_text!r}")
+    assert "分布式 ✓" in status_text, (
+        f"TUI 状态行未显示分布式生效 —— 请求可能被静默回退本地。状态行: {status_text!r}")
+    evidence = re.search(r"段·层\s*(\d+)-(\d+)", status_text)
+    assert evidence is not None, (
+        f"状态行缺少**承层证据**（远端实际承了哪段层）⇒ 无法核验'不是本地假装分布式'。"
+        f"状态行: {status_text!r}")
+    seg_start, seg_end = int(evidence.group(1)), int(evidence.group(2))
+    assert seg_start < seg_end, (
+        f"状态行承层区间非法: {seg_start}-{seg_end}；状态行: {status_text!r}")
+    # 交叉核验（防"本地假装分布式"）：UI 声称的承层区间必须与 capacity 规划的**远端**段有交叠。
+    # 若这次其实是本地整模在跑，段会落在 master 自己的区间上、与远端段不相交 ⇒ 这里会红。
+    capacity = control.get("/cluster/pipeline-capacity") or {}
+    remote_ranges = [
+        (int(item.get("start_layer")), int(item.get("end_layer")))
+        for item in (capacity.get("assignments") or [])
+        if str(item.get("node_id")) != "master"
+        and item.get("start_layer") is not None and item.get("end_layer") is not None
+    ]
+    assert remote_ranges, (
+        f"capacity 未给出任何远端段 ⇒ 无从核验'不是本地假装分布式'；capacity: "
+        f"{ {k: capacity.get(k) for k in ('admitted', 'status', 'reason_code', 'assignments')} }")
+    assert any(
+        not (seg_end <= start or seg_start >= end) for start, end in remote_ranges
+    ), (
+        f"状态行承层区间 {seg_start}-{seg_end} 与 capacity 的远端段 {remote_ranges} **无交叠** "
+        f"⇒ UI 声称的分布式与规划不符（疑似本地整模在跑）。状态行: {status_text!r}")
 
 
 def _pipeline_capacity_ready(api) -> tuple:
@@ -315,7 +369,18 @@ def _assistant_body(text: str) -> str:
 
 
 def test_dual_host_tui_distributed_end_to_end():
-    """★ F3 主判据：**TUI 真操作** ⇒ 真分布式执行 ⇒ `distributed_used=true`。
+    """★ F3 主判据（**任务图档**，默认不跑）：**TUI 真操作** ⇒ 任务图执行 ⇒ `distributed_used=true`。
+
+    ⚠️ 2026-10-08 更正（用户裁定）：**任务图需要整模加载，优先级低于层段（Route-A）路径，
+    产品正常情况下不放开它**。因此本档默认 skip —— 它失败只说明"没走任务图"，**不代表
+    分布式不可用**（层段路径才是默认路径）。层段侧的主判据见
+    `test_dual_host_tui_routed_pipeline_streams_text`。
+
+    实测反例（当作证据留档）：TUI 内 `/mode task_graph` 生效（`app.execution_mode
+    == "task_graph"` 断言通过），但同一请求的后端日志走的是 Route-A
+    （`Route-A 分配原始: raw=[('master',0,20,20,None),('android-21af7c52',20,24,4,
+    'stage_offer_v3')]` + 逐 step handoff）⇒ 不产生 workflow。这与"任务图优先级低"
+    一致，**不是缺陷**。
 
     操作序列（全部走 TUI，不绕过 UI 直调 `/api/chat`）：
     1. 验证集群已就绪（≥2 节点 online）—— 不就绪直接 skip（不虚构）；
@@ -327,6 +392,12 @@ def test_dual_host_tui_distributed_end_to_end():
     """
     from tui_api import ApiClient
     from tui_textual import KoakumaApp, MainScreen
+
+    if (os.environ.get("QLH_TUI_E2E_EXPECT_TASK_GRAPH") or "").strip() != "1":
+        pytest.skip(
+            "任务图需整模加载、优先级低于层段路径（产品正常不放开）⇒ 本档默认不跑；"
+            "要显式验证任务图路径请设 QLH_TUI_E2E_EXPECT_TASK_GRAPH=1。"
+            "分布式主判据请走层段档 test_dual_host_tui_routed_pipeline_streams_text")
 
     control = ApiClient(host=HOST, port=PORT, timeout=120.0)
     reason = _skip_reason(control)

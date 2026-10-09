@@ -987,6 +987,15 @@ def _run_exclusive_model_change(
                 try:
                     return change()
                 finally:
+                    # ★ 2026-10-09（稳定性 #73-④）：模型切换（无论成败）之后，必须把**失败态**的
+                    #   流水线加载事务复位 —— 否则它会一直停在 `aborted`/`rejected`，让
+                    #   `_synchronize_pipeline_workers_for_request` 永久判 not ready。
+                    #   实测复现：切到 GGUF 模型（master 引擎不支持）⇒ 事务 `aborted` ⇒ **之后
+                    #   每个请求都 503，连切回正确模型、甚至重启后端都无效**。
+                    #   只复位失败态；`committed` / `committing_local` 等正常态不动。
+                    _tx = getattr(scheduler, "_pipeline_load_transaction", None)
+                    if isinstance(_tx, dict) and str(_tx.get("phase") or "") in {"aborted", "rejected"}:
+                        scheduler._pipeline_load_transaction = None
                     _refresh_pipeline_layer_config()
                     if transition_started:
                         end_transition = getattr(
@@ -1368,6 +1377,10 @@ class NodeDetail(BaseModel):
     error_count: int = 0
     is_available: bool = False
     network_path: Optional[dict] = None
+    # 「在线但不干活」可见化：state=online 只代表心跳还在，这两个字段说明该节点
+    # 是否真的落在流水线容量计划里，以及没落进去时的原因码。
+    pipeline_participating: bool = False
+    pipeline_exclusion_reason: str = ""
 
 
 class ClusterStatus(BaseModel):
@@ -1377,6 +1390,8 @@ class ClusterStatus(BaseModel):
     current_task: Optional[dict] = None
     tcp_server: Optional[dict] = None
     pipeline: Optional[dict] = None
+    # 只读投影：容量决策（admitted / reason_code / participating / control_only / worker_count）。
+    pipeline_capacity: Optional[dict] = None
     pipeline_queue: Optional[dict] = None
     network_path: Optional[dict] = None
 
@@ -2385,6 +2400,35 @@ def _chat_origin(req: ChatRequest) -> str:
     return "web_http"
 
 
+def should_prefer_pytorch(prefer_flag: object, safetensors_path: object) -> bool:
+    """`QLH_PREFER_PYTORCH` 让路的判据（`#54`，纯函数，可单测）。
+
+    为真需同时满足三项：配置位为真、画像模型有 safetensors 目录、且该目录**存在**。
+    动机见 `config.PREFER_PYTORCH`：qwen3.5 的 keep-head 上游挂点在 `output_norm` 之后，
+    llama.cpp 上游被 fail-closed 拒绝（`#35`），而 GGUF 分支的优先级在 PyTorch 之前
+    ⇒ 必须显式让路，否则本机会落到 llama.cpp 而拿不到该模型。
+    """
+    return bool(prefer_flag) and bool(safetensors_path) and os.path.isdir(safetensors_path)
+
+
+def parse_pipeline_readiness(reason_text: str) -> dict:
+    """从失败原因文本里解析**结构化**的 pipeline readiness（DIST-4 第二句要求）。
+
+    文本形如：`pipeline_failed_then_local_pytorch: … | readiness=<code>: <reason>`
+    ⇒ 返回 `{"reason_code": …, "reason": …}`；无该标记时返回 `{}`。
+
+    抽成模块级纯函数，使该判据可脱离请求上下文单测（与 DIST-NEXT-8 的
+    `request_outcome.request_phase_metrics` 同一思路）。
+    """
+    text = str(reason_text or "")
+    marker = "readiness="
+    if marker not in text:
+        return {}
+    tail = text.split(marker, 1)[1].strip()
+    code, _, reason = tail.partition(":")
+    return {"reason_code": code.strip(), "reason": reason.strip()}
+
+
 def _augment_chat_metrics(metrics: dict | None, req: ChatRequest, **defaults) -> dict:
     """补齐统一聊天 metrics 字段，不覆盖调度器已给出的真实执行信息。"""
     result = dict(metrics or {})
@@ -2398,6 +2442,13 @@ def _augment_chat_metrics(metrics: dict | None, req: ChatRequest, **defaults) ->
     result.setdefault("client_app_variant", req.client_app_variant or "")
     result.setdefault("serving_node_id", scheduler.get_effective_node_id())
     result.setdefault("distributed_requested", scheduler.get_distributed_inference_enabled())
+    # ★ 2026-10-08：把**请求侧意图**也放进 metrics。此前 `routing_preference` 只存在于
+    #   响应顶层（`result`），TUI/安卓端拿到的 `metrics` 里没有它 ⇒ 界面**无法判断
+    #   "用户是否要求了分布式"**，只能看全局开关 `distributed_requested`。后果：用户用
+    #   `/route required`（或 preferred）要求分布式、而全局开关恰好关着时，`distributed_requested`
+    #   为 False ⇒ "已请求分布式，实际本地"这条提示**不会出现**，界面完全静默
+    #   （与"核心功能保证分布式一致性、交互时却违反且不提示"一致）。
+    result.setdefault("routing_preference", getattr(req, "routing_preference", "") or "")
     result.setdefault("distributed_used", False)
     result.setdefault("fallback", False)
     result.setdefault("fallback_reason", "")
@@ -2426,6 +2477,15 @@ def _augment_chat_metrics(metrics: dict | None, req: ChatRequest, **defaults) ->
     _marker = "readiness="
     if _marker in _failure_text:
         _capability_reason = _failure_text.split(_marker, 1)[1].strip()
+    # ★ 2026-10-08（DIST-4 第二句要求）：把**结构化**的 pipeline readiness 写回**响应 metrics**。
+    #   此前只把 `reason_code` 拼进 `fallback_reason` 字符串（见 `_execute_chat_full` 的失败分支）
+    #   ⇒ 响应体里没有结构化字段，调用方无法从单条响应判断「为什么没走分布式」。
+    #   现在补 `pipeline_readiness`（`reason_code` + `reason`）与 `pipeline_failure_reason`，
+    #   与 DIST-NEXT-8 的 `outcome` 并列 —— 单条响应即可重建失败归因。
+    _readiness = parse_pipeline_readiness(_failure_text)
+    if _readiness:
+        result.setdefault("pipeline_readiness", _readiness)
+        result.setdefault("pipeline_failure_reason", _failure_text)
     # ★ 2026-10-07（DIST-NEXT-8）：把互斥终态打进摘要 —— 一行内即可区分
     #   completed / fallback_completed / cancelled / refused / failed，
     #   不再靠 `fallback` 布尔去猜。
@@ -3953,6 +4013,30 @@ def _execute_chat_full(
     if req.routing_preference == "distributed_required":
         raise HTTPException(503, "distributed_required 执行失败：当前引擎未完成分布式流水线")
 
+    # ---- 流水线失败 ⇒ 整模回退守卫（★ 2026-10-09：**引擎无关**）----
+    #   ★ 原先只覆盖 llama.cpp / 孤岛（下面那个分支），PyTorch 路径漏了 ⇒ pipeline 尝试
+    #   失败后会**静默坠入整模**：`ensure_full_model()` 对 distributed-only 模型抛
+    #   RuntimeError，随后被函数尾部的 `except Exception` 泛化成
+    #   `500 推理失败: 当前模型以分布式专用模式准备…`，真实原因（`pipeline_failure_reason`）
+    #   在响应里彻底丢失。实测代价：64-token 请求 duration 仅 2779ms、没有任何 Route-A
+    #   prefill 却报 500，排查时把"为什么没走分布式"误导成了"路由判据问题"（实际与
+    #   max_new_tokens 无关）。这里把它提到引擎分支之前，失败即**具名 503**。
+    if pipeline_attempted:
+        ensure_full_guard = getattr(model_manager, "ensure_full_model", None)
+        if not callable(ensure_full_guard):
+            raise HTTPException(
+                503,
+                "分布式流水线失败且当前引擎不提供整模回退校验",
+            )
+        try:
+            ensure_full_guard()
+        except Exception as exc:
+            raise HTTPException(
+                503,
+                "分布式流水线失败（原因: "
+                f"{pipeline_failure_reason or '未记录'}），整模回退已拒绝: {exc}",
+            ) from exc
+
     # ---- llama.cpp / 孤岛引擎路径（整请求推理，不参与层拆分）----
     if backend_id_for(model_manager) in ("llama_cpp", "island"):
         if pipeline_attempted:
@@ -4428,10 +4512,8 @@ def _auto_load_default_model():
     #   动机见 `config.PREFER_PYTORCH` 的说明：qwen3.5 的 keep-head 上游挂点在
     #   `output_norm` 之后，llama.cpp 上游被 fail-closed 拒绝（#35），
     #   而 GGUF 分支的优先级在 PyTorch 之前 ⇒ 必须显式让路。
-    prefer_pytorch = (
-        bool(getattr(cfg, "PREFER_PYTORCH", False))
-        and bool(_active_safetensors)
-        and os.path.isdir(_active_safetensors)
+    prefer_pytorch = should_prefer_pytorch(
+        getattr(cfg, "PREFER_PYTORCH", False), _active_safetensors,
     )
     if prefer_pytorch:
         logger.info(
@@ -5018,6 +5100,110 @@ def _normalize_quant_for_engine(quant_type: str, engine: str) -> str:
     return quant
 
 
+def _estimate_full_model_load_bytes(model_id: Optional[str], engine: str, quant: str) -> int:
+    """估计**整模**加载所需的显存/内存字节数；拿不到信息时返回 0（表示"未知"）。
+
+    GGUF 走 llama.cpp：内存需求≈工件文件大小（mmap 时更省，但按最坏情况估）。
+    PyTorch 走 safetensors：参数字节按 dtype 估算（fp32=4 / fp16=2 / int8=1 / int4≈0.5 字节/参数）。
+    """
+    if not model_id:
+        return 0
+    try:
+        model = mc.get_model_config(model_id, _get_registered_experimental_models())
+    except Exception:  # pragma: no cover - 诊断/决策路径不抛
+        return 0
+    if model is None:
+        return 0
+    try:
+        if str(engine).lower() in ("llama_cpp", "gguf"):
+            path = mc.resolve_model_path(getattr(model, "gguf_path", "") or "")
+            if path and os.path.isfile(path):
+                return int(os.path.getsize(path))
+            return 0
+        # PyTorch：优先用 safetensors 实际文件大小（最准），否则按参数估算。
+        path = mc.resolve_model_path(getattr(model, "model_path", "") or "")
+        total = 0
+        if path and os.path.isdir(path):
+            for entry in os.scandir(path):
+                if entry.is_file() and entry.name.endswith(".safetensors"):
+                    total += int(entry.stat().st_size)
+        if total > 0:
+            return total
+        params = float(getattr(model, "parameter_count", 0) or 0)
+        if params <= 0:
+            # 退而求其次：用推荐显存反推（recommended_vram_gb 已含 KV/激活余量）。
+            rec = float(getattr(model, "recommended_vram_gb", 0) or 0)
+            return int(rec * 1024 ** 3 * 0.7) if rec > 0 else 0
+        per_param = {"fp32": 4.0, "fp16": 2.0, "int8": 1.0, "int4": 0.5}.get(
+            str(quant).lower(), 2.0
+        )
+        return int(params * per_param)
+    except Exception:  # pragma: no cover
+        return 0
+
+
+def _decide_pipeline_load_mode(model_id: Optional[str], engine: str, quant: str) -> tuple:
+    """★ 2026-10-09（自适应加载，用户裁定）决定分布式下的加载形态。
+
+    返回 `(mode, reason)`，`mode ∈ {"full", "pipeline"}`：
+    * `"full"` —— 可用显存/内存装得下**整模** ⇒ 直接整模加载（简单、启动快）；
+    * `"pipeline"` —— 装不下整模 ⇒ 走 `prepare_pipeline_model`，**各节点只在自己的分配段物化权重**
+      （这才是为边缘/小显存设计的路径；`#82` 的容量恒拒就发生在这里走错时）。
+
+    判据只做"整模装不装得下"这一层，**不替求解器决定怎么切分** ——
+    切分仍由 `pipeline_capacity` 按真实节点能力求解。
+    """
+    if RUN_MODE != "distributed":
+        return "full", "非分布式模式"
+    need = _estimate_full_model_load_bytes(model_id, engine, quant)
+    if need <= 0:
+        return "full", "无法估计整模需求（保持默认整模加载）"
+    profile = device_profile or {}
+    # ★ 2026-10-09：优先用**实时**探测，而不是注册时的画像快照 ——
+    #   `device_profile` 是启动时 `profiler.to_dict()` 的结果（且顶层未必有 `ram`），
+    #   实测在 CUDA 机器上拿不到可用值 ⇒ 决策退化成"未知 ⇒ 保持整模"。
+    #   这里直接问运行时：CUDA ⇒ `torch.cuda.mem_get_info`；CPU ⇒ `psutil.virtual_memory`。
+    available = 0.0
+    source = ""
+    try:
+        import torch_runtime as _tr
+
+        if _tr.cuda_available(load=False):
+            import torch as _torch
+
+            _free, _total = _torch.cuda.mem_get_info(0)
+            available = float(_free) / 1024 ** 3
+            source = "torch.cuda.mem_get_info"
+    except Exception:  # pragma: no cover - 探测失败则退化
+        available = 0.0
+    if available <= 0:
+        try:
+            import psutil as _psutil
+
+            available = float(_psutil.virtual_memory().available) / 1024 ** 3
+            source = "psutil.virtual_memory"
+        except Exception:  # pragma: no cover
+            available = 0.0
+    if available <= 0:
+        # 最后退化到注册时的画像（字段名兼容 PC 的 `ram.available_gb` 与 `gpu.vram_free_gb`）。
+        gpu_p = profile.get("gpu") or {}
+        ram_p = profile.get("ram") or {}
+        available = float(
+            (gpu_p.get("vram_free_gb") or ram_p.get("available_gb") or 0) or 0
+        )
+        source = "device_profile" if available > 0 else ""
+    if available <= 0:
+        return "full", "可用显存/内存未知（保持默认整模加载）"
+    # 留 15% 余量给 KV 缓存/激活/分配器开销。
+    fits = available * 1024 ** 3 * 0.85 >= need
+    if fits:
+        return "full", f"整模 {need / 1024**3:.2f}GB 可装入 {source}={available:.2f}GB"
+    return (
+        "pipeline",
+        f"整模 {need / 1024**3:.2f}GB 装不下 {source}={available:.2f}GB ⇒ 改为按段物化",
+    )
+
+
 def _validate_model_load_request(model_id: Optional[str], engine: str) -> None:
     """Reject unavailable model loads before unloading the current model."""
     if engine == "island":
@@ -5071,14 +5257,42 @@ def _resolve_model_path_for_engine(model_id: Optional[str], engine: str) -> Opti
 
 
 def _effective_engine_for_model(model_id: Optional[str], engine: str) -> str:
-    """Return the concrete engine to pass into ModelManager."""
-    if engine != "auto" or not model_id:
+    """Return the concrete engine to pass into ModelManager.
+
+    ★ 2026-10-09（稳定性 #73-④）：**分布式模式下必须落到能承载层段的引擎**。
+    master 要跑 `[0, k)` 本地段（`prepare_pipeline_model` / `load_layer_range`），而
+    **GGUF 路径不支持 `layer_range`** —— 实测报
+    `GGUF 整模恢复不接受 layer_range；裁层范围由工件 manifest 声明` ⇒
+    `pipeline_local_commit_failed` ⇒ 事务 aborted ⇒ **之后每个请求都 503，切回模型、
+    甚至重启后端都无效**（本次复现的 ④）。
+
+    而 `LoadModelRequest.engine` 的**默认值就是 `"llama_cpp"`**（并非 `"auto"`，见
+    `api_server.py` 的字段定义），所以"不传引擎"这条最常见路径在分布式模式下**必然选错**。
+    ⇒ 这里对 `auto` / `llama_cpp` / `gguf` 这类"不能承载层段"的取值统一纠正为 pytorch
+      （前提：该模型确实有 safetensors）。显式的 `pytorch` / `island` 不受影响。
+    """
+    if not model_id:
         return engine
     model = mc.get_model_config(model_id, _get_registered_experimental_models())
     if model is None:
         return engine
     payload = _model_api_payload(model)
-    return payload.get("preferred_engine") or engine
+    preferred = str(payload.get("preferred_engine") or "")
+    non_pipeline_engines = {"auto", "llama_cpp", "llama.cpp", "llama-cpp", "gguf"}
+    if (
+        RUN_MODE == "distributed"
+        and payload.get("has_safetensors")
+        and str(engine).strip().lower() in non_pipeline_engines
+    ):
+        logger.info(
+            "engine=%s 在分布式模式下纠正为 pytorch（模型 %s 有 safetensors；"
+            "GGUF 不支持 layer_range，会令 master 段无法准备）",
+            engine, model_id,
+        )
+        return "pytorch"
+    if engine != "auto":
+        return engine
+    return preferred or engine
 
 
 

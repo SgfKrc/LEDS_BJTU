@@ -754,14 +754,52 @@ def solve_pipeline_capacity(
         if range_constrained and unconstrained_admission:
             # ★ 2026-10-08：把「缺口区间」写进 reason —— 现场多次把本码误读成"工件区间配置错"，
             #   真因往往是 worker 掉线/未准入（见 `_uncovered_layer_ranges` 的说明）。
+            # ★ 2026-10-09（真机实测 BUG）：覆盖判定**必须把 master 自己的本地段算进去**。
+            #   原先只收集 worker 的 advertised `layer_ranges`，于是只要有任意 worker 声明了区间
+            #   （`range_constrained=True`），master 承担的前缀 `[0, local_layer_budget)` 就被判成
+            #   "未覆盖" ⇒ `master[0,20) + android[20,24)` 这种**正确拓扑恒被拒**
+            #   （实测：`reason=pipeline_layer_range_coverage_insufficient`、`uncovered=[0,20)`，
+            #   且求解器本身 admitted=True ⇒ 前后自相矛盾）。
+            #   worker 的 `layer_ranges` 是**执行契约**（不能给它分配区间外的层），
+            #   但它不该反过来否定 master 的本地段。
+            covered_ranges = [
+                item
+                for node in usable
+                for item in (node.get("layer_ranges") or [])
+            ]
+            if local_layer_budget is not None and layer_budget > 0:
+                # ★ 只在**显式**给出 `local_layer_budget` 时才算 master 的段：
+                #   budget is None 表示"无本地段约束"（整模 / 未声明），**不是**"master 跑全部"，
+                #   此时仍按 worker 的 advertised ranges 判覆盖（既有语义，见
+                #   `test_advertised_layer_ranges_reject_uncovered_cursor`）。
+                covered_ranges.append([0, int(layer_budget)])
             gaps = _uncovered_layer_ranges(
-                [
-                    item
-                    for node in usable
-                    for item in (node.get("layer_ranges") or [])
-                ],
+                covered_ranges,
                 int(descriptor.get("total_layers") or 0),
             )
+            if not gaps:
+                # ★ 2026-10-09（真机实测）：**缺口为空却仍被拒** ⇒ 不是"区间不连续"，而是
+                #   "每个节点必须装下自己那一段"这条硬约束下**某节点的空闲内存不够**
+                #   （总量 `raw_capacity_deficit_bytes=0`，但切分后单节点不够 —— 实测本机
+                #   `free=1.7GB` 却要跑 fp32 模型的 20 层，就是此例）。
+                #   原先一律报 `pipeline_layer_range_coverage_insufficient`，现场把
+                #   "内存不够"误读成"工件区间配置错"，浪费大量排查时间（见 #78 缺口 2）。
+                return {
+                    **base,
+                    "status": "rejected",
+                    "admitted": False,
+                    "reason_code": "pipeline_capacity_single_node_insufficient",
+                    "reason": (
+                        "advertised layer_ranges constrain the contiguous split so that no "
+                        "single node can host its own segment within its free memory "
+                        "(aggregate capacity is sufficient; check per-node free memory)"
+                    ),
+                    "allocatable_bytes": allocatable_bytes,
+                    "raw_capacity_deficit_bytes": max(0, raw_model_bytes - allocatable_bytes),
+                    "assignments": [],
+                    "uncovered_layer_ranges": [],
+                    "control_only_nodes": [node["node_id"] for node in usable],
+                }
             reason = (
                 "advertised layer_ranges cannot cover the requested contiguous layer interval"
             )

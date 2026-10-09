@@ -4646,11 +4646,11 @@ class Scheduler(
             task_id, request_id or "-", len(prompt),
         )
 
-        # TODO: 触发流水线推理流程
-        # 1. 主节点 Prefill → 中间特征 → TCP 发送至 client1
-        # 2. client1 计算 → 转发特征至 client2
-        # 3. client2 计算 → Decode 循环 → 回传结果
-
+        # ★ 2026-10-08（遗留清理）：此处原为「TODO: 触发流水线推理流程」+ 三步流程占位注释。
+        #   该流程**早已实现**，且不在本类内 —— 产品入口是 `api_server` 的分布式链路：
+        #   Route-A（`stage_offer_v3`）由 master 做首段 prefill → 层段 worker 依次转发 →
+        #   尾段 decode 回传，见 `scheduler_pipeline._run_route_a_stage_pipeline`。
+        #   本方法只负责登记任务并把 `task_id` 交给调用方；占位注释移除，避免"待实现"的误导。
         return task_id
 
     def complete_infer_task(self, task_id: str, result: str,
@@ -4705,8 +4705,13 @@ class Scheduler(
         #   「`NodeState`（ONLINE/OFFLINE）+ 心跳新鲜度」两维表达，
         #   见 `scheduler_types.NodeState` 的说明。
 
-        # TODO: 发送 TASK_STOP 指令给所有从节点
-        # TODO: 清空所有节点 KV 缓存
+        # ★ 2026-10-08（遗留清理）：此处原有两条 TODO（「发送 TASK_STOP 指令给所有从节点」
+        #   与「清空所有节点 KV 缓存」）—— 均已不再需要，且**本方法本身无调用方**：
+        #   ① 分布式取消走 v3 的 `stage_cancel`（worker 侧收敛并释放槽位，见
+        #      `task_worker_adapter` 的 `stage_cancel_acknowledged` 通路）；
+        #   ② "清空 KV"由**层配置换代**完成（`_publish_layer_configs` + assignment 状态机，
+        #      worker 在重配置时丢弃旧 KV），不需要逐节点下发清理指令。
+        #   ⇒ TODO 移除，避免误以为存在尚未实现的 STOP/KV 通路。
 
     def on_task_finished(self, result: str, metrics: dict = None) -> None:
         """

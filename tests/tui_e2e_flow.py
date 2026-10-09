@@ -210,10 +210,15 @@ class Session:
 
 
 def _build_app(api_kind: str):
-    """按剧本声明构造 app：`fake` = 可用的假后端；`unreachable` = 不可达端点。
+    """按剧本声明构造 app。
 
-    `unreachable` 用于"后端不可达时外壳照常可用"的降级步（照
-    `tests/test_tui_textual.py:114-135` 的既有写法）。
+    - `fake`（默认）= 可用的假后端（F1 档，零模型）；
+    - `unreachable` = 不可达端点（用于"后端不可达时外壳照常可用"的降级步，照
+      `tests/test_tui_textual.py:114-135` 的既有写法）；
+    - **`real`**（★ 2026-10-09 稳定性 #73 新增）= **真后端**，这是"真端到端"档：
+      真模型 +（若集群有 worker）真分布式层段。此前框架只支持 fake/unreachable，
+      ⇒ **任何剧本都打不出真分布式**（`topology` 永远只能是 `single_host_loopback`）。
+      主机/端口/超时可用 `QLH_TUI_E2E_REAL_HOST|PORT|TIMEOUT` 覆盖。
     """
     from tui_api import ApiClient
     from tui_textual import KoakumaApp
@@ -221,6 +226,14 @@ def _build_app(api_kind: str):
     app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.5), interval=30)
     if api_kind == "unreachable":
         app.api = ApiClient(host="127.0.0.1", port=1, timeout=0.3)
+    elif api_kind == "real":
+        import os
+
+        app.api = ApiClient(
+            host=os.environ.get("QLH_TUI_E2E_REAL_HOST", "127.0.0.1"),
+            port=int(os.environ.get("QLH_TUI_E2E_REAL_PORT", "8000")),
+            timeout=float(os.environ.get("QLH_TUI_E2E_REAL_TIMEOUT", "180")),
+        )
     else:
         app.api = FakeApi()
     return app, app.api
@@ -282,6 +295,103 @@ async def _action_chat_command(session, spec, flow, sink):
     box.focus()
     await session.pilot.press("enter")
     await session.pilot.pause()
+
+
+def _chat_text(app) -> str:
+    """取聊天区当前内容。
+
+    ★ 2026-10-09 修正：`chat_buffer` 是 **`ChatPane`（`#chat-pane`）的属性**，不是 `app`
+    的属性 —— 初版写成 `getattr(app, "chat_buffer")` 恒为空串，于是"回复已到达"也被判成
+    "后端无响应"（假失败）。这里按组件层级取，并在缓冲为空时回退到 `#chat-log` 的渲染内容。
+    """
+    try:
+        pane = app.screen.query_one("#chat-pane")
+    except Exception:  # noqa: BLE001 - 页面未挂载
+        pane = None
+    buf = str(getattr(pane, "chat_buffer", "") or "") if pane is not None else ""
+    if buf:
+        return buf
+    try:
+        rendered = app.screen.query_one("#chat-log").renderable
+        return str(rendered or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _assistant_text(app) -> str:
+    """取**最后一条 assistant 回复**之后的文本（用于等"回复真的开始产出"）。
+
+    ★ 2026-10-09：`send_chat` 原先的等待条件是「聊天区总长度增长」—— 这在「先 /clear 再发」
+    的步骤里会**立刻满足**（用户消息一渲染长度就变了）⇒ 没等模型输出就返回，把"回复还没来"
+    误判成"回复为空/被截断"。这里改为盯**最后一条 assistant 标记之后**的内容。
+    """
+    buf = _chat_text(app)
+    idx = max(buf.rfind("assistant"), buf.rfind("[dim]assistant[/]"))
+    if idx < 0:
+        return ""
+    return buf[idx + len("assistant"):].replace("[/]", "")
+
+
+# ★ 2026-10-09：**连接/后端类错误的兜底判据**（本轮实测教训）。
+#   后端没在运行时，`real_chat_not_rejected` 原先只判 `not_contains` 的几条业务文案 ⇒
+#   把「assistant 的回复其实是 ApiError: 无法连接后端」**假判为 PASS**；
+#   只有新加的 `min_chars` 判据抓到了它。这里统一把"连不上/超时/5xx"视为失败 ——
+#   任何 chat 步骤都不许把"错误"当成"回复"。
+_BACKEND_UNREACHABLE_MARKERS = (
+    "无法连接后端",
+    "ApiError",
+    "WinError 10061",
+    "WinError 10054",
+    "目标计算机积极拒绝",
+    "连接被拒绝",
+    "请求超时",
+    "模型未加载",
+    "HTTP 500",
+    "HTTP 502",
+    "HTTP 503",
+)
+
+
+def _assert_no_backend_error(text: str, where: str) -> None:
+    """`text` 里若含连接/后端错误标记 ⇒ 立刻失败（防「错误被当回复」的假 PASS）。"""
+    for marker in _BACKEND_UNREACHABLE_MARKERS:
+        if marker in text:
+            raise AssertionError(
+                f"{where}：assistant 回复里含后端/连接错误 {marker!r}"
+                f"（后端未运行、已重启或拒绝服务）。回复前 300 字：{text[:300]!r}"
+            )
+
+
+async def _action_send_chat(session, spec, flow, sink):
+    """在聊天屏发**真消息**并等回复落地（真后端 / `api: "real"` 档专用）。
+
+    与 `chat_command` 的关键区别：后者只把文本敲进去就返回（用于验证外壳的输入与
+    命令分发，后端回不回都不关心）；本 action **必须等 assistant 真的产出内容** ——
+    否则「发送成功但后端 500 / 回了错误 / 还没来得及回」都可能被误判成通过或"被截断"。
+    """
+    from textual.widgets import Input
+
+    pane = session.app.screen.query_one("#chat-pane")
+    box = pane.query_one(Input)
+    box.value = spec["text"]
+    box.focus()
+    await session.pilot.press("enter")
+    timeout = float(spec.get("timeout", 300.0))
+    min_reply = int(spec.get("min_reply_chars", 2))
+    ok = await wait_for(
+        session.pilot,
+        lambda: len(_assistant_text(session.app)) > min_reply,
+        timeout=timeout,
+    )
+    if not ok:
+        raise AssertionError(
+            f"send_chat 后 {timeout:.0f}s 内 assistant 未产出内容（后端无响应？）"
+            f" 当前内容前 300 字：{_chat_text(session.app)[:300]!r}"
+        )
+    # 流式可能还在继续：再给一点时间让可判定的文本到位。
+    await session.pilot.pause(spec.get("settle", 2.0))
+    # ★ 2026-10-09：等到了"内容"不等于"回复成功" —— 若那是连接/后端错误，必须当场失败。
+    _assert_no_backend_error(_assistant_text(session.app), "send_chat")
 
 
 async def _action_set_cluster_aux(session, spec, flow, sink):
@@ -449,6 +559,7 @@ ACTIONS = {
     "click_nav_unknown": _action_click_nav_unknown,
     "press": _action_press,
     "chat_command": _action_chat_command,
+    "send_chat": _action_send_chat,
     "set_cluster_aux": _action_set_cluster_aux,
     "cluster_toggle": _action_cluster_toggle,
     "confirm": _action_confirm,
@@ -587,8 +698,39 @@ async def _expect_service_stopped(session, spec, flow):
         raise AssertionError(f"段服务仍在运行（pid={process.pid}）")
 
 
+async def _expect_chat_reply(session, spec, flow):
+    """断言聊天缓冲内容（真后端档）。`contains` / `not_contains` / `min_chars` 可同时给。
+
+    这是「回复真的回来了、且不是报错」的判据：`not_contains` 用来卡住后端错误文案
+    （如"后端错误"/"禁止整模回退"/"Traceback"），**避免把失败当成功** ——
+    本 goal 的起点就是"看着像走了分布式、实际被拒且报错被藏起来"。
+    `min_chars` 用于 #73-③「生成不完整」：长回答 prompt 必须真的产出足够长的文本，
+    否则"截断"会伪装成 PASS。
+    """
+    buf = _chat_text(session.app)
+    if not buf.strip():
+        raise AssertionError("聊天区为空：没有产生任何对话内容")
+    min_chars = int(spec.get("min_chars") or 0)
+    # ★ 只量**最后一条 assistant 回复**，不含用户消息（否则"用户 prompt 很长"会伪装成"回复成型"）
+    reply = _assistant_text(session.app)
+    # ★ 2026-10-09：先拦"回复其实是错误"的情况，再谈长度/内容（否则错误会被当成合格回复）。
+    _assert_no_backend_error(reply, "chat_reply")
+    if min_chars and len(reply) < min_chars:
+        raise AssertionError(
+            f"assistant 回复过短：{len(reply)} < 要求 {min_chars}（可能被截断）。"
+            f"回复前 400 字：{reply[:400]!r}"
+        )
+    for needle in spec.get("contains", []) or []:
+        if needle not in buf:
+            raise AssertionError(f"chat_buffer 缺少 {needle!r}（前 400 字：{buf[:400]!r}）")
+    for needle in spec.get("not_contains", []) or []:
+        if needle in buf:
+            raise AssertionError(f"chat_buffer 不应包含 {needle!r}（前 400 字：{buf[:400]!r}）")
+
+
 EXPECTS = {
     "screen_is_main": _expect_screen_is_main,
+    "chat_reply": _expect_chat_reply,
     "nav_count": _expect_nav_count,
     "page": _expect_page,
     "nav_index": _expect_nav_index,

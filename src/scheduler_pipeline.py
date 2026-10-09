@@ -784,10 +784,16 @@ class SchedulerPipelineMixin:
         if registry is None:
             return
         state = registry.state(node_id)
+        # ★ 2026-10-08（DIST-1 推进）：把第三个旧集合 `_layer_config_acks` 也纳入比对
+        #   （此前只比 `pushed` 与 `expected`）—— 它同样是"谁已确认收到本代际配置"的
+        #   推断来源，理应一起走向权威视图。仍是**只观测**，不改判据。
+        acked = getattr(self, "_layer_config_acks", None)
+        has_ack = isinstance(acked, dict) and node_id in acked
         verdict = evaluate_assignment_consistency(
             state,
             legacy_pushed=bool(legacy_pushed),
             has_expected=isinstance(expected, dict) and bool(expected),
+            has_ack=has_ack,
         )
         if verdict.consistent:
             return
@@ -1673,12 +1679,22 @@ class SchedulerPipelineMixin:
         #   wire 大小。输入与中间段输出（`hidden_out_f32`）同尺寸，所以一次预检覆盖往返；
         #   超限时在 reserve/execute 之前以稳定 reason 结束 —— 不再让大 payload 走到
         #   「执行完成后才 `message_too_large`」。
+        # ★ 2026-10-09（接口税）：`chunked_input` 探测内含 `control.status(role="master")` 的
+        #   **全量 worker capabilities 深拷贝**，而此前每步每段都无条件执行 —— decode 每步
+        #   hidden 仅 ~11.5KB，远低于 8.1MB 单帧预算 ⇒ 探测结果必然用不上（白付深拷贝）。
+        #   改为只在实际超预算时才查询；fits 时 `_assert_layer_stage_offer_fits_frame` 本就
+        #   提前 return（不看该参数），故**语义完全等价**。
+        _fits_single_frame = hidden_fits_stage_frame(n_tokens, n_embd, "float32")
         _assert_layer_stage_offer_fits_frame(
             node_id=str(node_id), n_tokens=n_tokens, n_embd=n_embd,
             # ★ 2026-10-08（DIST-NEXT-2b）：对端声明 `stage_chunked_input` ⇒ 超预算的
             #   hidden 交由 provider 切 `stage_chunk` 分片发送，不在此提前拒绝。
-            chunked_input=_node_declares_stage_chunked_input(
-                getattr(self, "_task_worker_control", None), str(node_id),
+            chunked_input=(
+                False
+                if _fits_single_frame
+                else _node_declares_stage_chunked_input(
+                    getattr(self, "_task_worker_control", None), str(node_id),
+                )
             ),
         )
         hidden_spec = {
@@ -5098,7 +5114,15 @@ class SchedulerPipelineMixin:
                     transaction = self._pipeline_load_transaction or {}
                     phase = str(transaction.get("phase", "") or "")
                     plan = transaction.get("plan") or {}
-                if phase in {"rejected", "aborted", "invalidated"}:
+                if phase in {"rejected", "aborted"}:
+                    # ★ 2026-10-09（稳定性 #73-④）：**把 `invalidated` 从"不可恢复"里摘出来**。
+                    #   `invalidated` 是「模型被替换、事务正常作废」的标记（见 api_server 的
+                    #   `_invalidate_pipeline_load_transaction(reason_code="pipeline_model_changed")`），
+                    #   它**必须允许重新提交** —— 否则实测会出现：切一次模型（尤其切到 GGUF 这类
+                    #   master 引擎不支持的格式）后事务停在失败态，**之后每个请求都 503，连切回
+                    #   正确模型、甚至重启后端都无效**。
+                    #   而 `rejected`（本次容量计划不成立）与 `aborted`（本地提交失败）仍保持
+                    #   fail-closed；它们由模型切换路径的清理逻辑负责复位。
                     return {
                         **readiness,
                         "ready": False,
@@ -5884,6 +5908,12 @@ class SchedulerPipelineMixin:
                     import numpy as _np
 
                     local_input_ids = _np.array([[new_token_id]], dtype=_np.int64)
+                # ★ 2026-10-09（接口税量化）：per-step 分解打点。此前只有三段**近似**值
+                #   （相邻日志时间戳之差）—— 无法区分「master 本地算」与「等对端」，
+                #   于是 54.5ms 的 master 段里到底多少是 GPU→CPU 同步纯属猜测。
+                #   这三个时间戳把一步拆成：fwd（本地层前向）/ hidden（GPU→CPU 同步 +
+                #   形状整理）/ stage（全部层段 offer，含网络往返 + 对端计算）。
+                _perf_t_fwd = time.perf_counter()
                 local_result = mgr.forward_layers(
                     input_ids=local_input_ids,
                     attention_mask=attention_mask if is_prefill else None,
@@ -5891,6 +5921,7 @@ class SchedulerPipelineMixin:
                     use_cache=True,
                     apply_lm_head=False,
                 )
+                _perf_t_hid = time.perf_counter()
                 if local_result.get("cache") is not None or local_result.get("past_key_values"):
                     with self._kv_cache_lock:
                         self._kv_cache[task_id] = _prefer_cache_state(local_result)
@@ -5922,6 +5953,7 @@ class SchedulerPipelineMixin:
                     else [prompt_len + step - 1] * n_tokens
                 )
                 current_hidden = hidden
+                _perf_t_stage = time.perf_counter()
                 stage_token = None
                 for index, assignment in enumerate(stage_nodes):
                     last_stage = index == len(stage_nodes) - 1
@@ -5976,6 +6008,17 @@ class SchedulerPipelineMixin:
                             return {"response": "", "error": "route_a_middle_missing_hidden"}
                         current_hidden = stage_result["hidden_states"]
                         n_tokens = int(current_hidden.shape[0])
+                _perf_t_end = time.perf_counter()
+                # ★ 短格式：master.log 的每条消息在**写入端被截断到 ~119 字符**
+                #   （实测：`Route-A stage handoff:` 也正好停在 119）⇒ 时间戳 + `request_id=`
+                #   已占 75 字符，长字段会整段丢失。故这里用 `f=/h=/s=` 短名 + 整数毫秒。
+                logger.info(
+                    "perf step=%d f=%.0f h=%.0f s=%.0f",
+                    step,
+                    (_perf_t_hid - _perf_t_fwd) * 1000.0,
+                    (_perf_t_stage - _perf_t_hid) * 1000.0,
+                    (_perf_t_end - _perf_t_stage) * 1000.0,
+                )
                 if stage_token is None:
                     return {"response": "", "error": "route_a_stage_chain_empty"}
                 new_token_id = stage_token
@@ -7693,6 +7736,104 @@ class SchedulerPipelineMixin:
                 self.pipeline_queue._current_task_id = None
 
 
+    # ★ 2026-10-09（#78 缺口 2）：`reason_code` → 用户可读的中文说明。
+    #   容量求解器给出的 code 是给机器看的（如 `pipeline_capacity_workers_unavailable`），
+    #   直接抛给用户等于没抛；这里补一层人话，让 UI 能自助诊断。
+    _PIPELINE_REASON_HINT = {
+        "pipeline_capacity_workers_unavailable": (
+            "没有可用的分层 worker（从节点未连上，或未声明/未通过校验层段工件）"
+        ),
+        "pipeline_distributed_workers_unavailable": "分布式放置至少需要两个可用节点",
+        "pipeline_capacity_nodes_unavailable": "当前没有满足条件的可用节点",
+        "pipeline_segment_contract_unsatisfied": "层段契约不满足（声明区间与所需区间不符）",
+        "pipeline_layer_range_coverage_insufficient": "各节点声明的层区间覆盖不足",
+        "pipeline_capacity_single_node_insufficient": (
+            "区间被约束后，没有任何单个节点能在自己的空闲内存里装下所属层段"
+            "（总容量够，但切分后单节点不够 ⇒ 检查各节点空闲内存/降低精度）"
+        ),
+        "pipeline_distributed_capacity_insufficient": "分布式各节点总容量不足",
+        "node_capacity_unavailable": "节点容量不足（内存/显存）",
+        "pipeline_capacity_rejected": "集群容量准入被拒",
+        "pipeline_reshard_capacity_insufficient": "重新分片后容量不足",
+        "model_identity_mismatch": "参与节点的模型身份不一致（算子/工件不匹配）",
+        "pipeline_model_changed": "流水线准备期间模型被切换",
+        # ★ 2026-10-09（子 agent 复查 N2）：补齐**生产路径会真实产生**但此前漏收录的码 ——
+        #   漏了就等于"有码没说明"，UI 只能退回显示裸码。
+        "pipeline_local_commit_failed": "本地提交层段失败（master 侧无法按分配裁层/物化）",
+        "pipeline_full_model_fallback_forbidden": (
+            "该模型只以分布式流水线模式准备，禁止退回整模推理（无可用原因信息）"
+        ),
+        "pipeline_layer_range_not_advertised": (
+            "节点未声明层区间，无法判断它能承担哪一段"
+        ),
+        "pipeline_capacity_descriptor_invalid": "模型描述信息不合法，无法做容量求解",
+        "relay_layer_claim_invalid": "relay 段认领的层区间不合法（重叠/角色/不连续）",
+        # ★ 2026-10-09：由"该红必须红"测试扫出的其余生产码（见
+        #   `tests/test_pipeline_fallback_diagnostic.py::test_every_production_reason_code_has_a_hint`）。
+        "pipeline_capacity_manual_insufficient": "手动切分的容量不足",
+        "pipeline_capacity_manual_node_unavailable": "手动切分指定的节点不可用",
+        "pipeline_capacity_manual_range_invalid": "手动切分的层区间不合法",
+        "pipeline_capacity_not_computed": "容量尚未计算（集群还没就绪）",
+        "pipeline_descriptor_unavailable": "模型层段描述不可用（无法确定总层数/切分点）",
+        "pipeline_node_contract_invalid": "层段布局不满足「恰好连续覆盖每一层」契约",
+        "pipeline_reshard_descriptor_unavailable": "重分片缺少模型描述",
+        "pipeline_reshard_layout_invalid": "重分片后的层布局不合法",
+        "pipeline_reshard_plan_mismatch": "重分片计划与当前计划不一致",
+        "pipeline_runtime_unsupported": "当前运行时/引擎不支持该模型的层段执行",
+        "pipeline_single_node_plan_active": "已存在单机分层计划，与分布式请求冲突",
+    }
+
+    #: ★ 这些码出现在 `admitted=True`（成功）的 plan 里，**不是失败原因** ⇒ 不参与
+    #: 「每个失败码都要有中文说明」的检查（但仍保留在本表方便 UI 直接查）。
+    _PIPELINE_SUCCESS_REASON_CODES = frozenset({"distributed_forced"})
+
+    def _pipeline_unavailable_diagnostic(self) -> tuple:
+        """返回 `(reason_code, 人类可读说明)`，用于把「流水线不可用」的真实原因透给调用方/UI。
+
+        ★ 2026-10-09（#78 缺口 2）：此前回退路径只吐一句**硬编码**文案
+        「当前模型仅以分布式流水线模式准备，禁止整模回退；请等待从节点就绪」——
+        真因（如 `pipeline_capacity_workers_unavailable` = 从节点未声明工件）只留在
+        logcat 里，用户无从自助诊断。现在把容量求解器给出的 `reason_code` / `reason` /
+        `excluded_nodes` 一并带出去。
+        """
+        code = ""
+        parts = []
+        excluded = []
+        try:
+            txn = self._pipeline_load_transaction or {}
+            code = str(txn.get("reason_code") or "")
+            plan = txn.get("plan") if isinstance(txn.get("plan"), dict) else {}
+            if not code:
+                plan = plan or {}
+            reason_text = str(plan.get("reason") or "")
+            excluded = list(plan.get("excluded_nodes") or [])
+        except Exception:  # pragma: no cover - 诊断路径绝不抛
+            reason_text = ""
+            excluded = []
+        if not code:
+            active = getattr(self, "_active_pipeline_capacity_plan", None)
+            if isinstance(active, dict):
+                code = str(active.get("reason_code") or "")
+                reason_text = str(active.get("reason") or "") or reason_text
+                excluded = list(active.get("excluded_nodes") or []) or excluded
+        if not code:
+            return "", ""
+        hint = self._PIPELINE_REASON_HINT.get(code, "")
+        for item in (hint, reason_text):
+            if item:
+                parts.append(item)
+        if excluded:
+            preview = []
+            for node in excluded[:4]:
+                if isinstance(node, dict):
+                    nid = node.get("node_id") or node.get("id") or "?"
+                    why = node.get("reason") or node.get("reason_code") or ""
+                    preview.append(f"{nid}({why})" if why else str(nid))
+                else:
+                    preview.append(str(node))
+            parts.append("被排除的节点: " + ", ".join(preview))
+        return code, "；".join(parts)
+
     def _run_full_model_inference(self, prompt: str,
                                    max_new_tokens: int = 512,
                                    temperature: float = 0.7,
@@ -7707,12 +7848,27 @@ class SchedulerPipelineMixin:
         """
         mgr = self._host
         if mgr and getattr(mgr, "is_pipeline_prepared", False):
+            # ★ 2026-10-09（#78 缺口 2）：附上真实 `reason_code` + 人话说明 + 被排除的节点。
+            #   此前这里只吐硬编码文案，真因（如从节点未声明工件）只在 logcat 里，
+            #   用户看到「请等待从节点就绪」无从判断到底缺什么。
+            _code, _detail = "", ""
+            try:
+                _code, _detail = self._pipeline_unavailable_diagnostic()
+            except Exception:  # pragma: no cover - 诊断失败不影响主流程
+                pass
+            _suffix = ""
+            if _code:
+                _suffix = f"（原因: {_code}"
+                if _detail:
+                    _suffix += f" —— {_detail}"
+                _suffix += "）"
             return {
                 "response": "",
                 "error": (
                     "当前模型仅以分布式流水线模式准备，禁止整模回退；"
-                    "请等待从节点就绪或显式执行普通模型加载"
+                    "请等待从节点就绪或显式执行普通模型加载" + _suffix
                 ),
+                "reason_code": _code or "pipeline_full_model_fallback_forbidden",
             }
         if not mgr or not mgr.is_loaded:
             return {"response": "", "error": "模型未加载"}
@@ -7927,12 +8083,25 @@ class SchedulerPipelineMixin:
 
         mgr = self._host
         if mgr and getattr(mgr, "is_pipeline_prepared", False):
+            # ★ 2026-10-09（#78 缺口 2）：与非流式路径同样附上真实 reason_code + 人话说明。
+            _code, _detail = "", ""
+            try:
+                _code, _detail = self._pipeline_unavailable_diagnostic()
+            except Exception:  # pragma: no cover - 诊断失败不影响主流程
+                pass
+            _suffix = ""
+            if _code:
+                _suffix = f"（原因: {_code}"
+                if _detail:
+                    _suffix += f" —— {_detail}"
+                _suffix += "）"
             yield {
                 "done": True,
                 "error": (
                     "当前模型仅以分布式流水线模式准备，禁止整模回退；"
-                    "请等待从节点就绪或显式执行普通模型加载"
+                    "请等待从节点就绪或显式执行普通模型加载" + _suffix
                 ),
+                "reason_code": _code or "pipeline_full_model_fallback_forbidden",
             }
             return
         if not mgr or not mgr.is_loaded:

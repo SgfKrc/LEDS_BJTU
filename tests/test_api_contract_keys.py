@@ -226,6 +226,44 @@ class TestApiResponseKeys:
         assert body["nodes"]["master"]["network_path"] == network_path
         assert body["nodes_ready"] is True
 
+    def test_cluster_status_projects_pipeline_capacity_and_node_participation(
+            self, client, monkeypatch):
+        """「在线但不干活」必须在 /api/cluster/status 上可见（2026-10-08 第 4 条静默路径）。"""
+        payload = self._cluster_status_payload()
+        payload["pipeline_capacity"] = {
+            "status": "rejected",
+            "admitted": False,
+            "reason_code": "pipeline_distributed_workers_unavailable",
+            "participating_node_ids": [],
+            "control_only_nodes": ["master"],
+            "worker_count": 0,
+            "prepared_node_count": 0,
+            "ready_node_count": 0,
+        }
+        payload["nodes"]["master"]["pipeline_participating"] = False
+        payload["nodes"]["master"]["pipeline_exclusion_reason"] = (
+            "capacity_plan_control_only"
+        )
+        monkeypatch.setattr(
+            api_server_mod.scheduler,
+            "get_status",
+            lambda: payload,
+        )
+
+        response = client.get("/api/cluster/status")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["pipeline_capacity"]["admitted"] is False
+        assert body["pipeline_capacity"]["reason_code"] == (
+            "pipeline_distributed_workers_unavailable"
+        )
+        assert body["pipeline_capacity"]["worker_count"] == 0
+        assert body["nodes"]["master"]["pipeline_participating"] is False
+        assert body["nodes"]["master"]["pipeline_exclusion_reason"] == (
+            "capacity_plan_control_only"
+        )
+
     def test_cluster_resources_is_read_only_aggregate_projection(
             self, client, monkeypatch):
         projection = {

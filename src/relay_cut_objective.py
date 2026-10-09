@@ -25,6 +25,7 @@ from __future__ import annotations
 import itertools
 import math
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from src.relay_contract import CUT_LAYER_MIN, RelayHiddenSpec
@@ -180,6 +181,118 @@ def _segment_bytes(
     if has_embedding or has_lm_head:
         total += int(non_split_bytes)
     return total
+
+
+# --------------------------------------------------------------------------- 分段收益账
+#: ★ 2026-10-09（③）：以下默认值**全部来自实测**（见 `docs/已知问题记录.md` #70/#71/#72）：
+#:   - master（RTX 4060，GPU）16 层 ≈ 49ms ⇒ **3.06 ms/层**
+#:   - Surface（Intel 集显轻薄本）：单段 53ms，减 2×3ms 往返 ⇒ **11.75 ms/层**；RTT **3ms**
+#:   - Y700（Android + llama.cpp）：单段 84ms，减 2×19ms 往返 ⇒ **11.5 ms/层**；RTT **19ms**
+#: 这些数字是"要不要把层分出去"的唯一依据，不要凭感觉改。
+MEASURED_MASTER_MS_PER_LAYER = 3.06
+MEASURED_TABLET_MS_PER_LAYER = 11.75
+MEASURED_TABLET_RTT_MS = 3.0
+MEASURED_ANDROID_MS_PER_LAYER = 11.5
+MEASURED_ANDROID_RTT_MS = 19.0
+#: 一次 stage 的固定往返**次数**：offer→accept、accept→result（实测 `perf2`，见 #70）。
+STAGE_ROUND_TRIPS = 2
+
+
+@dataclass(frozen=True)
+class SegmentEconomics:
+    """把 `n_layers` 交给某设备作为**独立段**的账。
+
+    判据（由实测分解推出）：一次 stage 要付 `STAGE_ROUND_TRIPS` 次跨机往返，故
+
+        值得 ⟺ n·c_master > STAGE_ROUND_TRIPS·rtt + n·c_device
+        ⟹ n > STAGE_ROUND_TRIPS·rtt / (c_master − c_device)   （仅当 c_master > c_device 有解）
+
+    ⇒ **若该设备单层耗时不低于 master，则任何层数都不值得** —— 它不该参与逐 token 分段，
+    它的价值在**容量**（把装不下的模型切开），不在**速度**。这正是实测"去掉一个段 +49%"的成因。
+
+    ⚠️ 边界：这些 `c_*` 是**单请求、单 token**（batch=1）的值；合批后往返税与 `c_master`
+    都摊到 N 个请求上，不等式必须重算（见 #66/#70）。
+    """
+
+    n_layers: int
+    c_master_ms: float = MEASURED_MASTER_MS_PER_LAYER
+    c_device_ms: float = MEASURED_ANDROID_MS_PER_LAYER
+    rtt_ms: float = MEASURED_ANDROID_RTT_MS
+    round_trips: int = STAGE_ROUND_TRIPS
+
+    @property
+    def saved_ms(self) -> float:
+        """留在 master 上要花的时间。"""
+        return float(self.n_layers) * float(self.c_master_ms)
+
+    @property
+    def cost_ms(self) -> float:
+        """分出去要付的时间：固定往返税 + 对端自己算。"""
+        return (
+            float(self.round_trips) * float(self.rtt_ms)
+            + float(self.n_layers) * float(self.c_device_ms)
+        )
+
+    @property
+    def net_ms(self) -> float:
+        """净收益（正=值得分出去）。"""
+        return self.saved_ms - self.cost_ms
+
+    @property
+    def worthwhile(self) -> bool:
+        """严格大于 0 才算值得（恰好打平不值得——多一次往返就亏）。"""
+        return self.net_ms > 0.0
+
+    @property
+    def min_layers(self) -> float | None:
+        """达到盈亏平衡所需的最少层数；该设备**注定不划算**时返回 `None`。"""
+        gain = float(self.c_master_ms) - float(self.c_device_ms)
+        if gain <= 0.0:
+            return None
+        return float(self.round_trips) * float(self.rtt_ms) / gain
+
+
+def segment_worthwhile(
+    n_layers: int,
+    c_master_ms: float = MEASURED_MASTER_MS_PER_LAYER,
+    c_device_ms: float = MEASURED_ANDROID_MS_PER_LAYER,
+    rtt_ms: float = MEASURED_ANDROID_RTT_MS,
+) -> bool:
+    """便捷判据：把 `n_layers` 交给该设备是否值得（细节见 `SegmentEconomics`）。"""
+    return SegmentEconomics(n_layers, c_master_ms, c_device_ms, rtt_ms).worthwhile
+
+
+def cut_multiple_from_gguf(gguf_path: "str | Path") -> int | None:
+    """★ `#67`：**从源 GGUF 直接读**裁层整数倍（`<arch>.full_attention_interval`）。
+
+    为什么需要它：`cut_multiple` 此前**全靠人工传参**，而 `relay_cut_plan` 与
+    `HeteroBaseline` 的**默认值都是 1** —— 对 hybrid 架构（Qwen3.5，interval=4）**1 是错的**：
+    裁层 GGUF 的层类型按"（重编号后的）本地层号对 interval 取模"推导，非整数倍切点会整体错位，
+    llama.cpp 报 `missing tensor 'blk.x.<...>'`。本函数让人工参数成为**可选覆盖**而非必需知识。
+
+    返回 `None` 表示"源没有该约束"（非 hybrid 件，或 `interval <= 1`）⇒ 调用方保持既有行为；
+    这是**探测**语义而非校验，故文件缺失/读不动一律返回 `None` 而不抛。
+    """
+    try:
+        import gguf
+    except ImportError:  # pragma: no cover - torch-free / minimal 环境
+        return None
+    try:
+        reader = gguf.GGUFReader(str(gguf_path))
+    except Exception:  # noqa: BLE001 - 探测失败即"无约束"
+        return None
+    try:
+        arch_field = reader.fields.get("general.architecture")
+        if arch_field is None:
+            return None
+        arch = str(arch_field.contents())
+        interval_field = reader.fields.get(f"{arch}.full_attention_interval")
+        if interval_field is None:
+            return None
+        interval = int(interval_field.contents())
+    except Exception:  # noqa: BLE001
+        return None
+    return interval if interval > 1 else None
 
 
 def legal_cuts(total_layers: int, *, cut_multiple: int = 1,

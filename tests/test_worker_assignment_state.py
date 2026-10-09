@@ -303,6 +303,37 @@ def test_recovery_fence_observes_divergence_without_changing_the_verdict(caplog)
     assert "worker_assignment_state_divergence" not in caplog.text
 
 
+def test_ack_record_also_observed_without_changing_verdict(caplog):
+    """★ 2026-10-08（DIST-1 推进）：第三个旧集合 `_layer_config_acks` 也纳入一致性观测。
+
+    判据：有 ACK 记录而权威视图**无状态** ⇒ 记 `state_missing_but_legacy_expected`
+    （与 `has_expected` 同类："旧集合说有、权威视图没有"）；并且**不改判据** ——
+    只增一条可见事件，`_layer_config_expected` 等集合不被本观测改动。
+    """
+    sched = Scheduler()
+    sched._layer_config_acks["worker_01"] = {"config_id": "cfg-1"}
+    before_expected = dict(sched._layer_config_expected)
+
+    with caplog.at_level("WARNING", logger="scheduler"):
+        sched._observe_assignment_state_consistency(
+            "worker_01", legacy_pushed=False, expected={},
+        )
+
+    assert "event=worker_assignment_state_divergence" in caplog.text
+    assert "state_missing_but_legacy_expected" in caplog.text
+    # 只观测：不得改动任何旧集合
+    assert dict(sched._layer_config_expected) == before_expected
+    assert sched._layer_config_acks["worker_01"] == {"config_id": "cfg-1"}
+
+    # 没有 ack 记录时不得凭空产生分歧（回归"不谎报"）
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="scheduler"):
+        sched._observe_assignment_state_consistency(
+            "worker_09", legacy_pushed=False, expected={},
+        )
+    assert "worker_assignment_state_divergence" not in caplog.text
+
+
 def test_pushed_equivalence_mapping_and_effective_verdict(caplog):
     """`_layer_config_pushed` 的等价映射，以及"读路径切换"的保守规则。"""
     from worker_assignment_state import pushed_from_state

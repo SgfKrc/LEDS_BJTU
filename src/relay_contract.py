@@ -452,6 +452,15 @@ class RelayXFrameEvidence:
     #: 速度性能判定 —— **仅作记录与路由倾向，不影响准入**。
     #: `not_advantageous` = 「正确但比整模 GPU 慢约 20×」⇒ 定位是**能力组合**而非提速。
     performance_verdict: str = "unknown"
+    #: 两侧**权重/工件精度对齐**判据（`relay_precision.evaluate_relay_precision` 的 `level`：
+    #: `ok` / `warn` / `critical` / `unknown`）。
+    #: ★ 2026-10-08：**只记录** —— 不参与 `admits_production()`、不改变任何路由或准入
+    #: （把默认部署切成"两侧同源同精度"是**独立决定**，见
+    #: `docs/跨框架接力误差优化实验报告-2026-10-08.md` 的接入清单）。
+    #: 依据：端到端误差由两侧权重网格差主导 —— `fp32 × Q4_K_M` 的第 16 层 `rel_err` 为 `1.96e-1`，
+    #: 而同源 `f16 × f16` 仅 `3.33e-4`（相差 590×）。
+    precision_verdict: str = "unknown"
+    precision_aligned: bool = False
     evidence_refs: tuple = ()
 
     def admits_production(self) -> bool:

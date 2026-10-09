@@ -96,9 +96,29 @@ async def load_model(req: LoadModelRequest, request: Request = None):
         )
 
     _api_module._validate_model_load_request(req.model_id, engine)
-    resolved_model_path = _api_module._resolve_model_path_for_engine(req.model_id, engine)
+    # ★ 2026-10-09（稳定性 #73-④）：**先定引擎，再按引擎解析路径**。
+    #   此前顺序相反：路径按请求里的**原始** engine（默认 `llama_cpp`）解析 ⇒ 拿到 GGUF 文件，
+    #   而 `effective_engine` 已被纠正为 pytorch ⇒ **引擎与路径不匹配** ⇒ 加载直接 HTTP 500。
     effective_engine = _api_module._effective_engine_for_model(req.model_id, engine)
+    resolved_model_path = _api_module._resolve_model_path_for_engine(req.model_id, effective_engine)
     quant = _api_module._normalize_quant_for_engine(req.quant_type, effective_engine)
+
+    # ★ 2026-10-09（自适应加载，用户裁定）：分布式下**先判断整模能否装下**。
+    #   装得下 ⇒ 整模加载（简单、启动快）；
+    #   装不下 ⇒ 改走「按段物化」（`prepare_pipeline_model`）—— 各节点只在自己的分配段物化权重。
+    #   此前只有"整模"一条路，于是小显存/边缘环境下加载成功、容量求解却必然失败
+    #   （`#82` 实测：fp32 整模 8GB 装不下 ⇒ `admitted=False` ⇒ 每个请求 503）。
+    load_mode, load_reason = _api_module._decide_pipeline_load_mode(
+        req.model_id, effective_engine, quant
+    )
+    _api_module.logger.info(f"加载模式决策: mode={load_mode}（{load_reason}）")
+    if load_mode == "pipeline":
+        return await prepare_pipeline_model(
+            _api_module.PreparePipelineModelRequest(
+                model_id=req.model_id,
+                quant_type=req.quant_type,
+            )
+        )
 
     try:
         t0 = _api_module.time.time()
@@ -436,9 +456,26 @@ async def switch_model(req: SwitchModelRequest, request: Request = None):
             f"不支持的引擎: {engine}，可选: {', '.join(accepted_engines)}",
         )
     _api_module._validate_model_load_request(req.model_id, engine)
-    resolved_model_path = _api_module._resolve_model_path_for_engine(req.model_id, engine)
+    # ★ 2026-10-09（子 agent 复查 N1）：**先定引擎，再按引擎解析路径** —— 与 `/api/models/load`
+    #   保持同一顺序。此前这里是反的：路径按**原始** engine（默认 `llama_cpp`）解析 ⇒ 拿到
+    #   `.gguf`，而 `effective_engine` 已被纠正为 `pytorch` ⇒ 引擎与路径不匹配（同 `#73-④`）。
     effective_engine = _api_module._effective_engine_for_model(req.model_id, engine)
+    resolved_model_path = _api_module._resolve_model_path_for_engine(req.model_id, effective_engine)
     quant = _api_module._normalize_quant_for_engine(req.quant_type, effective_engine)
+
+    # ★ 2026-10-09（自适应加载，用户裁定）：与 `/api/models/load` 同一判据 ——
+    #   整模装不下时改走「按段物化」，而不是硬加载后让容量求解失败。
+    load_mode, load_reason = _api_module._decide_pipeline_load_mode(
+        req.model_id, effective_engine, quant
+    )
+    _api_module.logger.info(f"切换模式决策: mode={load_mode}（{load_reason}）")
+    if load_mode == "pipeline":
+        return await prepare_pipeline_model(
+            _api_module.PreparePipelineModelRequest(
+                model_id=req.model_id,
+                quant_type=req.quant_type,
+            )
+        )
 
     try:
         # 更新全局引擎配置（P3修复: switch_model 也需要更新 config）

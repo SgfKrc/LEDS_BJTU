@@ -454,6 +454,63 @@ def test_runtime_readiness_failure_short_circuits_optional_refreshes():
     _run(_main())
 
 
+def _pane_text(widget) -> str:
+    """取 `Static` 当前呈现的文本（Textual 8 用 `content`；旧版用 `renderable`/`_renderable`）。"""
+    for attr in ("content", "renderable", "_renderable"):
+        value = getattr(widget, attr, None)
+        if value is not None:
+            return str(value)
+    return ""
+
+
+def test_model_loading_summary_is_consistent_with_table():
+    """★ 2026-10-09（#73-②，用户截图实证）：加载期间**摘要 pane** 必须与 `model_text` 同源。
+
+    此前只改了 `model_text` 与状态表，漏了 `#status-pane` 的摘要 ⇒ 加载中顶部仍显示
+    「模型未加载」，与下面「加载中…」**同屏矛盾**（这正是用户截图里的 ②）。
+    """
+    from textual.widgets import Static
+
+    from tui_textual import KoakumaApp
+
+    async def _main():
+        app = KoakumaApp(ApiClient(host="127.0.0.1", port=1, timeout=0.1), interval=30)
+        app.api = _StubApi()
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.show_main()
+            await pilot.pause(0.4)
+            screen = app.screen
+            # 模拟"加载已开始、但 /api/status 还没更新"的窗口 —— 矛盾就出现在这个时机。
+            screen._model_loading_id = "qwen3-5-2b"
+            screen.fill_status(
+                {"status": "ok"},
+                {"model_loaded": False, "model_name": "Qwen3.5-2B", "active_model_id": None},
+                {},
+                {},
+            )
+            await pilot.pause(0.2)
+            assert "加载中" in screen.model_text, screen.model_text
+            summary = _pane_text(screen.query_one("#status-pane", Static))
+            assert "加载中" in summary, summary
+            assert "模型未加载" not in summary, (
+                f"加载期间摘要不得显示『模型未加载』（与『加载中』矛盾）：{summary}"
+            )
+            # 加载结束后必须回到常规呈现（不能卡在"加载中"）。
+            screen._model_loading_id = ""
+            screen.fill_status(
+                {"status": "ok"},
+                {"model_loaded": True, "model_name": "Qwen3.5-2B", "active_model_id": "qwen3-5-2b"},
+                {},
+                {},
+            )
+            await pilot.pause(0.2)
+            done = _pane_text(screen.query_one("#status-pane", Static))
+            assert "加载中" not in done, done
+            assert "模型已加载" in done, done
+
+    _run(_main())
+
+
 def test_endpoint_workbench_discovers_and_executes_get():
     """端点页跟随 OpenAPI，GET 可执行，路径模板不能被误发。"""
     from textual.widgets import Input

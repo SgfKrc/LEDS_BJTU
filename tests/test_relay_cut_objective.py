@@ -15,14 +15,57 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.relay_cut_objective import (  # noqa: E402
+    MEASURED_ANDROID_MS_PER_LAYER,
+    MEASURED_ANDROID_RTT_MS,
+    MEASURED_MASTER_MS_PER_LAYER,
+    MEASURED_TABLET_MS_PER_LAYER,
+    MEASURED_TABLET_RTT_MS,
+    SegmentEconomics,
     SegmentProfile,
     fit_segment_profile,
     fit_two_segment,
     legal_cuts,
     plan_relay_cut_n_segments,
+    segment_worthwhile,
 )
 
 MB = 1024 ** 2
+
+
+# ------------------------------------------------------- 分段收益判据（③，参数取实测）
+def test_measured_worker_segments_are_all_not_worthwhile():
+    """实测参数下，当前两台 worker 段都是**净亏**（docs #71/#72）—— 这是"去掉一个段 +49%"的成因。
+
+    Surface: 4 层 × 11.75ms/层、RTT 3ms  ⇒ saved 12.24ms vs cost 6+47  = 53ms
+    Y700   : 4 层 × 11.5ms/层、 RTT 19ms ⇒ saved 12.24ms vs cost 38+46 = 84ms
+    """
+    tablet = SegmentEconomics(4, MEASURED_MASTER_MS_PER_LAYER, MEASURED_TABLET_MS_PER_LAYER, MEASURED_TABLET_RTT_MS)
+    android = SegmentEconomics(4, MEASURED_MASTER_MS_PER_LAYER, MEASURED_ANDROID_MS_PER_LAYER, MEASURED_ANDROID_RTT_MS)
+
+    assert tablet.saved_ms == pytest.approx(4 * 3.06)
+    assert tablet.cost_ms == pytest.approx(2 * 3.0 + 4 * 11.75)      # 6 + 47
+    assert tablet.worthwhile is False
+    assert android.cost_ms == pytest.approx(2 * 19.0 + 4 * 11.5)     # 38 + 46
+    assert android.worthwhile is False
+    # 两者的单层耗时都**慢于** master ⇒ 分母非正 ⇒ 无解（再加层只会更亏）
+    assert tablet.min_layers is None
+    assert android.min_layers is None
+
+
+def test_faster_device_with_low_rtt_is_worthwhile():
+    """反向用例：设备单层更快且 RTT 低时**值得**分段，且存在最小层数。"""
+    econ = SegmentEconomics(8, c_master_ms=12.0, c_device_ms=6.0, rtt_ms=1.0)
+    assert econ.min_layers == pytest.approx(2 * 1.0 / (12.0 - 6.0))   # = 1/3 层
+    assert econ.worthwhile is True
+    assert segment_worthwhile(8, 12.0, 6.0, 1.0) is True
+
+
+def test_break_even_is_not_worthwhile():
+    """恰好打平（net == 0）**不算**值得：判据是严格大于。"""
+    econ = SegmentEconomics(2, c_master_ms=10.0, c_device_ms=5.0, rtt_ms=5.0)
+    assert econ.net_ms == pytest.approx(0.0)
+    assert econ.worthwhile is False
+    assert segment_worthwhile(3, 10.0, 5.0, 5.0) is True             # 30 > 10 + 15
 
 
 def _layers(total: int = 24, per_layer_bytes: int = 20 * MB, tail_extra: int = 8 * MB):

@@ -1966,15 +1966,24 @@ class EngineHost:
         # `NameError: name 'TaskGraphError' is not defined`，而不是真正的错误信息
         # （2026-10-06 用 Edge 包当 layer worker 入网时实测踩到）。
         from task_graph import TaskGraphError
+        # ★ 2026-10-08（#53）：与 master 侧共用 shim 定位（含"仓库默认构建产物"一档）。
+        from keep_head_shim import missing_shim_hint, resolve_keep_head_shim
 
         if self._layer_upstream is not None:
             return self._layer_upstream
         model_path = os.environ.get("QLH_LAYER_GGUF", "").strip()
-        shim_path = os.environ.get("QLH_KEEP_HEAD_SHIM", "").strip()
+        # ★ 2026-10-08（#53）：shim 走**共用的定位入口** —— 环境变量之后还有"仓库默认
+        #   构建产物"这一档，与 master 侧（`llama_engine`）完全一致。此前这里只读环境
+        #   变量 ⇒ 同一台机器上"master 能用、worker 报缺环境变量"。
+        shim_path = resolve_keep_head_shim()
         if not model_path or not shim_path:
-            raise TaskGraphError(
-                "层段 Stage 需要 QLH_LAYER_GGUF 与 QLH_KEEP_HEAD_SHIM 环境变量"
-            )
+            # 具名错误：分别指出**缺哪一个**，并列出 shim 已尝试过的路径。
+            missing = []
+            if not model_path:
+                missing.append("QLH_LAYER_GGUF（裁层 GGUF 路径）")
+            if not shim_path:
+                missing.append(missing_shim_hint())
+            raise TaskGraphError("层段 Stage 缺少必要配置：" + "；".join(missing))
         from llama_keep_head import KeepHeadUnavailable, KeepHeadUpstream
 
         def _env_int(name: str, default: int) -> int:
