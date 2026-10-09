@@ -33,6 +33,7 @@ for _path in (str(ROOT), str(ROOT / "src")):
 
 from src.relay_cut_objective import (  # noqa: E402
     SegmentProfile,
+    cut_multiple_from_gguf,
     fit_two_segment,
     plan_relay_cut_n_segments,
 )
@@ -96,8 +97,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--records", default=None,
                     help="已废弃：规划器不再直接消费原始/中位记录")
     ap.add_argument("--total-layers", type=int, required=True)
-    ap.add_argument("--cut-multiple", type=int, default=1,
-                    help="合法切点步长（Qwen3.5 = full_attention_interval = 4）")
+    ap.add_argument("--cut-multiple", type=int, default=None,
+                    help="合法切点步长（Qwen3.5 = full_attention_interval = 4）。"
+                         "★ 缺省时**自动从 --src-gguf 读**；都没有才退回 1")
+    ap.add_argument("--src-gguf", default=None,
+                    help="★ 源 GGUF（可选）：自动读出 full_attention_interval 作为切点步长。"
+                         "人工漏传该步长会让裁层工件的层类型整体错位、下游加载失败（#67）")
     ap.add_argument("--capacity-gb", type=float, default=16.0, help="每段可用容量（容量判据用）")
     ap.add_argument("--n-embd", type=int, default=896, help="模型 hidden 宽度（hidden 合同校验用）")
     ap.add_argument("--bandwidth-mbps", type=float, default=1000.0)
@@ -107,6 +112,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--non-split-mib", type=float, default=8.0)
     ap.add_argument("--json-out", default=None)
     args = ap.parse_args(argv)
+
+    # ★ `#67`：`cut_multiple` 缺省时**自动从源 GGUF 读**（人工显式传值仍优先）。
+    #   此前默认 1，对 hybrid 架构（Qwen3.5 interval=4）是错的 ⇒ 裁层工件层类型错位、
+    #   下游 llama.cpp 报 missing tensor。自动读让"不该忘的知识"不再依赖人工。
+    cut_multiple = args.cut_multiple
+    if cut_multiple is None:
+        auto = cut_multiple_from_gguf(args.src_gguf) if args.src_gguf else None
+        if auto is not None:
+            print(f"[cut] 自动从源 GGUF 读得 cut_multiple={auto}（full_attention_interval）")
+            cut_multiple = auto
+        else:
+            print("[cut] 未能从源读出 full_attention_interval ⇒ cut_multiple 退回 1")
+            cut_multiple = 1
 
     if not args.analysis_report:
         print("FAIL: --analysis-report is required; raw or median records are not decision evidence")
@@ -224,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
         n_embd=args.n_embd,
         segments=[fitted["upstream"], fitted["downstream"]],
         non_split_bytes=non_split_bytes,
-        cut_multiple=args.cut_multiple,
+        cut_multiple=cut_multiple,
         weights={"capacity": 0.0, "latency": 1.0, "risk": 0.0},
     )
 
@@ -270,7 +288,7 @@ def main(argv: list[str] | None = None) -> int:
         "experiment_identity": identity,
         "warmup": warmup,
         "total_layers": args.total_layers,
-        "cut_multiple": args.cut_multiple,
+        "cut_multiple": cut_multiple,
         "capacity_gb": args.capacity_gb,
         "layer_bytes": layer_bytes,
         "layer_bytes_source": layer_bytes_source,

@@ -25,6 +25,7 @@ from __future__ import annotations
 import itertools
 import math
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from src.relay_contract import CUT_LAYER_MIN, RelayHiddenSpec
@@ -259,6 +260,39 @@ def segment_worthwhile(
 ) -> bool:
     """便捷判据：把 `n_layers` 交给该设备是否值得（细节见 `SegmentEconomics`）。"""
     return SegmentEconomics(n_layers, c_master_ms, c_device_ms, rtt_ms).worthwhile
+
+
+def cut_multiple_from_gguf(gguf_path: "str | Path") -> int | None:
+    """★ `#67`：**从源 GGUF 直接读**裁层整数倍（`<arch>.full_attention_interval`）。
+
+    为什么需要它：`cut_multiple` 此前**全靠人工传参**，而 `relay_cut_plan` 与
+    `HeteroBaseline` 的**默认值都是 1** —— 对 hybrid 架构（Qwen3.5，interval=4）**1 是错的**：
+    裁层 GGUF 的层类型按"（重编号后的）本地层号对 interval 取模"推导，非整数倍切点会整体错位，
+    llama.cpp 报 `missing tensor 'blk.x.<...>'`。本函数让人工参数成为**可选覆盖**而非必需知识。
+
+    返回 `None` 表示"源没有该约束"（非 hybrid 件，或 `interval <= 1`）⇒ 调用方保持既有行为；
+    这是**探测**语义而非校验，故文件缺失/读不动一律返回 `None` 而不抛。
+    """
+    try:
+        import gguf
+    except ImportError:  # pragma: no cover - torch-free / minimal 环境
+        return None
+    try:
+        reader = gguf.GGUFReader(str(gguf_path))
+    except Exception:  # noqa: BLE001 - 探测失败即"无约束"
+        return None
+    try:
+        arch_field = reader.fields.get("general.architecture")
+        if arch_field is None:
+            return None
+        arch = str(arch_field.contents())
+        interval_field = reader.fields.get(f"{arch}.full_attention_interval")
+        if interval_field is None:
+            return None
+        interval = int(interval_field.contents())
+    except Exception:  # noqa: BLE001
+        return None
+    return interval if interval > 1 else None
 
 
 def legal_cuts(total_layers: int, *, cut_multiple: int = 1,
