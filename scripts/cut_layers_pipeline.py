@@ -105,6 +105,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--end", type=int, default=None, help="与 --k 同用：中段工件 [K,end)")
     ap.add_argument("--keep-head", type=int, default=None, help="保留前 N 层（上游段工件）")
     ap.add_argument("--outdir", required=True, help="输出目录（工件/manifest/report 都落这里）")
+    ap.add_argument("--name", default=None,
+                    help="产物基名（默认 `<arch>-cut-<lo>-<hi>`）；用于保持既有引用不失效")
     ap.add_argument("--hf-config", default=None,
                     help="HF config.json（可选）：额外做 #67-③ 层类型逐位校验")
     args = ap.parse_args(argv)
@@ -132,13 +134,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"FAIL: 切点不合法 — {why}")
         return 2
 
-    # 产物命名（与设备侧封装一致的 `-cut-<lo>-<hi>` 风格）
+    # 产物命名（默认 `-cut-<lo>-<hi>`；`--name` 可覆盖，用于保持既有引用不失效，
+    # 如 `local_docs/start_tail.ps1` 写死的 `qwen25-05b-f16-mid8-24`）。
     if args.keep_head is not None:
         lo, hi = 0, int(args.keep_head)
     else:
         lo = int(args.k)
         hi = int(args.end) if args.end is not None else total
-    stem = f"{identity['architecture']}-cut-{lo}-{hi}"
+    stem = args.name or f"{identity['architecture']}-cut-{lo}-{hi}"
     dst = outdir / f"{stem}.gguf"
     manifest_path = outdir / f"{stem}.manifest.json"
 
