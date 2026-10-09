@@ -135,8 +135,10 @@ def read_gguf_layer_info(path: str | Path) -> dict[str, Any] | None:
                 if key == "general.architecture" and value_type == _GGUF_TYPE_STRING:
                     arch = _gguf_read_string(handle)
                     continue
-                # 只留**整数**标量：真正的层数 KV 都是整数，浮点/字符串没有用还占地方。
-                if (key.endswith(".block_count") or key.endswith(".nextn_predict_layers")):
+                # 只留流水线合同需要的整数标量；浮点/字符串没有用还占地方。
+                if key.endswith((
+                    ".block_count", ".nextn_predict_layers", ".embedding_length",
+                )):
                     value = _gguf_read_scalar(handle, value_type)
                     if isinstance(value, int):
                         scalars[key] = value
@@ -151,11 +153,13 @@ def read_gguf_layer_info(path: str | Path) -> dict[str, Any] | None:
     if not isinstance(block_count, int) or block_count <= 0:
         return None
     nextn = scalars.get(f"{arch}.nextn_predict_layers") or 0
+    n_embd = scalars.get(f"{arch}.embedding_length") or 0
     return {
         "architecture": arch,
         "block_count": block_count,
         "nextn_predict_layers": int(nextn),
         "n_layer": max(0, block_count - int(nextn)),
+        "n_embd": max(0, int(n_embd)),
     }
 
 
@@ -249,10 +253,24 @@ def read_artifact_manifest(path: str | Path) -> dict[str, Any] | None:
     total = payload.get("n_layer")
     if isinstance(total, int) and total > 0:
         info["n_layer"] = total
-    for field in ("source_model_sha256", "artifact_sha256"):
+    for field in (
+        "source_model_sha256", "artifact_sha256", "tokenizer_sha256",
+    ):
         digest = str(payload.get(field, "") or "").strip().lower()
         if len(digest) == 64 and all(char in "0123456789abcdef" for char in digest):
             info[field] = digest
+    source_model_id = str(payload.get("source_model_id", "") or "").strip()
+    if (
+        1 <= len(source_model_id) <= 128
+        and all(
+            char in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:-"
+            for char in source_model_id
+        )
+    ):
+        info["source_model_id"] = source_model_id
+    hidden_size = payload.get("hidden_size")
+    if isinstance(hidden_size, int) and not isinstance(hidden_size, bool) and hidden_size > 0:
+        info["hidden_size"] = hidden_size
     return info or None
 
 

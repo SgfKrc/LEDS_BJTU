@@ -1067,6 +1067,11 @@ class Scheduler(
         self._pipeline_worker_opted_out = False
         self._pipeline_worker_opt_out: set[str] = set()
         self._pipeline_load_transaction: Optional[dict] = None
+        # Terminal model-runtime cleanup is independent from the one mutable
+        # load transaction.  A disconnected worker may keep an old candidate
+        # alive while later transactions continue on the remaining topology;
+        # retain that debt until the exact abort/finalize receipt arrives.
+        self._pipeline_model_cleanup_ledger: dict[str, dict] = {}
         # A persisted active transaction must be republished after a master
         # restart before distributed requests are admitted.
         self._pipeline_recovery_pending = False
@@ -1100,6 +1105,7 @@ class Scheduler(
         self._gemma4_sidecar_python_override: Optional[str] = None
         self._model_runtime_contract_lock = threading.RLock()
         self._active_pipeline_capacity_plan: Optional[dict] = None
+        self._pipeline_assignment_rollbacks: dict[str, dict] = {}
         # Recovery is control-plane state. A candidate is never published to
         # an executor before its capacity, artifact, and epoch gates pass.
         self._pipeline_reshard_coordinator: Optional[PipelineReshardCoordinator] = None
@@ -1926,7 +1932,10 @@ class Scheduler(
                     logger.debug("读取当前模型层数失败: %s", config_path, exc_info=True)
         return TOTAL_MODEL_LAYERS
 
-    def _get_active_pipeline_model_info(self) -> dict:
+    def _get_active_pipeline_model_info(
+        self, *, descriptor: Optional[dict] = None,
+        model_path: str = "", quant_type: str = "",
+    ) -> dict:
         """Describe the master's pipeline artifact — PyTorch **or** llama.cpp.
 
         不需要完整加载模型：两条引擎路径各自给出描述器，本方法只做形状归一与
@@ -1934,20 +1943,24 @@ class Scheduler(
         `LlamaCppEngine.get_pipeline_descriptor()` 读文件头提供。
         """
         manager = self._host
-        if not manager or not runtime_supports(manager, Capability.FORWARD_LAYERS):
-            return {}
-        get_descriptor = getattr(manager, "get_pipeline_descriptor", None)
-        if not callable(get_descriptor):
-            return {}
-        try:
-            descriptor = get_descriptor() or {}
-        except Exception:
-            logger.warning("读取主节点流水线模型描述器失败", exc_info=True)
-            return {}
+        if descriptor is None:
+            if not manager or not runtime_supports(manager, Capability.FORWARD_LAYERS):
+                return {}
+            get_descriptor = getattr(manager, "get_pipeline_descriptor", None)
+            if not callable(get_descriptor):
+                return {}
+            try:
+                descriptor = get_descriptor() or {}
+            except Exception:
+                logger.warning("读取主节点流水线模型描述器失败", exc_info=True)
+                return {}
+        else:
+            descriptor = dict(descriptor)
         if not descriptor.get("pipeline_runtime_supported", False):
             return {}
         model_path = os.path.abspath(
-            getattr(manager, "_full_model_path", "")
+            model_path
+            or getattr(manager, "_full_model_path", "")
             or getattr(manager, "_model_path", "")
             or ""
         )
@@ -1970,7 +1983,7 @@ class Scheduler(
             or self._get_master_model_sha256(),
             "model_type": model_type,
             "total_layers": int(descriptor["total_layers"]),
-            "quant_type": getattr(manager, "quant_type", "") or "",
+            "quant_type": quant_type or getattr(manager, "quant_type", "") or "",
             "inspection_mode": descriptor.get("inspection_mode", ""),
             "weight_bytes": int(descriptor.get("weight_bytes", 0) or 0),
         }
@@ -2623,22 +2636,6 @@ class Scheduler(
                 dict(self._active_pipeline_capacity_plan)
                 if self._active_pipeline_capacity_plan else None
             )
-            if capacity_plan is None and self._pipeline_load_transaction:
-                transaction_phase = str(
-                    self._pipeline_load_transaction.get("phase", "") or ""
-                )
-                candidate = self._pipeline_load_transaction.get("plan")
-                if (
-                    transaction_phase in {
-                        "preparing", "committing_local", "committing", "ready",
-                    }
-                    and isinstance(candidate, dict)
-                    and candidate.get("admitted")
-                ):
-                    capacity_plan = dict(candidate)
-                    capacity_plan["transaction_phase"] = (
-                        transaction_phase
-                    )
 
         if capacity_plan and capacity_plan.get("admitted"):
             return {
@@ -2772,6 +2769,7 @@ class Scheduler(
         # solver so it cannot produce an assignment the worker must reject.
         layer_ranges_by_node: dict[str, list[list[int]]] = {}
         layer_artifacts_by_node: dict[str, list[dict]] = {}
+        models_by_node: dict[str, list[dict]] = {}
         # ★ 2026-10-03：设备自荐的层容量（本地裁层后可承载的层数上限）。与
         #   `layer_ranges` 同源（v3 hello capabilities）但语义不同：ranges 是
         #   "当前已就绪、马上能跑的区间"，budget 是"能自裁并承载的上限" ⇒ 有了它，
@@ -2802,6 +2800,9 @@ class Scheduler(
                 artifacts = capabilities.get("layer_artifacts")
                 if isinstance(artifacts, list) and artifacts:
                     layer_artifacts_by_node[node_id] = artifacts
+                models = capabilities.get("models")
+                if isinstance(models, list) and models:
+                    models_by_node[node_id] = models
                 budget = capabilities.get("layer_budget")
                 if isinstance(budget, dict):
                     layer_budget_by_node[node_id] = budget
@@ -2952,6 +2953,8 @@ class Scheduler(
                 record["layer_ranges"] = layer_ranges_by_node[node_id]
             if node_id in layer_artifacts_by_node:
                 record["layer_artifacts"] = layer_artifacts_by_node[node_id]
+            if node_id in models_by_node:
+                record["models"] = models_by_node[node_id]
             if node_id in layer_budget_by_node:
                 record["layer_budget"] = layer_budget_by_node[node_id]
             # ★ 2026-10-05（DIST-3）：段类型透传给求解器，供其拒绝
@@ -3374,9 +3377,10 @@ class Scheduler(
                 local_layer_budget, relay_claims,
                 sorted(eligible_node_ids) if eligible_node_ids else None,
             )
+            capacity_nodes = self._get_pipeline_capacity_nodes(eligible_node_ids)
             result = solve_pipeline_capacity(
                 descriptor,
-                self._get_pipeline_capacity_nodes(eligible_node_ids),
+                capacity_nodes,
                 safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
                 require_distributed=require_distributed,
                 local_layer_budget=local_layer_budget,
@@ -3391,6 +3395,15 @@ class Scheduler(
                 "reason": str(exc),
                 "assignments": [],
             }
+        if result.get("admitted"):
+            from model_preflight import bind_model_preflight
+
+            result = bind_model_preflight(
+                result,
+                descriptor=descriptor,
+                nodes=capacity_nodes,
+                require_distributed=require_distributed,
+            )
         result["computed_at"] = time.time()
         result["transaction_phase"] = "planned" if result.get("admitted") else "rejected"
         result.setdefault("require_distributed", bool(require_distributed))
@@ -3443,9 +3456,10 @@ class Scheduler(
 
         total_layers = len(layer_bytes)
         node_ids = {str(item.get("node_id", "")) for item in assignments}
+        capacity_records = self._get_pipeline_capacity_nodes(node_ids)
         records = {
             item["node_id"]: item
-            for item in self._get_pipeline_capacity_nodes(node_ids)
+            for item in capacity_records
         }
         planned = []
         artifact_source_sha256 = ""
@@ -3585,7 +3599,7 @@ class Scheduler(
                 for item in planned
             ],
         }
-        return self._attach_pipeline_node_contract({
+        plan = {
             "schema_version": 1,
             "status": "admitted",
             "admitted": True,
@@ -3610,7 +3624,16 @@ class Scheduler(
             "single_node_full_model_candidates": [],
             "aggregate_only": len(planned) > 1,
             "computed_at": time.time(),
-        })
+        }
+        from model_preflight import bind_model_preflight
+
+        plan = bind_model_preflight(
+            plan,
+            descriptor=descriptor,
+            nodes=capacity_records,
+            require_distributed=len(planned) > 1,
+        )
+        return self._attach_pipeline_node_contract(plan)
 
     def _normalize_manual_assignments(self, assignments: list) -> list:
         """补齐手动区间的运行字段，并按节点能力放置 Embedding/LM Head。"""
@@ -3956,6 +3979,10 @@ class Scheduler(
                 qwen3_release, best_effort=True,
             )
 
+        cleanup_replayed = self._replay_pipeline_model_cleanup_for_node(
+            client_id,
+        )
+
         # REGISTER ACK precedes the client's task-worker hello. Fence this
         # connection from legacy layer assignment until that hello arrives.
         # The hello handler resolves the fence and triggers a fresh push.
@@ -3965,6 +3992,12 @@ class Scheduler(
         )
         if task_worker_handshake_pending:
             self._task_worker_control.mark_worker_connection_pending(client_id)
+        if cleanup_replayed:
+            logger.info(
+                "legacy_layer_config skipped reason=model_cleanup_pending node=%s",
+                client_id,
+            )
+        elif task_worker_handshake_pending:
             logger.info(
                 "legacy_layer_config skipped reason=task_worker_handshake_pending node=%s",
                 client_id,
@@ -4405,10 +4438,25 @@ class Scheduler(
         qwen3_disconnect = None
         with self._layer_config_lock:
             transaction = self._pipeline_load_transaction
+            cleanup_changed = False
+            for record in self._pipeline_model_cleanup_ledger.values():
+                if record.get("node_id") == client_id:
+                    record["state"] = "await_reconnect"
+                    cleanup_changed = True
+            if cleanup_changed:
+                if isinstance(transaction, dict):
+                    pending = set(transaction.get("finalize_pending", set()))
+                    pending.discard(client_id)
+                    transaction["finalize_pending"] = pending
+                    transaction.get("finalize_retry_state", {}).pop(
+                        client_id, None,
+                    )
+                self._persist_pipeline_lifecycle_locked()
             if (
                 transaction
                 and transaction.get("phase") in {
                     "preparing", "committing_local", "committing",
+                    "committing_global",
                 }
                 and client_id in set(transaction.get("worker_ids", set()))
             ):

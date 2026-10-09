@@ -702,6 +702,17 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
             }
             if "source_model_sha256" in artifact:
                 expected_artifact_fields.add("source_model_sha256")
+            contract_fields = {
+                "source_model_id", "hidden_size", "tokenizer_sha256",
+            }
+            present_contract_fields = contract_fields.intersection(artifact)
+            if present_contract_fields and present_contract_fields != contract_fields:
+                raise _error(
+                    "invalid_capabilities", item_field,
+                    "source_model_id, hidden_size, and tokenizer_sha256 "
+                    "must be declared together",
+                )
+            expected_artifact_fields.update(present_contract_fields)
             _require_exact_fields(artifact, expected_artifact_fields, item_field)
             layer_range = artifact["layer_range"]
             if (
@@ -738,6 +749,22 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
                 _require_string(
                     artifact["source_model_sha256"],
                     f"{item_field}.source_model_sha256",
+                    pattern=_SHA256,
+                )
+            if present_contract_fields:
+                _require_string(
+                    artifact["source_model_id"],
+                    f"{item_field}.source_model_id",
+                    pattern=_SAFE_ID,
+                )
+                _require_int(
+                    artifact["hidden_size"],
+                    f"{item_field}.hidden_size",
+                    minimum=1,
+                )
+                _require_string(
+                    artifact["tokenizer_sha256"],
+                    f"{item_field}.tokenizer_sha256",
                     pattern=_SHA256,
                 )
             artifact_ranges.append((layer_range[0], layer_range[1]))
@@ -839,6 +866,15 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
                     "invalid_capabilities",
                     f"payload.capabilities.layer_artifacts[{index}].artifact_sha256",
                     "layer artifact digest must match its advertised model identity",
+                )
+            if (
+                advertised_model.get("engine") != "llama_cpp"
+                or advertised_model.get("format") != "gguf"
+            ):
+                raise _error(
+                    "invalid_capabilities",
+                    f"payload.capabilities.layer_artifacts[{index}].model_id",
+                    "layer artifact identity must reference a llama_cpp/gguf model",
                 )
     max_concurrency = _require_int(
         capabilities["max_concurrency"],

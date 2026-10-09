@@ -96,9 +96,12 @@ def _normalize_layer_artifacts(
             raise PipelineCapacityError(f"{item_field} must be an object")
         allowed = {
             "layer_range", "segment_mode", "model_id", "artifact_sha256",
-            "source_model_sha256",
+            "source_model_sha256", "source_model_id", "hidden_size",
+            "tokenizer_sha256",
         }
-        required = allowed - {"source_model_sha256"}
+        required = {
+            "layer_range", "segment_mode", "model_id", "artifact_sha256",
+        }
         if set(item) - allowed or not required.issubset(item):
             raise PipelineCapacityError(
                 f"{item_field} has invalid or missing fields"
@@ -124,6 +127,12 @@ def _normalize_layer_artifacts(
         source_sha256 = str(
             item.get("source_model_sha256", "") or ""
         ).strip().lower()
+        contract_fields = {"source_model_id", "hidden_size", "tokenizer_sha256"}
+        present_contract_fields = contract_fields.intersection(item)
+        if present_contract_fields and present_contract_fields != contract_fields:
+            raise PipelineCapacityError(
+                f"{item_field} model preflight fields must be declared together"
+            )
         if not model_id:
             raise PipelineCapacityError(f"{item_field}.model_id must not be empty")
         if len(artifact_sha256) != 64 or any(
@@ -139,13 +148,41 @@ def _normalize_layer_artifacts(
             raise PipelineCapacityError(
                 f"{item_field}.source_model_sha256 must be a SHA-256 digest"
             )
-        normalized.append({
+        normalized_item = {
             "layer_range": layer_range,
             "segment_mode": mode,
             "model_id": model_id,
             "artifact_sha256": artifact_sha256,
             "source_model_sha256": source_sha256,
-        })
+        }
+        if present_contract_fields:
+            source_model_id = str(item.get("source_model_id", "") or "").strip()
+            tokenizer_sha256 = str(
+                item.get("tokenizer_sha256", "") or ""
+            ).strip().lower()
+            hidden_size = _non_negative_int(
+                item.get("hidden_size"), f"{item_field}.hidden_size",
+            )
+            if not source_model_id:
+                raise PipelineCapacityError(
+                    f"{item_field}.source_model_id must not be empty"
+                )
+            if hidden_size <= 0:
+                raise PipelineCapacityError(
+                    f"{item_field}.hidden_size must be positive"
+                )
+            if len(tokenizer_sha256) != 64 or any(
+                char not in "0123456789abcdef" for char in tokenizer_sha256
+            ):
+                raise PipelineCapacityError(
+                    f"{item_field}.tokenizer_sha256 must be a SHA-256 digest"
+                )
+            normalized_item.update({
+                "source_model_id": source_model_id,
+                "hidden_size": hidden_size,
+                "tokenizer_sha256": tokenizer_sha256,
+            })
+        normalized.append(normalized_item)
     return tuple(sorted(normalized, key=lambda item: item["layer_range"]))
 
 

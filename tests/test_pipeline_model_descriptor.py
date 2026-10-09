@@ -1,5 +1,6 @@
 """Metadata-only Safetensors descriptor tests."""
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -37,6 +38,17 @@ def _write_qwen2_fixture(root):
         "lm_head.weight": torch.zeros(4, 2, dtype=torch.float16),
     }
     save_file(tensors, str(root / "model.safetensors"))
+    tokenizer_payload = b'{"version":1}'
+    (root / "tokenizer.json").write_bytes(tokenizer_payload)
+    (root / "model.manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "artifact_sha256": "a" * 64,
+        "files": [{
+            "path": "tokenizer.json",
+            "sha256": hashlib.sha256(tokenizer_payload).hexdigest(),
+            "size_bytes": len(tokenizer_payload),
+        }],
+    }), encoding="utf-8")
 
 
 def _write_gemma4_fixture(root):
@@ -78,11 +90,24 @@ def test_descriptor_reads_headers_without_materializing_weights(tmp_path):
     assert descriptor["pipeline_runtime_supported"] is True
     assert descriptor["model_id"] == "fixture"
     assert descriptor["total_layers"] == 2
+    assert descriptor["hidden_size"] == 2
+    assert descriptor["tokenizer_sha256"] == hashlib.sha256(
+        (tmp_path / "tokenizer.json").read_bytes()
+    ).hexdigest()
     assert descriptor["indexed_tensor_count"] == 5
     assert descriptor["layer_weight_bytes"] == [4, 4]
     assert descriptor["component_weight_bytes"]["embedding"] == 16
     assert descriptor["component_weight_bytes"]["lm_head"] == 16
     assert descriptor["weight_bytes"] == 44
+
+
+def test_descriptor_fails_closed_when_tokenizer_no_longer_matches_manifest(tmp_path):
+    _write_qwen2_fixture(tmp_path)
+    (tmp_path / "tokenizer.json").write_text("tampered", encoding="utf-8")
+
+    descriptor = inspect_pipeline_model(tmp_path, model_id="fixture")
+
+    assert descriptor["tokenizer_sha256"] == ""
 
 
 def test_descriptor_rejects_missing_layer(tmp_path):

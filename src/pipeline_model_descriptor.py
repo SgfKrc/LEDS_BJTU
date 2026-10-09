@@ -7,6 +7,7 @@ does not materialize model weights in host RAM or VRAM.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -195,6 +196,49 @@ def _decoder_config(config: dict[str, Any]) -> dict[str, Any]:
     return text_config if isinstance(text_config, dict) else config
 
 
+def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(chunk_size), b""):
+                digest.update(chunk)
+    except OSError:
+        return ""
+    return digest.hexdigest()
+
+
+def tokenizer_sha256_from_asset(root: Path) -> str:
+    """Return the manifest-declared digest after hashing the live tokenizer."""
+
+    for filename in (".qlh-model-asset.json", "model.manifest.json"):
+        path = root / filename
+        if not path.is_file():
+            continue
+        try:
+            manifest = _read_json_object(path)
+        except PipelineModelDescriptorError:
+            continue
+        if manifest.get("schema") != 1 and manifest.get("schema_version") != 1:
+            continue
+        for entry in manifest.get("files", []):
+            if not isinstance(entry, dict):
+                continue
+            relative = Path(str(entry.get("path", "") or ""))
+            if relative.name != "tokenizer.json" or relative.is_absolute():
+                continue
+            declared = str(entry.get("sha256", "") or "").strip().lower()
+            if re.fullmatch(r"[0-9a-f]{64}", declared) is None:
+                return ""
+            tokenizer_path = (root / relative).resolve()
+            try:
+                tokenizer_path.relative_to(root.resolve())
+            except ValueError:
+                return ""
+            actual = _sha256_file(tokenizer_path)
+            return actual if actual == declared else ""
+    return ""
+
+
 def _safe_shard_path(root: Path, filename: str) -> Path:
     if not filename or Path(filename).is_absolute():
         raise PipelineModelDescriptorError("Safetensors 索引包含无效分片路径")
@@ -303,6 +347,12 @@ def inspect_pipeline_model(
         raise PipelineModelDescriptorError("config 的 num_hidden_layers 无效") from exc
     if total_layers <= 0:
         raise PipelineModelDescriptorError("config 缺少有效 num_hidden_layers")
+    try:
+        hidden_size = int(decoder_config.get("hidden_size", 0) or 0)
+    except (TypeError, ValueError) as exc:
+        raise PipelineModelDescriptorError("config 的 hidden_size 无效") from exc
+    if hidden_size <= 0:
+        raise PipelineModelDescriptorError("config 缺少有效 hidden_size")
 
     weight_map, declared_weight_bytes = _weight_map(root)
     keys_by_shard: dict[str, list[str]] = defaultdict(list)
@@ -382,6 +432,8 @@ def inspect_pipeline_model(
         "model_type": model_type,
         "architectures": [str(value) for value in architectures],
         "total_layers": total_layers,
+        "hidden_size": hidden_size,
+        "tokenizer_sha256": tokenizer_sha256_from_asset(root),
         "layer_prefix": layout["layer_prefix"],
         "weight_bytes": observed_weight_bytes,
         "indexed_tensor_count": len(weight_map),
@@ -423,6 +475,8 @@ def public_pipeline_descriptor(descriptor: dict[str, Any]) -> dict[str, Any]:
         "model_type",
         "architectures",
         "total_layers",
+        "hidden_size",
+        "tokenizer_sha256",
         "layer_prefix",
         "weight_bytes",
         "indexed_tensor_count",

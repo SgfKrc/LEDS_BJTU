@@ -987,27 +987,45 @@ class EngineHost:
             layer_range_mode = resolution.layer_range_mode
 
         with self._model_lifecycle_lock():
-            if layer_range_mode == LAYER_RANGE_PRECUT_ARTIFACT:
-                self._host.prepare_pipeline_model(
-                    model_id=model_id or "",
-                    model_path=model_path or "",
-                    quant_type=quant_type,
-                    model_sha256=model_sha256,
-                )
-            elif layer_range_mode not in {None, LAYER_RANGE_DYNAMIC}:
+            if layer_range_mode not in {
+                None, LAYER_RANGE_DYNAMIC, LAYER_RANGE_PRECUT_ARTIFACT,
+            }:
                 raise ValueError(
                     f"引擎 {engine or 'unknown'} 不支持层段模式 {layer_range_mode!r}"
                 )
-
-            result = self._host.load_layer_range(
-                start_layer=start_layer,
-                end_layer=end_layer,
-                has_embedding=embed,
-                has_lm_head=lm_head,
-                model_path=model_path,
-                quant_type=quant_type,
-                model_id=model_id,
-            )
+            transaction_id = f"layer_{uuid4().hex}"
+            candidate_prepared = False
+            try:
+                self._host.prepare_pipeline_candidate(
+                    transaction_id,
+                    model_id=model_id or "",
+                    model_path=model_path or "",
+                    quant_type=quant_type,
+                    layer_range=(start_layer, end_layer),
+                    model_sha256=model_sha256,
+                )
+                candidate_prepared = True
+                result = self._host.materialize_pipeline_candidate(
+                    transaction_id,
+                    start_layer=start_layer,
+                    end_layer=end_layer,
+                    has_embedding=embed,
+                    has_lm_head=lm_head,
+                    model_id=model_id,
+                )
+                self._host.commit_pipeline_candidate(transaction_id)
+                self._host.finalize_pipeline_candidate(transaction_id)
+            except Exception:
+                if candidate_prepared:
+                    try:
+                        self._host.abort_pipeline_candidate(transaction_id)
+                    except Exception:
+                        logger.warning(
+                            "层段候选事务回滚失败: transaction=%s",
+                            transaction_id,
+                            exc_info=True,
+                        )
+                raise
             self._host.model_loaded = False
             if quant_type:
                 self._host.current_quant = quant_type
@@ -1435,6 +1453,13 @@ class EngineHost:
                 pipeline_failure_reason = str(e)
                 logger.warning(f"流水线推理异常: {e}，回退到本地推理")
                 self._enforce_distributed_required(req, detail=str(e))
+
+        if self._pipeline_model_is_prepared() and not pipeline_attempted:
+            raise HTTPException(
+                409 if req.routing_preference == "local_only" else 503,
+                "当前模型仅以分布式流水线模式准备，禁止作为本地完整模型执行；"
+                "请等待流水线就绪或显式加载完整模型。",
+            )
 
         model_manager = self._host
         # ---- llama.cpp / 孤岛引擎路径（整请求推理，不参与层拆分）----
@@ -3282,38 +3307,55 @@ class EngineHost:
         check = getattr(sched, "has_pipeline_worker_reservation", None) if sched else None
         return bool(callable(check) and check())
 
+    def _pipeline_model_is_prepared(self) -> bool:
+        return bool(getattr(self._host, "is_pipeline_prepared", False))
+
     def _run_exclusive_model_change(
         self, change, prepare=None, *, release_worker_reservation: bool = False,
     ):
-        """Block inference, invalidate old worker ACKs, then refresh the new model.
+        """Invalidate distributed state only after the model change succeeds.
 
         （api_server 版嵌套 scheduler 锁；本进程无 scheduler 时仅持
         ModelHost 执行锁，等价单机拓扑。）
         """
         with self._host.full_chat_execution_lock:
-            if prepare is not None:
-                prepare()
             sched = self._scheduler
-            transition_started = False
-            if sched is not None:
-                begin_transition = getattr(
-                    sched, "_begin_layer_config_model_change", None,
-                )
-                if callable(begin_transition):
-                    begin_transition()
-                    transition_started = True
-                invalidate_transaction = getattr(
-                    sched, "_invalidate_pipeline_load_transaction", None,
-                )
-                if callable(invalidate_transaction):
-                    invalidate_transaction(
-                        reason_code="pipeline_model_changed",
-                        reason="local model replacement started",
+            if sched is None:
+                result = change()
+                if not (
+                    isinstance(result, dict)
+                    and result.get("success") is False
+                ) and prepare is not None:
+                    prepare()
+                return result
+
+            with sched._inference_lock:
+                with sched._layer_execution_lock:
+                    result = change()
+                    if (
+                        isinstance(result, dict)
+                        and result.get("success") is False
+                    ):
+                        return result
+
+                    begin_transition = getattr(
+                        sched, "_begin_layer_config_model_change", None,
                     )
-                with sched._inference_lock:
-                    with sched._layer_execution_lock:
+                    transition_started = callable(begin_transition)
+                    if transition_started:
+                        begin_transition()
+                    try:
+                        if prepare is not None:
+                            prepare()
+                        invalidate_transaction = getattr(
+                            sched, "_invalidate_pipeline_load_transaction", None,
+                        )
+                        if callable(invalidate_transaction):
+                            invalidate_transaction(
+                                reason_code="pipeline_model_changed",
+                                reason="local model replacement committed",
+                            )
                         with sched._layer_config_lock:
-                            # ★ 2026-10-07（DIST-NEXT-3）：清空 assignment 权威视图。
                             sched._worker_assignments.clear()
                             sched._layer_config_expected.clear()
                             sched._layer_config_acks.clear()
@@ -3330,17 +3372,15 @@ class EngineHost:
                                 release()
                             else:
                                 sched._pipeline_worker_reserved = False
-            try:
-                return change()
-            finally:
-                if sched is not None:
-                    self._refresh_pipeline_layer_config(sched)
-                    if transition_started:
-                        end_transition = getattr(
-                            sched, "_end_layer_config_model_change", None,
-                        )
-                        if callable(end_transition):
-                            end_transition()
+                        self._refresh_pipeline_layer_config(sched)
+                    finally:
+                        if transition_started:
+                            end_transition = getattr(
+                                sched, "_end_layer_config_model_change", None,
+                            )
+                            if callable(end_transition):
+                                end_transition()
+                    return result
 
     def _refresh_pipeline_layer_config(self, sched) -> None:
         """主节点模型变化后重新下发层配置，并使旧 ACK 失效。"""
@@ -3533,6 +3573,15 @@ class EngineHost:
                 503,
                 "本设备正作为 PyTorch 分层从节点，不能加载本地完整模型。",
             )
+        if self._pipeline_model_is_prepared():
+            if req is not None and req.routing_preference == "local_only":
+                from fastapi import HTTPException
+                raise HTTPException(
+                    409,
+                    "当前模型仅以分布式流水线模式准备；"
+                    "local_only 请求需要先显式加载完整模型。",
+                )
+            return
         if self._host.model_loaded and getattr(self._host, "is_loaded", False):
             return
         self._auto_load_default_model()

@@ -17,9 +17,33 @@ def test_gguf_qwen35_pipeline_descriptor_uses_canonical_model_type(
 ):
     model = tmp_path / "qwen35.gguf"
     model.write_bytes(b"GGUF fixture")
+    tokenizer_root = tmp_path / "tokenizer-asset"
+    tokenizer_root.mkdir()
+    tokenizer_payload = b'{"version":1}'
+    (tokenizer_root / "tokenizer.json").write_bytes(tokenizer_payload)
+    tokenizer_sha256 = hashlib.sha256(tokenizer_payload).hexdigest()
+    (tokenizer_root / ".qlh-model-asset.json").write_text(json.dumps({
+        "schema_version": 1,
+        "files": [{
+            "path": "tokenizer.json",
+            "size": len(tokenizer_payload),
+            "sha256": tokenizer_sha256,
+        }],
+    }), encoding="utf-8")
     monkeypatch.setattr(
         "relay_segment_info.read_gguf_layer_info",
-        lambda _path: {"architecture": "qwen35", "n_layer": 2},
+        lambda _path: {"architecture": "qwen35", "n_layer": 2, "n_embd": 2048},
+    )
+    monkeypatch.setattr(
+        "relay_segment_info.read_artifact_manifest",
+        lambda _path: {"source_model_sha256": "e" * 64},
+    )
+    monkeypatch.setattr(
+        "model_config.get_builtin_model",
+        lambda _model_id: types.SimpleNamespace(model_path=str(tokenizer_root)),
+    )
+    monkeypatch.setattr(
+        "model_config.resolve_model_path", lambda value: value,
     )
     monkeypatch.setattr(
         "relay_segment_info.read_gguf_tensor_bytes",
@@ -33,11 +57,15 @@ def test_gguf_qwen35_pipeline_descriptor_uses_canonical_model_type(
 
     engine = LlamaCppEngine()
     engine._model_path = str(model)
+    engine.active_model_id = "qwen3-5-2b"
 
     descriptor = engine.get_pipeline_descriptor()
 
     assert descriptor["model_type"] == "qwen3_5"
     assert descriptor["pipeline_runtime_supported"] is True
+    assert descriptor["hidden_size"] == 2048
+    assert descriptor["tokenizer_sha256"] == tokenizer_sha256
+    assert descriptor["source_model_sha256"] == "e" * 64
     assert descriptor["layer_weight_bytes"] == [4, 4]
 
 

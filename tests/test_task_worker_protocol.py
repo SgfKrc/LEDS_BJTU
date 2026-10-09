@@ -290,6 +290,9 @@ def test_hello_capabilities_validate_per_artifact_layer_contract(golden):
         "model_id": "tail20.gguf",
         "artifact_sha256": "a" * 64,
         "source_model_sha256": "b" * 64,
+        "source_model_id": "qwen3-5-2b",
+        "hidden_size": 2048,
+        "tokenizer_sha256": "d" * 64,
     }]
 
     decode_message(hello)
@@ -309,6 +312,22 @@ def test_hello_capabilities_validate_per_artifact_layer_contract(golden):
     with pytest.raises(WorkerProtocolError) as identity_error:
         decode_message(mismatched_identity)
     assert identity_error.value.code == "invalid_capabilities"
+
+    incomplete = copy.deepcopy(hello)
+    incomplete["payload"]["capabilities"]["layer_artifacts"][0].pop(
+        "tokenizer_sha256"
+    )
+    with pytest.raises(WorkerProtocolError) as incomplete_error:
+        decode_message(incomplete)
+    assert incomplete_error.value.code == "invalid_capabilities"
+
+    wrong_runtime = copy.deepcopy(hello)
+    wrong_runtime["payload"]["capabilities"]["engines"] = ["pytorch"]
+    wrong_runtime["payload"]["capabilities"]["models"][0]["engine"] = "pytorch"
+    wrong_runtime["payload"]["capabilities"]["models"][0]["format"] = "safetensors"
+    with pytest.raises(WorkerProtocolError) as runtime_error:
+        decode_message(wrong_runtime)
+    assert runtime_error.value.code == "invalid_capabilities"
 
 
 def test_hello_capabilities_reject_invalid_node_segment_mode(golden):

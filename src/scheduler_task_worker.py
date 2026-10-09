@@ -137,6 +137,24 @@ class SchedulerTaskWorkerMixin:
             or any(char not in "0123456789abcdef" for char in source_sha256)
         ):
             return None
+        source_model_id = str(data.get("source_model_id", "") or "").strip()
+        tokenizer_sha256 = str(data.get("tokenizer_sha256", "") or "").lower()
+        try:
+            hidden_size = int(data.get("hidden_size", 0) or 0)
+        except (TypeError, ValueError):
+            hidden_size = 0
+        # New cut manifests always expose ``hidden_size``.  The logical-model
+        # preflight contract is opt-in only when its two explicit identity
+        # fields are present, so old invocations remain a visible legacy
+        # artifact instead of disappearing from capabilities altogether.
+        contract_present = bool(source_model_id or tokenizer_sha256)
+        contract_complete = bool(
+            source_model_id
+            and hidden_size > 0
+            and re.fullmatch(r"[0-9a-f]{64}", tokenizer_sha256)
+        )
+        if contract_present and not contract_complete:
+            return None
         model_id = artifact_path.name
         if re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", model_id) is None:
             return None
@@ -144,7 +162,7 @@ class SchedulerTaskWorkerMixin:
         # （含 `\`），而协议对它的要求是 `^[A-Za-z0-9_.:-]{1,128}$` —— 反斜杠不合法 ⇒
         # 整个 hello 会被判 `payload.capabilities.models[0].model_id is invalid`，worker
         # 永远进不了 `admitted`（实测：这条错误被 legacy 通道的噪声盖了很久才浮出来）。
-        return {
+        result = {
             "start": int(value[0]),
             "end": int(value[1]),
             "model_id": model_id,
@@ -153,6 +171,13 @@ class SchedulerTaskWorkerMixin:
             "revision": str(data.get("generator_version", "") or ""),
             "segment_mode": segment_mode,
         }
+        if contract_complete:
+            result.update({
+                "source_model_id": source_model_id,
+                "hidden_size": hidden_size,
+                "tokenizer_sha256": tokenizer_sha256,
+            })
+        return result
 
     def _task_worker_capabilities(self) -> dict:
         """Build an honest PC Full Worker snapshot without loading a model."""
@@ -323,6 +348,12 @@ class SchedulerTaskWorkerMixin:
             }
             if artifact.get("source_model_sha256"):
                 item["source_model_sha256"] = artifact["source_model_sha256"]
+            if artifact.get("source_model_id"):
+                item.update({
+                    "source_model_id": artifact["source_model_id"],
+                    "hidden_size": artifact["hidden_size"],
+                    "tokenizer_sha256": artifact["tokenizer_sha256"],
+                })
             capabilities["layer_artifacts"] = [item]
             capabilities["segment_mode"] = artifact["segment_mode"]
         return capabilities

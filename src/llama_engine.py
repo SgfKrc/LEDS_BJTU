@@ -357,10 +357,10 @@ class LlamaCppEngine:
         if not path or not os.path.isfile(path):
             return {}
         try:
-            from relay_segment_info import read_gguf_layer_info
+            from relay_segment_info import read_artifact_manifest, read_gguf_layer_info
         except ImportError:  # 以包形式导入本模块时（src.llama_engine）
             try:
-                from .relay_segment_info import read_gguf_layer_info
+                from .relay_segment_info import read_artifact_manifest, read_gguf_layer_info
             except ImportError:
                 return {}
         info = read_gguf_layer_info(path)
@@ -369,6 +369,7 @@ class LlamaCppEngine:
         from pipeline_model_descriptor import (
             PIPELINE_RUNTIME_MODEL_TYPES,
             canonical_pipeline_model_type,
+            tokenizer_sha256_from_asset,
         )
 
         model_type = canonical_pipeline_model_type(info.get("architecture", ""))
@@ -411,15 +412,56 @@ class LlamaCppEngine:
             weight_bytes = int(os.path.getsize(path))
         except OSError:
             weight_bytes = 0
+        model_sha256 = self._pipeline_file_sha256(path)
+        artifact_manifest_info = None
+        tokenizer_sha256 = tokenizer_sha256_from_asset(Path(path).parent)
+        for manifest_path in (
+            Path(path).with_suffix(".manifest.json"),
+            Path(str(path) + ".manifest.json"),
+        ):
+            manifest_info = read_artifact_manifest(manifest_path)
+            if manifest_info:
+                artifact_manifest_info = manifest_info
+                if not tokenizer_sha256:
+                    tokenizer_sha256 = str(
+                        manifest_info.get("tokenizer_sha256", "") or ""
+                    )
+                break
+        if not tokenizer_sha256:
+            try:
+                from model_config import get_builtin_model, resolve_model_path
+
+                registered = get_builtin_model(
+                    str(getattr(self, "active_model_id", "") or "")
+                )
+                registered_path = (
+                    resolve_model_path(str(getattr(registered, "model_path", "") or ""))
+                    if registered is not None else ""
+                )
+                if registered_path:
+                    tokenizer_sha256 = tokenizer_sha256_from_asset(
+                        Path(registered_path)
+                    )
+            except Exception:
+                logger.debug(
+                    "GGUF pipeline descriptor could not resolve tokenizer asset",
+                    exc_info=True,
+                )
         descriptor = {
             "model_id": (
                 str(getattr(self, "active_model_id", "") or "")
                 or os.path.splitext(os.path.basename(path))[0]
             ),
             "model_path": path,
-            "model_sha256": self._pipeline_file_sha256(path),
+            "model_sha256": model_sha256,
+            "source_model_sha256": str(
+                (artifact_manifest_info or {}).get("source_model_sha256", "")
+                or model_sha256
+            ),
             "model_type": model_type,
             "total_layers": total_layers,
+            "hidden_size": int(info.get("n_embd", 0) or 0),
+            "tokenizer_sha256": tokenizer_sha256,
             "layer_weight_bytes": layer_weight_bytes,
             "component_weight_bytes": component_weight_bytes,
             "quant_type": str(getattr(self, "_quant_type", "") or ""),

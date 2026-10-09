@@ -102,6 +102,9 @@ class TestLayerCapabilities:
                 "artifact": "models\\qwen25-05b-f16-cut-16-20.gguf",
                 "artifact_sha256": artifact_sha256,
                 "source_model_sha256": "b" * 64,
+                "source_model_id": "qwen3-5-2b",
+                "hidden_size": 2048,
+                "tokenizer_sha256": "c" * 64,
                 "mode": "middle",
                 "generator_version": 2,
             }),
@@ -121,6 +124,9 @@ class TestLayerCapabilities:
             "model_id": model_id,
             "artifact_sha256": artifact_sha256,
             "source_model_sha256": "b" * 64,
+            "source_model_id": "qwen3-5-2b",
+            "hidden_size": 2048,
+            "tokenizer_sha256": "c" * 64,
         }]
         _validate_capabilities(caps, version=3)
 

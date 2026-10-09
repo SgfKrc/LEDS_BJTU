@@ -108,11 +108,12 @@ def _write_gguf(path: Path, kvs, *, magic: bytes = b"GGUF", version: int = 3) ->
     return path
 
 
-def _arch_kvs(arch: str, block_count: int, nextn: int = 0):
+def _arch_kvs(arch: str, block_count: int, nextn: int = 0, n_embd: int = 2048):
     return [
         ("general.architecture", 8, _kv_str(arch)),
         (f"{arch}.block_count", 4, struct.pack("<I", block_count)),
         (f"{arch}.nextn_predict_layers", 4, struct.pack("<I", nextn)),
+        (f"{arch}.embedding_length", 4, struct.pack("<I", n_embd)),
     ]
 
 
@@ -122,7 +123,7 @@ def test_read_gguf_layer_info_reads_block_count(tmp_path: Path) -> None:
 
     assert R.read_gguf_layer_info(path) == {
         "architecture": "qwen2", "block_count": 24,
-        "nextn_predict_layers": 0, "n_layer": 24,
+        "nextn_predict_layers": 0, "n_layer": 24, "n_embd": 2048,
     }
 
 
@@ -183,6 +184,9 @@ def test_read_artifact_manifest_reads_layer_range(tmp_path: Path) -> None:
         "n_layer": 8,
         "source_model_sha256": "a" * 64,
         "artifact_sha256": "b" * 64,
+        "source_model_id": "qwen2.5-0.5b",
+        "hidden_size": 896,
+        "tokenizer_sha256": "c" * 64,
     }),
                         encoding="utf-8")
 
@@ -191,6 +195,9 @@ def test_read_artifact_manifest_reads_layer_range(tmp_path: Path) -> None:
         "n_layer": 8,
         "source_model_sha256": "a" * 64,
         "artifact_sha256": "b" * 64,
+        "source_model_id": "qwen2.5-0.5b",
+        "hidden_size": 896,
+        "tokenizer_sha256": "c" * 64,
     }
 
 
