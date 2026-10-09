@@ -956,63 +956,66 @@ def _refresh_pipeline_layer_config() -> None:
 def _run_exclusive_model_change(
     change, prepare=None, *, release_worker_reservation: bool = False,
 ):
-    """Block inference, invalidate old worker ACKs, then refresh the new model."""
+    """Publish control-plane invalidation only after the model change succeeds."""
     with model_host.full_chat_execution_lock:
-        if prepare is not None:
-            prepare()
-        begin_transition = getattr(
-            scheduler, "_begin_layer_config_model_change", None,
-        )
-        transition_started = callable(begin_transition)
-        if transition_started:
-            begin_transition()
-        invalidate_transaction = getattr(
-            scheduler, "_invalidate_pipeline_load_transaction", None,
-        )
-        if callable(invalidate_transaction):
-            invalidate_transaction(
-                reason_code="pipeline_model_changed",
-                reason="local model replacement started",
-            )
         with scheduler._inference_lock:
             with scheduler._layer_execution_lock:
-                with scheduler._layer_config_lock:
-                    # ★ 2026-10-07（DIST-NEXT-3）：清空 assignment 权威视图（派生视图随之空）。
-                    scheduler._worker_assignments.clear()
-                    scheduler._layer_config_expected.clear()
-                    scheduler._layer_config_acks.clear()
-                    scheduler._active_layer_config = None
-                    scheduler._last_layer_config_ack_payload = None
-                    scheduler._local_pipeline_steps.clear()
-                if release_worker_reservation:
-                    release = getattr(
-                        scheduler,
-                        "release_pipeline_worker_for_local_model",
-                        None,
-                    )
-                    if callable(release):
-                        release()
-                    else:
-                        scheduler._pipeline_worker_reserved = False
+                result = change()
+                if isinstance(result, dict) and result.get("success") is False:
+                    return result
+
+                begin_transition = getattr(
+                    scheduler, "_begin_layer_config_model_change", None,
+                )
+                transition_started = callable(begin_transition)
+                if transition_started:
+                    begin_transition()
                 try:
-                    return change()
-                finally:
-                    # ★ 2026-10-09（稳定性 #73-④）：模型切换（无论成败）之后，必须把**失败态**的
-                    #   流水线加载事务复位 —— 否则它会一直停在 `aborted`/`rejected`，让
-                    #   `_synchronize_pipeline_workers_for_request` 永久判 not ready。
-                    #   实测复现：切到 GGUF 模型（master 引擎不支持）⇒ 事务 `aborted` ⇒ **之后
-                    #   每个请求都 503，连切回正确模型、甚至重启后端都无效**。
-                    #   只复位失败态；`committed` / `committing_local` 等正常态不动。
-                    _tx = getattr(scheduler, "_pipeline_load_transaction", None)
-                    if isinstance(_tx, dict) and str(_tx.get("phase") or "") in {"aborted", "rejected"}:
+                    if prepare is not None:
+                        prepare()
+                    invalidate_transaction = getattr(
+                        scheduler, "_invalidate_pipeline_load_transaction", None,
+                    )
+                    if callable(invalidate_transaction):
+                        invalidate_transaction(
+                            reason_code="pipeline_model_changed",
+                            reason="local model replacement committed",
+                        )
+                    with scheduler._layer_config_lock:
+                        scheduler._worker_assignments.clear()
+                        scheduler._layer_config_expected.clear()
+                        scheduler._layer_config_acks.clear()
+                        scheduler._active_layer_config = None
+                        scheduler._last_layer_config_ack_payload = None
+                        scheduler._local_pipeline_steps.clear()
+                    if release_worker_reservation:
+                        release = getattr(
+                            scheduler,
+                            "release_pipeline_worker_for_local_model",
+                            None,
+                        )
+                        if callable(release):
+                            release()
+                        else:
+                            scheduler._pipeline_worker_reserved = False
+                    _tx = getattr(
+                        scheduler, "_pipeline_load_transaction", None,
+                    )
+                    if (
+                        isinstance(_tx, dict)
+                        and str(_tx.get("phase") or "")
+                        in {"aborted", "rejected"}
+                    ):
                         scheduler._pipeline_load_transaction = None
                     _refresh_pipeline_layer_config()
+                finally:
                     if transition_started:
                         end_transition = getattr(
                             scheduler, "_end_layer_config_model_change", None,
                         )
                         if callable(end_transition):
                             end_transition()
+                return result
 
 
 # ============================================================
@@ -4022,6 +4025,13 @@ def _execute_chat_full(
 
     if req.routing_preference == "distributed_required":
         raise HTTPException(503, "distributed_required 执行失败：当前引擎未完成分布式流水线")
+
+    if _pipeline_model_is_prepared() and not pipeline_attempted:
+        raise HTTPException(
+            409 if req.routing_preference == "local_only" else 503,
+            "当前模型仅以分布式流水线模式准备，禁止作为本地完整模型执行；"
+            "请等待流水线就绪或显式加载完整模型。",
+        )
 
     # ---- 流水线失败 ⇒ 整模回退守卫（★ 2026-10-09：**引擎无关**）----
     #   ★ 原先只覆盖 llama.cpp / 孤岛（下面那个分支），PyTorch 路径漏了 ⇒ pipeline 尝试

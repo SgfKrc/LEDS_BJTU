@@ -229,6 +229,34 @@ class WorkerAssignmentRegistry:
             for node_id, state in sorted(self._states.items())
         }
 
+    def restore(self, snapshot: Mapping[str, Mapping[str, Any]]) -> None:
+        """Replace the registry with one previously emitted snapshot."""
+        restored: dict[str, WorkerAssignmentState] = {}
+        for raw_node_id, raw in (snapshot or {}).items():
+            if not isinstance(raw, Mapping):
+                continue
+            node_id = str(raw.get("node_id", raw_node_id) or raw_node_id)
+            assignment_id = str(raw.get("assignment_id", "") or "")
+            phase = str(raw.get("phase", "") or "")
+            if not node_id or not assignment_id or phase not in {
+                *ACTIVE_PHASES, *TERMINAL_PHASES,
+            }:
+                continue
+            restored[node_id] = WorkerAssignmentState(
+                node_id=node_id,
+                assignment_id=assignment_id,
+                config_id=str(raw.get("config_id", "") or ""),
+                connection_generation=int(
+                    raw.get("connection_generation", 0) or 0
+                ),
+                lease_id=str(raw.get("lease_id", "") or ""),
+                lease_epoch=int(raw.get("lease_epoch", 0) or 0),
+                phase=phase,
+                reason_code=str(raw.get("reason_code", "") or ""),
+                updated_at=float(raw.get("updated_at", self._clock()) or 0.0),
+            )
+        self._states = restored
+
     def drop(self, node_id: str) -> None:
         """移除记录（测试与节点彻底退场时使用）。"""
         self._states.pop(str(node_id or ""), None)

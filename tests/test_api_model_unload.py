@@ -68,6 +68,7 @@ def test_unload_model_releases_engine_runtime_and_worker_reservation(monkeypatch
         _active_layer_config=None,
         _last_layer_config_ack_payload=None,
         _local_pipeline_steps={},
+        _effective_role=lambda: "client",
         release_pipeline_worker_for_local_model=lambda: calls.append("release"),
         refresh_task_worker_capabilities=lambda: calls.append("refresh"),
     )
@@ -83,6 +84,6 @@ def test_unload_model_releases_engine_runtime_and_worker_reservation(monkeypatch
     result = api_server._unload_model_under_model_lock()
 
     assert result["unloaded"] is True
-    assert calls == ["release", "unload", "reset", "refresh"]
+    assert calls == ["unload", "reset", "release", "refresh"]
     assert host.model_loaded is False
     assert host.current_quant is None

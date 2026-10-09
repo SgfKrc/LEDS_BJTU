@@ -27,19 +27,22 @@ def exported_handlers() -> dict[str, object]:
 async def get_current_model(request: Request = None):
     """当前模型信息"""
     _api_module.require_model_api_source(request)
+    if _api_module._pipeline_model_is_prepared():
+        from pipeline_model_descriptor import public_pipeline_descriptor
+        descriptor = public_pipeline_descriptor(
+            _api_module.model_manager.get_pipeline_descriptor()
+        )
+        return {
+            "loaded": False,
+            "pipeline_prepared": True,
+            "segment_materialized": bool(
+                getattr(_api_module.model_manager, "is_loaded", False)
+            ),
+            "quant_type": _api_module.model_host.current_quant,
+            "model_id": descriptor.get("model_id"),
+            "descriptor": descriptor,
+        }
     if not _api_module.model_host.model_loaded:
-        if _api_module._pipeline_model_is_prepared():
-            from pipeline_model_descriptor import public_pipeline_descriptor
-            descriptor = public_pipeline_descriptor(
-                _api_module.model_manager.get_pipeline_descriptor()
-            )
-            return {
-                "loaded": False,
-                "pipeline_prepared": True,
-                "quant_type": _api_module.model_host.current_quant,
-                "model_id": descriptor.get("model_id"),
-                "descriptor": descriptor,
-            }
         return {
             "loaded": False,
             "pipeline_prepared": False,
@@ -127,11 +130,7 @@ async def load_model(req: LoadModelRequest, request: Request = None):
     try:
         t0 = _api_module.time.time()
 
-        # 临时修改 config（引擎 + 量化 + compile）
         import config as cfg
-        cfg.INFERENCE_ENGINE = effective_engine
-        cfg.QUANT_TYPE = quant
-        cfg.USE_COMPILE = req.use_compile
 
         def _prepare_model_load() -> None:
             # 新模型不能复用旧模型的上下文；必须和推理处于同一互斥边界。
@@ -162,6 +161,9 @@ async def load_model(req: LoadModelRequest, request: Request = None):
         result = await _api_module.run_in_threadpool(_do_switch)
 
         if result["success"]:
+            cfg.INFERENCE_ENGINE = effective_engine
+            cfg.QUANT_TYPE = quant
+            cfg.USE_COMPILE = req.use_compile
             _api_module.model_host.model_loaded = True
             _api_module.model_host.current_quant = getattr(_api_module.model_manager, "quant_type", None) or quant
             _api_module.model_host.generation_config["use_compile"] = req.use_compile
@@ -198,47 +200,122 @@ async def load_model(req: LoadModelRequest, request: Request = None):
     except _api_module.HTTPException:
         raise
     except Exception as e:
-        _api_module.model_host.model_loaded = False
+        manager_loaded = bool(
+            getattr(_api_module.model_manager, "is_loaded", False)
+        )
+        _api_module.model_host.model_loaded = manager_loaded
+        if manager_loaded:
+            _api_module.model_host.current_quant = (
+                getattr(_api_module.model_manager, "quant_type", None)
+                or _api_module.model_host.current_quant
+            )
         _api_module.logger.error(f"模型加载失败: {e}", exc_info=True)
         raise _api_module.HTTPException(500, f"模型加载失败: {str(e)}")
 
 async def _prepare_pipeline_model_resolution(resolution):
     resolved_model_path = resolution.model_path
     quant = resolution.quant_type
+    candidate_id = f"modeltxn_{_api_module.uuid.uuid4().hex}"
+    candidate_prepared = False
+    transaction_started = False
 
-    def _prepare() -> dict:
-        _api_module._reset_runtime_conversation_state(clear_histories=True)
-        return _api_module.model_host.prepare_pipeline_model(
-            model_id=resolution.model_id,
-            model_path=resolved_model_path,
-            quant_type=quant,
-        )
+    def _after_commit() -> None:
+        # The process-wide runtime selection is part of the published model
+        # identity.  Keep it behind the same commit fence as the manager and
+        # active capacity plan; prepare/commit failures must leave the previous
+        # selection untouched.
+        import config as cfg
 
-    try:
-        result = await _api_module.run_in_threadpool(
-            lambda: _api_module._run_exclusive_model_change(
-                _prepare,
-                release_worker_reservation=True,
+        cfg.INFERENCE_ENGINE = (
+            _api_module.backend_id_for(
+                _api_module.model_host, default=resolution.engine,
             )
+            or resolution.engine
         )
-        _api_module.model_host.model_loaded = False
-        _api_module.model_host.current_quant = quant
+        cfg.QUANT_TYPE = _api_module.model_host.current_quant or quant
+        _api_module._reset_runtime_conversation_state(clear_histories=True)
+        try:
+            _api_module._init_kv_cache()
+        except Exception:
+            _api_module.logger.warning(
+                "流水线模型提交后初始化 KV 缓存失败",
+                exc_info=True,
+            )
         try:
             _api_module.scheduler.refresh_task_worker_capabilities()
         except Exception:
-            _api_module.logger.debug("准备流水线模型后刷新 Worker 能力失败", exc_info=True)
+            _api_module.logger.debug(
+                "流水线模型提交后刷新 Worker 能力失败",
+                exc_info=True,
+            )
+
+    try:
+        result = await _api_module.run_in_threadpool(
+            lambda: _api_module.model_host.prepare_pipeline_candidate(
+                candidate_id,
+                model_id=resolution.model_id,
+                model_path=resolved_model_path,
+                quant_type=quant,
+            )
+        )
+        candidate_prepared = True
+        capacity_plan = await _api_module.run_in_threadpool(
+            lambda: _api_module.scheduler.start_pipeline_model_transaction(
+                candidate_id=candidate_id,
+                descriptor=result,
+                model_path=resolved_model_path,
+                quant_type=quant,
+                require_distributed=True,
+                on_commit=_after_commit,
+            )
+        )
+        if not capacity_plan.get("admitted"):
+            _api_module.model_host.abort_pipeline_candidate(candidate_id)
+            candidate_prepared = False
+            raise _api_module.coded_http_error(
+                409,
+                str(
+                    capacity_plan.get("reason_code", "model_preflight_rejected")
+                    or "model_preflight_rejected"
+                ),
+                str(capacity_plan.get("reason", "") or "模型与 Worker 工件事前裁决未通过"),
+            )
+        transaction_started = True
         from pipeline_model_descriptor import public_pipeline_descriptor
         return {
             "success": True,
             "loaded": False,
             "pipeline_prepared": True,
+            "transaction_id": candidate_id,
+            "transaction_phase": capacity_plan.get(
+                "transaction_phase", "preparing"
+            ),
             "descriptor": public_pipeline_descriptor(result),
+            "model_preflight": capacity_plan.get("model_preflight", {}),
+            "capacity_plan_id": capacity_plan.get("plan_id", ""),
         }
     except _api_module.HTTPException:
         raise
     except Exception as exc:
+        if candidate_prepared and not transaction_started:
+            try:
+                _api_module.model_host.abort_pipeline_candidate(candidate_id)
+            except Exception:
+                _api_module.logger.warning(
+                    "流水线候选准备失败后的清理失败: candidate=%s",
+                    candidate_id,
+                    exc_info=True,
+                )
         _api_module.logger.error("准备流水线模型失败: %s", exc, exc_info=True)
-        raise _api_module.HTTPException(400, f"准备流水线模型失败: {exc}") from exc
+        error_code = (
+            "MODEL_TXN_CONFLICT"
+            if "MODEL_TXN_CONFLICT" in str(exc)
+            else "MODEL_TXN_PREPARE_FAILED"
+        )
+        status_code = 409 if error_code == "MODEL_TXN_CONFLICT" else 400
+        raise _api_module.coded_http_error(
+            status_code, error_code, f"准备流水线模型失败: {exc}"
+        ) from exc
 
 
 async def prepare_pipeline_model(req: PreparePipelineModelRequest):
@@ -490,10 +567,7 @@ async def switch_model(req: SwitchModelRequest, request: Request = None):
         return await _prepare_pipeline_model_resolution(resolution)
 
     try:
-        # 更新全局引擎配置（P3修复: switch_model 也需要更新 config）
         import config as cfg
-        cfg.INFERENCE_ENGINE = effective_engine if effective_engine != "auto" else cfg.INFERENCE_ENGINE
-        cfg.QUANT_TYPE = quant
 
         def _prepare_model_switch() -> None:
             # 新模型不能复用旧模型的上下文；必须和推理处于同一互斥边界。
@@ -514,6 +588,9 @@ async def switch_model(req: SwitchModelRequest, request: Request = None):
         )
 
         if result["success"]:
+            if effective_engine != "auto":
+                cfg.INFERENCE_ENGINE = effective_engine
+            cfg.QUANT_TYPE = quant
             _api_module.model_host.model_loaded = True
             _api_module.model_host.current_quant = getattr(_api_module.model_manager, "quant_type", None) or quant
             _api_module._init_kv_cache()

@@ -284,9 +284,15 @@ async def chat(req: ChatRequest, request: Request = None):
                 )
             return _api_module._execute_requested_chat(req, cancel_event)
         with _api_module.model_host.full_chat_execution_lock:
-            if not _api_module.model_host.model_loaded or not _api_module.model_manager.is_loaded:
+            if (
+                not _api_module.model_host.model_loaded
+                or not _api_module.model_manager.is_loaded
+                or _api_module._pipeline_model_is_prepared()
+            ):
                 try:
                     _api_module._ensure_chat_model_or_forwarding(req)
+                except _api_module.HTTPException:
+                    raise
                 except FileNotFoundError:
                     raise _api_module.HTTPException(
                         400,
@@ -530,6 +536,14 @@ async def chat_stream(req: ChatRequest, request: Request):
                     )
                 else:
                     if (
+                        req.routing_preference == "local_only"
+                        and _api_module._pipeline_model_is_prepared()
+                    ):
+                        error = (
+                            "当前模型仅以分布式流水线模式准备；"
+                            "local_only 请求需要先显式加载完整模型。"
+                        )
+                    if (
                         (not _api_module.model_host.model_loaded or not _api_module.model_manager.is_loaded)
                         and not _api_module._pipeline_model_is_prepared()
                     ):
@@ -732,7 +746,11 @@ async def chat_stream(req: ChatRequest, request: Request):
                         )
                     return _api_module._execute_requested_chat(req, cancel_event)
                 with _api_module.model_host.full_chat_execution_lock:
-                    if not _api_module.model_host.model_loaded or not _api_module.model_manager.is_loaded:
+                    if (
+                        not _api_module.model_host.model_loaded
+                        or not _api_module.model_manager.is_loaded
+                        or _api_module._pipeline_model_is_prepared()
+                    ):
                         _api_module._ensure_chat_model_or_forwarding(req)
                     return _api_module._execute_requested_chat(req, cancel_event)
 
@@ -858,6 +876,16 @@ async def chat_stream(req: ChatRequest, request: Request):
             yield _error_event(
                 "本设备正作为 PyTorch 分层从节点，"
                 "请先断开主节点或明确切换本地模型。"
+            )
+            return
+
+        if (
+            req.routing_preference == "local_only"
+            and _api_module._pipeline_model_is_prepared()
+        ):
+            yield _error_event(
+                "当前模型仅以分布式流水线模式准备；"
+                "local_only 请求需要先显式加载完整模型。"
             )
             return
 

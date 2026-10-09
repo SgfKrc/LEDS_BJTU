@@ -82,6 +82,8 @@ class FakeModel:
         self.calls = []
         self.layer_load_calls = []
         self.pipeline_prepare_calls = []
+        self.candidate_calls = []
+        self._candidate_prepared = {}
 
     def chat(self, messages, max_tokens=None, temperature=None, top_p=None,
              **_kw):
@@ -114,6 +116,32 @@ class FakeModel:
     def prepare_pipeline_model(self, **kwargs):
         self.pipeline_prepare_calls.append(dict(kwargs))
         return {"pipeline_runtime_supported": True, **kwargs}
+
+    def prepare_pipeline_candidate(self, transaction_id, **kwargs):
+        self.candidate_calls.append(("prepare", transaction_id, dict(kwargs)))
+        self.pipeline_prepare_calls.append(dict(kwargs))
+        self._candidate_prepared[transaction_id] = dict(kwargs)
+        return {"pipeline_runtime_supported": True, **kwargs}
+
+    def materialize_pipeline_candidate(self, transaction_id, **kwargs):
+        self.candidate_calls.append(
+            ("materialize", transaction_id, dict(kwargs))
+        )
+        prepared = self._candidate_prepared[transaction_id]
+        return self.load_layer_range(
+            model_path=prepared.get("model_path"),
+            quant_type=prepared.get("quant_type"),
+            **kwargs,
+        )
+
+    def commit_pipeline_candidate(self, transaction_id):
+        self.candidate_calls.append(("commit", transaction_id))
+
+    def finalize_pipeline_candidate(self, transaction_id):
+        self.candidate_calls.append(("finalize", transaction_id))
+
+    def abort_pipeline_candidate(self, transaction_id):
+        self.candidate_calls.append(("abort", transaction_id))
 
 
 class FakeEngineHost(EngineHost):
@@ -1424,6 +1452,23 @@ def test_chat_full_llama_cpp_does_not_import_torch(monkeypatch):
     assert result["metrics"]["engine"] == "llama_cpp"
 
 
+@pytest.mark.parametrize("engine", ["pytorch", "llama_cpp"])
+def test_chat_full_partial_pipeline_local_only_fails_closed(engine):
+    host = make_full_host()
+    host._host._engine_type = engine
+    host._host.is_pipeline_prepared = True
+
+    with pytest.raises(HTTPException) as exc_info:
+        host.chat_full(ChatRequest(
+            message="hello",
+            routing_preference="local_only",
+        ))
+
+    assert exc_info.value.status_code == 409
+    assert "分布式流水线模式准备" in str(exc_info.value.detail)
+    assert host._host.calls == []
+
+
 # ----------------------------------------------------------------------
 # 14.5 1.2d task_graph 执行段（复制自 api_server._execute_task_graph_chat
 #      + _execute_task_graph_chat_with_slot + 5 个辅助函数）
@@ -1983,6 +2028,9 @@ def test_build_app_client_role_gates_chat():
 
     app = build_app("client")
     assert app.state.engine_host.role == "client"
+    fake_host = FakeEngineHost()
+    fake_host.role = "client"
+    app.state.engine_host = fake_host
     with TestClient(app) as c:
         # client 角色：chat 端点 404，层段/KV 端点仍可用
         assert c.post("/v1/chat", json={"message": "你好"}).status_code == 404
@@ -2798,10 +2846,14 @@ def test_engine_host_precut_layer_range_prepares_descriptor_before_loading():
         "model_id": "qwen3-0.6b",
         "model_path": "C:/models/qwen3-0.6b.gguf",
         "quant_type": "gguf",
+        "layer_range": (12, 24),
         "model_sha256": None,
     }]
     assert host._host.layer_load_calls[0]["start_layer"] == 12
     assert host._host.layer_load_calls[0]["end_layer"] == 24
+    assert [call[0] for call in host._host.candidate_calls] == [
+        "prepare", "materialize", "commit", "finalize",
+    ]
 
 
 def test_models_switch_invalid_engine_400(client):

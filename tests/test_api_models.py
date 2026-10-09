@@ -469,6 +469,38 @@ def test_exclusive_local_model_change_opts_out_pipeline_worker(monkeypatch):
     assert calls == ["released"]
 
 
+def test_failed_exclusive_model_change_preserves_active_control_state(monkeypatch):
+    calls = []
+    expected = {"worker": {"config_id": "cfg-old"}}
+    active_config = {"config_id": "cfg-old"}
+    monkeypatch.setattr(
+        api_server.scheduler, "_layer_config_expected", dict(expected),
+    )
+    monkeypatch.setattr(
+        api_server.scheduler, "_active_layer_config", dict(active_config),
+    )
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "release_pipeline_worker_for_local_model",
+        lambda: calls.append("released") or True,
+    )
+    monkeypatch.setattr(
+        api_server, "_refresh_pipeline_layer_config",
+        lambda: calls.append("refreshed"),
+    )
+
+    result = api_server._run_exclusive_model_change(
+        lambda: {"success": False, "error": "load failed"},
+        prepare=lambda: calls.append("prepared"),
+        release_worker_reservation=True,
+    )
+
+    assert result["success"] is False
+    assert api_server.scheduler._layer_config_expected == expected
+    assert api_server.scheduler._active_layer_config == active_config
+    assert calls == []
+
+
 def test_master_model_refresh_requests_authoritative_layer_sync(monkeypatch):
     """主节点加载模型后应以权威配置重新接管在线分层 worker。"""
     calls = []
@@ -728,28 +760,33 @@ def test_load_model_uses_switch_model_internally(monkeypatch):
 
 def test_prepare_pipeline_model_does_not_mark_full_model_loaded(monkeypatch, tmp_path):
     calls = []
+    transactions = []
+    import config as cfg
 
-    class FakeManager:
-        is_loaded = False
-        is_pipeline_prepared = False
+    monkeypatch.setattr(cfg, "INFERENCE_ENGINE", "old-engine")
+    monkeypatch.setattr(cfg, "QUANT_TYPE", "old-quant")
 
-        def prepare_pipeline_model(self, **kwargs):
-            calls.append(kwargs)
-            self.is_pipeline_prepared = True
-            return {
-                "schema_version": 1,
-                "inspection_mode": "safetensors_headers_only",
-                "model_id": kwargs["model_id"],
-                "model_type": "qwen2",
-                "total_layers": 4,
-                "weight_bytes": 1024,
-                "pipeline_runtime_supported": True,
-                "model_sha256": "c" * 64,
-            }
+    def prepare_candidate(transaction_id, **kwargs):
+        calls.append((transaction_id, kwargs))
+        return {
+            "schema_version": 1,
+            "inspection_mode": "safetensors_headers_only",
+            "model_id": kwargs["model_id"],
+            "model_type": "qwen2",
+            "total_layers": 4,
+            "hidden_size": 128,
+            "tokenizer_sha256": "d" * 64,
+            "weight_bytes": 1024,
+            "pipeline_runtime_supported": True,
+            "model_sha256": "c" * 64,
+        }
 
-    manager = FakeManager()
-    monkeypatch.setattr(model_host, "prepare_pipeline_model", manager.prepare_pipeline_model)
-    monkeypatch.setattr(model_host, "model_loaded", True)
+    fake_host = types.SimpleNamespace(
+        model_loaded=True,
+        current_quant="old-quant",
+        prepare_pipeline_candidate=prepare_candidate,
+    )
+    monkeypatch.setattr(api_server, "model_host", fake_host)
     monkeypatch.setattr(
         api_server,
         "_resolve_model_load_plan",
@@ -759,16 +796,20 @@ def test_prepare_pipeline_model_does_not_mark_full_model_loaded(monkeypatch, tmp
             quant_type="fp16",
         ),
     )
-    monkeypatch.setattr(api_server, "_refresh_pipeline_layer_config", lambda: None)
-    monkeypatch.setattr(
-        api_server.scheduler,
-        "release_pipeline_worker_for_local_model",
-        lambda: True,
-    )
     monkeypatch.setattr(
         api_server.scheduler,
         "refresh_task_worker_capabilities",
         lambda: True,
+    )
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "start_pipeline_model_transaction",
+        lambda **kwargs: transactions.append(kwargs) or {
+            "admitted": True,
+            "plan_id": "plan-test",
+            "transaction_phase": "preparing",
+            "model_preflight": {"ok": True},
+        },
     )
 
     result = asyncio.run(api_server.prepare_pipeline_model(
@@ -782,14 +823,89 @@ def test_prepare_pipeline_model_does_not_mark_full_model_loaded(monkeypatch, tmp
     assert result["loaded"] is False
     assert result["pipeline_prepared"] is True
     assert result["descriptor"]["model_type"] == "qwen2"
-    assert model_host.model_loaded is False
-    assert calls == [{
+    assert result["model_preflight"] == {"ok": True}
+    assert fake_host.model_loaded is True
+    assert result["transaction_id"].startswith("modeltxn_")
+    assert calls == [(result["transaction_id"], {
         "model_id": "tiny-qwen2",
         "model_path": str(tmp_path),
         "quant_type": "fp16",
-        "layer_range": None,
-        "model_sha256": None,
-    }]
+    })]
+    assert transactions[0]["candidate_id"] == result["transaction_id"]
+    assert transactions[0]["descriptor"]["model_type"] == "qwen2"
+    assert cfg.INFERENCE_ENGINE == "old-engine"
+    assert cfg.QUANT_TYPE == "old-quant"
+
+    # Scheduler invokes the callback only after ModelHost has published the
+    # candidate and mirrored its effective runtime quant.
+    fake_host.current_quant = "fp32"
+    transactions[0]["on_commit"]()
+
+    assert cfg.INFERENCE_ENGINE == "pytorch"
+    assert cfg.QUANT_TYPE == "fp32"
+
+
+def test_prepare_pipeline_model_rejects_named_model_preflight_failure(
+    monkeypatch, tmp_path,
+):
+    aborted = []
+    fake_host = types.SimpleNamespace(
+        model_loaded=True,
+        current_quant="old-quant",
+        prepare_pipeline_candidate=lambda transaction_id, **kwargs: {
+            "schema_version": 1,
+            "inspection_mode": "safetensors_headers_only",
+            "model_id": kwargs["model_id"],
+            "model_type": "qwen2",
+            "total_layers": 24,
+            "hidden_size": 2048,
+            "tokenizer_sha256": "d" * 64,
+            "weight_bytes": 1024,
+            "pipeline_runtime_supported": True,
+            "model_sha256": "c" * 64,
+        },
+        abort_pipeline_candidate=(
+            lambda transaction_id: aborted.append(transaction_id)
+        ),
+    )
+    monkeypatch.setattr(api_server, "model_host", fake_host)
+    monkeypatch.setattr(
+        api_server,
+        "_resolve_model_load_plan",
+        lambda *args, **kwargs: _resolved_load(
+            model_id="tiny-qwen2",
+            model_path=str(tmp_path),
+            quant_type="fp16",
+        ),
+    )
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "start_pipeline_model_transaction",
+        lambda **kwargs: {
+            "admitted": False,
+            "reason_code": "model_preflight_hidden_size_mismatch",
+            "reason": (
+                "model preflight rejected model=tiny-qwen2 "
+                "nodes=edge-1 missing_ranges=[8,24)"
+            ),
+            "missing_layer_ranges": [[8, 24]],
+        },
+    )
+
+    with pytest.raises(api_server.HTTPException) as exc_info:
+        asyncio.run(api_server.prepare_pipeline_model(
+            api_server.PreparePipelineModelRequest(
+                model_id="tiny-qwen2",
+                quant_type="fp16",
+            )
+        ))
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.error_code == "model_preflight_hidden_size_mismatch"
+    assert "model=tiny-qwen2" in exc_info.value.detail
+    assert "nodes=edge-1" in exc_info.value.detail
+    assert "missing_ranges=[8,24)" in exc_info.value.detail
+    assert len(aborted) == 1
 
 
 def test_load_model_reports_effective_cpu_quant(monkeypatch):
@@ -1052,6 +1168,51 @@ def test_mixed_pipeline_failure_cannot_bypass_partial_gguf_guard(monkeypatch):
     assert calls == {"chat": 0, "ensure": 1}
 
 
+@pytest.mark.parametrize("engine", ["pytorch", "llama_cpp"])
+def test_partial_pipeline_local_only_rejects_before_direct_chat(
+        monkeypatch, engine):
+    calls = []
+
+    class PartialManager:
+        _engine_type = engine
+        is_loaded = True
+        is_pipeline_prepared = True
+        tokenizer = object()
+
+        def chat(self, **kwargs):
+            calls.append(("chat", kwargs))
+            return {"content": "must not run", "usage": {}}
+
+        def chat_stream(self, **kwargs):
+            calls.append(("chat_stream", kwargs))
+            yield "must not run"
+
+    req = api_server.ChatRequest(
+        message="hello", routing_preference="local_only",
+    )
+    monkeypatch.setattr(api_server, "model_manager", PartialManager())
+    monkeypatch.setattr(api_server.model_host, "model_loaded", False)
+    monkeypatch.setattr(api_server, "RUN_MODE", "standalone")
+    monkeypatch.setattr(
+        api_server.scheduler, "get_distributed_inference_enabled", lambda: False,
+    )
+    monkeypatch.setattr(
+        api_server.scheduler, "has_pipeline_worker_reservation", lambda: False,
+    )
+    monkeypatch.setattr(
+        api_server,
+        "_external_route_decision",
+        lambda _req: types.SimpleNamespace(use_external=False, reason="disabled"),
+    )
+
+    with pytest.raises(api_server.HTTPException) as exc_info:
+        api_server._execute_chat_full(req)
+
+    assert exc_info.value.status_code == 409
+    assert "分布式流水线模式准备" in str(exc_info.value.detail)
+    assert calls == []
+
+
 def test_local_native_image_chat_uses_mtmd_and_removes_temp_file(monkeypatch):
     image = (
         "data:image/png;base64,"
@@ -1260,6 +1421,38 @@ def test_current_model_when_loaded(monkeypatch):
     assert result["model_id"] == "qwen-1_8b"
     assert result["engine"] == "pytorch"
     assert result["model_name"] == "Qwen-1.8B-Chat"
+
+
+def test_current_model_pipeline_segment_is_not_reported_as_full(monkeypatch):
+    class PartialManager:
+        active_model_id = "tiny-qwen2"
+        _engine_type = "pytorch"
+        is_loaded = True
+        is_pipeline_prepared = True
+
+        def get_pipeline_descriptor(self):
+            return {
+                "schema_version": 1,
+                "model_id": "tiny-qwen2",
+                "model_type": "qwen2",
+                "model_sha256": "a" * 64,
+                "total_layers": 4,
+                "hidden_size": 128,
+                "tokenizer_sha256": "b" * 64,
+                "pipeline_runtime_supported": True,
+            }
+
+    monkeypatch.setattr(api_server, "model_manager", PartialManager())
+    monkeypatch.setattr(model_host, "model_loaded", False)
+    monkeypatch.setattr(model_host, "current_quant", "fp32")
+
+    result = asyncio.run(api_server.get_current_model())
+
+    assert result["loaded"] is False
+    assert result["pipeline_prepared"] is True
+    assert result["segment_materialized"] is True
+    assert result["model_id"] == "tiny-qwen2"
+    assert result["quant_type"] == "fp32"
 
 
 # ================================================================
