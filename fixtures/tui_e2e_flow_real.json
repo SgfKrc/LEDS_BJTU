@@ -61,6 +61,25 @@
            "hidden 形状应为"
          ]}
       ]
+    },
+    {
+      "id": "long_reply_not_truncated",
+      "caption": "③ 生成不完整：清历史后发长回答 prompt → 回复应成型（≥200 字）且不含错误（用户截图实证的「中途截断」回归位）",
+      "actions": [
+        {"kind": "chat_command", "text": "/clear"},
+        {"kind": "send_chat", "text": "请详细列举你能做的十件事，每件用一句话说明", "timeout": 600, "settle": 4}
+      ],
+      "expect": [
+        {"kind": "chat_reply",
+         "min_chars": 200,
+         "not_contains": [
+           "后端错误",
+           "禁止整模回退",
+           "分布式流水线失败",
+           "推理失败",
+           "Traceback"
+         ]}
+      ]
     }
   ]
 }

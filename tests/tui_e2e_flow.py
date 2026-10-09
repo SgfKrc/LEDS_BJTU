@@ -318,31 +318,44 @@ def _chat_text(app) -> str:
         return ""
 
 
+def _assistant_text(app) -> str:
+    """取**最后一条 assistant 回复**之后的文本（用于等"回复真的开始产出"）。
+
+    ★ 2026-10-09：`send_chat` 原先的等待条件是「聊天区总长度增长」—— 这在「先 /clear 再发」
+    的步骤里会**立刻满足**（用户消息一渲染长度就变了）⇒ 没等模型输出就返回，把"回复还没来"
+    误判成"回复为空/被截断"。这里改为盯**最后一条 assistant 标记之后**的内容。
+    """
+    buf = _chat_text(app)
+    idx = max(buf.rfind("assistant"), buf.rfind("[dim]assistant[/]"))
+    if idx < 0:
+        return ""
+    return buf[idx + len("assistant"):].replace("[/]", "")
+
+
 async def _action_send_chat(session, spec, flow, sink):
     """在聊天屏发**真消息**并等回复落地（真后端 / `api: "real"` 档专用）。
 
     与 `chat_command` 的关键区别：后者只把文本敲进去就返回（用于验证外壳的输入与
-    命令分发，后端回不回都不关心）；本 action **必须等聊天区出现新内容** ——
-    否则「发送成功但后端 500 / 回了错误」会被误判成通过（这正是本 goal 要根治的
-    "看着像成功、实际被拒"那类问题）。
+    命令分发，后端回不回都不关心）；本 action **必须等 assistant 真的产出内容** ——
+    否则「发送成功但后端 500 / 回了错误 / 还没来得及回」都可能被误判成通过或"被截断"。
     """
     from textual.widgets import Input
 
     pane = session.app.screen.query_one("#chat-pane")
     box = pane.query_one(Input)
-    before = len(_chat_text(session.app))
     box.value = spec["text"]
     box.focus()
     await session.pilot.press("enter")
     timeout = float(spec.get("timeout", 300.0))
+    min_reply = int(spec.get("min_reply_chars", 2))
     ok = await wait_for(
         session.pilot,
-        lambda: len(_chat_text(session.app)) > before,
+        lambda: len(_assistant_text(session.app)) > min_reply,
         timeout=timeout,
     )
     if not ok:
         raise AssertionError(
-            f"send_chat 后 {timeout:.0f}s 内聊天区未增长（后端无响应？）"
+            f"send_chat 后 {timeout:.0f}s 内 assistant 未产出内容（后端无响应？）"
             f" 当前内容前 300 字：{_chat_text(session.app)[:300]!r}"
         )
     # 流式可能还在继续：再给一点时间让可判定的文本到位。
@@ -654,15 +667,25 @@ async def _expect_service_stopped(session, spec, flow):
 
 
 async def _expect_chat_reply(session, spec, flow):
-    """断言聊天缓冲内容（真后端档）。`contains` / `not_contains` 可同时给。
+    """断言聊天缓冲内容（真后端档）。`contains` / `not_contains` / `min_chars` 可同时给。
 
     这是「回复真的回来了、且不是报错」的判据：`not_contains` 用来卡住后端错误文案
     （如"后端错误"/"禁止整模回退"/"Traceback"），**避免把失败当成功** ——
     本 goal 的起点就是"看着像走了分布式、实际被拒且报错被藏起来"。
+    `min_chars` 用于 #73-③「生成不完整」：长回答 prompt 必须真的产出足够长的文本，
+    否则"截断"会伪装成 PASS。
     """
     buf = _chat_text(session.app)
     if not buf.strip():
         raise AssertionError("聊天区为空：没有产生任何对话内容")
+    min_chars = int(spec.get("min_chars") or 0)
+    # ★ 只量**最后一条 assistant 回复**，不含用户消息（否则"用户 prompt 很长"会伪装成"回复成型"）
+    reply = _assistant_text(session.app)
+    if min_chars and len(reply) < min_chars:
+        raise AssertionError(
+            f"assistant 回复过短：{len(reply)} < 要求 {min_chars}（可能被截断）。"
+            f"回复前 400 字：{reply[:400]!r}"
+        )
     for needle in spec.get("contains", []) or []:
         if needle not in buf:
             raise AssertionError(f"chat_buffer 缺少 {needle!r}（前 400 字：{buf[:400]!r}）")
