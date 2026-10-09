@@ -80,6 +80,8 @@ class FakeModel:
 
     def __init__(self):
         self.calls = []
+        self.layer_load_calls = []
+        self.pipeline_prepare_calls = []
 
     def chat(self, messages, max_tokens=None, temperature=None, top_p=None,
              **_kw):
@@ -94,9 +96,24 @@ class FakeModel:
         }
 
     def load_layer_range(self, start_layer=0, end_layer=24,
-                         has_embedding=False, has_lm_head=False):
+                         has_embedding=False, has_lm_head=False,
+                          model_path=None, quant_type=None, model_id=None,
+                          profile=None, total_layers=None):
         """层段加载桩：1.2 复制完成后接入真实实现。"""
-        return None
+        self.layer_load_calls.append({
+            "start_layer": start_layer,
+            "end_layer": end_layer,
+            "model_path": model_path,
+            "quant_type": quant_type,
+            "model_id": model_id,
+            "profile": profile,
+            "total_layers": total_layers,
+        })
+        return {"success": True, "layer_range": f"{start_layer}-{end_layer}"}
+
+    def prepare_pipeline_model(self, **kwargs):
+        self.pipeline_prepare_calls.append(dict(kwargs))
+        return {"pipeline_runtime_supported": True, **kwargs}
 
 
 class FakeEngineHost(EngineHost):
@@ -106,13 +123,22 @@ class FakeEngineHost(EngineHost):
         super().__init__()
         self._host = FakeModel()  # 替换真实 ModelHost
 
-    def load_model(self, engine=None, quant_type=None, use_compile=False, model_id=None):
+    def load_model(
+        self,
+        engine=None,
+        quant_type=None,
+        use_compile=False,
+        model_id=None,
+        model_path=None,
+        resolution=None,
+    ):
         return {"success": True, "engine": engine or "pytorch", "model_id": model_id}
 
     def unload_model(self):
         return {"success": True, "message": "模型已卸载"}
 
-    def switch_model(self, model_id, engine=None):
+    def switch_model(self, model_id, engine=None, quant_type=None, model_path=None,
+                     resolution=None):
         return {"success": True, "model_id": model_id, "engine": engine}
 
     def current_model(self):
@@ -1079,15 +1105,90 @@ def test_engine_host_auto_load_selects_sorted_gguf_candidate(tmp_path, monkeypat
 
     host._auto_load_default_model()
 
-    assert recorder.calls == [{
+    assert len(recorder.calls) == 1
+    call = dict(recorder.calls[0])
+    resolution = call.pop("resolution")
+    assert call == {
         "model_path": str(selected),
-        "quant_type": "int4",
+        "quant_type": "gguf",
         "profile": {"tier": "edge", "gpu": {}},
+        "model_id": None,
         "engine": "llama_cpp",
-    }]
+    }
+    assert resolution.engine == "llama_cpp"
+    assert resolution.model_path == str(selected)
     assert host.current_model()["loaded"] is True
-    assert host.current_model()["quant_type"] == "int4"
+    assert recorder.current_quant == "gguf"
     assert host.kv_cache_status()["page_size"] == 64
+
+
+def test_engine_host_auto_load_safetensors_only_uses_pytorch_quant(tmp_path, monkeypatch):
+    import config as cfg
+
+    model_dir = tmp_path / "safetensors-model"
+    model_dir.mkdir()
+
+    class RecordingModelHost:
+        def __init__(self):
+            self.full_chat_execution_lock = threading.RLock()
+            self.model = None
+            self.model_loaded = False
+            self.quant_type = None
+            self.calls = []
+
+        @staticmethod
+        def get_device():
+            return torch.device("cpu")
+
+        def load_model(self, **kwargs):
+            self.calls.append(kwargs)
+            self.quant_type = kwargs["quant_type"]
+
+    host = FakeEngineHost()
+    recorder = RecordingModelHost()
+    host._host = recorder
+    host._device_profile = {"tier": "edge", "gpu": {"cuda_available": False}}
+    monkeypatch.setattr(host, "_ensure_device_profile", lambda: host._device_profile)
+    monkeypatch.setattr(cfg, "get_active_model_paths", lambda: {})
+    monkeypatch.setattr(cfg, "GGUF_MODEL_PATH", str(tmp_path / "missing.gguf"))
+    monkeypatch.setattr(cfg, "MODEL_PATH", str(model_dir))
+    monkeypatch.setattr(cfg, "QUANT_TYPE", "int4")
+    monkeypatch.setattr(cfg, "PREFER_PYTORCH", False)
+
+    host._auto_load_default_model()
+
+    assert len(recorder.calls) == 1
+    call = recorder.calls[0]
+    assert call["engine"] == "pytorch"
+    assert call["model_path"] == str(model_dir)
+    assert call["quant_type"] == "fp32"
+    assert call["resolution"].runtime == "pytorch_cpu"
+
+
+def test_engine_host_auto_load_never_rebinds_active_id_to_global_artifact(
+    tmp_path, monkeypatch,
+):
+    import config as cfg
+
+    foreign = tmp_path / "foreign.gguf"
+    foreign.write_bytes(b"gguf")
+    host = FakeEngineHost()
+    host._device_profile = {"tier": "edge", "gpu": {"cuda_available": False}}
+    monkeypatch.setattr(host, "_ensure_device_profile", lambda: host._device_profile)
+    monkeypatch.setattr(
+        cfg,
+        "get_active_model_paths",
+        lambda: {
+            "model_id": "model-a",
+            "gguf_path": str(tmp_path / "missing-a.gguf"),
+            "model_path": str(tmp_path / "missing-a"),
+        },
+    )
+    monkeypatch.setattr(cfg, "GGUF_MODEL_PATH", str(foreign))
+    monkeypatch.setattr(cfg, "MODEL_PATH", str(tmp_path / "foreign-safetensors"))
+
+    with pytest.raises(FileNotFoundError, match="未找到可自动加载的模型文件"):
+        host._auto_load_default_model()
 
 
 def test_engine_host_remote_worker_selection_enforces_feature_health_model_and_load(
@@ -2081,6 +2182,10 @@ def make_peer():
 
     peer = PeerClient(master_host="127.0.0.1", master_port=8888,
                       node_id="test_client")
+    peer._host._ensure_device_profile = lambda: {
+        "tier": "edge",
+        "gpu": {"cuda_available": False},
+    }
     fake = FakeModel()
     fake.forward_layers_called = []
 
@@ -2099,7 +2204,8 @@ def make_peer():
         return out
 
     fake.forward_layers = _forward_layers
-    fake.load_model = lambda **kw: {"success": True}
+    fake.full_load_calls = []
+    fake.load_model = lambda **kw: fake.full_load_calls.append(dict(kw))
     fake.is_loaded = True
     fake._engine_type = "pytorch"
     fake.model = type("M", (), {"config": type("C", (), {"model_type": "qwen"})()})()
@@ -2120,11 +2226,14 @@ def test_peer_layer_config_new_format(monkeypatch):
         "has_embedding": True, "has_lm_head": False,
         "model_id": "qwen-1.8b", "model_sha256": "abc123",
         "model_type": "qwen", "total_layers": 24,
+        "master_quant_type": "fp32",
     })
     ack = [p for t, p in peer._client.sent if t.value == "layer_config_ack"]
     assert ack and ack[0]["status"] == "ready"
     assert ack[0]["config_id"] == "cfg-1"
     assert peer._active_layer_config["config_id"] == "cfg-1"
+    assert peer._host._host.full_load_calls == []
+    assert peer._host._host.layer_load_calls[0]["quant_type"] == "fp32"
 
 
 def test_peer_disconnect_marks_client_for_reregistration():
@@ -2588,13 +2697,13 @@ def test_v1_models_current_unloaded_shape_real_host():
 # 14.7 模型生命周期校验（contract_diff 2026-08-05 复测修复回归）
 #    - /v1/models/load：引擎白名单 400（此前 500）
 #    - /v1/models/switch：未注册模型 404 detail（此前 200 success:false）
-#    - 引擎大小写经 _check_load_engine 归一化后执行（校验与执行同值）
+#    - 引擎大小写经统一 resolver 归一化后执行（校验与执行同值）
 # ----------------------------------------------------------------------
 def test_models_load_invalid_engine_400(client):
     # ★ 2026-09-19：`qwen-1_8b` 已从内置列表移除 ⇒ 改用 `qwen3-0.6b`
     #   （本用例验的是「引擎白名单」，与具体模型无关）。
     resp = client.post("/v1/models/load", json={
-        "engine": "torch", "model_id": "qwen3-0.6b"})
+        "engine": "tensorrt", "model_id": "qwen3-0.6b"})
     assert resp.status_code == 400
     assert resp.json()["error_code"] == "MODEL_ENGINE_UNSUPPORTED"
 
@@ -2605,6 +2714,94 @@ def test_models_load_engine_case_normalized(client):
     resp = client.post("/v1/models/load", json={
         "engine": "LLAMA_CPP", "model_id": "qwen3-0.6b"})
     assert resp.status_code == 200
+
+
+def test_models_load_torch_alias_uses_pytorch(client):
+    resp = client.post("/v1/models/load", json={
+        "engine": "torch", "quant_type": "int4", "model_id": "qwen3-0.6b"})
+    assert resp.status_code == 200
+    assert resp.json()["engine"] == "pytorch"
+
+
+def test_models_load_layer_range_never_loads_full_model(monkeypatch):
+    from inference_service import routes as routes_module
+    from model_load_resolver import ModelLoadResolution
+
+    host = FakeEngineHost()
+    full_load_calls = []
+    host.load_model = lambda **kwargs: full_load_calls.append(dict(kwargs))
+    resolution = ModelLoadResolution(
+        model_id="qwen3-0.6b",
+        requested_engine="pytorch",
+        engine="pytorch",
+        artifact_kind="safetensors",
+        model_path="C:/models/qwen3-0.6b",
+        requested_quant="fp32",
+        quant_type="fp32",
+        runtime="pytorch_cpu",
+        runtime_quant="fp32",
+        layer_range_mode="dynamic",
+        reason_code="ENGINE_EXPLICIT",
+        reason="test",
+    )
+    monkeypatch.setattr(
+        routes_module,
+        "_resolve_service_model_load",
+        lambda **_kwargs: resolution,
+    )
+
+    response = TestClient(make_app(engine_host=host)).post(
+        "/v1/models/load",
+        json={
+            "engine": "pytorch",
+            "quant_type": "fp32",
+            "model_id": "qwen3-0.6b",
+            "layer_range": "0-12",
+        },
+    )
+
+    assert response.status_code == 200
+    assert full_load_calls == []
+    assert host._host.layer_load_calls == [{
+        "start_layer": 0,
+        "end_layer": 12,
+        "model_path": "C:/models/qwen3-0.6b",
+        "quant_type": "fp32",
+        "model_id": "qwen3-0.6b",
+        "profile": None,
+        "total_layers": None,
+    }]
+
+
+def test_engine_host_precut_layer_range_prepares_descriptor_before_loading():
+    from model_load_resolver import ModelLoadResolution
+
+    host = FakeEngineHost()
+    resolution = ModelLoadResolution(
+        model_id="qwen3-0.6b",
+        requested_engine="llama_cpp",
+        engine="llama_cpp",
+        artifact_kind="gguf",
+        model_path="C:/models/qwen3-0.6b.gguf",
+        requested_quant="Q4_K_M",
+        quant_type="gguf",
+        runtime="llama_cpp_native",
+        runtime_quant="gguf",
+        layer_range_mode="precut_artifact",
+        reason_code="ENGINE_EXPLICIT",
+        reason="test",
+    )
+
+    host.load_layer_range(layer_range="12-24", resolution=resolution)
+
+    assert host._host.pipeline_prepare_calls == [{
+        "model_id": "qwen3-0.6b",
+        "model_path": "C:/models/qwen3-0.6b.gguf",
+        "quant_type": "gguf",
+        "model_sha256": None,
+    }]
+    assert host._host.layer_load_calls[0]["start_layer"] == 12
+    assert host._host.layer_load_calls[0]["end_layer"] == 24
 
 
 def test_models_switch_invalid_engine_400(client):
@@ -2639,13 +2836,14 @@ class _FakeLoadHost:
         self.switch_calls = []
 
     def load_model(self, engine=None, quant_type=None, use_compile=False,
-                   model_id=None):
+                   model_id=None, model_path=None, profile=None, resolution=None):
         self.load_calls.append((engine, quant_type, use_compile, model_id))
         # 模拟 manager 归一化：llama_cpp 引擎忽略请求量化（GGUF 自带）
         self.quant_type = "gguf" if engine == "llama_cpp" else (quant_type or "int4")
         return None
 
-    def switch_model(self, model_id=None, engine=None):
+    def switch_model(self, model_id=None, engine=None, quant_type=None,
+                     model_path=None, profile=None, resolution=None):
         self.switch_calls.append((model_id, engine))
         self.quant_type = "int8"
         return {"success": True, "model_id": model_id, "quant_type": "int8"}

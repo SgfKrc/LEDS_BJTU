@@ -583,11 +583,21 @@ async def http_exception_with_request_id(request: Request, exc: HTTPException):
 from model_host import SchedulerCallbackSet, model_host
 from koakuma_engine import (
     Capability,
-    accepted_backend_requests,
     backend_capabilities,
     backend_id_for,
     registered_backends,
     runtime_supports,
+)
+from model_load_resolver import (
+    ModelLoadFacts,
+    ModelLoadResolution,
+    ModelLoadResolutionError,
+    OP_DISTRIBUTED_LOAD,
+    OP_DYNAMIC_LAYER_RANGE,
+    OP_FULL_MODEL,
+    effective_pytorch_cuda_available,
+    preferred_engine_for_artifacts,
+    resolve_model_load,
 )
 
 model_manager = model_host
@@ -4457,17 +4467,29 @@ def _auto_load_default_model():
     if getattr(cfg, "ISLAND_ENABLED", False) and getattr(cfg, "ISLAND_BASE_URL", ""):
         from island_engine import mask_island_url
 
+        resolution = resolve_model_load(
+            ModelLoadFacts(
+                model_id=None,
+                island_enabled=True,
+                island_base_url=str(cfg.ISLAND_BASE_URL),
+            ),
+            requested_engine="island",
+            requested_quant="island",
+        )
+
         logger.info(
             f"自动加载孤岛引擎: endpoint={mask_island_url(cfg.ISLAND_BASE_URL)}"
         )
         t0 = time.time()
-        cfg.INFERENCE_ENGINE = "island"
-        cfg.QUANT_TYPE = "island"
+        cfg.INFERENCE_ENGINE = resolution.engine
+        cfg.QUANT_TYPE = resolution.quant_type
         cfg.USE_COMPILE = False
         _run_exclusive_model_change(
             lambda: model_manager.load_model(
                 profile=device_profile,
-                engine="island",
+                engine=resolution.engine,
+                quant_type=resolution.quant_type,
+                resolution=resolution,
             )
         )
         _init_kv_cache()
@@ -4478,7 +4500,7 @@ def _auto_load_default_model():
             "rounds": 0,
         }
         model_host.model_loaded = True
-        model_host.current_quant = "island"
+        model_host.current_quant = resolution.quant_type
         scheduler.refresh_task_worker_capabilities()
         logger.info(f"✅ 孤岛引擎自动连接完成 ({time.time() - t0:.1f}s)")
         return
@@ -4494,12 +4516,17 @@ def _auto_load_default_model():
 
     # 1. 优先查找 GGUF 文件（llama.cpp 引擎，不依赖 transformers/bitsandbytes）
     gguf_candidates = []
-    gguf_configured = _active_gguf if _active_gguf and os.path.isfile(_active_gguf) else cfg.GGUF_MODEL_PATH
+    gguf_configured = (
+        _active_gguf
+        if _active_id
+        else cfg.GGUF_MODEL_PATH
+    )
     if os.path.isfile(gguf_configured):
         gguf_candidates.append(gguf_configured)
-    # 搜索 models 目录下的所有 .gguf 文件
+    # 只有旧配置没有画像 model_id 时才允许目录扫描；已有 model_id 时若偷换成
+    # 目录里的另一个 GGUF，会造成 active identity 与真实工件不一致。
     models_dir = os.path.dirname(gguf_configured)
-    if os.path.isdir(models_dir):
+    if not _active_id and os.path.isdir(models_dir):
         for f in sorted(glob.glob(os.path.join(models_dir, "*.gguf"))):
             if f not in gguf_candidates:
                 gguf_candidates.append(f)
@@ -4520,30 +4547,46 @@ def _auto_load_default_model():
             f"QLH_PREFER_PYTORCH=1 ⇒ 本机优先走 PyTorch: {_active_safetensors}"
         )
 
-    if gguf_candidates and not prefer_pytorch:
-        gguf_path = gguf_candidates[0]
-        engine = "llama_cpp"
-        model_path = gguf_path
-        quant = "int4"
-        if len(gguf_candidates) > 1:
-            logger.info(f"发现 {len(gguf_candidates)} 个 GGUF 文件，选择: {os.path.basename(gguf_path)}")
-    elif _active_safetensors and os.path.isdir(_active_safetensors):
-        # 2a. 画像模型的 Safetensors 目录（PyTorch 后端）
-        engine = "pytorch"
-        model_path = _active_safetensors
-        quant = cfg.QUANT_TYPE
-    elif os.path.isdir(cfg.MODEL_PATH):
-        # 2b. 回退：Safetensors 目录必须使用 PyTorch 后端。
-        engine = "pytorch"
-        model_path = cfg.MODEL_PATH
-        quant = cfg.QUANT_TYPE
-    else:
+    safetensors_path = (
+        _active_safetensors
+        if _active_safetensors and os.path.isdir(_active_safetensors)
+        else "" if _active_id
+        else cfg.MODEL_PATH if os.path.isdir(cfg.MODEL_PATH) else ""
+    )
+    gguf_path = gguf_candidates[0] if gguf_candidates else ""
+    cuda_ok = _resolution_cuda_available()
+    auto_facts = ModelLoadFacts(
+        model_id=_active_id or None,
+        model_name=_active_id or "默认模型",
+        registered=True,
+        has_safetensors=bool(safetensors_path),
+        has_gguf=bool(gguf_path),
+        safetensors_path=safetensors_path or None,
+        gguf_path=gguf_path or None,
+        preferred_engine="pytorch" if prefer_pytorch else preferred_engine_for_artifacts(
+            has_safetensors=bool(safetensors_path),
+            has_gguf=bool(gguf_path),
+            cuda_available=cuda_ok,
+        ),
+        cuda_available=cuda_ok,
+    )
+    try:
+        resolution = resolve_model_load(
+            auto_facts,
+            requested_engine="pytorch" if prefer_pytorch else "auto",
+            requested_quant=getattr(cfg, "QUANT_TYPE", "int4"),
+        )
+    except ModelLoadResolutionError as exc:
         raise FileNotFoundError(
-            f"未找到可自动加载的模型文件。已检查:\n"
+            f"未找到可自动加载的模型文件（{exc.code}: {exc.message}）。已检查:\n"
             f"  GGUF 配置路径: {gguf_configured}\n"
             f"  Safetensors 路径: {cfg.MODEL_PATH}\n"
             f"  models 目录: {models_dir}"
-        )
+        ) from exc
+
+    engine = resolution.engine
+    model_path = resolution.model_path
+    quant = resolution.quant_type
 
     logger.info(f"自动加载默认模型: path={model_path}, engine={engine}")
 
@@ -4557,7 +4600,9 @@ def _auto_load_default_model():
             model_path=model_path,
             quant_type=quant,
             profile=device_profile,
+            model_id=resolution.model_id,
             engine=engine,
+            resolution=resolution,
         )
     )
 
@@ -5038,12 +5083,11 @@ def _model_api_payload(model: mc.ModelConfig) -> dict:
     if file_status["is_available"] and not supported_engines:
         unavailable_reason = "模型文件已存在，但当前设备缺少可用推理后端。"
 
-    if "pytorch" in supported_engines:
-        preferred_engine = "pytorch"
-    elif "llama_cpp" in supported_engines:
-        preferred_engine = "llama_cpp"
-    else:
-        preferred_engine = "auto"
+    preferred_engine = preferred_engine_for_artifacts(
+        has_safetensors=file_status["has_safetensors"],
+        has_gguf=file_status["has_gguf"],
+        cuda_available=_resolution_cuda_available(),
+    )
     default_quant = "Q4_K_M" if preferred_engine == "llama_cpp" else "int4"
     profile = _model_profile_payload(model, preferred_engine=preferred_engine)
 
@@ -5079,25 +5123,116 @@ def _model_api_payload(model: mc.ModelConfig) -> dict:
     }
 
 
-def _normalize_quant_for_engine(quant_type: str, engine: str) -> str:
-    """Return a safe quant value for the concrete engine or raise HTTP 400."""
-    raw = str(quant_type or "").strip()
-    if engine == "llama_cpp":
-        return raw or "gguf"
-    if engine == "island":
-        # 孤岛引擎量化精度由后端决定，网关侧仅作展示标签
-        return "island"
+def _model_resolution_http_error(exc: ModelLoadResolutionError) -> HTTPException:
+    status = 404 if exc.code == "MODEL_NOT_REGISTERED" else 400
+    return coded_http_error(status, exc.code, exc.message)
 
-    quant = raw.lower()
-    # ★ 2026-10-03：允许 fp32（`model_module` 内部的 `runtime_quant` 也用这个名字）。
-    #   跨框架 D→L 的对照基准（`relay_experiment` 的 d2l_mainrepo 路径）上游是
-    #   `torch.float32`，而端点此前只收 fp16/int8/int4 ⇒ 端点路径无法与基准同精度
-    #   对齐，对拍结果会掺进纯精度造成的分叉。
-    if quant in ("f32", "fp32", "float32"):
-        return "fp32"
-    if quant not in ("fp16", "int8", "int4"):
-        raise HTTPException(400, f"不支持的量化类型: {quant}，可选: fp32, fp16, int8, int4")
-    return quant
+
+def _resolution_cuda_available() -> bool:
+    """Probe CUDA for an actual load decision, preserving injected probes."""
+
+    system_cuda = False
+    try:
+        system_cuda = bool(mc.is_cuda_available())
+    except Exception:
+        pass
+    if not system_cuda:
+        system_cuda = cuda_available(load=True)
+    return effective_pytorch_cuda_available(
+        system_cuda_available=system_cuda,
+        profile=device_profile,
+    )
+
+
+def _model_load_facts(
+    model_id: Optional[str],
+    *,
+    preferred_engine: Optional[str] = None,
+) -> ModelLoadFacts:
+    """Collect registry/filesystem facts without making a backend decision."""
+
+    import config as cfg
+
+    resolved_id = model_id or mc.get_profile_default_model_id()
+    model = mc.get_model_config(resolved_id, _get_registered_experimental_models())
+    if model is None:
+        return ModelLoadFacts(
+            model_id=resolved_id,
+            registered=False,
+            cuda_available=_resolution_cuda_available(),
+            island_enabled=bool(getattr(cfg, "ISLAND_ENABLED", False)),
+            island_base_url=str(getattr(cfg, "ISLAND_BASE_URL", "") or ""),
+        )
+
+    status = mc.get_model_file_status(model)
+    cuda_ok = _resolution_cuda_available()
+    preferred = preferred_engine or preferred_engine_for_artifacts(
+        has_safetensors=bool(status["has_safetensors"]),
+        has_gguf=bool(status["has_gguf"]),
+        cuda_available=cuda_ok,
+    )
+    return ModelLoadFacts(
+        model_id=resolved_id,
+        model_name=model.name,
+        registered=True,
+        has_safetensors=bool(status["has_safetensors"]),
+        has_gguf=bool(status["has_gguf"]),
+        safetensors_path=(
+            mc.resolve_model_path(model.model_path)
+            if status["has_safetensors"] else None
+        ),
+        gguf_path=(
+            mc.resolve_model_path(model.gguf_path)
+            if status["has_gguf"] else None
+        ),
+        preferred_engine=preferred,
+        cuda_available=cuda_ok,
+        island_enabled=bool(getattr(cfg, "ISLAND_ENABLED", False)),
+        island_base_url=str(getattr(cfg, "ISLAND_BASE_URL", "") or ""),
+    )
+
+
+def _resolve_model_load_plan(
+    model_id: Optional[str],
+    engine: Optional[str],
+    quant_type: Optional[str],
+    *,
+    operation: str = OP_FULL_MODEL,
+    preferred_engine: Optional[str] = None,
+) -> ModelLoadResolution:
+    try:
+        return resolve_model_load(
+            _model_load_facts(model_id, preferred_engine=preferred_engine),
+            requested_engine=engine,
+            requested_quant=quant_type,
+            operation=operation,
+        )
+    except ModelLoadResolutionError as exc:
+        raise _model_resolution_http_error(exc) from exc
+
+
+def _normalize_quant_for_engine(quant_type: str, engine: str) -> str:
+    """Compatibility wrapper; production routes consume one full resolution."""
+
+    canonical = str(engine or "").lower()
+    facts = ModelLoadFacts(
+        model_id=None,
+        has_safetensors=canonical in {"pytorch", "torch"},
+        has_gguf=canonical in {"llama_cpp", "llama.cpp", "llama-cpp", "gguf"},
+        safetensors_path="model-dir" if canonical in {"pytorch", "torch"} else None,
+        gguf_path="model.gguf" if canonical in {"llama_cpp", "llama.cpp", "llama-cpp", "gguf"} else None,
+        cuda_available=_resolution_cuda_available(),
+        island_enabled=canonical == "island",
+        island_base_url="configured" if canonical == "island" else "",
+    )
+    try:
+        return resolve_model_load(
+            facts,
+            requested_engine=engine,
+            requested_quant=quant_type,
+        ).quant_type
+    except ModelLoadResolutionError as exc:
+        raise _model_resolution_http_error(exc) from exc
 
 
 def _estimate_full_model_load_bytes(model_id: Optional[str], engine: str, quant: str) -> int:
@@ -5205,94 +5340,22 @@ def _decide_pipeline_load_mode(model_id: Optional[str], engine: str, quant: str)
 
 
 def _validate_model_load_request(model_id: Optional[str], engine: str) -> None:
-    """Reject unavailable model loads before unloading the current model."""
-    if engine == "island":
-        # 孤岛引擎无本地文件依赖；端点可达性在加载时由健康检查校验
-        import config as cfg
-        if not getattr(cfg, "ISLAND_BASE_URL", ""):
-            raise HTTPException(
-                status_code=400,
-                detail="孤岛引擎未配置端点：请设置 QLH_ISLAND_BASE_URL 后重试。",
-            )
-        return
-    if not model_id:
-        return
+    """Compatibility wrapper; production routes consume one full resolution."""
 
-    model = mc.get_model_config(model_id, _get_registered_experimental_models())
-    if model is None:
-        raise coded_http_error(
-            404,
-            "MODEL_NOT_REGISTERED",
-            f"模型 '{model_id}' 未在注册表中找到。",
-        )
-
-    payload = _model_api_payload(model)
-    if not payload["is_available"]:
-        raise HTTPException(
-            status_code=400,
-            detail=f"模型 '{model.name}' 不可加载：{payload['unavailable_reason']}",
-        )
-
-    if engine == "llama_cpp" and not payload["has_gguf"]:
-        raise HTTPException(status_code=400, detail=f"模型 '{model.name}' 未配置或未下载 GGUF 文件。")
-    if engine == "pytorch":
-        if not payload["has_safetensors"]:
-            raise HTTPException(status_code=400, detail=f"模型 '{model.name}' 未配置或未下载 Safetensors 文件。")
+    _resolve_model_load_plan(model_id, engine, "int4")
 
 
 def _resolve_model_path_for_engine(model_id: Optional[str], engine: str) -> Optional[str]:
-    """Resolve a registered model path for the requested engine, including DB models."""
-    if not model_id:
-        return None
-    model = mc.get_model_config(model_id, _get_registered_experimental_models())
-    if model is None:
-        return None
-    payload = _model_api_payload(model)
-    selected_engine = engine if engine != "auto" else payload.get("preferred_engine", "auto")
-    if selected_engine == "llama_cpp" and payload.get("has_gguf"):
-        return mc.resolve_model_path(model.gguf_path)
-    if selected_engine == "pytorch" and payload.get("has_safetensors"):
-        return mc.resolve_model_path(model.model_path)
-    return None
+    """Compatibility wrapper; production routes consume one full resolution."""
+
+    return _resolve_model_load_plan(model_id, engine, "int4").model_path
 
 
 def _effective_engine_for_model(model_id: Optional[str], engine: str) -> str:
-    """Return the concrete engine to pass into ModelManager.
+    """Compatibility wrapper preserving both layer-range implementation modes."""
 
-    ★ 2026-10-09（稳定性 #73-④）：**分布式模式下必须落到能承载层段的引擎**。
-    master 要跑 `[0, k)` 本地段（`prepare_pipeline_model` / `load_layer_range`），而
-    **GGUF 路径不支持 `layer_range`** —— 实测报
-    `GGUF 整模恢复不接受 layer_range；裁层范围由工件 manifest 声明` ⇒
-    `pipeline_local_commit_failed` ⇒ 事务 aborted ⇒ **之后每个请求都 503，切回模型、
-    甚至重启后端都无效**（本次复现的 ④）。
-
-    而 `LoadModelRequest.engine` 的**默认值就是 `"llama_cpp"`**（并非 `"auto"`，见
-    `api_server.py` 的字段定义），所以"不传引擎"这条最常见路径在分布式模式下**必然选错**。
-    ⇒ 这里对 `auto` / `llama_cpp` / `gguf` 这类"不能承载层段"的取值统一纠正为 pytorch
-      （前提：该模型确实有 safetensors）。显式的 `pytorch` / `island` 不受影响。
-    """
-    if not model_id:
-        return engine
-    model = mc.get_model_config(model_id, _get_registered_experimental_models())
-    if model is None:
-        return engine
-    payload = _model_api_payload(model)
-    preferred = str(payload.get("preferred_engine") or "")
-    non_pipeline_engines = {"auto", "llama_cpp", "llama.cpp", "llama-cpp", "gguf"}
-    if (
-        RUN_MODE == "distributed"
-        and payload.get("has_safetensors")
-        and str(engine).strip().lower() in non_pipeline_engines
-    ):
-        logger.info(
-            "engine=%s 在分布式模式下纠正为 pytorch（模型 %s 有 safetensors；"
-            "GGUF 不支持 layer_range，会令 master 段无法准备）",
-            engine, model_id,
-        )
-        return "pytorch"
-    if engine != "auto":
-        return engine
-    return preferred or engine
+    operation = OP_DISTRIBUTED_LOAD if RUN_MODE == "distributed" else OP_FULL_MODEL
+    return _resolve_model_load_plan(model_id, engine, "int4", operation=operation).engine
 
 
 

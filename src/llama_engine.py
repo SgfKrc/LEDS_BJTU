@@ -297,7 +297,7 @@ class LlamaCppEngine:
     # 流水线模型描述器
     # ================================================================
 
-    def _pipeline_file_sha256(self, path: str) -> str:
+    def _pipeline_file_sha256(self, path: str, *, use_cache: bool = True) -> str:
         """整文件 sha256，按 `(path, mtime, size)` 记忆 —— 大 GGUF 只读一次。
 
         与 PyTorch 侧 `model_sync.compute_model_sha256`（目录内 artifact 的稳定序
@@ -309,12 +309,16 @@ class LlamaCppEngine:
             stat = os.stat(path)
         except OSError:
             return ""
-        key = (path, int(stat.st_mtime), int(stat.st_size))
+        key = (
+            path,
+            int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+            int(stat.st_size),
+        )
         cache = getattr(self, "_pipeline_sha_cache", None)
         if not isinstance(cache, dict):
             cache = {}
             self._pipeline_sha_cache = cache
-        if cache.get("key") == key:
+        if use_cache and cache.get("key") == key:
             return str(cache.get("value", ""))
         digest = hashlib.sha256()
         try:
@@ -486,7 +490,8 @@ class LlamaCppEngine:
         """按 `[start, end)` 在工件目录里找裁层 GGUF —— **靠 manifest 自证，不猜文件名**。
 
         工件由 `scripts/cut_layers.py` 产出，旁边必有 `<artifact>.gguf.manifest.json`，
-        里面的 `source_layer_range` 正是「这一段来自源模型的哪几层」。命名并不统一
+        里面的 `source_layer_range`、`source_model_sha256`、`artifact_sha256`
+        共同证明区间、源整模和段工件身份。命名并不统一
         （`cut-16` / `cut-16-20` / `head8` / `mid8-16` / `cut-k16` …），按文件名猜会
         在下一个命名上翻车，所以只认 manifest。
 
@@ -503,17 +508,57 @@ class LlamaCppEngine:
         )
         if not directory.is_dir():
             return ""
+        descriptor = dict(getattr(self, "_pipeline_descriptor", None) or {})
+        expected_source_sha256 = str(
+            descriptor.get("model_sha256", "") or ""
+        ).strip().lower()
+        if not expected_source_sha256:
+            source_path = str(
+                descriptor.get("model_path", "")
+                or getattr(self, "_model_path", "")
+                or ""
+            )
+            expected_source_sha256 = self._pipeline_file_sha256(
+                source_path,
+                use_cache=False,
+            ).lower()
+        if not expected_source_sha256:
+            raise RuntimeError("无法确定预切 GGUF 的源整模摘要，拒绝按层区间猜测工件")
+
         wanted = [int(start), int(end)]
+        matches: list[str] = []
         for manifest in sorted(directory.glob("*.manifest.json")):
             info = read_artifact_manifest(manifest)
             if not info:
                 continue
             if list(info.get("source_layer_range") or []) != wanted:
                 continue
-            artifact = manifest.name[: -len(".manifest.json")] + ".gguf"
+            if str(info.get("source_model_sha256", "") or "").lower() != expected_source_sha256:
+                continue
+            expected_artifact_sha256 = str(
+                info.get("artifact_sha256", "") or ""
+            ).lower()
+            if not expected_artifact_sha256:
+                continue
+            artifact = manifest.name[: -len(".manifest.json")]
+            if not artifact.lower().endswith(".gguf"):
+                artifact += ".gguf"
             candidate = directory / artifact
-            if candidate.is_file():
-                return str(candidate)
+            if not candidate.is_file():
+                continue
+            if self._pipeline_file_sha256(
+                str(candidate),
+                use_cache=False,
+            ).lower() != expected_artifact_sha256:
+                continue
+            matches.append(str(candidate))
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"层区间[{int(start)},{int(end)})存在多个同源且摘要有效的裁层工件，"
+                "拒绝按文件名顺序静默选择"
+            )
+        if matches:
+            return matches[0]
         return ""
 
     def load_layer_range(

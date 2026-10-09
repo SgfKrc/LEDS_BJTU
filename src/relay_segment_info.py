@@ -225,9 +225,8 @@ def read_gguf_tensor_bytes(path: str | Path) -> dict[str, int] | None:
 def read_artifact_manifest(path: str | Path) -> dict[str, Any] | None:
     """读**段工件旁的 manifest**（`<artifact>.gguf.manifest.json` 或显式路径）里的层范围。
 
-    返回 `{"source_layer_range": [start, end], "n_layer": N}`（能读到哪个给哪个）；
-    读不到 ⇒ `None`。用于回答「这一段**来自源模型的哪几层**」—— 工件头部**没有**这个信息
-    （裁层生成器只改 `block_count`、不记录来源层号），只能靠 manifest 自证（#30）。
+    返回经过基本格式校验的层范围、源整模摘要和段工件摘要（能读到哪个给哪个）；
+    读不到 ⇒ `None`。工件选择方必须同时校验这些字段，不能只按层区间猜测同源性。
     """
     target = Path(path)
     if not target.is_file():
@@ -250,6 +249,10 @@ def read_artifact_manifest(path: str | Path) -> dict[str, Any] | None:
     total = payload.get("n_layer")
     if isinstance(total, int) and total > 0:
         info["n_layer"] = total
+    for field in ("source_model_sha256", "artifact_sha256"):
+        digest = str(payload.get(field, "") or "").strip().lower()
+        if len(digest) == 64 and all(char in "0123456789abcdef" for char in digest):
+            info[field] = digest
     return info or None
 
 

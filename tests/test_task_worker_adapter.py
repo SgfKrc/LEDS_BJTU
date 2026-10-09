@@ -262,6 +262,48 @@ def test_layer_worker_matches_physical_identity_but_not_full_model_alias():
     assert provider.supports_model_identity(requested, "full_inference") is False
 
 
+def test_worker_artifact_matching_normalizes_local_engine_aliases_and_rejects_unknown():
+    requested = ModelIdentity(
+        model_id="model-a", engine="llama.cpp", format="gguf",
+        revision="rev-a", sha256="a" * 64,
+    )
+    exact_alias = [{
+        "model_id": "model-a", "engine": "gguf", "format": "gguf",
+        "revision": "rev-a", "sha256": "a" * 64,
+    }]
+    layer_alias = [{
+        "model_id": "layer-a", "engine": "llama-cpp", "format": "gguf",
+        "revision": "layer-rev", "sha256": "a" * 64,
+    }]
+    unknown = [{
+        "model_id": "model-a", "engine": "llama_magic", "format": "gguf",
+        "revision": "rev-a", "sha256": "a" * 64,
+    }]
+
+    assert RemoteFullWorkerProvider._model_matches(requested, exact_alias) is True
+    assert RemoteFullWorkerProvider._layer_model_matches(requested, layer_alias) is True
+    assert RemoteFullWorkerProvider._model_matches(requested, unknown) is False
+    assert RemoteFullWorkerProvider._layer_model_matches(requested, unknown) is False
+
+    torch_requested = ModelIdentity(
+        model_id="model-b", engine="pytorch", format="safetensors",
+        revision="rev-b", sha256="b" * 64,
+    )
+    torch_alias = [{
+        "model_id": "model-b", "engine": "torch", "format": "safetensors",
+        "revision": "rev-b", "sha256": "b" * 64,
+    }]
+    assert RemoteFullWorkerProvider._model_matches(torch_requested, torch_alias) is True
+
+    external_requested = ModelIdentity(
+        model_id="model-c", engine="external_api", format="remote",
+        revision="rev-c", sha256="c" * 64,
+    )
+    assert RemoteFullWorkerProvider._model_matches(
+        external_requested, [external_requested.snapshot()],
+    ) is True
+
+
 def test_route_a_stage_result_maps_hidden_bytes_back_to_pipeline_tensor():
     import struct
     from scheduler_pipeline import _layer_stage_result_to_pipeline_value

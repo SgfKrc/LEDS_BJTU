@@ -28,6 +28,7 @@ from task_provider import (
     StageAttempt,
     StageRequest,
     StageResult,
+    canonical_model_engine,
 )
 
 from task_worker_chunks import (
@@ -715,10 +716,17 @@ class RemoteFullWorkerProvider:
         if requested is None or not isinstance(models, list):
             return False
         expected = requested.snapshot()
-        return any(
-            isinstance(model, dict) and model == expected
-            for model in models
-        )
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            try:
+                candidate = dict(model)
+                candidate["engine"] = canonical_model_engine(model.get("engine"))
+            except ValueError:
+                continue
+            if candidate == expected:
+                return True
+        return False
 
     @staticmethod
     def _layer_model_matches(
@@ -733,12 +741,20 @@ class RemoteFullWorkerProvider:
         if requested is None or not isinstance(models, list):
             return False
         expected = requested.snapshot()
-        return any(
-            isinstance(model, dict)
-            and all(model.get(key) == expected.get(key)
-                    for key in ("engine", "format", "sha256"))
-            for model in models
-        )
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            try:
+                engine = canonical_model_engine(model.get("engine"))
+            except ValueError:
+                continue
+            if (
+                engine == expected["engine"]
+                and model.get("format") == expected["format"]
+                and model.get("sha256") == expected["sha256"]
+            ):
+                return True
+        return False
 
     def _supports_stage_chunked_input(self) -> bool:
         """对端是否声明能接收 `stage_chunk` + `hidden_ref`（默认否）。"""

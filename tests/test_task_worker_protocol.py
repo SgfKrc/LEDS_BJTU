@@ -148,6 +148,70 @@ def test_worker_capability_lists_and_concurrency_are_bounded(golden):
     assert concurrency_error.value.code == "invalid_capabilities"
 
 
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    [
+        ("llama.cpp", "llama_cpp"),
+        ("llama-cpp", "llama_cpp"),
+        ("gguf", "llama_cpp"),
+        ("llama", "llama_cpp"),
+        ("torch", "pytorch"),
+    ],
+)
+def test_wire_capabilities_normalize_local_engine_aliases(golden, alias, canonical):
+    hello = copy.deepcopy(golden["messages"][0])
+    capabilities = hello["payload"]["capabilities"]
+    capabilities["engines"] = [alias]
+    capabilities["models"][0]["engine"] = alias
+
+    decoded = decode_message(hello)
+
+    assert decoded.payload["capabilities"]["engines"] == [canonical]
+    assert decoded.payload["capabilities"]["models"][0]["engine"] == canonical
+
+
+def test_wire_model_identity_normalizes_alias_and_preserves_non_local_engine(golden):
+    offer = copy.deepcopy(golden["messages"][2])
+    offer["version"] = 2
+    offer["payload"]["model_identity"] = {
+        "model_id": "model-a",
+        "engine": "llama.cpp",
+        "format": "gguf",
+        "revision": "rev-a",
+        "sha256": "a" * 64,
+    }
+    assert decode_message(offer).payload["model_identity"]["engine"] == "llama_cpp"
+
+    offer["payload"]["model_identity"]["engine"] = "external_api"
+    assert decode_message(offer).payload["model_identity"]["engine"] == "external_api"
+
+    hello = copy.deepcopy(golden["messages"][0])
+    capabilities = hello["payload"]["capabilities"]
+    capabilities["engines"] = ["speculative_assisted"]
+    capabilities["models"][0]["engine"] = "speculative_assisted"
+    decoded = decode_message(hello)
+    assert decoded.payload["capabilities"]["engines"] == ["speculative_assisted"]
+    assert decoded.payload["capabilities"]["models"][0]["engine"] == (
+        "speculative_assisted"
+    )
+
+
+def test_wire_engine_aliases_fail_closed_and_canonical_duplicates_are_rejected(golden):
+    unknown = copy.deepcopy(golden["messages"][0])
+    unknown["payload"]["capabilities"]["engines"] = ["llama_magic"]
+    unknown["payload"]["capabilities"]["models"][0]["engine"] = "llama_magic"
+    with pytest.raises(WorkerProtocolError) as captured:
+        decode_message(unknown)
+    assert captured.value.code == "invalid_capabilities"
+
+    duplicate = copy.deepcopy(golden["messages"][0])
+    duplicate["payload"]["capabilities"]["engines"] = ["llama.cpp", "gguf"]
+    duplicate["payload"]["capabilities"]["models"][0]["engine"] = "llama_cpp"
+    with pytest.raises(WorkerProtocolError) as captured:
+        decode_message(duplicate)
+    assert captured.value.code == "invalid_capabilities"
+
+
 def test_layer_forward_result_metadata_is_accepted():
     """层段结果回记的对账字段必须被接受。
 

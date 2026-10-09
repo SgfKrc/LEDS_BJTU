@@ -25,6 +25,16 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from api_errors import coded_http_error
 from model_api_access import require_model_api_source
+from model_load_resolver import (
+    ModelLoadFacts,
+    ModelLoadResolutionError,
+    OP_DISTRIBUTED_LOAD,
+    OP_FULL_MODEL,
+    OP_LAYER_RANGE,
+    effective_pytorch_cuda_available,
+    preferred_engine_for_artifacts,
+    resolve_model_load,
+)
 from inference_service.kv_host import KVCapacityError, KVCleanupError
 from . import __version__
 from .protocol import (
@@ -155,57 +165,113 @@ async def status(request: Request):
 # ----------------------------------------------------------------------
 # 模型生命周期
 # ----------------------------------------------------------------------
-_VALID_ENGINES = ("auto", "llama_cpp", "pytorch", "island")
 _GENERATION_ID_PATTERN = re.compile(r"^gen_[A-Za-z0-9_-]{8,96}$")
 
 
-def _check_load_engine(engine: Optional[str]) -> str:
-    """对齐 api_server.py:2220-2222 的引擎白名单校验（400）。"""
-    e = (engine or "auto").lower()
-    if e not in _VALID_ENGINES:
-        raise coded_http_error(
-            400,
-            "MODEL_ENGINE_UNSUPPORTED",
-            f"不支持的引擎: {e}，可选: auto, llama_cpp, pytorch, island",
-        )
-    return e
-
-
-def _check_model_registered(model_id: Optional[str], engine: str) -> None:
-    """对齐 api_server.py:5029-5051 _validate_model_load_request 的注册校验。
-
-    island 引擎无本地文件依赖；model_id 为空直接放行（对齐 api_server）。
-    inference-svc 模型域仅内置模型（DB 实验模型由 control-svc 承载），
-    故 get_model_config 的 db_models 参数恒传空 dict。
-    """
-    if engine == "island" or not model_id:
-        return
+def _resolve_service_model_load(
+    *,
+    host,
+    model_id: Optional[str],
+    engine: Optional[str],
+    quant_type: Optional[str],
+    operation: str,
+):
+    import config as cfg
     import model_config as mc
+    from torch_runtime import cuda_available
 
-    model = mc.get_model_config(model_id, {})
+    profile_loader = getattr(host, "_ensure_device_profile", None)
+    profile = profile_loader() if callable(profile_loader) else getattr(
+        host, "_device_profile", None
+    )
+    cuda_ok = effective_pytorch_cuda_available(
+        system_cuda_available=cuda_available(load=True),
+        profile=profile,
+    )
+
+    resolved_id = model_id or mc.get_profile_default_model_id()
+    model = mc.get_model_config(resolved_id, {})
     if model is None:
-        raise coded_http_error(
-            404,
-            "MODEL_NOT_REGISTERED",
-            f"模型 '{model_id}' 未在注册表中找到。",
+        facts = ModelLoadFacts(
+            model_id=resolved_id,
+            registered=False,
+            cuda_available=cuda_ok,
+            island_enabled=bool(getattr(cfg, "ISLAND_ENABLED", False)),
+            island_base_url=str(getattr(cfg, "ISLAND_BASE_URL", "") or ""),
         )
+    else:
+        status = mc.get_model_file_status(model)
+        facts = ModelLoadFacts(
+            model_id=resolved_id,
+            model_name=model.name,
+            registered=True,
+            has_safetensors=bool(status["has_safetensors"]),
+            has_gguf=bool(status["has_gguf"]),
+            safetensors_path=(
+                mc.resolve_model_path(model.model_path)
+                if status["has_safetensors"] else None
+            ),
+            gguf_path=(
+                mc.resolve_model_path(model.gguf_path)
+                if status["has_gguf"] else None
+            ),
+            preferred_engine=preferred_engine_for_artifacts(
+                has_safetensors=bool(status["has_safetensors"]),
+                has_gguf=bool(status["has_gguf"]),
+                cuda_available=cuda_ok,
+            ),
+            cuda_available=cuda_ok,
+            island_enabled=bool(getattr(cfg, "ISLAND_ENABLED", False)),
+            island_base_url=str(getattr(cfg, "ISLAND_BASE_URL", "") or ""),
+        )
+    try:
+        return resolve_model_load(
+            facts,
+            requested_engine=engine or "auto",
+            requested_quant=quant_type,
+            operation=operation,
+        )
+    except ModelLoadResolutionError as exc:
+        status_code = 404 if exc.code == "MODEL_NOT_REGISTERED" else 400
+        raise coded_http_error(status_code, exc.code, exc.message) from exc
 
 
 @router.post("/models/load")
 async def models_load(req: LoadModelRequest, request: Request):
     require_model_api_source(request)
-    engine = _check_load_engine(req.engine)
-    _check_model_registered(req.model_id, engine)
     host = _engine_host(request)
-    result = host.load_model(
-        engine=engine,
-        quant_type=req.quant_type,
-        use_compile=req.use_compile,
+    operation = (
+        OP_LAYER_RANGE
+        if req.layer_range
+        else OP_DISTRIBUTED_LOAD
+        if getattr(host, "_run_mode", "standalone") == "distributed"
+        else OP_FULL_MODEL
+    )
+    resolution = _resolve_service_model_load(
+        host=host,
         model_id=req.model_id,
+        engine=req.engine,
+        quant_type=req.quant_type,
+        operation=operation,
     )
     if req.layer_range:
-        host.load_layer_range(layer_range=req.layer_range)
-    return result
+        return host.load_layer_range(
+            layer_range=req.layer_range,
+            model_id=resolution.model_id,
+            model_path=resolution.model_path,
+            quant_type=resolution.quant_type,
+            engine=resolution.engine,
+            layer_range_mode=resolution.layer_range_mode,
+            resolution=resolution,
+        )
+    return host.load_model(
+        engine=resolution.engine,
+        quant_type=resolution.quant_type,
+        use_compile=req.use_compile,
+        model_id=resolution.model_id,
+        model_path=resolution.model_path,
+        resolution=resolution,
+    )
 
 
 @router.post("/models/unload")
@@ -217,9 +283,26 @@ async def models_unload(req: UnloadModelRequest, request: Request):
 @router.post("/models/switch")
 async def models_switch(req: SwitchModelRequest, request: Request):
     require_model_api_source(request)
-    engine = _check_load_engine(req.engine)
-    _check_model_registered(req.model_id, engine)
-    return _engine_host(request).switch_model(model_id=req.model_id, engine=engine)
+    host = _engine_host(request)
+    operation = (
+        OP_DISTRIBUTED_LOAD
+        if getattr(host, "_run_mode", "standalone") == "distributed"
+        else OP_FULL_MODEL
+    )
+    resolution = _resolve_service_model_load(
+        host=host,
+        model_id=req.model_id,
+        engine=req.engine,
+        quant_type=None,
+        operation=operation,
+    )
+    return host.switch_model(
+        model_id=resolution.model_id,
+        engine=resolution.engine,
+        quant_type=resolution.quant_type,
+        model_path=resolution.model_path,
+        resolution=resolution,
+    )
 
 
 @router.get("/models/current")

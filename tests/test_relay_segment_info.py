@@ -178,10 +178,20 @@ def test_read_gguf_layer_info_is_none_on_bad_input(tmp_path: Path) -> None:
 def test_read_artifact_manifest_reads_layer_range(tmp_path: Path) -> None:
     """★ 「来自源模型的哪几层」只能由 manifest 自证（工件头里**没有**这个信息）。"""
     manifest = tmp_path / "mid8-16.gguf.manifest.json"
-    manifest.write_text(json.dumps({"source_layer_range": [8, 16], "n_layer": 8}),
+    manifest.write_text(json.dumps({
+        "source_layer_range": [8, 16],
+        "n_layer": 8,
+        "source_model_sha256": "a" * 64,
+        "artifact_sha256": "b" * 64,
+    }),
                         encoding="utf-8")
 
-    assert R.read_artifact_manifest(manifest) == {"source_layer_range": [8, 16], "n_layer": 8}
+    assert R.read_artifact_manifest(manifest) == {
+        "source_layer_range": [8, 16],
+        "n_layer": 8,
+        "source_model_sha256": "a" * 64,
+        "artifact_sha256": "b" * 64,
+    }
 
 
 def test_read_artifact_manifest_is_none_on_bad_input(tmp_path: Path) -> None:

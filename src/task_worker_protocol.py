@@ -9,6 +9,11 @@ import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+try:
+    from .task_provider import canonical_model_engine
+except ImportError:  # pragma: no cover - top-level import in worker bundles
+    from task_provider import canonical_model_engine
+
 
 PROTOCOL_NAME = "qlh.task_worker"
 PROTOCOL_VERSION = 3
@@ -407,15 +412,22 @@ def _validate_model_identity(value: Any, field: str) -> dict[str, Any]:
     # "island": TP 孤岛引擎（网关整请求转发，指纹为端点摘要）
     # "external_api": 外部推理服务（路线 B，指纹为外部端点摘要）
     # "speculative_assisted": 投机解码（路线 C-1，本地 draft + 外部 verify）
-    if model["engine"] not in _SUPPORTED_ENGINES:
+    engine = _require_string(
+        model["engine"], f"{field}.engine", max_length=64,
+    )
+    try:
+        engine = canonical_model_engine(engine)
+    except ValueError as exc:
         raise _error(
             "invalid_model_identity", f"{field}.engine",
             "model engine is unsupported",
-        )
+        ) from exc
     _require_string(model["format"], f"{field}.format", pattern=_SAFE_ID)
     _require_string(model["revision"], f"{field}.revision", pattern=_SAFE_ID)
     _require_string(model["sha256"], f"{field}.sha256", pattern=_SHA256)
-    return model
+    normalized = dict(model)
+    normalized["engine"] = engine
+    return normalized
 
 
 def _validate_layer_budget(value: Any) -> None:
@@ -760,14 +772,27 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
             "payload.capabilities.stage_chunked_input",
         )
     engines = capabilities["engines"]
-    if not isinstance(engines, list) or not engines or any(
-        value not in _SUPPORTED_ENGINES
-        for value in engines
-    ):
+    if not isinstance(engines, list) or not engines:
         raise _error(
             "invalid_capabilities", "payload.capabilities.engines",
             "engines must contain supported engine identifiers",
         )
+    canonical_engines = []
+    for index, value in enumerate(engines):
+        try:
+            engine = canonical_model_engine(_require_string(
+                value,
+                f"payload.capabilities.engines[{index}]",
+                max_length=64,
+            ))
+        except (ValueError, WorkerProtocolError) as exc:
+            raise _error(
+                "invalid_capabilities", "payload.capabilities.engines",
+                "engines must contain supported engine identifiers",
+            ) from exc
+        canonical_engines.append(engine)
+    engines = canonical_engines
+    capabilities["engines"] = engines
     if len(engines) != len(set(engines)):
         raise _error(
             "invalid_capabilities", "payload.capabilities.engines",
@@ -783,6 +808,7 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
     for index, model in enumerate(models):
         field = f"payload.capabilities.models[{index}]"
         model = _validate_model_identity(model, field)
+        models[index] = model
         model_ids.append(model["model_id"])
         if model["engine"] not in engines:
             raise _error(
@@ -1076,7 +1102,7 @@ def _validate_payload(
                 "layer fields are only valid for layer_forward",
             )
         if version >= 2:
-            _validate_model_identity(
+            payload["model_identity"] = _validate_model_identity(
                 payload["model_identity"], "payload.model_identity",
             )
     elif message_type == "stage_accept":

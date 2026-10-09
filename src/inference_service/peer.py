@@ -14,7 +14,7 @@ _send_layer_config_ack / _send_layer_result / pipeline_done|abort），
   get_effective_node_id() → self._node_id
 
 未复制（开发期从节点不承担，归 scheduler-svc 控制面）：
-  链式直连 chain_forward（结果经主节点中转回退，主节点侧兼容）、
+  legacy 多段 CHAIN_FORWARD（由 master 向下一逻辑段转发，worker 不互连）、
   bootstrap 首次连接部署、备用主节点/角色转让、DB 主节点发现。
 """
 import base64
@@ -27,6 +27,13 @@ from typing import Any, Dict, Optional
 
 # ★ #31 M2：层流水线支持的架构走**单一事实来源**（此前硬编码 `{"qwen","qwen2"}`）
 from pipeline_model_descriptor import PIPELINE_RUNTIME_MODEL_TYPES
+from model_load_resolver import (
+    ModelLoadFacts,
+    OP_DYNAMIC_LAYER_RANGE,
+    effective_pytorch_cuda_available,
+    resolve_model_load,
+)
+from torch_runtime import cuda_available
 
 logger = logging.getLogger("inference_service.peer")
 
@@ -498,15 +505,37 @@ class PeerClient:
             if not local_model_path:
                 raise RuntimeError(f"模型同步后仍无本地路径: {model_id}")
 
-            self._host._host.load_model(
-                model_path=local_model_path,
-                quant_type="int4",
-                profile=None,
-                engine="pytorch",
+            requested_quant = str(
+                cfg.get("master_quant_type") or cfg.get("quant_type") or "int4"
             )
+            profile = self._host._ensure_device_profile()
+
+            resolution = resolve_model_load(
+                ModelLoadFacts(
+                    model_id=model_id,
+                    model_name=model_id,
+                    registered=True,
+                    has_safetensors=True,
+                    safetensors_path=local_model_path,
+                    preferred_engine="pytorch",
+                    cuda_available=effective_pytorch_cuda_available(
+                        system_cuda_available=cuda_available(load=True),
+                        profile=profile,
+                    ),
+                ),
+                requested_engine="pytorch",
+                requested_quant=requested_quant,
+                operation=OP_DYNAMIC_LAYER_RANGE,
+            )
+
             self._host._host.load_layer_range(
                 start_layer=start, end_layer=end,
                 has_embedding=has_embed, has_lm_head=has_lm,
+                model_path=resolution.model_path,
+                quant_type=resolution.quant_type,
+                profile=profile,
+                total_layers=total_layers,
+                model_id=resolution.model_id,
             )
 
             with self._layer_config_lock:

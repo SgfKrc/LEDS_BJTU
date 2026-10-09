@@ -21,8 +21,10 @@ from koakuma_engine import (
     BackendCapabilities,
     backend_capabilities,
     backend_id_for,
+    normalize_backend_request,
     select_backend,
 )
+from model_load_resolver import ModelLoadResolution
 
 
 class InferenceHost(Protocol):
@@ -336,6 +338,7 @@ class ModelHost:
         model_id: str = None,
         engine: str = None,
         db_experimental_models: list = None,
+        resolution: ModelLoadResolution | None = None,
     ) -> None:
         """Load a model, routing the GGUF engine *around* the torch-backed manager.
 
@@ -349,12 +352,14 @@ class ModelHost:
         positional and keyword callers keep working.
         """
 
-        requested_engine = str(engine or "").strip().lower()
-        if requested_engine in ("", "auto"):
-            requested_engine = str(self.select_engine(profile) or "").strip().lower()
-        if requested_engine in ("llama_cpp", "llama.cpp", "llama-cpp", "gguf"):
+        requested_engine = normalize_backend_request(engine or "auto")
+        if requested_engine == "auto":
+            requested_engine = normalize_backend_request(self.select_engine(profile))
+        if requested_engine == "llama_cpp":
             self._load_gguf_model(model_path=model_path, model_id=model_id, profile=profile)
             return
+        if requested_engine == "pytorch" and str(model_path or "").lower().endswith(".gguf"):
+            raise ValueError("PyTorch loader 拒绝 GGUF 路径")
         manager = self._materialize_manager()
         manager.load_model(
             model_path=model_path,
@@ -363,6 +368,7 @@ class ModelHost:
             model_id=model_id,
             engine=engine,
             db_experimental_models=db_experimental_models,
+            resolution=resolution,
         )
 
     def prepare_pipeline_model(
@@ -456,7 +462,9 @@ class ModelHost:
         except Exception:  # pragma: no cover - config defines it in practice
             GGUF_MODEL_PATH = ""
 
-        if model_path and str(model_path).endswith(".gguf"):
+        if model_path:
+            if not str(model_path).lower().endswith(".gguf"):
+                raise ValueError("llama.cpp loader 只接受显式 GGUF 文件路径")
             gguf_path = model_path
         elif GGUF_MODEL_PATH and os.path.isfile(GGUF_MODEL_PATH):
             gguf_path = GGUF_MODEL_PATH
@@ -511,11 +519,7 @@ class ModelHost:
         object.__setattr__(self, "_engine_type", "llama_cpp")
         object.__setattr__(self, "quant_type", "gguf")
         object.__setattr__(self, "model_path", gguf_path)
-        try:
-            import config as _cfg
-            object.__setattr__(self, "current_quant", str(getattr(_cfg, "QUANT_TYPE", "int4")))
-        except Exception:  # pragma: no cover
-            pass
+        object.__setattr__(self, "current_quant", "gguf")
 
     def _gguf_available(self) -> bool:
         """Whether a GGUF file can be resolved *without* importing torch."""
@@ -539,6 +543,7 @@ class ModelHost:
         engine: str = None,
         model_path: str = None,
         db_experimental_models: list = None,
+        resolution: ModelLoadResolution | None = None,
     ) -> dict:
         """Switch models, keeping the GGUF engine on the torch-free path.
 
@@ -551,9 +556,9 @@ class ModelHost:
 
         import importlib.util
 
-        requested = str(engine or "").strip().lower()
-        wants_gguf = requested in ("llama_cpp", "llama.cpp", "llama-cpp", "gguf")
-        if not wants_gguf and requested in ("", "auto"):
+        requested = normalize_backend_request(engine or "auto")
+        wants_gguf = requested == "llama_cpp"
+        if not wants_gguf and requested == "auto":
             torch_absent = importlib.util.find_spec("torch") is None
             wants_gguf = torch_absent and self._gguf_available()
         if wants_gguf:
@@ -565,6 +570,8 @@ class ModelHost:
                 "model_name": model_id,
                 "error": None,
             }
+        if requested == "pytorch" and str(model_path or "").lower().endswith(".gguf"):
+            raise ValueError("PyTorch loader 拒绝 GGUF 路径")
         # ★ 切回非 GGUF 引擎前，先确认 `_manager` 仍是模型管理器：`_load_gguf_model`
         #   会把 `LlamaCppEngine` 装成 `_manager`（它没有 `switch_model`），此时直接
         #   转发会抛 AttributeError。
@@ -589,6 +596,7 @@ class ModelHost:
             engine=engine,
             model_path=model_path,
             db_experimental_models=db_experimental_models,
+            resolution=resolution,
         )
 
     def unload_model(self) -> None:

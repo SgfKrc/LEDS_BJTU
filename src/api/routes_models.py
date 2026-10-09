@@ -86,22 +86,31 @@ async def load_model(req: LoadModelRequest, request: Request = None):
     _api_module.require_model_api_source(request)
     global kv_cache, conversation_stats
 
-    engine = req.engine.lower()
-    accepted_engines = _api_module.accepted_backend_requests()
-    if engine not in accepted_engines:
-        raise _api_module.coded_http_error(
-            400,
-            "MODEL_ENGINE_UNSUPPORTED",
-            f"不支持的引擎: {engine}，可选: {', '.join(accepted_engines)}",
-        )
-
-    _api_module._validate_model_load_request(req.model_id, engine)
-    # ★ 2026-10-09（稳定性 #73-④）：**先定引擎，再按引擎解析路径**。
-    #   此前顺序相反：路径按请求里的**原始** engine（默认 `llama_cpp`）解析 ⇒ 拿到 GGUF 文件，
-    #   而 `effective_engine` 已被纠正为 pytorch ⇒ **引擎与路径不匹配** ⇒ 加载直接 HTTP 500。
-    effective_engine = _api_module._effective_engine_for_model(req.model_id, engine)
-    resolved_model_path = _api_module._resolve_model_path_for_engine(req.model_id, effective_engine)
-    quant = _api_module._normalize_quant_for_engine(req.quant_type, effective_engine)
+    operation = (
+        _api_module.OP_DISTRIBUTED_LOAD
+        if _api_module.RUN_MODE == "distributed"
+        else _api_module.OP_FULL_MODEL
+    )
+    resolution = _api_module._resolve_model_load_plan(
+        req.model_id,
+        req.engine,
+        req.quant_type,
+        operation=operation,
+    )
+    effective_engine = resolution.engine
+    resolved_model_path = resolution.model_path
+    quant = resolution.quant_type
+    _api_module.logger.info(
+        "模型加载裁决: model=%s engine=%s path_kind=%s quant=%s runtime=%s "
+        "layer_range_mode=%s reason_code=%s",
+        resolution.model_id,
+        effective_engine,
+        resolution.artifact_kind,
+        quant,
+        resolution.runtime,
+        resolution.layer_range_mode,
+        resolution.reason_code,
+    )
 
     # ★ 2026-10-09（自适应加载，用户裁定）：分布式下**先判断整模能否装下**。
     #   装得下 ⇒ 整模加载（简单、启动快）；
@@ -109,16 +118,11 @@ async def load_model(req: LoadModelRequest, request: Request = None):
     #   此前只有"整模"一条路，于是小显存/边缘环境下加载成功、容量求解却必然失败
     #   （`#82` 实测：fp32 整模 8GB 装不下 ⇒ `admitted=False` ⇒ 每个请求 503）。
     load_mode, load_reason = _api_module._decide_pipeline_load_mode(
-        req.model_id, effective_engine, quant
+        resolution.model_id, effective_engine, quant
     )
     _api_module.logger.info(f"加载模式决策: mode={load_mode}（{load_reason}）")
     if load_mode == "pipeline":
-        return await prepare_pipeline_model(
-            _api_module.PreparePipelineModelRequest(
-                model_id=req.model_id,
-                quant_type=req.quant_type,
-            )
-        )
+        return await _prepare_pipeline_model_resolution(resolution)
 
     try:
         t0 = _api_module.time.time()
@@ -143,12 +147,13 @@ async def load_model(req: LoadModelRequest, request: Request = None):
             return _api_module._run_exclusive_model_change(
                 lambda: _api_module.model_manager.switch_model(
                     # ★ 2026-09-19：未指定模型时按**设备画像**取默认（边缘 <1B / PC ~2B）。
-                    model_id=req.model_id or _api_module.mc.get_profile_default_model_id(),
+                    model_id=resolution.model_id,
                     quant_type=quant,
                     profile=_api_module.device_profile,
                     engine=effective_engine if effective_engine != "auto" else None,
                     model_path=resolved_model_path,
                     db_experimental_models=_api_module._get_registered_experimental_models(),
+                    resolution=resolution,
                 ),
                 prepare=_prepare_model_load,
                 release_worker_reservation=True,
@@ -197,27 +202,14 @@ async def load_model(req: LoadModelRequest, request: Request = None):
         _api_module.logger.error(f"模型加载失败: {e}", exc_info=True)
         raise _api_module.HTTPException(500, f"模型加载失败: {str(e)}")
 
-async def prepare_pipeline_model(req: PreparePipelineModelRequest):
-    """Prepare a Qwen/Qwen2 artifact for distributed layer loading only.
-
-    This endpoint deliberately does not set ``model_loaded`` and does not
-    instantiate a Transformers model. The first local weight materialization
-    happens only when the scheduler's master assignment is executed.
-    """
-    _api_module._validate_model_load_request(req.model_id, "pytorch")
-    resolved_model_path = _api_module._resolve_model_path_for_engine(req.model_id, "pytorch")
-    if not resolved_model_path:
-        raise _api_module.coded_http_error(
-            400,
-            "PIPELINE_MODEL_PATH_UNRESOLVED",
-            f"模型 '{req.model_id}' 的 Safetensors 路径不可用",
-        )
-    quant = _api_module._normalize_quant_for_engine(req.quant_type, "pytorch")
+async def _prepare_pipeline_model_resolution(resolution):
+    resolved_model_path = resolution.model_path
+    quant = resolution.quant_type
 
     def _prepare() -> dict:
         _api_module._reset_runtime_conversation_state(clear_histories=True)
-        return _api_module.model_manager.prepare_pipeline_model(
-            model_id=req.model_id,
+        return _api_module.model_host.prepare_pipeline_model(
+            model_id=resolution.model_id,
             model_path=resolved_model_path,
             quant_type=quant,
         )
@@ -247,6 +239,22 @@ async def prepare_pipeline_model(req: PreparePipelineModelRequest):
     except Exception as exc:
         _api_module.logger.error("准备流水线模型失败: %s", exc, exc_info=True)
         raise _api_module.HTTPException(400, f"准备流水线模型失败: {exc}") from exc
+
+
+async def prepare_pipeline_model(req: PreparePipelineModelRequest):
+    """Prepare a Qwen/Qwen2 artifact for distributed layer loading only.
+
+    This endpoint deliberately does not set ``model_loaded`` and does not
+    instantiate a Transformers model. The first local weight materialization
+    happens only when the scheduler's master assignment is executed.
+    """
+    resolution = _api_module._resolve_model_load_plan(
+        req.model_id,
+        "pytorch",
+        req.quant_type,
+        operation=_api_module.OP_DYNAMIC_LAYER_RANGE,
+    )
+    return await _prepare_pipeline_model_resolution(resolution)
 
 async def list_available_models():
     """列出可选模型配置 + 可用引擎"""
@@ -446,36 +454,40 @@ async def switch_model(req: SwitchModelRequest, request: Request = None):
     _api_module.require_model_api_source(request)
     global kv_cache, conversation_stats
 
-    # 验证 engine 参数
-    engine = req.engine.lower()
-    accepted_engines = _api_module.accepted_backend_requests()
-    if engine not in accepted_engines:
-        raise _api_module.coded_http_error(
-            400,
-            "MODEL_ENGINE_UNSUPPORTED",
-            f"不支持的引擎: {engine}，可选: {', '.join(accepted_engines)}",
-        )
-    _api_module._validate_model_load_request(req.model_id, engine)
-    # ★ 2026-10-09（子 agent 复查 N1）：**先定引擎，再按引擎解析路径** —— 与 `/api/models/load`
-    #   保持同一顺序。此前这里是反的：路径按**原始** engine（默认 `llama_cpp`）解析 ⇒ 拿到
-    #   `.gguf`，而 `effective_engine` 已被纠正为 `pytorch` ⇒ 引擎与路径不匹配（同 `#73-④`）。
-    effective_engine = _api_module._effective_engine_for_model(req.model_id, engine)
-    resolved_model_path = _api_module._resolve_model_path_for_engine(req.model_id, effective_engine)
-    quant = _api_module._normalize_quant_for_engine(req.quant_type, effective_engine)
+    operation = (
+        _api_module.OP_DISTRIBUTED_LOAD
+        if _api_module.RUN_MODE == "distributed"
+        else _api_module.OP_FULL_MODEL
+    )
+    resolution = _api_module._resolve_model_load_plan(
+        req.model_id,
+        req.engine,
+        req.quant_type,
+        operation=operation,
+    )
+    effective_engine = resolution.engine
+    resolved_model_path = resolution.model_path
+    quant = resolution.quant_type
+    _api_module.logger.info(
+        "模型切换裁决: model=%s engine=%s path_kind=%s quant=%s runtime=%s "
+        "layer_range_mode=%s reason_code=%s",
+        resolution.model_id,
+        effective_engine,
+        resolution.artifact_kind,
+        quant,
+        resolution.runtime,
+        resolution.layer_range_mode,
+        resolution.reason_code,
+    )
 
     # ★ 2026-10-09（自适应加载，用户裁定）：与 `/api/models/load` 同一判据 ——
     #   整模装不下时改走「按段物化」，而不是硬加载后让容量求解失败。
     load_mode, load_reason = _api_module._decide_pipeline_load_mode(
-        req.model_id, effective_engine, quant
+        resolution.model_id, effective_engine, quant
     )
     _api_module.logger.info(f"切换模式决策: mode={load_mode}（{load_reason}）")
     if load_mode == "pipeline":
-        return await prepare_pipeline_model(
-            _api_module.PreparePipelineModelRequest(
-                model_id=req.model_id,
-                quant_type=req.quant_type,
-            )
-        )
+        return await _prepare_pipeline_model_resolution(resolution)
 
     try:
         # 更新全局引擎配置（P3修复: switch_model 也需要更新 config）
@@ -489,12 +501,13 @@ async def switch_model(req: SwitchModelRequest, request: Request = None):
 
         result = _api_module._run_exclusive_model_change(
             lambda: _api_module.model_manager.switch_model(
-                model_id=req.model_id,
+                model_id=resolution.model_id,
                 quant_type=quant,
                 profile=_api_module.device_profile,
                 engine=effective_engine if effective_engine != "auto" else None,
                 model_path=resolved_model_path,
                 db_experimental_models=_api_module._get_registered_experimental_models(),
+                resolution=resolution,
             ),
             prepare=_prepare_model_switch,
             release_worker_reservation=True,

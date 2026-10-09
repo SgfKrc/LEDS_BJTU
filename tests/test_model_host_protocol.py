@@ -247,12 +247,38 @@ class TestLazyModelManager:
         fake_module.get_gguf_model_path = lambda: str(model_path)
         monkeypatch.setitem(sys.modules, "llama_engine", fake_module)
 
+        monkeypatch.setattr(
+            ModelHost,
+            "select_engine",
+            lambda self, profile=None: "llama_cpp",
+        )
         host = ModelHost()
-        monkeypatch.setattr(host, "select_engine", lambda profile=None: "llama_cpp")
         host.load_model(model_path=str(model_path), engine=None)
 
         assert host.is_loaded is True
         assert host.engine_type == "llama_cpp"
+        assert host.current_quant == "gguf"
+
+    def test_explicit_llama_path_cannot_fall_back_to_global_gguf(
+            self, monkeypatch, tmp_path):
+        foreign = tmp_path / "foreign.gguf"
+        foreign.write_bytes(b"foreign")
+
+        class FakeGguf:
+            def load_model(self, **_kwargs):
+                raise AssertionError("非 GGUF 显式路径不得回退并加载全局工件")
+
+        fake_module = types.ModuleType("llama_engine")
+        fake_module.LlamaCppEngine = FakeGguf
+        fake_module.get_gguf_model_path = lambda: str(foreign)
+        monkeypatch.setitem(sys.modules, "llama_engine", fake_module)
+
+        host = ModelHost()
+        with pytest.raises(ValueError, match="只接受显式 GGUF"):
+            host.load_model(
+                model_path=str(tmp_path / "safetensors-model"),
+                engine="llama_cpp",
+            )
 
     def test_prepare_gguf_pipeline_does_not_materialize_torch_manager(
             self, monkeypatch, tmp_path):
