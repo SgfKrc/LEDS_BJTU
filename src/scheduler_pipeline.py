@@ -7751,12 +7751,41 @@ class SchedulerPipelineMixin:
             "区间被约束后，没有任何单个节点能在自己的空闲内存里装下所属层段"
             "（总容量够，但切分后单节点不够 ⇒ 检查各节点空闲内存/降低精度）"
         ),
-        "pipeline_distributed_capacity_insufficient": "分布式各节点总容量不足",        "node_capacity_unavailable": "节点容量不足（内存/显存）",
+        "pipeline_distributed_capacity_insufficient": "分布式各节点总容量不足",
+        "node_capacity_unavailable": "节点容量不足（内存/显存）",
         "pipeline_capacity_rejected": "集群容量准入被拒",
         "pipeline_reshard_capacity_insufficient": "重新分片后容量不足",
         "model_identity_mismatch": "参与节点的模型身份不一致（算子/工件不匹配）",
         "pipeline_model_changed": "流水线准备期间模型被切换",
+        # ★ 2026-10-09（子 agent 复查 N2）：补齐**生产路径会真实产生**但此前漏收录的码 ——
+        #   漏了就等于"有码没说明"，UI 只能退回显示裸码。
+        "pipeline_local_commit_failed": "本地提交层段失败（master 侧无法按分配裁层/物化）",
+        "pipeline_full_model_fallback_forbidden": (
+            "该模型只以分布式流水线模式准备，禁止退回整模推理（无可用原因信息）"
+        ),
+        "pipeline_layer_range_not_advertised": (
+            "节点未声明层区间，无法判断它能承担哪一段"
+        ),
+        "pipeline_capacity_descriptor_invalid": "模型描述信息不合法，无法做容量求解",
+        "relay_layer_claim_invalid": "relay 段认领的层区间不合法（重叠/角色/不连续）",
+        # ★ 2026-10-09：由"该红必须红"测试扫出的其余生产码（见
+        #   `tests/test_pipeline_fallback_diagnostic.py::test_every_production_reason_code_has_a_hint`）。
+        "pipeline_capacity_manual_insufficient": "手动切分的容量不足",
+        "pipeline_capacity_manual_node_unavailable": "手动切分指定的节点不可用",
+        "pipeline_capacity_manual_range_invalid": "手动切分的层区间不合法",
+        "pipeline_capacity_not_computed": "容量尚未计算（集群还没就绪）",
+        "pipeline_descriptor_unavailable": "模型层段描述不可用（无法确定总层数/切分点）",
+        "pipeline_node_contract_invalid": "层段布局不满足「恰好连续覆盖每一层」契约",
+        "pipeline_reshard_descriptor_unavailable": "重分片缺少模型描述",
+        "pipeline_reshard_layout_invalid": "重分片后的层布局不合法",
+        "pipeline_reshard_plan_mismatch": "重分片计划与当前计划不一致",
+        "pipeline_runtime_unsupported": "当前运行时/引擎不支持该模型的层段执行",
+        "pipeline_single_node_plan_active": "已存在单机分层计划，与分布式请求冲突",
     }
+
+    #: ★ 这些码出现在 `admitted=True`（成功）的 plan 里，**不是失败原因** ⇒ 不参与
+    #: 「每个失败码都要有中文说明」的检查（但仍保留在本表方便 UI 直接查）。
+    _PIPELINE_SUCCESS_REASON_CODES = frozenset({"distributed_forced"})
 
     def _pipeline_unavailable_diagnostic(self) -> tuple:
         """返回 `(reason_code, 人类可读说明)`，用于把「流水线不可用」的真实原因透给调用方/UI。

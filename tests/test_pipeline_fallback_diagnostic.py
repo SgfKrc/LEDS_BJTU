@@ -148,5 +148,36 @@ def test_no_diagnostic_falls_back_to_stable_code():
     assert streamed["reason_code"] == "pipeline_full_model_fallback_forbidden"
 
 
+def test_every_production_reason_code_has_a_hint():
+    """★ 该红必须红（子 agent 复查 N2）：**生产路径会产生的每个 `reason_code` 都要有中文说明**。
+
+    否则 UI 只能退回显示裸码 —— 那正是本 issue 要根治的形态。
+    这里从源码里扫字面量（而不是手抄清单），所以新增码却忘记补表 ⇒ **本测试立刻红**。
+    """
+    import io
+    import re
+
+    hint = SchedulerPipelineMixin._PIPELINE_REASON_HINT
+    success_codes = SchedulerPipelineMixin._PIPELINE_SUCCESS_REASON_CODES
+    src_dir = ROOT / "src"
+    literal = re.compile(r'"reason_code"\s*:\s*"([a-z0-9_]+)"')
+    found: dict = {}
+    for path in sorted(src_dir.glob("*.py")):
+        text = io.open(path, encoding="utf-8", errors="replace").read()
+        for code in literal.findall(text):
+            # 纯占位/非 pipeline 域的码不参与（如 auth/store 等其它子系统）。
+            if not code.startswith(("pipeline_", "relay_", "node_", "model_", "distributed_")):
+                continue
+            if code in success_codes:
+                continue  # `admitted=True` 时的 reason，不是失败原因
+            found.setdefault(code, path.name)
+    missing = {code: where for code, where in found.items() if code not in hint}
+    assert not missing, (
+        "以下 reason_code 在源码里会产生，却没有中文说明（请补 _PIPELINE_REASON_HINT）："
+        + ", ".join(f"{code}@{where}" for code, where in sorted(missing.items()))
+    )
+    assert found, "没扫到任何 reason_code 字面量 ⇒ 正则或源码结构变了，本测试已失效"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
