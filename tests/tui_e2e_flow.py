@@ -332,6 +332,36 @@ def _assistant_text(app) -> str:
     return buf[idx + len("assistant"):].replace("[/]", "")
 
 
+# ★ 2026-10-09：**连接/后端类错误的兜底判据**（本轮实测教训）。
+#   后端没在运行时，`real_chat_not_rejected` 原先只判 `not_contains` 的几条业务文案 ⇒
+#   把「assistant 的回复其实是 ApiError: 无法连接后端」**假判为 PASS**；
+#   只有新加的 `min_chars` 判据抓到了它。这里统一把"连不上/超时/5xx"视为失败 ——
+#   任何 chat 步骤都不许把"错误"当成"回复"。
+_BACKEND_UNREACHABLE_MARKERS = (
+    "无法连接后端",
+    "ApiError",
+    "WinError 10061",
+    "WinError 10054",
+    "目标计算机积极拒绝",
+    "连接被拒绝",
+    "请求超时",
+    "模型未加载",
+    "HTTP 500",
+    "HTTP 502",
+    "HTTP 503",
+)
+
+
+def _assert_no_backend_error(text: str, where: str) -> None:
+    """`text` 里若含连接/后端错误标记 ⇒ 立刻失败（防「错误被当回复」的假 PASS）。"""
+    for marker in _BACKEND_UNREACHABLE_MARKERS:
+        if marker in text:
+            raise AssertionError(
+                f"{where}：assistant 回复里含后端/连接错误 {marker!r}"
+                f"（后端未运行、已重启或拒绝服务）。回复前 300 字：{text[:300]!r}"
+            )
+
+
 async def _action_send_chat(session, spec, flow, sink):
     """在聊天屏发**真消息**并等回复落地（真后端 / `api: "real"` 档专用）。
 
@@ -360,6 +390,8 @@ async def _action_send_chat(session, spec, flow, sink):
         )
     # 流式可能还在继续：再给一点时间让可判定的文本到位。
     await session.pilot.pause(spec.get("settle", 2.0))
+    # ★ 2026-10-09：等到了"内容"不等于"回复成功" —— 若那是连接/后端错误，必须当场失败。
+    _assert_no_backend_error(_assistant_text(session.app), "send_chat")
 
 
 async def _action_set_cluster_aux(session, spec, flow, sink):
@@ -681,6 +713,8 @@ async def _expect_chat_reply(session, spec, flow):
     min_chars = int(spec.get("min_chars") or 0)
     # ★ 只量**最后一条 assistant 回复**，不含用户消息（否则"用户 prompt 很长"会伪装成"回复成型"）
     reply = _assistant_text(session.app)
+    # ★ 2026-10-09：先拦"回复其实是错误"的情况，再谈长度/内容（否则错误会被当成合格回复）。
+    _assert_no_backend_error(reply, "chat_reply")
     if min_chars and len(reply) < min_chars:
         raise AssertionError(
             f"assistant 回复过短：{len(reply)} < 要求 {min_chars}（可能被截断）。"
