@@ -1727,7 +1727,15 @@ class MainScreen(Screen):
             self.model_text = f"[yellow]加载中[/] {self._model_loading_id}"
         else:
             self.model_text = str(active) if active else ("[yellow]未加载[/]" if not loaded else "—")
-        if loaded:
+        # ★ 2026-10-09（#73-②）：这三处必须与 `model_text` / 表格**同源**。
+        #   此前只改了 `model_text` 与表格，漏了这一条摘要 ⇒ 加载期间顶部仍显示
+        #   「模型未加载」，与下面「加载中…」**同屏矛盾**（正是用户截图里的 ②）。
+        if self._model_loading_id:
+            pane.update(
+                f"[green]后端可用[/]  ·  [yellow]加载中[/] {self._model_loading_id}"
+                f"  ·  {self.app.api.base_url}"
+            )
+        elif loaded:
             pane.update(f"[green]后端可用[/]  ·  模型已加载  ·  {self.app.api.base_url}")
         else:
             pane.update(f"[green]后端可用[/]  ·  [yellow]模型未加载[/]（此时聊天会返回后端错误）"
