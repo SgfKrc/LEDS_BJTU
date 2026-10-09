@@ -5153,14 +5153,42 @@ def _resolve_model_path_for_engine(model_id: Optional[str], engine: str) -> Opti
 
 
 def _effective_engine_for_model(model_id: Optional[str], engine: str) -> str:
-    """Return the concrete engine to pass into ModelManager."""
-    if engine != "auto" or not model_id:
+    """Return the concrete engine to pass into ModelManager.
+
+    ★ 2026-10-09（稳定性 #73-④）：**分布式模式下必须落到能承载层段的引擎**。
+    master 要跑 `[0, k)` 本地段（`prepare_pipeline_model` / `load_layer_range`），而
+    **GGUF 路径不支持 `layer_range`** —— 实测报
+    `GGUF 整模恢复不接受 layer_range；裁层范围由工件 manifest 声明` ⇒
+    `pipeline_local_commit_failed` ⇒ 事务 aborted ⇒ **之后每个请求都 503，切回模型、
+    甚至重启后端都无效**（本次复现的 ④）。
+
+    而 `LoadModelRequest.engine` 的**默认值就是 `"llama_cpp"`**（并非 `"auto"`，见
+    `api_server.py` 的字段定义），所以"不传引擎"这条最常见路径在分布式模式下**必然选错**。
+    ⇒ 这里对 `auto` / `llama_cpp` / `gguf` 这类"不能承载层段"的取值统一纠正为 pytorch
+      （前提：该模型确实有 safetensors）。显式的 `pytorch` / `island` 不受影响。
+    """
+    if not model_id:
         return engine
     model = mc.get_model_config(model_id, _get_registered_experimental_models())
     if model is None:
         return engine
     payload = _model_api_payload(model)
-    return payload.get("preferred_engine") or engine
+    preferred = str(payload.get("preferred_engine") or "")
+    non_pipeline_engines = {"auto", "llama_cpp", "llama.cpp", "llama-cpp", "gguf"}
+    if (
+        RUN_MODE == "distributed"
+        and payload.get("has_safetensors")
+        and str(engine).strip().lower() in non_pipeline_engines
+    ):
+        logger.info(
+            "engine=%s 在分布式模式下纠正为 pytorch（模型 %s 有 safetensors；"
+            "GGUF 不支持 layer_range，会令 master 段无法准备）",
+            engine, model_id,
+        )
+        return "pytorch"
+    if engine != "auto":
+        return engine
+    return preferred or engine
 
 
 

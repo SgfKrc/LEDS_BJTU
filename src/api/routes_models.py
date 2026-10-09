@@ -96,8 +96,11 @@ async def load_model(req: LoadModelRequest, request: Request = None):
         )
 
     _api_module._validate_model_load_request(req.model_id, engine)
-    resolved_model_path = _api_module._resolve_model_path_for_engine(req.model_id, engine)
+    # ★ 2026-10-09（稳定性 #73-④）：**先定引擎，再按引擎解析路径**。
+    #   此前顺序相反：路径按请求里的**原始** engine（默认 `llama_cpp`）解析 ⇒ 拿到 GGUF 文件，
+    #   而 `effective_engine` 已被纠正为 pytorch ⇒ **引擎与路径不匹配** ⇒ 加载直接 HTTP 500。
     effective_engine = _api_module._effective_engine_for_model(req.model_id, engine)
+    resolved_model_path = _api_module._resolve_model_path_for_engine(req.model_id, effective_engine)
     quant = _api_module._normalize_quant_for_engine(req.quant_type, effective_engine)
 
     try:
