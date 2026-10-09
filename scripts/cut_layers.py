@@ -193,11 +193,17 @@ def _validate_layer_types(identity: dict, hf_config: Path) -> list[str]:
 
 
 def _manifest(identity: dict, k: int | None, dst: Path, kept: int, dropped: int, *,
-              end: int | None = None, keep_head: int | None = None) -> dict:
+              end: int | None = None, keep_head: int | None = None,
+              kept_names: list[str] | None = None) -> dict:
     """产出一份可复算的 manifest（三种模式都覆盖）。
 
     `mode=head` / `mode=middle` 时 `contract` 段**标记为不适用** —— `relay_contract.RelayTrimPlan`
     只描述「丢弃前 K 层、保留到末尾」一种形态，用它描述上游段/中段会误导读者与下游校验。
+
+    ★ `#67`-⑥：`kept_names` 给出时，额外写 `artifact_contains` ——**显式**声明该工件带不带
+    `token_embd` / `output_norm` / `output.weight`，并给出 `can_serve_tail`（能否承担末段职责）。
+    此前下游只能靠「段类型 + 区间」反推，于是在 `LayerArtifactCatalog.kt` 里写出了与实际产物
+    矛盾的断言（"中间段没有 final_norm"，而实测 `tensors_kept=55` 明确含 `output_norm`）。
     """
     mode = _cut_mode(k, end, keep_head)
     if mode == "head":
@@ -243,6 +249,20 @@ def _manifest(identity: dict, k: int | None, dst: Path, kept: int, dropped: int,
         "first_local_layer_maps_to": first_local,
         "artifact_sha256": _sha256(dst) if dst.exists() else "",
     }
+    # ★ `#67`-⑥：显式声明归属（下游不必靠"段类型 + 区间"反推）。
+    if kept_names is not None:
+        names = set(kept_names)
+        has_tok = "token_embd.weight" in names
+        has_norm = "output_norm.weight" in names
+        has_out = "output.weight" in names
+        result["artifact_contains"] = {
+            "token_embd": has_tok,
+            "output_norm": has_norm,
+            "output_weight": has_out,
+            # 能否承担**末段**职责：需 final_norm，且末段要么有独立 output.weight，
+            # 要么 tie embeddings（此时 token_embd 兼作 lm_head）。
+            "can_serve_tail": bool(has_norm and (has_out or has_tok)),
+        }
     if mode != "tail":
         # `RelayTrimPlan` 只描述 tail 语义 ⇒ 上游段/中段**不给**可能误导的合同字段。
         result["contract"] = {"skipped": f"mode={mode} 不由 RelayTrimPlan 描述"}
@@ -530,7 +550,8 @@ def main() -> int:
     print(f"[done] {dst}：保留 {len(keep)} 张量、丢弃 {len(drop)}")
 
     manifest = _manifest(identity, args.k, dst, len(keep), len(drop),
-                         end=args.end, keep_head=args.keep_head)
+                         end=args.end, keep_head=args.keep_head,
+                         kept_names=[new_name for _, new_name in keep])
     if args.manifest:
         Path(args.manifest).write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
                                        encoding="utf-8")
