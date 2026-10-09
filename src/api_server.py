@@ -5093,10 +5093,14 @@ def _model_api_payload(model: mc.ModelConfig) -> dict:
     if file_status["is_available"] and not supported_engines:
         unavailable_reason = "模型文件已存在，但当前设备缺少可用推理后端。"
 
+    # ★ 必须用 `_torch_cuda_available()`（L-tier 档不加载 torch），
+    #   不能用 `_resolution_cuda_available()`（它走 `cuda_available(load=True)`，会强制拉起 torch）。
+    #   列表接口在 GGUF/llama.cpp-only 环境也必须答得出来，不能"为了列模型"而加载 torch。
+    #   回归: tests/test_api_cold_start.py::test_default_gguf_api_import_and_bootstrap_queries_do_not_load_torch
     preferred_engine = preferred_engine_for_artifacts(
         has_safetensors=file_status["has_safetensors"],
         has_gguf=file_status["has_gguf"],
-        cuda_available=_resolution_cuda_available(),
+        cuda_available=_torch_cuda_available(),
     )
     default_quant = "Q4_K_M" if preferred_engine == "llama_cpp" else "int4"
     profile = _model_profile_payload(model, preferred_engine=preferred_engine)

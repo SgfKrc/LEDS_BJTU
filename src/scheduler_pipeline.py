@@ -8874,6 +8874,16 @@ class SchedulerPipelineMixin:
         "pipeline_reshard_plan_mismatch": "重分片计划与当前计划不一致",
         "pipeline_runtime_unsupported": "当前运行时/引擎不支持该模型的层段执行",
         "pipeline_single_node_plan_active": "已存在单机分层计划，与分布式请求冲突",
+        # ★ 2026-10-10（票4 MODEL-TXN-01）：模型/pipeline 原子切换新产生的码，
+        #   由 `test_every_production_reason_code_has_a_hint` 扫出（漏了 UI 只能显示裸码）。
+        "pipeline_master_required": "只有 master 节点能编排模型切换（当前节点角色不是 master）",
+        "pipeline_model_transaction_committing": (
+            "模型事务正在跨越提交栅栏（local/global commit 进行中），请稍后重试"
+        ),
+        "pipeline_transaction_not_started": "模型事务未能启动（候选准备没有返回结果）",
+        "pipeline_workers_unavailable": (
+            "没有可用的分层 worker（TCP 服务未运行，或没有在线的从节点）"
+        ),
     }
 
     #: ★ 这些码出现在 `admitted=True`（成功）的 plan 里，**不是失败原因** ⇒ 不参与

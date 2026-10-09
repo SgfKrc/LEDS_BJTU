@@ -161,6 +161,14 @@ class _Host:
     def __init__(self) -> None:
         self._host = _HostInner()
 
+    def _ensure_device_profile(self):
+        """与 `inference_service/engine_host.py` 的同名方法对齐（惰性探测，未探测时为 None）。
+
+        `peer._handle_layer_config_locked`（peer.py:511）在解析层段模型加载时会取设备画像；
+        桩缺这个方法会让该分支直接 AttributeError，与实现脱节。
+        """
+        return None
+
 
 @pytest.fixture()
 def _stub_model_sync(monkeypatch):
@@ -226,7 +234,9 @@ def test_layer_load_error_ack_echoes_generation(_stub_model_sync):
     def fail_load(**_kwargs):
         raise RuntimeError("simulated load failure")
 
-    peer._host._host.load_model = fail_load
+    # ★ 桩要打在真实调用点上：peer 解析后调的是 `load_layer_range`（peer.py:531），
+    #   不是 `load_model` —— 打在旧名字上会让本测试静默变成"加载成功"。
+    peer._host._host.load_layer_range = fail_load
     peer._handle_layer_config({
         "start_layer": 0, "end_layer": 8,
         "node_id": "client1", "config_id": "cfg-load", "generation": 16,
