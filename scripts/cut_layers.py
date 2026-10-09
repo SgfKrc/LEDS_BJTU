@@ -138,6 +138,60 @@ def _validate_cut(identity: dict, k: int | None = None, *,
     return problems
 
 
+def _validate_layer_types(identity: dict, hf_config: Path) -> list[str]:
+    """★ `#67` 缺口 ③：**层类型序列逐位校验**（fail-closed）。
+
+    为什么必须校验：llama.cpp **不读** HF 的 `layer_types`，而是按（裁层重编号后的）
+    **本地层号对 `full_attention_interval` 取模**推导层类型
+    （`android/.../llama.cpp/src/models/qwen35.cpp:21-27`：
+    `is_recr_impl[i] = (i+1) % full_attn_interval != 0`）。
+
+    ⇒ 若源模型的 `layer_types` **本身不遵循该规律**，则无论怎么切，重推序列都对不上，
+    加载必报 `missing tensor 'blk.x.<...>'`；而生成器此前**只挡整数倍、不挡这个**
+    ⇒ 会**静默产出一个坏工件**，直到设备上加载才炸。
+
+    这里只做"源是否可信"这一半；"工件加载后是否真的对"属 `#67` 缺口 ⑨（需真机加载）。
+    """
+    problems: list[str] = []
+    interval = identity.get("full_attention_interval")
+    n_layer = int(identity.get("n_layer") or 0)
+    if not interval:
+        problems.append(
+            "--hf-config 已给出，但源 GGUF 没有 full_attention_interval：无法做层类型校验"
+        )
+        return problems
+    try:
+        cfg = json.loads(Path(hf_config).read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - 校验路径统一收成 problem
+        problems.append(f"--hf-config 读取失败: {exc}")
+        return problems
+    # Qwen3.5 把文本侧参数放在 text_config 下；兼容直接平铺的写法。
+    tc = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else cfg
+    layer_types = list(tc.get("layer_types") or [])
+    if not layer_types:
+        problems.append("--hf-config 里找不到 layer_types（应为 text_config.layer_types）")
+        return problems
+    if len(layer_types) != n_layer:
+        problems.append(
+            f"layer_types 长度={len(layer_types)} ≠ 源模型层数 n_layer={n_layer}"
+            "（源不可信，拒绝裁层）"
+        )
+        return problems
+    for local, src_idx in enumerate(range(n_layer)):
+        want_full = (local + 1) % int(interval) == 0
+        got = layer_types[src_idx]
+        is_full = got == "full_attention"
+        if want_full != is_full:
+            problems.append(
+                f"layer_types[{src_idx}]={got!r}，但 llama.cpp 按 full_attention_interval="
+                f"{interval} 会把**本地第 {local} 层**重推为 "
+                f"{'full_attention' if want_full else 'linear_attention'}"
+                " —— 层类型会整体错位、加载必报 missing tensor（源不合法，拒绝裁层）"
+            )
+            break  # 一位不符即足以拒绝；逐位刷屏对现场无益
+    return problems
+
+
 def _manifest(identity: dict, k: int | None, dst: Path, kept: int, dropped: int, *,
               end: int | None = None, keep_head: int | None = None) -> dict:
     """产出一份可复算的 manifest（三种模式都覆盖）。
@@ -298,6 +352,10 @@ def main() -> int:
     ap.add_argument("--manifest", help="输出 manifest JSON 的路径")
     ap.add_argument("--verify-manifest", help="校验模式：对照该 manifest 检查 --src 工件")
     ap.add_argument("--dry-run", action="store_true", help="只列出影响，不写文件")
+    ap.add_argument("--hf-config", default=None,
+                    help="★ HF config.json（可选）：做 `#67`-③ **层类型序列逐位校验** —— "
+                         "源的 layer_types 必须与 llama.cpp 按 full_attention_interval 重推的"
+                         "序列一致，否则加载必报 missing tensor（fail-closed，拒绝产出坏工件）")
     args = ap.parse_args()
 
     src = Path(args.src)
@@ -340,6 +398,9 @@ def main() -> int:
         return 2
 
     problems = _validate_cut(identity, args.k, end=args.end, keep_head=args.keep_head)
+    # ★ `#67`-③：层类型序列逐位校验（可选，给了 --hf-config 才做）。
+    if args.hf_config:
+        problems += _validate_layer_types(identity, Path(args.hf_config))
     keep, drop = _plan_tensors(reader, args.k, end=args.end, keep_head=args.keep_head)
     mode = _cut_mode(args.k, args.end, args.keep_head)
     if mode == "head":
