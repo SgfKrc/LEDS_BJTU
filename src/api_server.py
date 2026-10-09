@@ -5100,6 +5100,110 @@ def _normalize_quant_for_engine(quant_type: str, engine: str) -> str:
     return quant
 
 
+def _estimate_full_model_load_bytes(model_id: Optional[str], engine: str, quant: str) -> int:
+    """估计**整模**加载所需的显存/内存字节数；拿不到信息时返回 0（表示"未知"）。
+
+    GGUF 走 llama.cpp：内存需求≈工件文件大小（mmap 时更省，但按最坏情况估）。
+    PyTorch 走 safetensors：参数字节按 dtype 估算（fp32=4 / fp16=2 / int8=1 / int4≈0.5 字节/参数）。
+    """
+    if not model_id:
+        return 0
+    try:
+        model = mc.get_model_config(model_id, _get_registered_experimental_models())
+    except Exception:  # pragma: no cover - 诊断/决策路径不抛
+        return 0
+    if model is None:
+        return 0
+    try:
+        if str(engine).lower() in ("llama_cpp", "gguf"):
+            path = mc.resolve_model_path(getattr(model, "gguf_path", "") or "")
+            if path and os.path.isfile(path):
+                return int(os.path.getsize(path))
+            return 0
+        # PyTorch：优先用 safetensors 实际文件大小（最准），否则按参数估算。
+        path = mc.resolve_model_path(getattr(model, "model_path", "") or "")
+        total = 0
+        if path and os.path.isdir(path):
+            for entry in os.scandir(path):
+                if entry.is_file() and entry.name.endswith(".safetensors"):
+                    total += int(entry.stat().st_size)
+        if total > 0:
+            return total
+        params = float(getattr(model, "parameter_count", 0) or 0)
+        if params <= 0:
+            # 退而求其次：用推荐显存反推（recommended_vram_gb 已含 KV/激活余量）。
+            rec = float(getattr(model, "recommended_vram_gb", 0) or 0)
+            return int(rec * 1024 ** 3 * 0.7) if rec > 0 else 0
+        per_param = {"fp32": 4.0, "fp16": 2.0, "int8": 1.0, "int4": 0.5}.get(
+            str(quant).lower(), 2.0
+        )
+        return int(params * per_param)
+    except Exception:  # pragma: no cover
+        return 0
+
+
+def _decide_pipeline_load_mode(model_id: Optional[str], engine: str, quant: str) -> tuple:
+    """★ 2026-10-09（自适应加载，用户裁定）决定分布式下的加载形态。
+
+    返回 `(mode, reason)`，`mode ∈ {"full", "pipeline"}`：
+    * `"full"` —— 可用显存/内存装得下**整模** ⇒ 直接整模加载（简单、启动快）；
+    * `"pipeline"` —— 装不下整模 ⇒ 走 `prepare_pipeline_model`，**各节点只在自己的分配段物化权重**
+      （这才是为边缘/小显存设计的路径；`#82` 的容量恒拒就发生在这里走错时）。
+
+    判据只做"整模装不装得下"这一层，**不替求解器决定怎么切分** ——
+    切分仍由 `pipeline_capacity` 按真实节点能力求解。
+    """
+    if RUN_MODE != "distributed":
+        return "full", "非分布式模式"
+    need = _estimate_full_model_load_bytes(model_id, engine, quant)
+    if need <= 0:
+        return "full", "无法估计整模需求（保持默认整模加载）"
+    profile = device_profile or {}
+    # ★ 2026-10-09：优先用**实时**探测，而不是注册时的画像快照 ——
+    #   `device_profile` 是启动时 `profiler.to_dict()` 的结果（且顶层未必有 `ram`），
+    #   实测在 CUDA 机器上拿不到可用值 ⇒ 决策退化成"未知 ⇒ 保持整模"。
+    #   这里直接问运行时：CUDA ⇒ `torch.cuda.mem_get_info`；CPU ⇒ `psutil.virtual_memory`。
+    available = 0.0
+    source = ""
+    try:
+        import torch_runtime as _tr
+
+        if _tr.cuda_available(load=False):
+            import torch as _torch
+
+            _free, _total = _torch.cuda.mem_get_info(0)
+            available = float(_free) / 1024 ** 3
+            source = "torch.cuda.mem_get_info"
+    except Exception:  # pragma: no cover - 探测失败则退化
+        available = 0.0
+    if available <= 0:
+        try:
+            import psutil as _psutil
+
+            available = float(_psutil.virtual_memory().available) / 1024 ** 3
+            source = "psutil.virtual_memory"
+        except Exception:  # pragma: no cover
+            available = 0.0
+    if available <= 0:
+        # 最后退化到注册时的画像（字段名兼容 PC 的 `ram.available_gb` 与 `gpu.vram_free_gb`）。
+        gpu_p = profile.get("gpu") or {}
+        ram_p = profile.get("ram") or {}
+        available = float(
+            (gpu_p.get("vram_free_gb") or ram_p.get("available_gb") or 0) or 0
+        )
+        source = "device_profile" if available > 0 else ""
+    if available <= 0:
+        return "full", "可用显存/内存未知（保持默认整模加载）"
+    # 留 15% 余量给 KV 缓存/激活/分配器开销。
+    fits = available * 1024 ** 3 * 0.85 >= need
+    if fits:
+        return "full", f"整模 {need / 1024**3:.2f}GB 可装入 {source}={available:.2f}GB"
+    return (
+        "pipeline",
+        f"整模 {need / 1024**3:.2f}GB 装不下 {source}={available:.2f}GB ⇒ 改为按段物化",
+    )
+
+
 def _validate_model_load_request(model_id: Optional[str], engine: str) -> None:
     """Reject unavailable model loads before unloading the current model."""
     if engine == "island":
