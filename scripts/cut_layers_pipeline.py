@@ -33,6 +33,48 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CUT_SCRIPT = REPO_ROOT / "scripts" / "cut_layers.py"
 REPORT_SCHEMA = "qlh.cut_layers.report.v1"
 
+#: ★ `#67`-⑨：llama.cpp 判定"加载失败"的标志 —— **取自源码真实的抛出点**
+#: （`llama-model-loader.cpp:560` `failed to load model from`、`:1098` `missing tensor`、
+#: `llama.cpp:372` `error loading model`、`gguf_init_from_file` `failed to open GGUF file`）。
+#: 生成期的 ③⑩④ 只能挡"已知会坏"的源；只有这里才验证"产出的工件真能加载"。
+LLAMA_LOAD_FAILURE_MARKERS = (
+    "missing tensor",
+    "missing tensor info mapping",
+    "failed to load model",
+    "error loading model",
+    "failed to open gguf file",
+)
+
+
+def verify_artifact_loads(artifact: Path, llama_bin, *, timeout_s: int = 300,
+                          threads: int = 4) -> tuple[bool | None, str]:
+    """★ `#67`-⑨：**加载自证** —— 用钉死的 llama.cpp 真的把工件加载一次。
+
+    返回 `(ok, detail)`：
+    * `ok is None` —— 没有可用的 llama.cpp 二进制 ⇒ **跳过**（不误判为成功/失败）；
+    * `ok is True` —— exit=0 且输出无失败标志；
+    * `ok is False` —— 退出码非 0，或输出命中 `LLAMA_LOAD_FAILURE_MARKERS`。
+    """
+    bin_path = Path(llama_bin) if llama_bin else None
+    if not bin_path or not bin_path.is_file():
+        return None, "llama.cpp 可执行文件不可用（跳过加载自证）"
+    art = Path(artifact)
+    if not art.is_file():
+        return False, f"工件不存在: {art}"
+    cmd = [str(bin_path), "-m", str(art), "-p", "hi", "-n", "1", "-t", str(int(threads))]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return False, f"llama.cpp 加载超时（>{timeout_s}s）"
+    blob = ((proc.stdout or "") + (proc.stderr or "")).lower()
+    hits = [marker for marker in LLAMA_LOAD_FAILURE_MARKERS if marker in blob]
+    if proc.returncode != 0:
+        return False, f"llama.cpp 退出码 {proc.returncode}（命中: {hits or '无已知失败标志'}）"
+    if hits:
+        return False, f"llama.cpp 输出命中失败标志: {hits}"
+    return True, "llama.cpp 加载成功（exit=0 且无失败标志）"
+
 
 def _sha256(path: Path, chunk: int = 1 << 20) -> str:
     h = hashlib.sha256()
@@ -109,6 +151,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="产物基名（默认 `<arch>-cut-<lo>-<hi>`）；用于保持既有引用不失效")
     ap.add_argument("--hf-config", default=None,
                     help="HF config.json（可选）：额外做 #67-③ 层类型逐位校验")
+    ap.add_argument("--llama-bin", default=None,
+                    help="★ llama.cpp 可执行文件（如 llama-debug.exe）：做 #67-⑨ **加载自证** "
+                         "（真的加载一次工件，抓 missing tensor）；不给则跳过该项")
     args = ap.parse_args(argv)
 
     src = Path(args.src)
@@ -176,6 +221,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     manifest_verified = verify.returncode == 0
 
+    # ★ `#67`-⑨：加载自证（给了 --llama-bin 才做；未给则记为 skipped）
+    load_ok, load_detail = verify_artifact_loads(dst, args.llama_bin) if args.llama_bin \
+        else (None, "未提供 --llama-bin（跳过加载自证）")
+    llama_commit = ""
+    if args.llama_bin:
+        # 钉死版本（⑨ 要求"钉死 llama.cpp commit"）：从二进制所属仓库读 HEAD
+        try:
+            probe = subprocess.run(
+                ["git", "-C", str(Path(args.llama_bin).parent), "rev-parse", "HEAD"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            if probe.returncode == 0:
+                llama_commit = (probe.stdout or "").strip()
+        except Exception:  # pragma: no cover
+            llama_commit = ""
+
     report = {
         "schema": REPORT_SCHEMA,
         "source": {
@@ -195,6 +256,11 @@ def main(argv: list[str] | None = None) -> int:
         "checks": {
             "cut_point_legal": True,
             "manifest_verified": manifest_verified,
+            # ⑨：None=跳过（未给 --llama-bin 或二进制不可用），True/False=实测结果
+            "load_verified": load_ok,
+            "load_detail": load_detail,
+            "llama_bin": str(args.llama_bin or ""),
+            "llama_commit": llama_commit,
         },
     }
     (outdir / "cut-report.json").write_text(
@@ -202,7 +268,11 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"[pipeline] 工件={dst.name} sha256={report['artifact']['sha256'][:16]}… "
           f"manifest_verified={manifest_verified}")
+    print(f"[pipeline] 加载自证: {load_detail}")
     print(f"[pipeline] report={outdir / 'cut-report.json'}")
+    # fail-closed：加载自证**明确失败**（False）时以非零退出；跳过（None）不算失败。
+    if load_ok is False:
+        return 2
     return 0 if manifest_verified else 2
 
 
