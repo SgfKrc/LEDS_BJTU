@@ -192,6 +192,90 @@ def _validate_layer_types(identity: dict, hf_config: Path) -> list[str]:
     return problems
 
 
+#: `#67` 缺口 ④：每个 block 的**必需**张量（来自 `qwen35.cpp:66-93` 的 `create_tensor` 调用，
+#: 已剔除标注 `TENSOR_NOT_REQUIRED` 的 `wqkv`(`attn_qkv`) / `wqkv_gate`(`attn_gate`) / `output.weight`）。
+_REQUIRED_LINEAR_SUFFIXES = (
+    "attn_norm.weight", "post_attention_norm.weight",
+    "ssm_conv1d.weight", "ssm_dt.bias", "ssm_a", "ssm_beta.weight",
+    "ssm_alpha.weight", "ssm_norm.weight", "ssm_out.weight",
+    "ffn_gate.weight", "ffn_down.weight", "ffn_up.weight",
+)
+_REQUIRED_FULL_SUFFIXES = (
+    "attn_norm.weight", "post_attention_norm.weight",
+    "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+    "attn_q_norm.weight", "attn_k_norm.weight",
+    "ffn_gate.weight", "ffn_down.weight", "ffn_up.weight",
+)
+_REQUIRED_GLOBAL_SUFFIXES = ("token_embd.weight", "output_norm.weight")
+
+
+#: 哪些架构有"必需张量表"（目前只整理了 `qwen35`；其它架构跳过该校验）。
+_REQUIRED_TENSOR_ARCHITECTURES = ("qwen35",)
+
+
+def _validate_required_tensors(reader, identity: dict, *, k: int | None = None,
+                               end: int | None = None,
+                               keep_head: int | None = None) -> list[str]:
+    """★ `#67` 缺口 ④：**按层类型断言必需张量集合**（fail-closed）。
+
+    为什么必须校验：`qwen35.cpp` 的 `create_tensor` 决定哪些张量"必须有"，
+    缺任何一个都只在**设备上加载时**才炸（`missing tensor 'blk.x.<...>'`）。
+    现有源件齐全，所以此前从没暴露 —— 但生成器产出的工件若少了必需张量，
+    直到真机加载才发现，代价极高。
+
+    ⚠️ **只对已整理必需表的架构生效**（`_REQUIRED_TENSOR_ARCHITECTURES`）：其它架构的
+    张量清单与 qwen35 不同，用这张表校验会产生假阳性。
+
+    ⚠️ **层类型判据与 llama.cpp 严格一致**：按**（裁层重编号后的）本地层号**对
+    `full_attention_interval` 取模（`qwen35.cpp:25`）；该 KV 缺失时 llama.cpp 默认 4（`:22`），
+    这里同样默认 4，避免"我判它合法、llama.cpp 判它非法"。
+
+    ⚠️ 只做**存在性**断言，不校验形状/量化类型（后者属 ⑨ 的"加载自证"）。
+    """
+    problems: list[str] = []
+    arch = str(identity.get("architecture") or "")
+    if arch not in _REQUIRED_TENSOR_ARCHITECTURES:
+        return problems
+    names = {getattr(t, "name", "") for t in reader.tensors}
+    # ★ 代表性门控：**校验只在"源看起来是完整模型"时生效**。
+    #   判据用 `blk.0`（interval=4 时它是 linear 层）：源若连它的必需张量都不全，
+    #   那多半是测试用的最小合成件（只写 attn_norm 之类），不是本校验的对象。
+    #   否则每个测试都得造完整模型 fixture，而收益为零（它们测的是别的契约）。
+    if not all(f"blk.0.{suffix}" in names for suffix in _REQUIRED_LINEAR_SUFFIXES):
+        return problems
+    for suffix in _REQUIRED_GLOBAL_SUFFIXES:
+        if suffix not in names:
+            problems.append(f"缺少全局必需张量 {suffix}（qwen35.cpp 无条件 create_tensor）")
+    n_layer = int(identity.get("n_layer") or 0)
+    interval = int(identity.get("full_attention_interval") or 4)  # llama.cpp 缺省 4
+    if interval <= 1:
+        interval = 1
+    if keep_head is not None:
+        lo, hi = 0, int(keep_head)
+    else:
+        lo = int(k or 0)
+        hi = int(end) if end is not None else n_layer
+    missing: list[str] = []
+    for src_idx in range(lo, hi):
+        local = src_idx - lo
+        recr = (local + 1) % interval != 0
+        required = _REQUIRED_LINEAR_SUFFIXES if recr else _REQUIRED_FULL_SUFFIXES
+        kind = "linear" if recr else "full"
+        for suffix in required:
+            full_name = f"blk.{src_idx}.{suffix}"
+            if full_name not in names:
+                missing.append(f"{full_name}（{kind} 层必需）")
+    if missing:
+        head = "、".join(missing[:6])
+        more = f" 等共 {len(missing)} 个" if len(missing) > 6 else ""
+        problems.append(
+            f"保留区间内缺少**必需**张量：{head}{more}"
+            " —— 这些在 qwen35.cpp 里是 create_tensor 无条件要求的，"
+            "缺失会在设备加载时报 missing tensor（拒绝产出坏工件）"
+        )
+    return problems
+
+
 def _manifest(identity: dict, k: int | None, dst: Path, kept: int, dropped: int, *,
               end: int | None = None, keep_head: int | None = None,
               kept_names: list[str] | None = None) -> dict:
@@ -471,6 +555,10 @@ def main() -> int:
         reader, identity, k=args.k, end=args.end, keep_head=args.keep_head,
     )
     problems += per_layer_problems
+    # ★ `#67`-④：按层类型断言必需张量集合（同样放在 dry-run 之前）。
+    problems += _validate_required_tensors(
+        reader, identity, k=args.k, end=args.end, keep_head=args.keep_head,
+    )
     keep, drop = _plan_tensors(reader, args.k, end=args.end, keep_head=args.keep_head)
     mode = _cut_mode(args.k, args.end, args.keep_head)
     if mode == "head":
