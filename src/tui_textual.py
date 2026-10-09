@@ -1344,6 +1344,11 @@ class MainScreen(Screen):
         self.page_index = 0
         self.health_text = "…"
         self.model_text = "…"
+        # ★ 2026-10-09（稳定性 #73-②）：模型加载中的**权威标记**。此前只有状态栏
+        #   （`set_busy`）知道"正在加载"，而「模型」面板仍按 `/api/status` 渲染（后者
+        #   要等加载完成才更新）⇒ 加载期间同时出现「正在加载 qwen3-5-2b（5-20 秒）…」
+        #   与「模型 未加载」两个互相矛盾的状态（用户截图实证）。
+        self._model_loading_id = ""
         self.log_line_count = 0
         #: ``/models`` 原始项（模型屏写操作需要 engine/quant/可用性）
         self.model_rows: Dict[str, Dict[str, Any]] = {}
@@ -1716,7 +1721,12 @@ class MainScreen(Screen):
         loaded = bool(status.get("model_loaded"))
         model_name = status.get("model_name") or "—"
         active = status.get("active_model_id") or registry.get("active_model_id")
-        self.model_text = str(active) if active else ("[yellow]未加载[/]" if not loaded else "—")
+        # ★ 2026-10-09（#73-②）：`正在加载` 优先于 `/api/status`（后者要到加载完成才更新），
+        #   否则加载中会同时出现「正在加载…」与「未加载」。
+        if self._model_loading_id:
+            self.model_text = f"[yellow]加载中[/] {self._model_loading_id}"
+        else:
+            self.model_text = str(active) if active else ("[yellow]未加载[/]" if not loaded else "—")
         if loaded:
             pane.update(f"[green]后端可用[/]  ·  模型已加载  ·  {self.app.api.base_url}")
         else:
@@ -1727,8 +1737,12 @@ class MainScreen(Screen):
         table.add_row("运行模式", str(status.get("run_mode") or "—"))
         table.add_row("节点角色", f"{status.get('node_role') or '—'} · {status.get('node_id') or '—'}")
         table.add_row("最大节点数", str(status.get("max_nodes", "—")))
-        table.add_row("模型", f"{model_name}（{'已加载' if loaded else '未加载'}）")
-        table.add_row("当前模型 ID", str(active or "—（未加载）"))
+        if self._model_loading_id:
+            table.add_row("模型", f"[yellow]加载中…[/] {self._model_loading_id}")
+            table.add_row("当前模型 ID", f"[yellow]加载中[/] {self._model_loading_id}")
+        else:
+            table.add_row("模型", f"{model_name}（{'已加载' if loaded else '未加载'}）")
+            table.add_row("当前模型 ID", str(active or "—（未加载）"))
         table.add_row("引擎", str(status.get("engine") or "—（未加载）"))
         table.add_row("量化", str(status.get("current_quant") or "—"))
         table.add_row("流水线", "已准备" if status.get("pipeline_prepared") else "未准备")
@@ -2978,6 +2992,9 @@ class MainScreen(Screen):
         """模型控制走独立 worker 组：加载 5-20 秒，不能阻塞 UI 也不与只读刷新互斥。"""
         app = self.app
         if kind == "load":
+            # ★ 2026-10-09（稳定性 #73-②）：先落"加载中"权威状态，再发请求。
+            #   必须 try/finally —— 否则加载失败时该标记会永久残留（状态永远停在"加载中"）。
+            self.app.call_from_thread(self._begin_model_load, model_id)
             self.app.call_from_thread(self.set_busy, f"正在加载 {model_id}（5-20 秒）…")
             try:
                 result = load_model(app.api, model_id, engine=engine, quant_type=quant)
@@ -2985,6 +3002,8 @@ class MainScreen(Screen):
                 text = f"[green]模型已加载[/] {model_id} {detail}".strip()
             except ApiError as exc:
                 text = f"[red]模型加载失败[/]：{exc}"
+            finally:
+                self.app.call_from_thread(self._end_model_load)
         else:
             self.app.call_from_thread(self.set_busy, "正在卸载模型…")
             try:
@@ -2996,6 +3015,16 @@ class MainScreen(Screen):
 
     def set_busy(self, text: str) -> None:
         self.write_status(f"[yellow]…[/] {text}")
+
+    # ★ 2026-10-09（稳定性 #73-②）：模型加载的**单一权威状态**，供「状态」屏与状态栏
+    #   共用 —— 消除"未加载"与"正在加载…"并存的自相矛盾（用户截图实证）。
+    #   经 `call_from_thread` 调用：它们写 UI 状态，必须在主线程执行。
+    def _begin_model_load(self, model_id: str) -> None:
+        self._model_loading_id = str(model_id or "")
+        self.model_text = f"[yellow]加载中[/] {self._model_loading_id}"
+
+    def _end_model_load(self) -> None:
+        self._model_loading_id = ""
 
     def action_queue_toggle_pause(self) -> None:
         """队列屏 P：暂停/恢复接受新请求（可逆，无需确认）。"""
