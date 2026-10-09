@@ -187,6 +187,8 @@ scripts/*
 !scripts/model_tools/
 # 设备侧按需裁层的依赖（Termux 侧跑，见 scripts/model_tools/qlh_device_cut_range.sh）
 !scripts/cut_layers.py
+# 切层制作流水线（串起 源sha + 命令 + 产物sha + 校验，产 cut-report.json）
+!scripts/cut_layers_pipeline.py
 !scripts/model_tools.py
 !scripts/android_validation.py
 !scripts/edge_preflight.py
