@@ -1111,8 +1111,6 @@ class Scheduler(
         self._local_pipeline_cancelled: set[str] = set()
         self._local_pipeline_cancelled_order: collections.deque = collections.deque()
         self._local_pipeline_steps: dict[str, int] = {}
-        self._chain_clients: dict[str, object] = {}
-        self._chain_clients_lock = threading.Lock()
         # Optional Transport v2 runtime factory.  It is unset by default so
         # all existing TCP clients keep the Legacy wire path unchanged.
         self._transport_runtime_factory: Optional[Callable[[str], object]] = None
@@ -1541,14 +1539,6 @@ class Scheduler(
                 tcp_client.disconnect()
             except Exception:
                 logger.debug("停止主节点连接失败", exc_info=True)
-        with self._chain_clients_lock:
-            chain_clients = list(self._chain_clients.values())
-            self._chain_clients.clear()
-        for chain_client in chain_clients:
-            try:
-                chain_client.disconnect()
-            except Exception:
-                logger.debug("停止链式连接失败", exc_info=True)
         if self._tcp_server:
             self._tcp_server.stop()
         logger.info("调度器已停止")
@@ -3997,9 +3987,13 @@ class Scheduler(
         if msg_type == "register":
             data = msg.get("data", {})
             if data.get("node_type") == "pipeline_peer":
+                reason = "worker peer 数据连接已禁用；层段数据必须经 master 转发"
                 if self._tcp_server:
-                    self._tcp_server.confirm_registration(client_id)
-                logger.debug("节点间流水线传输连接已认证: %s", client_id)
+                    self._tcp_server.reject_client(client_id, reason)
+                logger.warning(
+                    "拒绝 legacy pipeline_peer 注册: client=%s reason=%s",
+                    client_id, reason,
+                )
                 return
             # get_client_info 对未知 client_id 返回 None（如从节点收到主节点的
             # register 拒绝回执、或注册与断开竞态），必须兜底为空 dict，
@@ -4247,7 +4241,7 @@ class Scheduler(
             self._handle_layer_result(client_id, msg)
 
         elif msg_type == "chain_forward":
-            # ---- 从节点：收到另一从节点的链式直连转发（P2 优化）----
+            # ---- 从节点：收到 master 转发的下一逻辑段 hidden ----
             threading.Thread(
                 target=self._handle_chain_forward,
                 args=(client_id, msg),
@@ -4564,14 +4558,6 @@ class Scheduler(
                     "error": "与主节点的连接已断开",
                 }
                 event.set()
-        with self._chain_clients_lock:
-            chain_clients = list(self._chain_clients.values())
-            self._chain_clients.clear()
-        for chain_client in chain_clients:
-            try:
-                chain_client.disconnect()
-            except Exception:
-                logger.debug("主节点断线时关闭链式连接失败", exc_info=True)
         with self._kv_cache_lock:
             active_tasks = list(self._kv_cache)
             self._kv_cache.clear()

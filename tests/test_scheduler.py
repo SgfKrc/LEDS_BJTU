@@ -3518,7 +3518,7 @@ class TestPipelineMessageDispatch:
         assert "tcp_peer_addr" in node.device_info
         assert node.device_info["tcp_peer_addr"] == "10.0.0.9:51234"
 
-    def test_pipeline_peer_registration_is_not_added_as_worker(self, sched):
+    def test_pipeline_peer_registration_is_rejected(self, sched):
         server = MagicMock()
         sched._tcp_server = server
         sched._on_tcp_message("client-peer", {
@@ -3528,7 +3528,10 @@ class TestPipelineMessageDispatch:
                 "node_type": "pipeline_peer",
             },
         })
-        server.confirm_registration.assert_called_once_with("client-peer")
+        server.reject_client.assert_called_once()
+        assert server.reject_client.call_args.args[0] == "client-peer"
+        assert "必须经 master" in server.reject_client.call_args.args[1]
+        server.confirm_registration.assert_not_called()
         assert "client-peer" not in sched.nodes
 
     def test_tcp_disconnect_logs_and_marks_offline(self, sched, caplog):
@@ -4463,18 +4466,18 @@ class TestPipelineQueueIntegration:
 
 
 # ================================================================
-# 链式拓扑 测试 (P2 — 节点直连)
+# 星状拓扑与逻辑段链测试
 # ================================================================
 
 
 class TestChainTopology:
-    """测试链式直连转发基础设施"""
+    """测试逻辑段链保留、worker peer 数据连接已移除。"""
 
     @pytest.fixture
     def sched(self):
         s = Scheduler()
         from scheduler import NodeInfo, NodeState
-        # 注册 3 个在线从节点（带地址）
+        # 注册 3 个在线从节点；地址只属于 master 控制面。
         s.nodes["client1"] = NodeInfo(
             node_id="client1", role="client", state=NodeState.ONLINE,
             address="192.168.1.2:8888",
@@ -4489,25 +4492,9 @@ class TestChainTopology:
         )
         return s
 
-    def test_get_node_address_valid(self, sched):
-        """_get_node_address 应正确解析地址"""
-        addr = sched._get_node_address("client1")
-        assert addr is not None
-        assert addr["host"] == "192.168.1.2"
-        assert addr["port"] == 8888
-
-    def test_get_node_address_invalid(self, sched):
-        """_get_node_address 对未知节点返回 None"""
-        assert sched._get_node_address("nonexistent") is None
-
-    def test_get_node_address_offline_no_address(self, sched):
-        """离线且无地址的节点返回 None"""
-        from scheduler import NodeInfo, NodeState
-        sched.nodes["offline_node"] = NodeInfo(
-            node_id="offline_node", role="client", state=NodeState.OFFLINE,
-            address="",
-        )
-        assert sched._get_node_address("offline_node") is None
+    def test_worker_peer_connector_is_not_exposed(self, sched):
+        assert not hasattr(sched, "_send_chain_forward")
+        assert not hasattr(sched, "_chain_clients")
 
     def test_broadcast_pipeline_abort(self, sched):
         """_broadcast_pipeline_abort 应调用 _send_to_worker 给所有节点"""
@@ -4726,7 +4713,7 @@ class TestChainTopology:
         assert elapsed < 2.0
 
     def test_chain_forward_routing(self, sched):
-        """CHAIN_FORWARD 消息应路由到 _handle_chain_forward"""
+        """master 发来的 CHAIN_FORWARD 应路由到处理器。"""
         import threading
         called = []
 
@@ -4745,12 +4732,38 @@ class TestChainTopology:
                     "hidden_states": "dGVzdA==",
                 },
             }
-            sched._on_tcp_message("client1", msg)
+            sched._on_tcp_message("master", msg)
             assert len(called) == 1
-            assert called[0][0] == "client1"
+            assert called[0][0] == "master"
             assert called[0][1] == "chain_forward"
         finally:
             sched._handle_chain_forward = original
+
+    def test_chain_forward_from_worker_is_rejected(self, sched):
+        called = []
+        original = sched._handle_layer_forward
+        sched._handle_layer_forward = lambda *args: called.append(args)
+        try:
+            sched._handle_chain_forward("client1", {
+                "type": "chain_forward",
+                "data": {"task_id": "task-peer-bypass", "step": 0},
+            })
+            assert called == []
+        finally:
+            sched._handle_layer_forward = original
+
+    def test_layer_forward_from_worker_is_rejected(self, sched):
+        called = []
+        original = sched._handle_layer_forward_locked
+        sched._handle_layer_forward_locked = lambda *args: called.append(args)
+        try:
+            sched._handle_layer_forward("client1", {
+                "type": "layer_forward",
+                "data": {"task_id": "task-peer-bypass", "step": 0},
+            })
+            assert called == []
+        finally:
+            sched._handle_layer_forward_locked = original
 
     def test_chain_forward_ack_routing(self, sched):
         """CHAIN_FORWARD_ACK 消息应路由并记录 ACK 状态。"""
@@ -4824,7 +4837,7 @@ class TestChainTopology:
         assert sched._chain_ack_state == {}
 
     def test_chain_forward_delegates_to_layer_forward(self, sched):
-        """_handle_chain_forward 应委托给 _handle_layer_forward"""
+        """master 的 CHAIN_FORWARD 应委托给层前向并回接收 ACK。"""
         called_with = []
         ack_calls = []
 
@@ -4837,24 +4850,27 @@ class TestChainTopology:
         sched._send_chain_forward_ack = lambda **kwargs: ack_calls.append(kwargs) or True
 
         try:
-            msg = {"type": "chain_forward", "data": {"task_id": "t1", "step": 2}}
-            sched._handle_chain_forward("client2", msg)
+            msg = {"type": "chain_forward", "data": {
+                "task_id": "t1", "step": 2, "_chain_predecessor": "client1",
+            }}
+            sched._handle_chain_forward("master", msg)
             assert len(called_with) == 1
-            assert called_with[0] == "client2"
+            assert called_with[0] == "master"
             assert ack_calls
             assert ack_calls[0]["task_id"] == "t1"
+            assert ack_calls[0]["from_node_id"] == "client1"
             assert ack_calls[0]["status"] == "received"
         finally:
             sched._handle_layer_forward = original
             sched._send_chain_forward_ack = original_ack
 
-    def test_layer_forward_with_chain_next_forwards_and_sends_ack(self, sched, monkeypatch):
-        """_handle_layer_forward 有 chain_next 时应直连转发并发送 sent ACK。"""
+    def test_layer_forward_with_chain_next_relays_through_master(self, sched, monkeypatch):
+        """_handle_layer_forward 保留段接力，但必须经 master 转发。"""
         from model_host import model_host as _host
         import torch
 
-        forward_calls = []
-        ack_calls = []
+        peer_forward_calls = []
+        master_result_calls = []
 
         class MockModelManager:
             is_loaded = True
@@ -4873,19 +4889,19 @@ class TestChainTopology:
                     ),),
                 }
 
-        def mock_forward(target_id, data):
-            forward_calls.append((target_id, data))
+        def mock_peer_forward(target_id, data):
+            peer_forward_calls.append((target_id, data))
             return True
 
         def mock_send_result(cid, tid, result_data=None, error=None):
-            pass  # 不应被调用（链式转发成功时）
+            master_result_calls.append((cid, tid, result_data, error))
+            return True
 
-        original_fwd = sched._send_chain_forward
         original_send = sched._send_layer_result
-        original_ack = sched._send_chain_forward_ack
-        sched._send_chain_forward = mock_forward
+        monkeypatch.setattr(
+            sched, "_send_chain_forward", mock_peer_forward, raising=False,
+        )
         sched._send_layer_result = mock_send_result
-        sched._send_chain_forward_ack = lambda **kwargs: ack_calls.append(kwargs) or True
         monkeypatch.setattr(_host, "_manager", MockModelManager())
         monkeypatch.setattr(sched, "_record_local_pipeline_participation", lambda *a, **kw: True)
         sched._active_layer_config = {
@@ -4913,17 +4929,12 @@ class TestChainTopology:
             }
             sched._handle_layer_forward("master", msg)
 
-            assert len(forward_calls) == 1
-            assert forward_calls[0][0] == "client2"
-            assert ack_calls
-            assert ack_calls[0]["task_id"] == "task_forward"
-            assert ack_calls[0]["step"] == 0
-            assert ack_calls[0]["target_node_id"] == "client2"
-            assert ack_calls[0]["status"] == "sent"
+            assert peer_forward_calls == []
+            assert len(master_result_calls) == 1
+            assert master_result_calls[0][0:2] == ("master", "task_forward")
+            assert master_result_calls[0][2]["_relay_to"] == "client2"
         finally:
-            sched._send_chain_forward = original_fwd
             sched._send_layer_result = original_send
-            sched._send_chain_forward_ack = original_ack
 
     def test_qwen_layer_forward_uses_original_cache_layout(
             self, sched, monkeypatch):
@@ -5032,7 +5043,7 @@ class TestChainTopology:
         assert "缺少本地 KV cache" in errors[-1]
 
     def test_master_relay_records_chain_sent_ack(self, sched):
-        """L2 主节点中转成功后应记录发往目标节点的 sent ACK 状态。"""
+        """master 转发成功后应记录发往目标逻辑段的 sent ACK 状态。"""
         sent = []
 
         def mock_send(worker_id, data, msg_type):
@@ -5132,6 +5143,52 @@ class TestChainTopology:
 
         assert sent[0][0] == "client2"
         assert sent[0][1]["_chain_predecessor"] == "client1"
+
+    def test_master_relays_three_logical_segments_in_order(self, sched):
+        sent = []
+        sched._send_to_worker = lambda worker_id, data, msg_type: sent.append(
+            (worker_id, data, msg_type)
+        )
+        sched._pipeline_active_tasks.add("task-three-hop")
+        sched._pipeline_task_contracts["task-three-hop"] = {
+            "config_id": "cfg-three-hop",
+            "model_sha256": "sha-three-hop",
+            "model_type": "qwen2",
+            "worker_ids": ["client1", "client2", "client3"],
+            "last_node_id": "client3",
+            "current_step": 0,
+        }
+
+        def result(node_id, relay_to=None, chain_path=None, **extra):
+            data = {
+                "task_id": "task-three-hop",
+                "node_id": node_id,
+                "step": 0,
+                "config_id": "cfg-three-hop",
+                "model_sha256": "sha-three-hop",
+                "model_type": "qwen2",
+                "chain_path": chain_path or [node_id],
+                **extra,
+            }
+            if relay_to is not None:
+                data["_relay_to"] = relay_to
+            sched._handle_layer_result(node_id, {"data": data})
+
+        result("client1", relay_to="client2", hidden_states="aDE=")
+        result(
+            "client2", relay_to="client3",
+            chain_path=["client1", "client2"], hidden_states="aDI=",
+        )
+        result(
+            "client3", chain_path=["client1", "client2", "client3"],
+            logits="bG9naXRz",
+        )
+
+        assert [item[0] for item in sent] == ["client2", "client3"]
+        assert sent[0][1]["_chain_predecessor"] == "client1"
+        assert sent[1][1]["_chain_predecessor"] == "client2"
+        final = sched._pipeline_results["task-three-hop:client3"]
+        assert final["chain_path"] == ["client1", "client2", "client3"]
 
     def test_layer_config_release_clears_worker_reservation(self, sched):
         from tcp_comm import MessageType
@@ -5531,7 +5588,7 @@ class TestChainTopology:
         )
 
     def test_chain_info_built_in_run_pipeline(self, sched):
-        """run_pipeline 应构建链式拓扑信息"""
+        """逻辑段链只包含身份，不能把 peer 地址下发给 worker。"""
         # mock get_layer_assignments 返回 2 个从节点
         original = sched.get_layer_assignments
         sched.get_layer_assignments = lambda: {
@@ -5554,11 +5611,18 @@ class TestChainTopology:
                 if a.get("node_id") != "master"
             ]
             pipeline_nodes.sort(key=lambda a: a.get("start_layer", 0))
-            assert len(pipeline_nodes) == 2
-            assert pipeline_nodes[0]["node_id"] == "client1"
-            assert pipeline_nodes[1]["node_id"] == "client2"
+            route = sched._build_star_chain_route(pipeline_nodes)
+            assert route == [
+                {"node_id": "client1"},
+                {"node_id": "client2"},
+            ]
+            assert all("host" not in item and "port" not in item for item in route)
         finally:
             sched.get_layer_assignments = original
+
+    def test_star_chain_route_rejects_missing_identity(self, sched):
+        with pytest.raises(ValueError, match="missing node_id"):
+            sched._build_star_chain_route([{"start_layer": 0, "end_layer": 12}])
 
 
 # ================================================================

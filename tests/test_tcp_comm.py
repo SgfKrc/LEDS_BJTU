@@ -248,7 +248,7 @@ class TestMessageType:
         assert actual == expected
 
     def test_chain_forward_type(self):
-        """链式直连转发类型（P2 优化）"""
+        """master 向下一逻辑段转发的消息类型保持 wire 兼容。"""
         assert MessageType.CHAIN_FORWARD.value == "chain_forward"
 
     def test_chain_forward_ack_type(self):
@@ -940,6 +940,36 @@ class TestTCPServerConnectionManagement:
             payload = recv_exact(cli_sock, unpack_header(header))
             ack = parse_message(payload)
             assert ack["data"]["status"] == "rejected"
+            assert server.get_client_ids() == []
+        finally:
+            srv_sock.close()
+            cli_sock.close()
+
+    def test_registration_rejects_legacy_pipeline_peer(self, monkeypatch):
+        monkeypatch.setattr(tcp_comm_mod, "_get_cluster_secret", lambda: "s" * 32)
+        server = TCPServer(host="127.0.0.1", port=0)
+        srv_sock, cli_sock = socket.socketpair()
+        try:
+            client_id = "client-peer"
+            msg = {
+                "type": "register",
+                "data": {
+                    "client_id": client_id,
+                    "role": "client",
+                    "node_type": "pipeline_peer",
+                    "auth": tcp_comm_mod.build_auth_signature(client_id),
+                },
+            }
+            with pytest.raises(tcp_comm_mod._RegistrationRejected):
+                server._handle_registration(
+                    srv_sock, ("127.0.0.1", 54321), "pending_54321", msg,
+                )
+
+            header = recv_exact(cli_sock, HEADER_LEN)
+            payload = recv_exact(cli_sock, unpack_header(header))
+            ack = parse_message(payload)
+            assert ack["data"]["status"] == "rejected"
+            assert "pipeline_peer" in ack["data"]["reason"]
             assert server.get_client_ids() == []
         finally:
             srv_sock.close()

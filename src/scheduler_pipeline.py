@@ -3840,6 +3840,13 @@ class SchedulerPipelineMixin:
 
 
     def _handle_layer_forward(self, client_id: str, msg: dict) -> None:
+        if client_id != "master":
+            logger.warning(
+                "丢弃非 master 来源的层前向指令: source=%s task=%s",
+                client_id,
+                msg.get("data", {}).get("task_id", "-") if isinstance(msg, dict) else "-",
+            )
+            return
         with self._layer_execution_lock:
             self._handle_layer_forward_locked(client_id, msg)
 
@@ -4143,13 +4150,13 @@ class SchedulerPipelineMixin:
                     f"time={elapsed_ms:.0f}ms"
                 )
 
-            # ---- 链式直连：转发给下一个从节点（P2 优化 + 主节点中转回退）----
+            # ---- 星状转发：经主节点把 hidden 交给下一层段 ----
             chain_next = data.get("chain_next")
             chain_remaining = data.get("chain_remaining", [])
 
             if chain_next and isinstance(chain_next, dict) and chain_next.get("node_id"):
-                # 非末节点：通过 TCP 直连转发 hidden_states 给下一个节点
-                # ★ hidden_states 为 bytes → base64 编码（JSON 兼容，接收端自动解码）
+                # 保留逻辑层段接力，但 worker 之间不建立数据连接；master
+                # 校验相邻段后再转发，避免 legacy 回退路径破坏星状拓扑。
                 import base64 as _b64
                 _hs = response.get("hidden_states")
                 chain_data = {
@@ -4172,48 +4179,13 @@ class SchedulerPipelineMixin:
                     "top_p": data.get("top_p", 0.9),
                 }
 
-                # L1: 直连下一个从节点
-                ok = self._send_chain_forward(chain_next["node_id"], chain_data)
-                if ok:
-                    logger.debug(f"🔗 L1 直连成功: → {chain_next['node_id']}")
-                    self._send_chain_forward_ack(
-                        task_id=task_id,
-                        step=step,
-                        config_id=config_id,
-                        from_node_id=self.get_effective_node_id(),
-                        target_node_id=chain_next["node_id"],
-                        status="sent",
+                chain_data["_relay_to"] = chain_next["node_id"]
+                sent = self._send_layer_result("master", task_id, result_data=chain_data)
+                if not sent:
+                    logger.error(
+                        "星状层段转发未能回到主节点: task=%s target=%s",
+                        task_id, chain_next["node_id"],
                     )
-                else:
-                    # L2: 主节点中转（从节点 → 主节点 → 目标从节点）
-                    logger.warning(
-                        f"⚠️ L1 直连 {chain_next['node_id']} 失败，"
-                        f"尝试 L2 主节点中转"
-                    )
-                    chain_data["_relay_to"] = chain_next["node_id"]
-                    sent = self._send_layer_result("master", task_id, result_data=chain_data)
-                    if sent:
-                        logger.info(
-                            f"🔄 L2 中转请求已发送至主节点: "
-                            f"{self._scheduler_facade_global('NODE_ID')} → master → {chain_next['node_id']}"
-                        )
-                    else:
-                        error_msg = (
-                            f"链式转发到 {chain_next['node_id']} 失败 "
-                            f"(L1直连失败，L2中转请求发送失败)"
-                        )
-                        logger.error(
-                            f"❌ {error_msg}，回退到全模型推理"
-                        )
-                        self._send_chain_forward_ack(
-                            task_id=task_id,
-                            step=step,
-                            config_id=config_id,
-                            from_node_id=self.get_effective_node_id(),
-                            target_node_id=chain_next["node_id"],
-                            status="error",
-                            error=error_msg,
-                        )
             else:
                 # 末节点（或无链配置）：发送 LAYER_RESULT 回主节点
                 self._send_layer_result("master", task_id, result_data=response)
@@ -4448,7 +4420,7 @@ class SchedulerPipelineMixin:
 
     def _handle_chain_forward(self, client_id: str, msg: dict) -> None:
         """
-        从节点：收到另一从节点的 CHAIN_FORWARD → 执行本节点层前向 → 继续转发或回传。
+        从节点：收到 master 的 CHAIN_FORWARD → 执行本节点层前向 → 回传 master。
 
         CHAIN_FORWARD 的消息结构与 LAYER_FORWARD 一致（均为 hidden_states + chain 信息），
         直接委托 _handle_layer_forward 处理（其内部根据 chain_next 决定下一步动作）。
@@ -4456,7 +4428,13 @@ class SchedulerPipelineMixin:
         data = msg.get("data", {})
         task_id = data.get("task_id", "")
         step = data.get("step", -1)
-        logger.info(f"🔗 收到链式转发: from={client_id}, task={task_id or '?'}")
+        if client_id != "master":
+            logger.warning(
+                "丢弃非 master 来源的逻辑段转发: source=%s task=%s",
+                client_id, task_id or "-",
+            )
+            return
+        logger.info(f"🔗 收到 master 层段转发: task={task_id or '?'}")
         self._send_chain_forward_ack(
             task_id=task_id,
             step=step,
@@ -4576,7 +4554,7 @@ class SchedulerPipelineMixin:
         唤醒正在等待的 run_pipeline() 主循环。
 
         特殊处理: 如果 data 中包含 _relay_to 字段，说明从节点请求
-        主节点中转 hidden_states 到目标节点（L2 链式回退），此时
+        master 将 hidden_states 转发给下一逻辑段，此时
         主节点转发后直接返回，不存储结果也不唤醒 run_pipeline()。
         """
         data = msg.get("data", {})
@@ -4617,7 +4595,7 @@ class SchedulerPipelineMixin:
             )
             return
 
-        # ★ 中转请求：从节点直连失败 → 请主节点转发到目标节点
+        # ★ 星状中转请求：worker 只声明下一逻辑段，由 master 校验并转发。
         relay_target = data.get("_relay_to")
         if relay_target:
             source_index = worker_ids.index(node_id)
@@ -5319,108 +5297,6 @@ class SchedulerPipelineMixin:
                 self._chain_ack_state.pop(task_id, None)
 
 
-    def _get_node_address(self, node_id: str) -> Optional[dict]:
-        """
-        获取节点的 (host, port) 地址信息。
-
-        返回 {"host": str, "port": int} 或 None（节点未知/离线）。
-        """
-        with self._nodes_lock:
-            node = self.nodes.get(node_id)
-        if not node or not node.address:
-            return None
-        # address 格式: "host:port"
-        addr = node.address
-        if ":" in addr:
-            host, port_str = addr.rsplit(":", 1)
-            try:
-                return {"host": host, "port": int(port_str)}
-            except ValueError:
-                logger.warning(f"节点 {node_id} 地址格式无效 (端口非数字): {addr}")
-                return None
-        logger.warning(f"节点 {node_id} 地址缺失或格式错误: {addr or '(空)'}")
-        return None
-
-
-    def _send_chain_forward(self, target_node_id: str, data: dict) -> bool:
-        """
-        从节点 → 下一个从节点：链式直连转发 hidden_states。
-
-        通过目标节点已有的 TCP 服务端建立短连接，发送 CHAIN_FORWARD
-        后立即关闭（fire-and-forget）。
-
-        Returns:
-            True 发送成功，False 连接失败
-        """
-        from transport_port import create_client, MessageType
-
-        addr = self._get_node_address(target_node_id)
-        if not addr:
-            logger.error(f"无法获取节点 {target_node_id} 的地址")
-            return False
-
-        try:
-            t0 = time.time()
-            target = (addr["host"], addr["port"])
-            with self._chain_clients_lock:
-                cached = self._chain_clients.get(target_node_id)
-                cached_target = (
-                    getattr(cached, "server_host", ""),
-                    getattr(cached, "server_port", 0),
-                ) if cached else None
-                cached_ready = bool(
-                    cached
-                    and cached_target == target
-                    and getattr(cached, "_running", False)
-                    and getattr(cached, "is_registered", False)
-                    and getattr(cached, "sock", None) is not None
-                )
-                if cached_ready:
-                    client = cached
-                else:
-                    if cached is not None:
-                        try:
-                            cached.disconnect()
-                        except Exception:
-                            pass
-                    client = create_client(
-                        server_host=addr["host"],
-                        server_port=addr["port"],
-                        client_id=self.get_effective_node_id(),
-                        role="client",
-                        node_type="pipeline_peer",
-                        **self._transport_runtime_kwargs(target_node_id),
-                    )
-                    if self._control_fence is not None:
-                        client.set_control_fence(self._control_fence)
-                    if not client.connect():
-                        logger.error(
-                            "链式转发: 连接 %s (%s:%s) 失败",
-                            target_node_id, addr["host"], addr["port"],
-                        )
-                        return False
-                    self._chain_clients[target_node_id] = client
-
-            client.send_data(data, MessageType.CHAIN_FORWARD)
-            elapsed_ms = (time.time() - t0) * 1000
-            hs_shape = data.get("hidden_shape", "?")
-            logger.debug(
-                f"🔗 链式转发: {self._scheduler_facade_global('NODE_ID')} → {target_node_id} "
-                f"hidden_states={hs_shape}, time={elapsed_ms:.0f}ms"
-            )
-            return True
-        except Exception as e:
-            logger.error(f"链式转发到 {target_node_id} 失败: {e}")
-            with self._chain_clients_lock:
-                failed_client = self._chain_clients.pop(target_node_id, None)
-            if failed_client is not None:
-                try:
-                    failed_client.disconnect()
-                except Exception:
-                    pass
-            return False
-
-
     def _send_to_worker(self, worker_id: str, data: dict,
                         msg_type=None) -> None:
         """主节点 → 从节点：发送消息"""
@@ -5430,6 +5306,23 @@ class SchedulerPipelineMixin:
         if not self._tcp_server or not self._tcp_server._running:
             raise ConnectionError("TCP 服务端未运行")
         self._tcp_server.send_to_client(worker_id, data, msg_type)
+
+
+    @staticmethod
+    def _build_star_chain_route(pipeline_nodes: list[dict]) -> list[dict[str, str]]:
+        """Return the logical segment order without exposing peer addresses.
+
+        Workers only need the next segment identity.  The master owns address
+        resolution and every inter-segment forward, which keeps the data plane
+        hub-and-spoke while preserving D→L/L→L multi-segment semantics.
+        """
+        route: list[dict[str, str]] = []
+        for node in pipeline_nodes:
+            node_id = str(node.get("node_id", "") or "").strip()
+            if not node_id:
+                raise ValueError("pipeline segment is missing node_id")
+            route.append({"node_id": node_id})
+        return route
 
     @staticmethod
     def _parse_relay_segment_map(raw: str) -> dict[str, dict[str, object]]:
@@ -6405,17 +6298,17 @@ class SchedulerPipelineMixin:
             4. 自回归生成循环:
                a. Prefill (step 0): 发送完整 input_ids + chain_info 给首节点
                b. Decode (step 1+): 发送新 token + chain_info 给首节点
-               c. 首节点处理 → 直连转发 hidden_states 给下一个节点（CHAIN_FORWARD）
+               c. 每个中间段把 hidden_states 回传 master，由 master 转发给下一段
                d. 中间节点处理 → 继续链式转发
                e. 末节点处理 → 直接返回 logits 给主节点（LAYER_RESULT）
                f. 主节点从 logits 采样下一个 token
                g. 判断 EOS / max_tokens → 继续或结束
             5. 广播 PIPELINE_DONE，各节点清理 KV cache
 
-        **链式拓扑 (P2)**:
-            - 主节点仅与首、末节点通信（O(1) 网络开销/step）
-            - 中间节点间 TCP 直连转发 hidden_states
-            - 每个 step 网络传输: N+1 次（vs 旧方案 2N 次）
+        **星状数据拓扑**:
+            - master 是唯一协调与转发节点，worker 之间不互连
+            - hidden_states 仍按逻辑层段顺序接力，master 校验相邻目标后转发
+            - 每个 step 网络传输: 每个 worker 一次上行与下一段一次下行
             6. 解码完整序列 → 返回 response text
 
         Returns:
@@ -6842,18 +6735,9 @@ class SchedulerPipelineMixin:
             # 判断 Prefill vs Decode
             is_prefill = (step == 0)
 
-            # ---- 链式拓扑：构建节点链信息（P2 优化）----
-            # 每个从节点收到 chain_next（下一个节点地址），处理完后直接
-            # TCP 转发 hidden_states 给下一个节点。主节点仅与首尾节点通信。
-            chain_info = []
-            for i, node in enumerate(pipeline_nodes):
-                nid = node["node_id"]
-                addr = self._get_node_address(nid)
-                chain_info.append({
-                    "node_id": nid,
-                    "host": addr["host"] if addr else "",
-                    "port": addr["port"] if addr else 0,
-                })
+            # ---- 星状数据拓扑：构建逻辑层段顺序 ----
+            # 保留逻辑层段顺序，但所有 worker 数据流都经 master 中转。
+            chain_info = self._build_star_chain_route(pipeline_nodes)
 
             first_node_id = pipeline_nodes[0]["node_id"]
             last_node_id = pipeline_nodes[-1]["node_id"]
@@ -6987,7 +6871,7 @@ class SchedulerPipelineMixin:
                     forward_data["input_ids"] = [[new_token_id]]
 
             if has_chain:
-                # 链式拓扑：附加上下一个节点的地址信息
+                # 只下发逻辑相邻节点身份；peer 地址不进入 worker 数据面。
                 forward_data["chain_next"] = chain_info[1] if len(chain_info) > 1 else None
                 forward_data["chain_remaining"] = chain_info[2:] if len(chain_info) > 2 else []
                 logger.debug(

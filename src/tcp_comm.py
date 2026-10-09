@@ -217,8 +217,8 @@ class MessageType(str, Enum):
     # 分布式流水线推理
     LAYER_FORWARD = "layer_forward"              # 主→从：执行层前向传播
     LAYER_RESULT = "layer_result"                # 从→主：层前向传播结果
-    CHAIN_FORWARD = "chain_forward"              # 从→从：链式直连层前向转发（P2 优化）
-    CHAIN_FORWARD_ACK = "chain_forward_ack"      # 从→主：链式转发每跳接收/错误确认
+    CHAIN_FORWARD = "chain_forward"              # 主→从：下一逻辑段层前向转发
+    CHAIN_FORWARD_ACK = "chain_forward_ack"      # 从→主：逻辑段接收/错误确认
     PIPELINE_DONE = "pipeline_done"              # 主→从：流水线任务完成（清理 KV 缓存）
     PIPELINE_ABORT = "pipeline_abort"            # 主→从：取消流水线任务
     PIPELINE_PAUSE = "pipeline_pause"            # 主→从：暂停流水线（二期协同抢占，协议预留）
@@ -1463,7 +1463,6 @@ class TCPServer:
                     registration_confirmed_now
                     and self.on_registration_confirmed is not None
                     and current is not None
-                    and current.node_type != "pipeline_peer"
                 ):
                     try:
                         self.on_registration_confirmed(client_id)
@@ -1508,8 +1507,7 @@ class TCPServer:
             if client_id in self._recv_threads:
                 del self._recv_threads[client_id]
             # 通知上层断连（仅对本线程实际移除的已注册连接通知一次）
-            if (self.on_disconnect and removed is not None
-                    and removed.node_type != "pipeline_peer"):
+            if self.on_disconnect and removed is not None:
                 try:
                     self.on_disconnect(client_id)
                 except Exception as e:
@@ -1598,6 +1596,21 @@ class TCPServer:
             except OSError as e:
                 logger.debug(f"注册拒绝 ACK 发送失败: {e}", exc_info=True)
             raise _RegistrationRejected("从节点不能声明 role='master'")
+        if node_type == "pipeline_peer":
+            reason = "pipeline_peer 已禁用；worker 数据连接必须以 master 为中心"
+            logger.error(
+                "⛔ 拒绝注册: node_type='pipeline_peer' 已禁用，来源 %s:%s",
+                addr[0], addr[1],
+            )
+            ack = build_message(MessageType.REGISTER, {
+                "status": "rejected",
+                "reason": reason,
+            })
+            try:
+                conn.sendall(ack)
+            except OSError as e:
+                logger.debug("pipeline_peer 拒绝 ACK 发送失败: %s", e, exc_info=True)
+            raise _RegistrationRejected(reason)
         # Android 节点只能作为 client
         if node_type == "android" and role == "master":
             logger.error(
@@ -1827,8 +1840,7 @@ class TCPServer:
                         pass
                     removed = self._pop_client_if_same(cid, conn)
                     # 通知上层（仅本线程实际移除连接时通知一次）
-                    if (removed is not None and self.on_disconnect
-                            and removed.node_type != "pipeline_peer"):
+                    if removed is not None and self.on_disconnect:
                         try:
                             self.on_disconnect(cid)
                         except Exception as e:
