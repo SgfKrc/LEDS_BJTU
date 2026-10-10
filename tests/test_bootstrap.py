@@ -7,6 +7,10 @@
 import os
 import sys
 
+import pytest
+
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 
@@ -244,14 +248,15 @@ def test_source_checkout_requires_explicit_master_role(tmp_path, monkeypatch):
     assert node_config.resolve_initial_node_role() == "master"
 
 
-def test_source_checkout_rejects_unknown_role_as_client(tmp_path, monkeypatch):
+def test_source_checkout_rejects_unknown_role_explicitly(tmp_path, monkeypatch):
     import node_config
 
     monkeypatch.setenv("QLH_NODE_CONFIG_PATH", str(tmp_path / "node_config.json"))
     monkeypatch.setenv("QLH_NODE_ROLE", "typo-role")
     monkeypatch.setattr(sys, "frozen", False, raising=False)
 
-    assert node_config.resolve_initial_node_role() == "client"
+    with pytest.raises(ValueError, match="invalid node role"):
+        node_config.resolve_initial_node_role()
 
 
 def test_frozen_config_migrates_legacy_exe_directory_file(tmp_path, monkeypatch):

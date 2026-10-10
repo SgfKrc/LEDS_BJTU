@@ -800,6 +800,46 @@ def test_task_graph_distributed_required_auto_assigns_remote_worker(
     assert len(manager.calls) == 2
 
 
+def test_release_profile_discards_task_graph_required_result_before_commit(
+    task_graph_api, monkeypatch,
+):
+    manager, coordinator = task_graph_api
+    identity = ModelIdentity(
+        model_id="fake-model",
+        engine="llama_cpp",
+        format="gguf",
+        revision="local-test",
+        sha256="f" * 64,
+    )
+    provider = _remote_worker_provider(identity, "worker_release")
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "remote_task_worker_providers",
+        lambda: [provider],
+    )
+    monkeypatch.setattr(
+        api_server, "_active_task_graph_model_identity", lambda: identity,
+    )
+    monkeypatch.setenv("QLH_RELEASE_PROFILE_ENFORCE", "1")
+
+    with pytest.raises(HTTPException) as captured:
+        asyncio.run(api_server.chat(api_server.ChatRequest(
+            message="release route policy",
+            session_id="task-session",
+            execution_mode="task_graph",
+            routing_preference="distributed_required",
+            workflow_id="wf_releasetaskroute01",
+        )))
+
+    assert captured.value.status_code == 503
+    assert (
+        captured.value.error_code
+        == "DISTRIBUTED_REQUIRED_RELEASE_ROUTE_FORBIDDEN"
+    )
+    assert coordinator.get("wf_releasetaskroute01")["state"] == "cancelled"
+    assert len(manager.calls) == 2
+
+
 def test_task_graph_distributed_required_rejects_without_eligible_worker(
     task_graph_api, monkeypatch,
 ):

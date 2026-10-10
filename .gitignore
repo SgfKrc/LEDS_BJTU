@@ -185,6 +185,10 @@ docs/agent_tool/
 # 以及上手/流水线要用到的工具）。
 scripts/*
 !scripts/model_tools/
+!scripts/package_contract/
+!scripts/package_contract/linux_clean_gate.py
+!scripts/run_linux_package_gate.ps1
+!scripts/version_contract.py
 # 设备侧按需裁层的依赖（Termux 侧跑，见 scripts/model_tools/qlh_device_cut_range.sh）
 !scripts/cut_layers.py
 # 切层制作流水线（串起 源sha + 命令 + 产物sha + 校验，产 cut-report.json）

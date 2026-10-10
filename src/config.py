@@ -20,6 +20,12 @@ import sys
 import socket
 import hashlib
 
+from release_contract import apply_release_profile_to_env, release_profile_enforced
+
+# A packaged artifact owns its product-route switches. Apply those values
+# before .env and user node configuration are considered.
+apply_release_profile_to_env()
+
 # 加载 .env 文件中的环境变量（必须在读取任何环境变量之前）
 try:
     from dotenv import load_dotenv
@@ -599,7 +605,7 @@ REVIEW_REJECT_THRESHOLD = -2         # 阻止阈值: score <= -2
 # 通过环境变量 QLH_CLUSTER_SECRET 设置（必须设置，否则集群通信将拒绝认证）
 # 生产部署时务必使用随机字符串（建议 32+ 字符）
 CLUSTER_SECRET = os.environ.get("QLH_CLUSTER_SECRET", "")
-if not CLUSTER_SECRET and NODE_ROLE == "master" and getattr(sys, "frozen", False):
+if not CLUSTER_SECRET and NODE_ROLE == "master" and release_profile_enforced():
     try:
         from node_config import ensure_local_cluster_secret
         CLUSTER_SECRET = ensure_local_cluster_secret()

@@ -5011,6 +5011,62 @@ class TestPipelineQueueIntegration:
         assert fallback_calls
         assert "queued worker failed" in fallback_calls[0]["_fallback_reason"]
 
+    def test_required_distributed_queued_worker_error_does_not_fallback(
+            self, sched, monkeypatch):
+        """强制分布式队列任务返回 error 时必须原样失败，禁止整模回退。"""
+        pipeline_error = {
+            "response": "",
+            "error": "queued distributed step failed",
+        }
+        monkeypatch.setattr(sched, "_all_pipeline_nodes_ready", lambda: True)
+        monkeypatch.setattr(
+            sched, "_has_active_distributed_pipeline_plan", lambda: True,
+        )
+        monkeypatch.setattr(
+            sched, "run_pipeline", lambda prompt="", **kwargs: pipeline_error,
+        )
+        monkeypatch.setattr(
+            sched,
+            "_run_full_model_inference",
+            lambda *args, **kwargs: pytest.fail(
+                "distributed_required 队列任务不得回退整模"
+            ),
+        )
+
+        result = sched._process_queued_pipeline_task(
+            prompt="queued", _require_distributed=True,
+        )
+
+        assert result is pipeline_error
+
+    def test_required_distributed_queued_worker_exception_does_not_fallback(
+            self, sched, monkeypatch):
+        """强制分布式队列任务抛异常时必须 fail closed，禁止整模回退。"""
+        monkeypatch.setattr(sched, "_all_pipeline_nodes_ready", lambda: True)
+        monkeypatch.setattr(
+            sched, "_has_active_distributed_pipeline_plan", lambda: True,
+        )
+
+        def raise_pipeline_error(*args, **kwargs):
+            raise RuntimeError("queued distributed exploded")
+
+        monkeypatch.setattr(sched, "run_pipeline", raise_pipeline_error)
+        monkeypatch.setattr(
+            sched,
+            "_run_full_model_inference",
+            lambda *args, **kwargs: pytest.fail(
+                "distributed_required 队列异常不得回退整模"
+            ),
+        )
+
+        result = sched._process_queued_pipeline_task(
+            prompt="queued", _require_distributed=True,
+        )
+
+        assert "distributed_required" in result["error"]
+        assert "queued distributed exploded" in result["error"]
+        assert result["metrics"]["fallback"] is False
+
     def test_run_pipeline_safe_respects_queue_busy(self, sched):
         """
         当 pipeline_queue.is_busy=True 时，run_pipeline_safe 应将请求入队。
@@ -5125,6 +5181,125 @@ class TestPipelineQueueIntegration:
         assert captured["_require_distributed"] is True
         assert captured["_force_distributed_assignment"] is True
         assert captured["_pipeline_model_sync_timeout"] == 3
+
+    def test_required_distributed_queued_result_error_does_not_fallback(
+            self, sched, monkeypatch):
+        """排队完成后返回 pipeline error 时不得在等待方执行整模回退。"""
+        from model_host import model_host as _host
+
+        class MockModelManager:
+            is_loaded = True
+            _engine_type = "pytorch"
+
+        pipeline_error = {
+            "response": "",
+            "error": "queued pipeline result failed",
+        }
+        monkeypatch.setattr(_host, "_manager", MockModelManager())
+        monkeypatch.setattr(
+            sched,
+            "_synchronize_pipeline_workers_for_request",
+            lambda **kwargs: {"ready": True, "reason_code": "ready"},
+        )
+        monkeypatch.setattr(
+            sched.pipeline_queue, "enqueue", lambda **kwargs: "queued-error",
+        )
+        monkeypatch.setattr(
+            sched.pipeline_queue,
+            "wait_for_result",
+            lambda *args, **kwargs: {
+                "status": "done",
+                "result": pipeline_error,
+            },
+        )
+        monkeypatch.setattr(
+            sched,
+            "_run_full_model_inference",
+            lambda *args, **kwargs: pytest.fail(
+                "distributed_required 排队结果错误不得回退整模"
+            ),
+        )
+        sched.pipeline_queue._current_task_id = "busy"
+
+        try:
+            result = sched.run_pipeline_safe(
+                "queued prompt", _require_distributed=True,
+            )
+        finally:
+            sched.pipeline_queue._current_task_id = None
+
+        assert result is pipeline_error
+
+    def test_required_distributed_immediate_error_does_not_fallback(
+            self, sched, monkeypatch):
+        """立即执行返回 pipeline error 时必须原样失败，禁止整模回退。"""
+        from model_host import model_host as _host
+
+        class MockModelManager:
+            is_loaded = True
+            _engine_type = "pytorch"
+
+        pipeline_error = {
+            "response": "",
+            "error": "immediate distributed step failed",
+        }
+        monkeypatch.setattr(_host, "_manager", MockModelManager())
+        monkeypatch.setattr(
+            sched,
+            "_synchronize_pipeline_workers_for_request",
+            lambda **kwargs: {"ready": True, "reason_code": "ready"},
+        )
+        monkeypatch.setattr(
+            sched, "run_pipeline", lambda prompt="", **kwargs: pipeline_error,
+        )
+        monkeypatch.setattr(
+            sched,
+            "_run_full_model_inference",
+            lambda *args, **kwargs: pytest.fail(
+                "distributed_required 立即执行错误不得回退整模"
+            ),
+        )
+
+        result = sched.run_pipeline_safe(
+            "immediate prompt", _require_distributed=True,
+        )
+
+        assert result is pipeline_error
+
+    def test_required_distributed_immediate_exception_does_not_fallback(
+            self, sched, monkeypatch):
+        """立即执行抛异常时必须 fail closed，禁止整模回退。"""
+        from model_host import model_host as _host
+
+        class MockModelManager:
+            is_loaded = True
+            _engine_type = "pytorch"
+
+        def raise_pipeline_error(*args, **kwargs):
+            raise RuntimeError("immediate distributed exploded")
+
+        monkeypatch.setattr(_host, "_manager", MockModelManager())
+        monkeypatch.setattr(
+            sched,
+            "_synchronize_pipeline_workers_for_request",
+            lambda **kwargs: {"ready": True, "reason_code": "ready"},
+        )
+        monkeypatch.setattr(sched, "run_pipeline", raise_pipeline_error)
+        monkeypatch.setattr(
+            sched,
+            "_run_full_model_inference",
+            lambda *args, **kwargs: pytest.fail(
+                "distributed_required 立即执行异常不得回退整模"
+            ),
+        )
+
+        result = sched.run_pipeline_safe(
+            "immediate prompt", _require_distributed=True,
+        )
+
+        assert "distributed_required" in result["error"]
+        assert "immediate distributed exploded" in result["error"]
+        assert result["metrics"]["fallback"] is False
 
 
 # ================================================================

@@ -13,6 +13,7 @@ SSE 事件格式对齐 api_server /api/chat/stream（2026-08-03 基线）：
 """
 import asyncio
 import base64
+import concurrent.futures
 import json
 import logging
 import re
@@ -36,7 +37,7 @@ from model_load_resolver import (
     resolve_model_load,
 )
 from inference_service.kv_host import KVCapacityError, KVCleanupError
-from . import __version__
+from . import __contract_version__, __version__
 from .protocol import (
     ChatCancelRequest,
     ChatRequest,
@@ -60,34 +61,64 @@ router = APIRouter(prefix="/v1")
 logger = logging.getLogger("inference_service.routes")
 
 
-async def _iterate_sync_generator(iterable):
+def _normalize_operation_id(value: Optional[str]) -> str:
+    """Normalize the HTTP request identity to the durable receipt contract."""
+
+    cleaned = re.sub(r"[^A-Za-z0-9._:-]", "", str(value or "").strip())
+    return cleaned[:256] or "-"
+
+
+async def _iterate_sync_generator(iterable, cancel_event=None):
     """桥接阻塞式生成器而不阻塞 ASGI 事件循环（复制自
     api_server.py:4132 的等价实现；生成期间 /v1/chat/cancel、/v1/health
     仍可被处理——取消功能依赖此桥接）。"""
-    queue: asyncio.Queue = asyncio.Queue()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=1)
     done = object()
+
+    def _put_from_thread(payload) -> bool:
+        future = asyncio.run_coroutine_threadsafe(queue.put(payload), loop)
+        while True:
+            try:
+                future.result(timeout=0.1)
+                return True
+            except concurrent.futures.TimeoutError:
+                if cancel_event is not None and cancel_event.is_set():
+                    future.cancel()
+                    return False
+            except Exception:
+                return False
 
     def _pump():
         try:
             for item in iterable:
-                loop.call_soon_threadsafe(queue.put_nowait, (item, None))
+                if not _put_from_thread((item, None)):
+                    return
         except Exception as exc:
-            loop.call_soon_threadsafe(queue.put_nowait, (None, exc))
+            _put_from_thread((None, exc))
         finally:
-            try:
-                loop.call_soon_threadsafe(queue.put_nowait, (done, None))
-            except RuntimeError:
-                pass
+            _put_from_thread((done, None))
 
     loop = asyncio.get_running_loop()
     threading.Thread(target=_pump, name="inference-svc-stream-bridge", daemon=True).start()
-    while True:
-        item, error = await queue.get()
-        if item is done:
-            break
-        if error is not None:
-            raise error
-        yield item
+    completed_normally = False
+    try:
+        while True:
+            item, error = await queue.get()
+            if item is done:
+                completed_normally = True
+                break
+            if error is not None:
+                raise error
+            yield item
+    finally:
+        if not completed_normally and cancel_event is not None:
+            cancel_event.set()
+        close = getattr(iterable, "close", None)
+        if callable(close):
+            try:
+                close()
+            except ValueError:
+                pass
 
 
 # ----------------------------------------------------------------------
@@ -145,7 +176,12 @@ def _decode_tensor(tensor_ref: str):
 # ----------------------------------------------------------------------
 @router.get("/health", response_model=None)
 async def health():
-    return {"status": "ok", "service": "inference-svc", "version": __version__}
+    return {
+        "status": "ok",
+        "service": "inference-svc",
+        "version": __version__,
+        "contract_version": __contract_version__,
+    }
 
 
 @router.get("/ready")
@@ -350,10 +386,14 @@ def chat(req: ChatRequest, request: Request):
     不阻塞事件循环（对齐 api_server run_in_threadpool 语义）。"""
     _require_master_role(request)
     host = _engine_host(request)
-    request_id = request.headers.get("X-QLH-Request-ID", "-")
+    request_id = _normalize_operation_id(
+        request.headers.get("X-QLH-Request-ID"),
+    )
     generation_id, cancel_event = host.register_generation(req.generation_id)
     try:
-        result = host.chat_full(req, cancel_event)
+        result = host.chat_full_with_operation_id(
+            req, cancel_event, request_id,
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -370,7 +410,9 @@ async def chat_stream(req: ChatRequest, request: Request):
     """SSE 流式（事件格式与 api_server /api/chat/stream 一致）。"""
     _require_master_role(request)
     host = _engine_host(request)
-    request_id = request.headers.get("X-QLH-Request-ID", "-")
+    request_id = _normalize_operation_id(
+        request.headers.get("X-QLH-Request-ID"),
+    )
     generation_id, cancel_event = host.register_generation(req.generation_id)
 
     # T9.5：distributed_required 无分布式路径时明确失败（所有模式）
@@ -386,7 +428,12 @@ async def chat_stream(req: ChatRequest, request: Request):
         # full：完整功能，推理完成后一次性返回单个 done 事件（SSE 格式）；
         # chat_full 阻塞调用放线程池（api_server run_in_threadpool 语义）
         try:
-            result = await run_in_threadpool(host.chat_full, req, cancel_event)
+            result = await run_in_threadpool(
+                host.chat_full_with_operation_id,
+                req,
+                cancel_event,
+                request_id,
+            )
         except HTTPException as e:
             return StreamingResponse(
                 iter([_sse_error(e.detail, request_id)]),
@@ -412,8 +459,8 @@ async def chat_stream(req: ChatRequest, request: Request):
             iter([_sse_event(payload)]), media_type="text/event-stream"
         )
 
-    # interactive：start → token* → done | error | cancelled（T9 契约 §9.4.1；
-    # engine_host 薄实现不提交历史，history_committed 如实上报 false）
+    # interactive：start → token* → done | error | cancelled（T9 契约 §9.4.1）；
+    # EngineHost 与 full/fast 共用历史读取、裁剪和完成时提交。
     if req.streaming_mode == "interactive":
         async def _generate_interactive():
             yield _sse_event({
@@ -426,16 +473,30 @@ async def chat_stream(req: ChatRequest, request: Request):
             completed_normally = False
             try:
                 async for event in _iterate_sync_generator(
-                    host.chat_stream_events(req, cancel_event)
+                    host.chat_stream_events_with_operation_id(
+                        req, cancel_event, request_id,
+                    ),
+                    cancel_event,
                 ):
                     if event.get("done"):
                         event["request_id"] = request_id
                         event["generation_id"] = generation_id
-                        event["session_id"] = req.session_id
-                        event["history_committed"] = False
+                        event.setdefault("session_id", req.session_id)
                         metrics = event.setdefault("metrics", {})
                         metrics["routing_preference"] = req.routing_preference
-                        metrics["distributed_used"] = False
+                        metrics.setdefault("distributed_used", False)
+                        try:
+                            host._enforce_distributed_required(
+                                req,
+                                metrics,
+                                detail="interactive 终态未完成允许的分布式执行",
+                            )
+                        except HTTPException as exc:
+                            yield _sse_error(str(exc.detail), request_id)
+                            return
+                        event["history_committed"] = host.commit_stream_event(
+                            req, event, cancel_event, request_id,
+                        )
                     yield _sse_event(event)
                 completed_normally = True
             except Exception as e:
@@ -454,12 +515,18 @@ async def chat_stream(req: ChatRequest, request: Request):
         completed_normally = False
         try:
             async for event in _iterate_sync_generator(
-                host.chat_stream_events(req, cancel_event)
+                host.chat_stream_events_with_operation_id(
+                    req, cancel_event, request_id,
+                ),
+                cancel_event,
             ):
                 if event.get("done"):
                     # engine_host 薄实现的 done 事件带 "-" 占位，此处覆盖为真实值
                     event["request_id"] = request_id
                     event["generation_id"] = generation_id
+                    event["history_committed"] = host.commit_stream_event(
+                        req, event, cancel_event, request_id,
+                    )
                 yield _sse_event(event)
             completed_normally = True
         except Exception as e:

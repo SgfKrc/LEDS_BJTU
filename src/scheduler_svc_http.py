@@ -24,6 +24,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from api_errors import coded_http_error, install_http_error_handler
+from release_contract import PRODUCT_VERSION
 
 logger = logging.getLogger("scheduler_svc_http")
 
@@ -1099,7 +1100,7 @@ def build_scheduler_app(scheduler) -> "FastAPI":
     from fastapi import FastAPI
 
     set_scheduler(scheduler)
-    app = FastAPI(title="scheduler-svc", version="0.1.0")
+    app = FastAPI(title="scheduler-svc", version=PRODUCT_VERSION)
     install_http_error_handler(app)
     app.include_router(router)
     transfer_runtime = getattr(scheduler, "_qwen3_artifact_transfer_runtime", None)

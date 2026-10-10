@@ -8512,6 +8512,8 @@ class SchedulerPipelineMixin:
                 )
             result = self.run_pipeline(prompt, **kwargs)
             if result.get("error"):
+                if require_distributed:
+                    return result
                 if self._stream_output_started(kwargs):
                     logger.warning(
                         "流水线已输出部分内容，跳过全模型回退以避免重复回答: %s",
@@ -8529,6 +8531,12 @@ class SchedulerPipelineMixin:
                 )
             return result
         except Exception as e:
+            if require_distributed:
+                return {
+                    "response": "",
+                    "error": f"distributed_required: queued pipeline failed: {e}",
+                    "metrics": {"distributed_used": False, "fallback": False},
+                }
             if self._stream_output_started(kwargs):
                 logger.error(
                     "流水线已输出部分内容后异常，跳过全模型回退: %s",

@@ -23,7 +23,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from api_errors import install_http_error_handler
-from inference_service.engine_host import EngineHost
+from inference_service.engine_host import ChatGenerationCancelled, EngineHost
 from inference_service.kv_host import KVHost
 from inference_service.protocol import ChatRequest, LoadModelRequest
 from inference_service.routes import router
@@ -1670,6 +1670,90 @@ def test_task_graph_with_slot_real_execution(monkeypatch):
     assert "local_full_model" in fake_coord.providers
 
 
+def test_engine_host_release_profile_discards_task_graph_required_before_commit(
+    monkeypatch,
+):
+    """The inference service cannot revive task_graph as a release route."""
+    import config as _cfg
+    from task_provider import ModelIdentity
+
+    monkeypatch.setattr(_cfg, "TASK_GRAPH_ENABLED", True)
+    monkeypatch.setattr(_cfg, "TASK_WORKER_EXPERIMENTAL_ENABLED", True)
+    monkeypatch.setenv("QLH_RELEASE_PROFILE_ENFORCE", "1")
+
+    host = make_full_host()
+    identity = ModelIdentity(
+        model_id="qwen-1.8b",
+        engine="llama_cpp",
+        format="gguf",
+        revision="release-test",
+        sha256="a" * 64,
+    )
+    monkeypatch.setattr(
+        host, "_active_task_graph_model_identity", lambda: identity,
+    )
+    monkeypatch.setattr(
+        host,
+        "_eligible_remote_task_worker_provider_ids",
+        lambda *_args, **_kwargs: ["remote_release_worker"],
+    )
+
+    class FakeCoordinator:
+        def __init__(self):
+            self.providers = []
+            self.discarded = []
+
+        def has_provider(self, provider_id):
+            return provider_id in self.providers
+
+        def register_provider(self, provider):
+            self.providers.append(provider.provider_id)
+
+        def run(self, **_kwargs):
+            return (
+                {"content": "forbidden task graph result"},
+                {
+                    "workflow_id": "wf_releaseenginehost01",
+                    "state": "result_ready",
+                    "stages": [{
+                        "attempts": [{
+                            "state": "completed",
+                            "provider_kind": "remote_full_worker",
+                            "provider_node_id": "worker-release",
+                        }],
+                    }],
+                },
+            )
+
+        def discard_result(self, workflow_id):
+            self.discarded.append(workflow_id)
+            return {"workflow_id": workflow_id, "state": "cancelled"}
+
+        def commit_result(self, _workflow_id):
+            pytest.fail("release route rejection must happen before commit")
+
+    coordinator = FakeCoordinator()
+    monkeypatch.setattr(
+        host, "_ensure_task_graph_coordinator", lambda: coordinator,
+    )
+
+    with pytest.raises(HTTPException) as captured:
+        host.execute_task_graph_chat_with_slot(ChatRequest(
+            message="release route policy",
+            session_id="s1",
+            execution_mode="task_graph",
+            routing_preference="distributed_required",
+            workflow_id="wf_releaseenginehost01",
+        ))
+
+    assert captured.value.status_code == 503
+    assert (
+        captured.value.error_code
+        == "DISTRIBUTED_REQUIRED_RELEASE_ROUTE_FORBIDDEN"
+    )
+    assert coordinator.discarded == ["wf_releaseenginehost01"]
+
+
 def test_task_graph_auto_remote_identity_path(monkeypatch):
     """auto_remote 分支调用 _active_task_graph_model_identity（修复前
     1597 行裸 model_manager NameError）：无可用远端 → 本地降级执行。"""
@@ -1861,6 +1945,48 @@ def test_chat_full_session_switch(monkeypatch):
     assert host.session_history("s_new")[-1]["role"] == "assistant"
 
 
+def test_chat_full_same_session_reloads_after_runtime_reset(monkeypatch):
+    import inference_service.engine_host as engine_host_module
+
+    rows = [
+        {"role": "user", "content": "persisted question"},
+        {"role": "assistant", "content": "persisted answer"},
+    ]
+    monkeypatch.setattr(
+        engine_host_module._local_store,
+        "load_local_conversation",
+        lambda session_id: list(rows) if session_id == "s1" else [],
+    )
+    monkeypatch.setattr(
+        engine_host_module._local_store,
+        "get_local_save_history",
+        lambda: False,
+    )
+
+    host = make_full_host()
+    host._active_session_id = "s1"
+    host._session_histories["s1"] = [{"role": "user", "content": "stale"}]
+    host._reset_runtime_conversation_state(clear_histories=True)
+
+    host.chat_full(ChatRequest(message="continue", session_id="s1"))
+
+    assert host.session_history("s1")[:2] == rows
+
+
+def test_engine_host_close_releases_task_graph_coordinator():
+    host = FakeEngineHost()
+    closed = []
+    host._task_graph_coordinator = SimpleNamespace(
+        close=lambda: closed.append(True),
+    )
+
+    host.close()
+    host.close()
+
+    assert closed == [True]
+    assert host._task_graph_coordinator is None
+
+
 def test_chat_full_first_message_auto_title(monkeypatch):
     """首条消息自动标题：截取前 30 字。"""
     titles = []
@@ -2006,8 +2132,110 @@ def test_engine_host_persists_locally_without_legacy_export(monkeypatch):
     monkeypatch.setattr(engine_host_module, "_local_store", fake_local_store)
 
     host = EngineHost()
-    assert host._persist_conversation_turn("s-local", "q", "a", {}) is True
+    result = host._persist_conversation_turn("s-local", "q", "a", {})
+    assert result.value == "committed"
     assert events == [("local", "s-local", "q", "a", {}, None)]
+
+
+def test_inference_http_request_id_replay_survives_host_restart(monkeypatch):
+    import inference_service.engine_host as engine_host_module
+
+    durable: dict[str, list[dict]] = {"default": []}
+    receipts: dict[str, tuple[str, str, str]] = {}
+
+    def save_turn(
+        session_id, user, assistant, metrics=None, *, operation_id=None,
+    ):
+        turn = (session_id, user, assistant)
+        if operation_id in receipts:
+            if receipts[operation_id] != turn:
+                raise ValueError("operation_id has conflicting conversation turn")
+            return False
+        receipts[operation_id] = turn
+        durable.setdefault(session_id, []).extend([
+            {"role": "user", "content": user},
+            {"role": "assistant", "content": assistant},
+        ])
+        return True
+
+    monkeypatch.setattr(
+        engine_host_module._local_store, "get_local_save_history", lambda: True,
+    )
+    monkeypatch.setattr(
+        engine_host_module._local_store, "save_local_conversation_turn", save_turn,
+    )
+    monkeypatch.setattr(
+        engine_host_module._local_store,
+        "load_local_conversation",
+        lambda session_id: list(durable.get(session_id, [])),
+    )
+    monkeypatch.setattr(
+        engine_host_module._local_store,
+        "update_local_session_title",
+        lambda *_args, **_kwargs: None,
+    )
+
+    headers = {"X-QLH-Request-ID": "req-restart-replay"}
+    first_host = make_full_host()
+    with TestClient(make_app(engine_host=first_host)) as first_client:
+        first = first_client.post(
+            "/v1/chat", json={"message": "same question"}, headers=headers,
+        )
+    assert first.status_code == 200
+    assert len(durable["default"]) == 2
+
+    restarted_host = make_full_host()
+    with TestClient(make_app(engine_host=restarted_host)) as second_client:
+        replay = second_client.post(
+            "/v1/chat", json={"message": "same question"}, headers=headers,
+        )
+
+    assert replay.status_code == 200
+    assert len(durable["default"]) == 2
+    assert restarted_host.session_history("default") == durable["default"]
+
+
+def test_inference_stream_producer_does_not_commit_before_terminal_consumption(
+    monkeypatch,
+):
+    import inference_service.engine_host as engine_host_module
+
+    writes = []
+    monkeypatch.setattr(
+        engine_host_module._local_store, "get_local_save_history", lambda: True,
+    )
+    monkeypatch.setattr(
+        engine_host_module._local_store,
+        "save_local_conversation_turn",
+        lambda *args, **kwargs: writes.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        engine_host_module._local_store,
+        "load_local_conversation",
+        lambda _session_id: [],
+    )
+
+    class StreamingModel(FakeModel):
+        def chat_stream(self, messages, **_kwargs):
+            del messages
+            yield "first"
+            yield "second"
+
+    host = make_full_host(StreamingModel)
+    cancel_event = threading.Event()
+    events = host.chat_stream_events_with_operation_id(
+        ChatRequest(message="stream", session_id="stream-session"),
+        cancel_event,
+        "req-stream-consume",
+    )
+
+    assert next(events) == {"token": "first"}
+    cancel_event.set()
+    with pytest.raises(ChatGenerationCancelled):
+        next(events)
+
+    assert writes == []
+    assert host.session_history("stream-session") == []
 
 
 def test_build_app_master_role(monkeypatch, tmp_path):

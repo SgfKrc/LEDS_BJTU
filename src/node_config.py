@@ -16,6 +16,28 @@ from pathlib import Path
 from typing import Any
 
 from network_address import canonical_host
+from release_contract import (
+    DEFAULT_PACKAGED_NODE_ROLE,
+    is_release_environment_locked,
+    release_profile_enforced,
+)
+
+
+_ROLE_ALIASES = {
+    "master": "master",
+    "auto": "auto",
+    "slave": "client",
+    "worker": "client",
+    "client": "client",
+}
+
+
+def _parse_node_role(value: Any, *, source: str) -> str:
+    raw = str(value or "").strip().lower()
+    try:
+        return _ROLE_ALIASES[raw]
+    except KeyError as exc:
+        raise ValueError(f"invalid node role from {source}: {value!r}") from exc
 
 
 def get_app_root() -> Path:
@@ -41,34 +63,19 @@ def get_node_config_path() -> Path:
 
 
 def resolve_initial_node_role() -> str:
-    """Resolve startup role without promoting an unconfigured source clone.
-
-    Packaged installs retain the historical master-first behavior for the
-    first-run setup UI.  A source checkout with no persisted configuration is
-    treated as a worker until the user explicitly selects ``master``.
-    """
+    """Resolve an explicit/confirmed role, then the release/development default."""
     explicit = os.environ.get("QLH_NODE_ROLE", "").strip().lower()
     if explicit:
-        if explicit == "master":
-            return "master"
-        if explicit == "auto":
-            return "auto"
-        if explicit in {"slave", "worker", "client"}:
-            return "client"
-        # An unrecognised role must not promote a source checkout.
-        return "master" if getattr(sys, "frozen", False) else "client"
+        return _parse_node_role(explicit, source="QLH_NODE_ROLE")
     data = load_node_config()
     node = data.get("node") if isinstance(data.get("node"), dict) else {}
     configured = str(node.get("role", "")).strip().lower()
-    if configured:
-        if configured == "master":
-            return "master"
-        if configured == "auto":
-            return "auto"
-        if configured in {"slave", "worker", "client"}:
-            return "client"
-        return "master" if getattr(sys, "frozen", False) else "client"
-    return "master" if getattr(sys, "frozen", False) else "client"
+    confirmed = bool(node.get("role_confirmed", False) or data.get("bootstrapped", False))
+    if configured and confirmed:
+        return _parse_node_role(configured, source="node_config.json")
+    if release_profile_enforced():
+        return DEFAULT_PACKAGED_NODE_ROLE
+    return "client"
 
 
 def load_node_config() -> dict[str, Any]:
@@ -256,19 +263,19 @@ def apply_node_config_to_env(
         cluster.get("master_api_port") if node.get("role") == "master" else None,
         overwrite=overwrite,
     )
-    # Feature gates are user-owned runtime preferences.  Keeping them in the
-    # node config lets the settings UI survive a restart without putting the
-    # flags (or any secrets) into the repository.
+    # Development feature gates remain user preferences. A release profile is
+    # an artifact-owned upper bound and cannot be changed by stale user state.
     features = data.get("features") if isinstance(data.get("features"), dict) else {}
-    # Unlike transport identity, these switches are deliberately controlled
-    # by the user's settings UI and therefore override a stale process-level
-    # .env value on startup.
-    _set_env_value("QLH_TASK_GRAPH_ENABLED", features.get("task_graph_enabled"), overwrite=True)
-    _set_env_value(
-        "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED",
-        features.get("task_worker_experimental_enabled"),
-        overwrite=True,
-    )
+    if not is_release_environment_locked("QLH_TASK_GRAPH_ENABLED"):
+        _set_env_value(
+            "QLH_TASK_GRAPH_ENABLED", features.get("task_graph_enabled"), overwrite=True,
+        )
+    if not is_release_environment_locked("QLH_TASK_WORKER_EXPERIMENTAL_ENABLED"):
+        _set_env_value(
+            "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED",
+            features.get("task_worker_experimental_enabled"),
+            overwrite=True,
+        )
     return data
 
 
@@ -337,6 +344,15 @@ def ensure_local_cluster_secret() -> str:
     role_confirmed = bool(node.get("role_confirmed", False) or data.get("bootstrapped", False))
     if not data and explicit_role:
         role_confirmed = True
+    persisted_node = {
+        **node,
+        "role_confirmed": role_confirmed,
+        "node_id": node.get("node_id", os.environ.get("QLH_NODE_ID", "master")),
+        "node_type": node.get("node_type", os.environ.get("QLH_NODE_TYPE", "pc")),
+        "pipeline_worker": bool(node.get("pipeline_worker", True)),
+    }
+    if explicit_role:
+        persisted_node["role"] = _parse_node_role(explicit_role, source="QLH_NODE_ROLE")
     data.update({
         "bootstrapped": bool(data.get("bootstrapped", False)),
         "cluster": {
@@ -344,13 +360,7 @@ def ensure_local_cluster_secret() -> str:
             "cluster_id": cluster.get("cluster_id", "qlh-default"),
             "cluster_secret": secret,
         },
-        "node": {
-            "role": node.get("role", os.environ.get("QLH_NODE_ROLE", "master")),
-            "role_confirmed": role_confirmed,
-            "node_id": node.get("node_id", os.environ.get("QLH_NODE_ID", "master")),
-            "node_type": node.get("node_type", os.environ.get("QLH_NODE_TYPE", "pc")),
-            "pipeline_worker": bool(node.get("pipeline_worker", True)),
-        },
+        "node": persisted_node,
     })
     write_node_config(data)
     os.environ.setdefault("QLH_CLUSTER_SECRET", secret)
