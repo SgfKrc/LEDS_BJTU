@@ -3787,9 +3787,10 @@ def test_scheduler_worker_lease_uses_duration_across_wall_clock_skew(
 
 
 def test_full_worker_stage_round_trips_through_independent_process(
-    monkeypatch,
+    monkeypatch, tmp_path,
 ):
     import config as cfg
+    import node_config as _node_config
     from task_graph import StageSpec, TaskGraphCoordinator
 
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -3797,7 +3798,16 @@ def test_full_worker_stage_round_trips_through_independent_process(
     port = probe.getsockname()[1]
     probe.close()
     secret = "n2-independent-process-secret"
+    # ★ 票9 SEC-BOUNDARY-01 起，集群长期凭据的唯一事实源是 LocalSecretStore：
+    #   `config` 导入时执行 `node_config.apply_node_config_to_env()`，会用 store 里的
+    #   (secret, epoch) 覆盖 `QLH_CLUSTER_SECRET`（防旧 .env 回滚已轮换凭据）。
+    #   因此只给子进程传 env 是无效的（两侧不同源 ⇒ TCP 注册 v2 HMAC 签名不匹配）。
+    #   这里把同一凭据写进一个临时 store，并让子进程指向它。
+    secret_store = tmp_path / "node-secret-store"
+    monkeypatch.setenv("QLH_NODE_SECRET_STORE_PATH", str(secret_store))
+    _node_config._store_cluster_credential(secret, 1)
     monkeypatch.setattr(cfg, "CLUSTER_SECRET", secret)
+    monkeypatch.setattr(cfg, "CLUSTER_SECRET_EPOCH", 1)
     control = TaskWorkerControlPlane()
     identity = ModelIdentity(
         model_id="qwen-1_8b",
@@ -3845,10 +3855,13 @@ def test_full_worker_stage_round_trips_through_independent_process(
     )
     env = dict(os.environ)
     env.update({
-        "QLH_CLUSTER_SECRET": secret,
+        # ★ 凭据以 store 为唯一来源（见上）；这里显式指向同一临时 store，
+        #   env 里的 QLH_CLUSTER_SECRET 反而会被 config 用 store 覆盖，故清除。
+        "QLH_NODE_SECRET_STORE_PATH": str(secret_store),
         "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED": "true",
         "PYTHONUTF8": "1",
     })
+    env.pop("QLH_CLUSTER_SECRET", None)
     process = None
     coordinator = TaskGraphCoordinator()
     try:
