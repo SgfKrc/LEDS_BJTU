@@ -158,6 +158,42 @@ def _mark_layer_config_pushed(sched, node_id: str) -> None:
     registry.transition(node_id, phase="ready")
 
 
+def _install_layer_assignment(
+    sched, node_id: str, expected: dict, *, ack: dict | None = None,
+    phase: str | None = None,
+) -> dict:
+    """Install one complete assignment fixture through the production source."""
+    payload = dict(expected)
+    state = sched._worker_assignments.begin(
+        node_id,
+        assignment_id=str(payload.get("assignment_id", "") or ""),
+        expected_config=payload,
+        reason_code="test_fixture",
+    )
+    canonical = sched._worker_assignments.expected(node_id)
+    if ack is not None:
+        receipt = {
+            "node_id": node_id,
+            "assignment_id": state.assignment_id,
+            "config_id": canonical.get("config_id", ""),
+            **({"generation": canonical["generation"]}
+               if "generation" in canonical else {}),
+            **dict(ack),
+        }
+        assert sched._worker_assignments.record_ack(node_id, receipt) is not None
+    if phase:
+        sched._worker_assignments.transition(node_id, phase=phase)
+    return canonical
+
+
+def _layer_expected(sched, node_id: str) -> dict:
+    return sched._worker_assignments.expected(node_id)
+
+
+def _layer_ack(sched, node_id: str) -> dict:
+    return sched._worker_assignments.acknowledgement(node_id)
+
+
 class TestComputeLayerAssignment:
     """测试动态分层计算"""
 
@@ -763,7 +799,7 @@ class TestComputeLayerAssignment:
         for node_id, start, end in (
             ("worker-a", 0, 2), ("worker-b", 2, 4),
         ):
-            sched._layer_config_expected[node_id] = {
+            _install_layer_assignment(sched, node_id, {
                 "node_id": node_id,
                 "config_id": "cfg-1",
                 "phase": "prepare",
@@ -773,11 +809,12 @@ class TestComputeLayerAssignment:
                 "required_bytes": 100,
                 "model_sha256": "sha",
                 "model_type": "qwen2",
-            }
+            })
 
         def ack(node_id, start, end):
             sched._handle_layer_config_ack(node_id, {"data": {
                 "node_id": node_id,
+                "assignment_id": _layer_expected(sched, node_id)["assignment_id"],
                 "config_id": "cfg-1",
                 "status": "prepared",
                 "phase": "prepare",
@@ -821,7 +858,7 @@ class TestComputeLayerAssignment:
             "worker_ids": {"worker-a", "worker-b"},
             "prepared_nodes": set(),
         }
-        sched._layer_config_expected["worker-a"] = {
+        _install_layer_assignment(sched, "worker-a", {
             "node_id": "worker-a",
             "config_id": "cfg-2",
             "generation": 2,
@@ -832,13 +869,15 @@ class TestComputeLayerAssignment:
             "required_bytes": 100,
             "model_sha256": "sha",
             "model_type": "qwen2",
-        }
+        })
 
         stale_error = {
             "node_id": "worker-a",
+            "assignment_id": _layer_expected(sched, "worker-a")["assignment_id"],
             "config_id": "cfg-2",
             "generation": 1,
             "status": "error",
+            "phase": "prepare",
             "error": "capacity changed",
         }
         sched._handle_layer_config_ack("worker-a", {"data": stale_error})
@@ -873,7 +912,7 @@ class TestComputeLayerAssignment:
             "worker_ids": {"worker"},
             "ready_nodes": set(),
         }
-        sched._layer_config_expected["worker"] = {
+        expected = _install_layer_assignment(sched, "worker", {
             "node_id": "worker",
             "config_id": "cfg-3",
             "phase": "commit",
@@ -882,10 +921,11 @@ class TestComputeLayerAssignment:
             "end_layer": 2,
             "model_sha256": "sha",
             "model_type": "qwen2",
-        }
+        })
 
         sched._handle_layer_config_ack("worker", {"data": {
             "node_id": "worker",
+            "assignment_id": expected["assignment_id"],
             "config_id": "cfg-3",
             "status": "ready",
             "phase": "commit",
@@ -947,7 +987,10 @@ class TestComputeLayerAssignment:
             "phase": "commit", "start_layer": 2, "end_layer": 4,
         }
         sched._active_pipeline_capacity_plan = dict(old_plan)
-        sched._layer_config_expected["worker"] = dict(old_expected)
+        old_expected = _install_layer_assignment(
+            sched, "worker", old_expected,
+        )
+        candidate_assignment_id = "asg_candidate_new"
         sched._pipeline_load_transaction = {
             "config_id": "cfg-new",
             "generation": 2,
@@ -977,6 +1020,7 @@ class TestComputeLayerAssignment:
             "ready_nodes": set(),
             "expected": {"worker": {
                 "node_id": "worker", "config_id": "cfg-new",
+                "assignment_id": candidate_assignment_id,
                 "generation": 2, "phase": "prepare",
                 "plan_id": "plan-new", "start_layer": 2, "end_layer": 4,
                 "has_lm_head": True,
@@ -990,7 +1034,8 @@ class TestComputeLayerAssignment:
         }
 
         sched._handle_layer_config_ack("worker", {"data": {
-            "node_id": "worker", "config_id": "cfg-new", "generation": 2,
+            "node_id": "worker", "assignment_id": candidate_assignment_id,
+            "config_id": "cfg-new", "generation": 2,
             "status": "prepared", "phase": "prepare", "plan_id": "plan-new",
             "layer_range": [2, 4], "model_sha256": "sha-new",
             "model_type": "qwen2", "engine": "pytorch",
@@ -999,11 +1044,29 @@ class TestComputeLayerAssignment:
 
         assert sched._pipeline_load_transaction["phase"] == "committing"
         assert sched._active_pipeline_capacity_plan == old_plan
-        assert sched._layer_config_expected["worker"] == old_expected
+        assert _layer_expected(sched, "worker") == old_expected
         assert [item[0] for item in calls] == ["materialize"]
+        commit_payload = next(
+            payload for _, payload in sent
+            if payload.get("phase") == "commit"
+        )
+        assert commit_payload["assignment_id"] == candidate_assignment_id
+        sched._handle_layer_config_ack("worker", {"data": {
+            "node_id": "worker", "assignment_id": candidate_assignment_id,
+            "config_id": "cfg-new", "generation": 2,
+            "status": "prepared", "phase": "prepare", "plan_id": "plan-new",
+            "layer_range": [2, 4], "model_sha256": "sha-new",
+            "model_type": "qwen2", "engine": "pytorch",
+            "available_bytes": 100,
+        }})
+        assert [item[0] for item in calls] == ["materialize"]
+        assert sum(
+            payload.get("phase") == "commit" for _, payload in sent
+        ) == 1
 
         sched._handle_layer_config_ack("worker", {"data": {
-            "node_id": "worker", "config_id": "cfg-new", "generation": 2,
+            "node_id": "worker", "assignment_id": candidate_assignment_id,
+            "config_id": "cfg-new", "generation": 2,
             "status": "ready", "phase": "commit", "plan_id": "plan-new",
             "layer_range": [2, 4], "model_sha256": "sha-new",
             "model_type": "qwen2", "engine": "pytorch",
@@ -1012,7 +1075,11 @@ class TestComputeLayerAssignment:
 
         assert sched._pipeline_load_transaction["phase"] == "ready"
         assert sched._active_pipeline_capacity_plan["plan_id"] == "plan-new"
-        assert sched._layer_config_expected["worker"]["config_id"] == "cfg-new"
+        assert _layer_expected(sched, "worker")["config_id"] == "cfg-new"
+        assert (
+            _layer_expected(sched, "worker")["assignment_id"]
+            == candidate_assignment_id
+        )
         assert [item[0] for item in calls] == [
             "materialize", "commit", "callback", "finalize",
         ]
@@ -1020,16 +1087,36 @@ class TestComputeLayerAssignment:
             payload for _, payload in sent if payload.get("finalize")
         )
         assert sched._pipeline_load_transaction["finalize_pending"] == {"worker"}
+        sched._handle_layer_config_ack("worker", {"data": {
+            "node_id": "worker", "assignment_id": candidate_assignment_id,
+            "config_id": "cfg-new", "generation": 2,
+            "status": "ready", "phase": "commit", "plan_id": "plan-new",
+            "layer_range": [2, 4], "model_sha256": "sha-new",
+            "model_type": "qwen2", "engine": "pytorch",
+            "has_lm_head": True,
+        }})
+        assert [item[0] for item in calls] == [
+            "materialize", "commit", "callback", "finalize",
+        ]
+        assert sum(bool(payload.get("finalize")) for _, payload in sent) == 1
 
         sched._handle_layer_config_ack("worker", {"data": {
-            "node_id": "worker",
-            "config_id": finalize_payload["config_id"],
-            "generation": 2,
+            **finalize_payload,
             "status": "finalized",
-            "finalized_config_id": "cfg-new",
         }})
 
         assert sched._pipeline_load_transaction["finalize_pending"] == set()
+        assert finalize_payload["config_id"] not in (
+            sched._pipeline_model_cleanup_ledger
+        )
+        sched._handle_layer_config_ack("worker", {"data": {
+            **finalize_payload,
+            "status": "finalized",
+        }})
+        assert sched._pipeline_load_transaction["finalize_pending"] == set()
+        assert [item[0] for item in calls] == [
+            "materialize", "commit", "callback", "finalize",
+        ]
 
     def test_candidate_reshard_failure_aborts_without_publishing(
             self, sched, monkeypatch):
@@ -1153,6 +1240,129 @@ class TestComputeLayerAssignment:
         assert sched._active_pipeline_capacity_plan == old_plan
         assert calls == ["candidate-timeout"]
 
+    def test_candidate_abort_does_not_restore_invalidated_active_assignment(
+            self, sched):
+        class Host:
+            def abort_pipeline_candidate(self, _transaction_id):
+                return None
+
+        sched._host = Host()
+        active = _install_layer_assignment(sched, "worker", {
+            "node_id": "worker",
+            "config_id": "cfg-active",
+            "generation": 5,
+        })
+        active_plan = {"admitted": True, "plan_id": "plan-active"}
+        sched._active_pipeline_capacity_plan = dict(active_plan)
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-candidate",
+            "generation": 6,
+            "phase": "preparing",
+            "candidate_id": "candidate-new",
+            "plan": {"model_id": "new-model"},
+            "worker_ids": {"worker"},
+            "expected": {"worker": {
+                "node_id": "worker",
+                "assignment_id": "asg-candidate",
+                "config_id": "cfg-candidate",
+                "generation": 6,
+            }},
+            "previous_control_state": {
+                "retry_state": {},
+                "assignments": sched._worker_assignments.snapshot(),
+                "active_plan": dict(active_plan),
+            },
+        }
+
+        sched._worker_assignments.release(
+            "worker", reason_code="connection_closed",
+        )
+        sched._active_pipeline_capacity_plan = None
+        sched._abort_pipeline_load_transaction(
+            "cfg-candidate", "candidate_failed", "test abort",
+        )
+
+        state = sched._worker_assignments.state("worker")
+        assert state is not None
+        assert state.assignment_id == active["assignment_id"]
+        assert state.phase == "released"
+        assert sched._worker_assignments.expected("worker") == {}
+        assert sched._active_pipeline_capacity_plan is None
+
+    def test_candidate_abort_preserves_valid_active_assignment(
+            self, sched):
+        sent = []
+
+        class Host:
+            def abort_pipeline_candidate(self, _transaction_id):
+                return None
+
+        sched._host = Host()
+        sched._tcp_server = type("Server", (), {
+            "_running": True,
+            "send_layer_config": lambda self, node_id, payload: sent.append(
+                (node_id, dict(payload))
+            ),
+        })()
+        active = _install_layer_assignment(
+            sched,
+            "worker",
+            {
+                "node_id": "worker",
+                "config_id": "cfg-active",
+                "generation": 5,
+                "start_layer": 0,
+                "end_layer": 2,
+                "model_sha256": "sha-active",
+                "model_type": "qwen2",
+            },
+            ack={
+                "status": "ready",
+                "layer_range": [0, 2],
+                "model_sha256": "sha-active",
+                "model_type": "qwen2",
+                "engine": "pytorch",
+            },
+            phase="ready",
+        )
+        active_plan = {"admitted": True, "plan_id": "plan-active"}
+        sched._active_pipeline_capacity_plan = dict(active_plan)
+        active_snapshot = sched._worker_assignments.snapshot()
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-candidate",
+            "generation": 6,
+            "phase": "preparing",
+            "candidate_id": "candidate-new",
+            "plan": {"model_id": "new-model"},
+            "worker_ids": {"worker"},
+            "expected": {"worker": {
+                "node_id": "worker",
+                "assignment_id": "asg-candidate",
+                "config_id": "cfg-candidate",
+                "generation": 6,
+            }},
+            "previous_control_state": {
+                "retry_state": {},
+                "assignments": active_snapshot,
+                "active_plan": dict(active_plan),
+            },
+        }
+
+        sched._abort_pipeline_load_transaction(
+            "cfg-candidate", "candidate_failed", "test abort",
+        )
+
+        assert sched._worker_assignments.snapshot() == active_snapshot
+        assert sched._active_pipeline_capacity_plan == active_plan
+        assert _layer_expected(sched, "worker")["assignment_id"] == (
+            active["assignment_id"]
+        )
+        assert len(sched._pipeline_model_cleanup_ledger) == 1
+        cleanup = next(iter(sched._pipeline_model_cleanup_ledger.values()))
+        assert cleanup["assignment_id"] == "asg-candidate"
+        assert cleanup["candidate_config_id"] == "cfg-candidate"
+        assert sent == [("worker", cleanup["payload"])]
+
     def test_master_finalize_cleanup_retries_and_blocks_new_candidate(
             self, sched, monkeypatch):
         calls = []
@@ -1207,12 +1417,14 @@ class TestComputeLayerAssignment:
             candidate_config_id="cfg-candidate",
             generation=9,
             action="finalize",
+            assignment_id="asg-candidate",
             payload={"finalize": True},
         )
         cleanup_id = record["cleanup_id"]
         canonical = {
             "node_id": "worker",
             "config_id": cleanup_id,
+            "assignment_id": "asg-candidate",
             "generation": 9,
             "status": "finalized",
             "cleanup_action": "finalize",
@@ -1222,7 +1434,15 @@ class TestComputeLayerAssignment:
 
         mismatches = [
             dict(canonical, config_id="wrong-cleanup"),
+            dict(canonical, assignment_id=""),
+            dict(canonical, assignment_id="asg-stale"),
             dict(canonical, cleanup_action="abort"),
+            dict(canonical, status="released"),
+            dict(
+                canonical,
+                finalized_config_id="",
+                aborted_config_id="cfg-candidate",
+            ),
             dict(
                 canonical,
                 candidate_config_id="cfg-other",
@@ -1233,6 +1453,8 @@ class TestComputeLayerAssignment:
         for payload in mismatches:
             assert sched._ack_pipeline_model_cleanup("worker", payload) is False
             assert cleanup_id in sched._pipeline_model_cleanup_ledger
+        assert sched._ack_pipeline_model_cleanup("other-worker", canonical) is False
+        assert cleanup_id in sched._pipeline_model_cleanup_ledger
 
         assert sched._ack_pipeline_model_cleanup("worker", canonical) is True
         assert sched._pipeline_model_cleanup_ledger == {}
@@ -1371,6 +1593,55 @@ class TestComputeLayerAssignment:
         assert sched._layer_config_inflight == set()
         assert sched._layer_config_generation > 10
 
+    def test_model_change_invalidates_candidate_into_durable_abort_cleanup(
+            self, sched):
+        aborted = []
+        sent = []
+        sched._host = type("Host", (), {
+            "abort_pipeline_candidate": (
+                lambda self, candidate_id: aborted.append(candidate_id)
+            ),
+        })()
+        sched._tcp_server = type("Server", (), {
+            "_running": True,
+            "send_layer_config": (
+                lambda self, node_id, payload: sent.append(
+                    (node_id, dict(payload))
+                )
+            ),
+        })()
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-model-change",
+            "candidate_id": "candidate-local",
+            "generation": 10,
+            "phase": "preparing",
+            "plan": {"model_id": "model-next"},
+            "worker_ids": {"worker"},
+            "expected": {
+                "worker": {
+                    "node_id": "worker",
+                    "config_id": "cfg-model-change",
+                    "assignment_id": "asg-candidate",
+                },
+            },
+        }
+
+        sched._invalidate_pipeline_load_transaction(
+            reason_code="pipeline_model_changed",
+            reason="local model replacement committed",
+        )
+
+        assert sched._pipeline_load_transaction["phase"] == "invalidated"
+        assert aborted == ["candidate-local"]
+        assert len(sched._pipeline_model_cleanup_ledger) == 1
+        record = next(iter(sched._pipeline_model_cleanup_ledger.values()))
+        assert record["node_id"] == "worker"
+        assert record["candidate_config_id"] == "cfg-model-change"
+        assert record["assignment_id"] == "asg-candidate"
+        assert record["action"] == "abort"
+        assert record["payload"]["aborted_config_id"] == "cfg-model-change"
+        assert sent == [("worker", record["payload"])]
+
     def test_superseded_local_commit_is_not_published(self, sched, monkeypatch):
         sent = []
         plan = {
@@ -1391,14 +1662,14 @@ class TestComputeLayerAssignment:
             "worker_ids": {"worker"},
             "prepared_nodes": set(),
         }
-        sched._layer_config_expected["worker"] = {
+        _install_layer_assignment(sched, "worker", {
             "node_id": "worker",
             "config_id": "cfg-superseded",
             "phase": "prepare",
             "plan_id": "plan-superseded",
             "start_layer": 2,
             "end_layer": 4,
-        }
+        })
         sched._host = type("Host", (), {
             "prepare_pipeline_tokenizer": lambda self: None,
             "load_layer_range": lambda self, *args, **kwargs: (
@@ -1430,7 +1701,7 @@ class TestComputeLayerAssignment:
             "worker_ids": {"worker"},
             "ready_nodes": set(),
         }
-        sched._layer_config_expected["worker"] = {
+        expected = _install_layer_assignment(sched, "worker", {
             "node_id": "worker",
             "config_id": "cfg-late-prepare",
             "phase": "commit",
@@ -1440,11 +1711,12 @@ class TestComputeLayerAssignment:
             "required_bytes": 100,
             "model_sha256": "sha",
             "model_type": "qwen2",
-        }
+        })
 
         with caplog.at_level(logging.ERROR):
             sched._handle_layer_config_ack("worker", {"data": {
                 "node_id": "worker",
+                "assignment_id": expected["assignment_id"],
                 "config_id": "cfg-late-prepare",
                 "status": "prepared",
                 "phase": "prepare",
@@ -1456,7 +1728,7 @@ class TestComputeLayerAssignment:
                 "available_bytes": 100,
             }})
 
-        assert sched._layer_config_acks["worker"]["status"] == "prepared"
+        assert _layer_ack(sched, "worker")["status"] == "prepared"
         assert sched._pipeline_load_transaction["phase"] == "committing"
         assert not any("阶段未通过" in record.message for record in caplog.records)
 
@@ -1595,7 +1867,7 @@ class TestComputeLayerAssignment:
             "worker_ids": {"worker"},
             "ready_nodes": set(),
         }
-        sched._layer_config_expected["worker"] = {
+        expected = _install_layer_assignment(sched, "worker", {
             "node_id": "worker",
             "config_id": "cfg-generation",
             "generation": 8,
@@ -1605,9 +1877,10 @@ class TestComputeLayerAssignment:
             "end_layer": 2,
             "model_sha256": "sha",
             "model_type": "qwen2",
-        }
+        })
         stale = {
             "node_id": "worker",
+            "assignment_id": expected["assignment_id"],
             "config_id": "cfg-generation",
             "generation": 7,
             "status": "ready",
@@ -1621,7 +1894,7 @@ class TestComputeLayerAssignment:
         sched._handle_layer_config_ack("worker", {"data": stale})
         assert sched._pipeline_load_transaction["phase"] == "committing"
         assert sched._layer_config_pushed == set()
-        assert "worker" not in sched._layer_config_acks
+        assert _layer_ack(sched, "worker") == {}
 
         sched._handle_layer_config_ack(
             "worker", {"data": {**stale, "generation": 8}},
@@ -2496,10 +2769,10 @@ class TestPipelineReadiness:
             "ready_nodes": {"worker-a"},
             "plan": {"assignments": []},
         }
-        sched._layer_config_expected["worker-a"] = {
+        _install_layer_assignment(sched, "worker-a", {
             "config_id": "cfg-new",
             "generation": 8,
-        }
+        })
         sched._pipeline_recovery_pending = True
         sched._maybe_finish_pipeline_recovery()
         assert sched._pipeline_recovery_pending is True
@@ -2673,7 +2946,7 @@ class TestPipelineReadiness:
 
         snapshot = sched._pipeline_lifecycle_snapshot_locked()
 
-        assert snapshot["schema_version"] == 3
+        assert snapshot["schema_version"] == 4
         assert snapshot["worker_ids"] == ["worker-a", "worker-b"]
         assert snapshot["prepared_nodes"] == ["worker-a"]
         assert snapshot["assignments"] == [{
@@ -2687,6 +2960,7 @@ class TestPipelineReadiness:
             "cleanup_id": cleanup["cleanup_id"],
             "node_id": "worker-a",
             "candidate_config_id": "cfg-1",
+            "assignment_id": "",
             "generation": 3,
             "action": "finalize",
             "created_at": cleanup["created_at"],
@@ -2743,6 +3017,78 @@ class TestPipelineReadiness:
         assert restored["state"] == "await_reconnect"
         assert restored["attempts"] == 0
         assert restored["next_retry"] == 0.0
+        assert restored["legacy_identity"] is True
+        assert restored["assignment_id"] == ""
+        assert restored["payload"]["assignment_id"] == ""
+        assert restored["payload"]["aborted_config_id"] == "cfg-worker"
+
+    def test_schema_v4_cleanup_round_trip_preserves_exact_assignment(
+            self, sched, monkeypatch):
+        import local_store
+
+        record = sched._record_pipeline_model_cleanup_locked(
+            node_id="worker-a",
+            candidate_config_id="cfg-worker",
+            generation=8,
+            action="finalize",
+            assignment_id="asg-worker",
+            payload={
+                "finalize": True,
+                "finalized_config_id": "cfg-worker",
+            },
+        )
+        snapshot = sched._pipeline_lifecycle_snapshot_locked()
+        sched._pipeline_model_cleanup_ledger.clear()
+        monkeypatch.setattr(
+            local_store, "get_local_setting",
+            lambda _key, _default=None: snapshot,
+        )
+
+        sched._load_pipeline_recovery_state()
+
+        restored = sched._pipeline_model_cleanup_ledger[record["cleanup_id"]]
+        assert restored["legacy_identity"] is False
+        assert restored["assignment_id"] == "asg-worker"
+        assert restored["payload"]["assignment_id"] == "asg-worker"
+        monkeypatch.setattr(
+            sched, "push_layer_config_to_clients", lambda: None,
+        )
+        ack = dict(restored["payload"])
+        ack["status"] = "finalized"
+
+        assert sched._ack_pipeline_model_cleanup("worker-a", ack) is True
+        assert sched._pipeline_model_cleanup_ledger == {}
+
+    def test_schema_v4_cleanup_payload_drift_fails_recovery_closed(
+            self, sched, monkeypatch):
+        import local_store
+
+        sched._record_pipeline_model_cleanup_locked(
+            node_id="worker-a",
+            candidate_config_id="cfg-worker",
+            generation=8,
+            action="abort",
+            assignment_id="asg-worker",
+            payload={
+                "release": True,
+                "abort": True,
+                "aborted_config_id": "cfg-worker",
+            },
+        )
+        snapshot = sched._pipeline_lifecycle_snapshot_locked()
+        snapshot["cleanup_ledger"][0]["payload"]["assignment_id"] = "asg-stale"
+        sched._pipeline_model_cleanup_ledger.clear()
+        monkeypatch.setattr(
+            local_store, "get_local_setting",
+            lambda _key, _default=None: snapshot,
+        )
+
+        sched._load_pipeline_recovery_state()
+
+        assert sched._pipeline_model_cleanup_ledger == {}
+        assert sched._pipeline_recovery_pending is True
+        assert sched._pipeline_recovery_failure == "pipeline_recovery_state_invalid"
+        assert sched._pipeline_lifecycle_persist_ok is False
 
     def test_schema_v1_recovery_without_model_digest_fails_closed(
             self, sched, monkeypatch):
@@ -2993,6 +3339,7 @@ class TestPipelineReadiness:
             "type": "layer_config_ack",
             "data": {
                 "node_id": "client1",
+                "assignment_id": payload["assignment_id"],
                 "config_id": payload["config_id"],
                 "generation": payload["generation"],
                 "status": "ready",
@@ -3003,6 +3350,33 @@ class TestPipelineReadiness:
             },
         })
         assert sched._all_pipeline_nodes_ready() is True
+
+    def test_publish_captures_authenticated_connection_epoch(
+            self, sched, monkeypatch):
+        sent = []
+        sched._tcp_server = type("Server", (), {
+            "get_authenticated_peer_epoch": lambda self, node_id: (
+                37 if node_id == "client1" else 0
+            ),
+            "send_layer_config": lambda self, node_id, payload: sent.append(
+                (node_id, dict(payload))
+            ),
+        })()
+        monkeypatch.setattr(
+            sched, "_start_layer_config_retry_monitor", lambda: None,
+        )
+
+        configs = {"client1": {
+            "node_id": "client1",
+            "config_id": "cfg-epoch",
+            "generation": 11,
+        }}
+        sched._publish_layer_configs(configs)
+
+        state = sched._worker_assignments.state("client1")
+        assert state is not None
+        assert state.connection_generation == 37
+        assert sent[0][1]["assignment_id"] == state.assignment_id
 
     def test_readiness_reports_worker_layer_load_error(self, sched, monkeypatch):
         """在线不等于可计算，层加载错误必须成为明确的阻塞原因。"""
@@ -3023,12 +3397,11 @@ class TestPipelineReadiness:
                  "layers_count": 16},
             ],
         })
-        sched._layer_config_expected["client1"] = {
+        _install_layer_assignment(sched, "client1", {
             "config_id": "cfg-1", "model_id": "deepseek-r1",
-        }
-        sched._layer_config_acks["client1"] = {
+        }, ack={
             "status": "error", "error": "missing tokenizer.json",
-        }
+        })
 
         readiness = sched._get_pipeline_readiness()
 
@@ -3062,9 +3435,9 @@ class TestPipelineReadiness:
                  "layers_count": 16},
             ],
         })
-        sched._layer_config_expected["client1"] = {
+        _install_layer_assignment(sched, "client1", {
             "config_id": "cfg-1", "model_id": "qwen-1_8b",
-        }
+        })
 
         status = sched._get_pipeline_status()
 
@@ -3152,6 +3525,69 @@ class TestPipelineWaitResult:
         assert result["step"] >= 2
         assert elapsed < 0.5
 
+    def test_wait_for_layer_result_uses_one_absolute_request_deadline(self, sched):
+        from request_deadline import RequestDeadline
+
+        request_deadline = RequestDeadline.start(0.24)
+
+        def publish_first_result():
+            key = "task-deadline-first:client1"
+            with sched._pipeline_lock:
+                sched._pipeline_results[key] = {
+                    "task_id": "task-deadline-first",
+                    "node_id": "client1",
+                }
+                event = sched._pipeline_events.get(key)
+                if event is not None:
+                    event.set()
+
+        threading.Timer(0.06, publish_first_result).start()
+        started = time.monotonic()
+        first = sched._wait_for_layer_result(
+            "task-deadline-first",
+            "client1",
+            timeout=5.0,
+            request_deadline=request_deadline,
+        )
+        second = sched._wait_for_layer_result(
+            "task-deadline-second",
+            "client1",
+            timeout=5.0,
+            request_deadline=request_deadline,
+        )
+        elapsed = time.monotonic() - started
+
+        assert first["task_id"] == "task-deadline-first"
+        assert second["reason_code"] == "request_deadline_exceeded"
+        assert elapsed < 0.5
+
+    def test_legacy_layer_wait_signature_still_uses_remaining_deadline(
+        self, sched, monkeypatch,
+    ):
+        from request_deadline import RequestDeadline
+
+        observed = {}
+
+        def old_wait(task_id, node_ids, timeout):
+            observed["timeout"] = timeout
+            time.sleep(timeout + 0.02)
+            return {"task_id": task_id, "node_id": node_ids}
+
+        monkeypatch.setattr(sched, "_wait_for_layer_result", old_wait)
+        request_deadline = RequestDeadline.start(0.08)
+        result = sched._wait_for_layer_result_with_ack(
+            "task-legacy-deadline",
+            "client1",
+            timeout=5.0,
+            ack_node_ids=["client1"],
+            ack_step=0,
+            ack_timeout=5.0,
+            request_deadline=request_deadline,
+        )
+
+        assert observed["timeout"] <= 0.081
+        assert result["reason_code"] == "request_deadline_exceeded"
+
     def test_result_before_wait(self, sched):
         """在等待线程中，另一侧注入结果 → 应立即唤醒"""
         import threading
@@ -3207,10 +3643,12 @@ class TestPipelineMessageDispatch:
         """_handle_layer_result 应将结果存入并触发 event"""
         sched._pipeline_active_tasks.add("task_1")
         sched._pipeline_task_contracts["task_1"] = {
+            "execution_protocol": "legacy_layer_v1",
             "config_id": "cfg-1",
             "model_sha256": "sha-1",
             "model_type": "qwen2",
             "worker_ids": ["client1"],
+            "assignment_ids": {"client1": "asg-client1"},
             "last_node_id": "client1",
             "current_step": 0,
         }
@@ -3220,6 +3658,7 @@ class TestPipelineMessageDispatch:
                 "task_id": "task_1",
                 "node_id": "client1",
                 "step": 0,
+                "assignment_id": "asg-client1",
                 "config_id": "cfg-1",
                 "model_sha256": "sha-1",
                 "model_type": "qwen2",
@@ -3248,19 +3687,48 @@ class TestPipelineMessageDispatch:
         })
         assert sched._pipeline_results == {}
 
+    def test_route_a_task_rejects_identity_less_legacy_layer_result(self, sched):
+        sched._pipeline_active_tasks.add("task-route-a")
+        sched._pipeline_task_contracts["task-route-a"] = {
+            "execution_protocol": "route_a_stage_v3",
+            "config_id": "route_a:task-route-a",
+            "model_sha256": "sha-route-a",
+            "model_type": "qwen2",
+            "worker_ids": ["client1"],
+            "last_node_id": "client1",
+            "current_step": 0,
+        }
+
+        sched._handle_layer_result("client1", {"data": {
+            "task_id": "task-route-a",
+            "node_id": "client1",
+            "step": 0,
+            "config_id": "route_a:task-route-a",
+            "model_sha256": "sha-route-a",
+            "model_type": "qwen2",
+            "error": "spoofed legacy result",
+        }})
+
+        assert sched._pipeline_results == {}
+
     def test_layer_result_rejects_spoofed_source_and_stale_step(self, sched):
         sched._pipeline_active_tasks.add("task-contract")
         sched._pipeline_task_contracts["task-contract"] = {
+            "execution_protocol": "legacy_layer_v1",
             "config_id": "cfg-contract",
             "model_sha256": "sha-contract",
             "model_type": "qwen2",
             "worker_ids": ["client1", "client2"],
+            "assignment_ids": {
+                "client1": "asg-client1", "client2": "asg-client2",
+            },
             "last_node_id": "client2",
             "current_step": 1,
         }
         base = {
             "task_id": "task-contract",
             "step": 1,
+            "assignment_id": "asg-client2",
             "config_id": "cfg-contract",
             "model_sha256": "sha-contract",
             "model_type": "qwen2",
@@ -3274,6 +3742,47 @@ class TestPipelineMessageDispatch:
         )
 
         assert sched._pipeline_results == {}
+
+    def test_active_task_uses_frozen_assignment_after_worker_reconfiguration(
+            self, sched):
+        old = _install_layer_assignment(sched, "client1", {
+            "node_id": "client1",
+            "config_id": "cfg-shared",
+            "generation": 3,
+        })
+        sched._pipeline_active_tasks.add("task-frozen")
+        sched._pipeline_task_contracts["task-frozen"] = {
+            "execution_protocol": "legacy_layer_v1",
+            "config_id": "cfg-shared",
+            "model_sha256": "sha-shared",
+            "model_type": "qwen2",
+            "worker_ids": ["client1"],
+            "assignment_ids": {
+                "client1": old["assignment_id"],
+            },
+            "last_node_id": "client1",
+            "current_step": 0,
+        }
+        new = _install_layer_assignment(sched, "client1", {
+            "node_id": "client1",
+            "config_id": "cfg-shared",
+            "generation": 3,
+        })
+        assert new["assignment_id"] != old["assignment_id"]
+
+        sched._handle_layer_result("client1", {"data": {
+            "task_id": "task-frozen",
+            "node_id": "client1",
+            "step": 0,
+            "assignment_id": old["assignment_id"],
+            "config_id": "cfg-shared",
+            "model_sha256": "sha-shared",
+            "model_type": "qwen2",
+            "chain_path": ["client1"],
+            "hidden_states": "dGVzdA==",
+        }})
+
+        assert "task-frozen:client1" in sched._pipeline_results
 
     def test_pipeline_done_clears_kv_cache(self, sched):
         """PIPELINE_DONE 应清理指定 task 的 KV 缓存"""
@@ -3367,6 +3876,7 @@ class TestPipelineMessageDispatch:
         assert _host.current_quant == "fp16"
         assert sched._active_layer_config == {
             "node_id": "client1",
+            "assignment_id": "",
             "config_id": "cfg-1",
             "model_id": "qwen-test",
             "model_sha256": "sha-qwen",
@@ -3572,6 +4082,7 @@ class TestPipelineMessageDispatch:
             "is_loaded": False, "model_loaded": False, "layer_range": None,
         })()
         sched._active_layer_config = {
+            "assignment_id": "asg-relay",
             "config_id": "cfg-relay", "model_id": "qwen-test",
             "model_sha256": "sha-relay", "model_type": "qwen2",
             "layer_range": [8, 16], "engine": "relay_middle",
@@ -3588,6 +4099,7 @@ class TestPipelineMessageDispatch:
         hidden = (b"\x00" * (4 * 4))
         sched._handle_layer_forward_locked("master", {"data": {
             "task_id": "relay-task", "step": 0, "use_kv_cache": False,
+            "assignment_id": "asg-relay",
             "config_id": "cfg-relay", "model_sha256": "sha-relay",
             "model_type": "qwen2", "hidden_states": hidden,
             "hidden_shape": [4, 4], "relay_segment": relay_spec,
@@ -3731,6 +4243,7 @@ class TestPipelineMessageDispatch:
         monkeypatch.setattr(pipeline_module, "PIPELINE_RELAY_ENABLED", True)
         active = {
             "node_id": "worker",
+            "assignment_id": "asg-duplicate",
             "config_id": "cfg-duplicate",
             "model_id": "tiny-qwen2",
             "model_sha256": "sha",
@@ -4073,12 +4586,13 @@ class TestPipelineMessageDispatch:
             "model_sha256": "sha-qwen",
             "model_type": "qwen",
         }
-        sched._layer_config_expected["client1"] = expected
+        expected = _install_layer_assignment(sched, "client1", expected)
 
         stale = {
             "type": "layer_config_ack",
             "data": {
                 "node_id": "client1",
+                "assignment_id": expected["assignment_id"],
                 "config_id": "cfg-old",
                 "status": "ready",
                 "layer_range": [8, 16],
@@ -4103,19 +4617,19 @@ class TestPipelineMessageDispatch:
         sched._tcp_server.send_layer_config.side_effect = (
             lambda node_id, data: sent.append((node_id, data))
         )
-        sched._layer_config_expected["client1"] = {
+        expected = _install_layer_assignment(sched, "client1", {
             "node_id": "client1",
             "config_id": "cfg-same",
             "start_layer": 0,
             "end_layer": 8,
-        }
+        })
         sched._layer_config_retry_state["client1"] = {
             "attempts": 1,
             "next_retry": 0.0,
         }
 
         assert sched._retry_pending_layer_configs(now=10.0) == 1
-        assert sent == [("client1", sched._layer_config_expected["client1"])]
+        assert sent == [("client1", expected)]
         assert sent[0][1]["config_id"] == "cfg-same"
 
     def test_duplicate_ready_config_only_resends_cached_ack(self, sched, monkeypatch):
@@ -4387,6 +4901,216 @@ class TestPipelineFallback:
 
         assert result["response"] == "distributed"
         assert sync_timeouts == [3]
+
+    def test_model_sync_exhausting_request_budget_does_not_fallback(
+            self, sched, monkeypatch):
+        from model_host import model_host as _host
+
+        class MockModelManager:
+            is_loaded = True
+            _engine_type = "pytorch"
+
+        monkeypatch.setattr(_host, "_manager", MockModelManager())
+        monkeypatch.setattr(sched, "_all_pipeline_nodes_ready", lambda: False)
+
+        def slow_sync(**_kwargs):
+            time.sleep(0.08)
+            return {"ready": False, "reason": "still loading"}
+
+        monkeypatch.setattr(
+            sched, "_synchronize_pipeline_workers_for_request", slow_sync,
+        )
+        monkeypatch.setattr(
+            sched,
+            "_run_full_model_inference",
+            lambda *args, **kwargs: pytest.fail(
+                "deadline exhaustion must not enter full-model fallback"
+            ),
+        )
+
+        result = sched.run_pipeline_safe(
+            "deadline during prepare",
+            _request_timeout_seconds=0.05,
+            _pipeline_model_sync_timeout=1.0,
+        )
+
+        assert result["reason_code"] == "request_deadline_exceeded"
+        assert result["metrics"]["fallback"] is False
+
+    def test_full_model_stream_deadline_keeps_lock_until_worker_stops(
+            self, sched, monkeypatch):
+        from request_deadline import RequestDeadline
+
+        entered = threading.Event()
+        release_worker = threading.Event()
+        worker_exited = threading.Event()
+
+        class BlockingModelManager:
+            is_loaded = True
+            is_pipeline_prepared = False
+            layer_range = None
+            _engine_type = "pytorch"
+            tokenizer = object()
+
+            def ensure_full_model(self):
+                return None
+
+            def get_pipeline_descriptor(self):
+                return {}
+
+            def chat_stream(self, **_kwargs):
+                entered.set()
+                try:
+                    release_worker.wait(timeout=2.0)
+                    yield "late"
+                finally:
+                    worker_exited.set()
+
+        callbacks = type("Callbacks", (), {
+            "build_model_chat_prompt": staticmethod(lambda *_args: "prompt"),
+            "format_model_response": staticmethod(
+                lambda text, *_args, **_kwargs: (text, None)
+            ),
+        })()
+        sched._host = BlockingModelManager()
+        monkeypatch.setattr(sched, "_require_callbacks", lambda: callbacks)
+
+        started = time.monotonic()
+        try:
+            events = list(sched._run_full_model_inference_stream(
+                "blocked stream",
+                _request_deadline=RequestDeadline.start(0.08),
+            ))
+            elapsed = time.monotonic() - started
+
+            assert entered.is_set()
+            assert elapsed < 0.5
+            assert events[-1]["reason_code"] == "request_deadline_exceeded"
+            assert not sched._inference_lock.acquire(blocking=False), (
+                "backend worker 仍运行时不得提前释放推理锁"
+            )
+        finally:
+            release_worker.set()
+
+        assert worker_exited.wait(timeout=1.0)
+        acquire_deadline = time.monotonic() + 1.0
+        while time.monotonic() < acquire_deadline:
+            if sched._inference_lock.acquire(blocking=False):
+                sched._inference_lock.release()
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("backend worker 结束后推理锁未最终释放")
+
+    def test_q0_restore_lock_wait_is_bounded_by_original_deadline(
+            self, sched, monkeypatch):
+        from request_deadline import RequestDeadline
+        from scheduler_types import PreemptState, QueueTask
+
+        class ScriptedLock:
+            def __init__(self):
+                self.acquire_calls = 0
+                self.held = False
+
+            def acquire(self, blocking=True, timeout=-1):
+                del blocking
+                self.acquire_calls += 1
+                if self.acquire_calls == 1:
+                    self.held = True
+                    return True
+                if timeout is not None and timeout > 0:
+                    time.sleep(timeout)
+                return False
+
+            def release(self):
+                assert self.held
+                self.held = False
+
+        scripted_lock = ScriptedLock()
+        sched._inference_lock = scripted_lock
+        monkeypatch.setattr(sched, "_all_pipeline_nodes_ready", lambda: False)
+        monkeypatch.setattr(
+            sched,
+            "_run_full_model_inference",
+            lambda *args, **kwargs: {"response": "q0", "metrics": {}},
+        )
+        q0_task = QueueTask(
+            task_id="q0-deadline",
+            prompt="urgent",
+            max_new_tokens=1,
+            priority_level=0,
+            original_level=0,
+        )
+        preempt_state = PreemptState(
+            task_id="original-deadline",
+            generated_ids=[],
+            full_input_ids=None,
+            current_step=1,
+            max_new_tokens=32,
+            temperature=0.7,
+            top_p=0.9,
+            prompt="original",
+            pipeline_nodes=[],
+            first_node_id="worker-1",
+        )
+        lock_state = {"held": False}
+        sched.pipeline_queue._current_task_id = preempt_state.task_id
+
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="restoring preempted"):
+            sched._execute_q0_inline(
+                q0_task,
+                preempt_state,
+                RequestDeadline.start(0.06),
+                lock_state,
+            )
+
+        assert time.monotonic() - started < 0.3
+        assert scripted_lock.acquire_calls == 2
+        assert lock_state["held"] is False
+        assert sched.pipeline_queue._current_task_id == preempt_state.task_id
+
+    def test_late_queue_result_cannot_overwrite_request_deadline(
+            self, sched, monkeypatch):
+        from model_host import model_host as _host
+
+        class MockModelManager:
+            is_loaded = True
+            _engine_type = "pytorch"
+
+        monkeypatch.setattr(_host, "_manager", MockModelManager())
+        monkeypatch.setattr(sched, "_all_pipeline_nodes_ready", lambda: True)
+        monkeypatch.setattr(
+            sched.pipeline_queue, "enqueue", lambda **_kwargs: "queued-late",
+        )
+
+        def late_result(*_args, **_kwargs):
+            time.sleep(0.08)
+            return {
+                "status": "done",
+                "result": {"response": "too late", "metrics": {}},
+            }
+
+        cancelled = []
+        monkeypatch.setattr(
+            sched.pipeline_queue, "wait_for_result", late_result,
+        )
+        monkeypatch.setattr(
+            sched.pipeline_queue,
+            "cancel_task",
+            lambda task_id: cancelled.append(task_id) or True,
+        )
+        sched.pipeline_queue._current_task_id = "busy"
+        try:
+            result = sched.run_pipeline_safe(
+                "queued deadline", _request_timeout_seconds=0.05,
+            )
+        finally:
+            sched.pipeline_queue._current_task_id = None
+
+        assert result["reason_code"] == "request_deadline_exceeded"
+        assert result.get("response") != "too late"
+        assert cancelled == ["queued-late"]
 
 
     def test_fallback_waits_for_inference_lock(self, sched, monkeypatch):
@@ -5517,7 +6241,11 @@ class TestChainTopology:
 
         sched._pipeline_active_tasks.add("task_ack")
         sched._pipeline_task_contracts["task_ack"] = {
+            "execution_protocol": "legacy_layer_v1",
             "config_id": "cfg-ack", "worker_ids": ["client1", "client2"],
+            "assignment_ids": {
+                "client1": "asg-client1", "client2": "asg-client2",
+            },
             "current_step": 0,
         }
         sched._handle_chain_forward_ack(
@@ -5527,6 +6255,7 @@ class TestChainTopology:
                     "task_id": "task_ack",
                     "step": 0,
                     "config_id": "cfg-ack",
+                    "assignment_id": "asg-client1",
                     "node_id": "client1",
                     "target_node_id": "client2",
                     "status": "sent",
@@ -5618,7 +6347,11 @@ class TestChainTopology:
         """CHAIN_FORWARD_ACK 消息应路由并记录 ACK 状态。"""
         sched._pipeline_active_tasks.add("task_ack_route")
         sched._pipeline_task_contracts["task_ack_route"] = {
+            "execution_protocol": "legacy_layer_v1",
             "config_id": "cfg-route", "worker_ids": ["client1", "client2"],
+            "assignment_ids": {
+                "client1": "asg-client1", "client2": "asg-client2",
+            },
             "current_step": 1,
         }
         msg = {
@@ -5627,6 +6360,7 @@ class TestChainTopology:
                 "task_id": "task_ack_route",
                 "step": 1,
                 "config_id": "cfg-route",
+                "assignment_id": "asg-client2",
                 "node_id": "client2",
                 "from_node_id": "client1",
                 "status": "received",
@@ -5637,11 +6371,50 @@ class TestChainTopology:
 
         assert sched._chain_ack_state["task_ack_route"][1]["client2"]["status"] == "received"
 
+    def test_chain_forward_ack_rejects_stale_assignment(self, sched):
+        sched._pipeline_active_tasks.add("task-ack-identity")
+        sched._pipeline_task_contracts["task-ack-identity"] = {
+            "execution_protocol": "legacy_layer_v1",
+            "config_id": "cfg-identity",
+            "worker_ids": ["client1", "client2"],
+            "assignment_ids": {
+                "client1": "asg-client1", "client2": "asg-client2",
+            },
+            "current_step": 0,
+        }
+        base = {
+            "task_id": "task-ack-identity",
+            "step": 0,
+            "config_id": "cfg-identity",
+            "node_id": "client2",
+            "from_node_id": "client1",
+            "status": "received",
+        }
+
+        sched._handle_chain_forward_ack(
+            "client2", {"data": {**base, "assignment_id": "asg-stale"}},
+        )
+        assert "task-ack-identity" not in sched._chain_ack_state
+
+        sched._handle_chain_forward_ack(
+            "client2", {"data": {**base, "assignment_id": "asg-client2"}},
+        )
+        assert (
+            sched._chain_ack_state["task-ack-identity"][0]["client2"][
+                "assignment_id"
+            ]
+            == "asg-client2"
+        )
+
     def test_chain_ack_received_is_not_overwritten_by_late_sent(self, sched):
         """下游 received ACK 先到时，后到的 sent 回报不应覆盖已确认状态。"""
         sched._pipeline_active_tasks.add("task_ack_order")
         sched._pipeline_task_contracts["task_ack_order"] = {
+            "execution_protocol": "legacy_layer_v1",
             "config_id": "cfg-order", "worker_ids": ["client1", "client2"],
+            "assignment_ids": {
+                "client1": "asg-client1", "client2": "asg-client2",
+            },
             "current_step": 0,
         }
         sched._handle_chain_forward_ack(
@@ -5651,6 +6424,7 @@ class TestChainTopology:
                     "task_id": "task_ack_order",
                     "step": 0,
                     "config_id": "cfg-order",
+                    "assignment_id": "asg-client2",
                     "node_id": "client2",
                     "from_node_id": "client1",
                     "status": "received",
@@ -5664,6 +6438,7 @@ class TestChainTopology:
                     "task_id": "task_ack_order",
                     "step": 0,
                     "config_id": "cfg-order",
+                    "assignment_id": "asg-client1",
                     "node_id": "client1",
                     "target_node_id": "client2",
                     "status": "sent",
@@ -5673,6 +6448,10 @@ class TestChainTopology:
 
         state = sched._chain_ack_state["task_ack_order"][0]["client2"]
         assert state["status"] == "received"
+        assert state["assignment_id"] == "asg-client2"
+        assert state["target_assignment_id"] == "asg-client2"
+        assert state["source_assignment_id"] == "asg-client1"
+        assert state["reporter_node_id"] == "client2"
 
     def test_late_chain_ack_is_discarded(self, sched):
         sched._handle_chain_forward_ack("client2", {
@@ -5700,13 +6479,16 @@ class TestChainTopology:
 
         try:
             msg = {"type": "chain_forward", "data": {
-                "task_id": "t1", "step": 2, "_chain_predecessor": "client1",
+                "task_id": "t1", "step": 2,
+                "assignment_id": "asg-client2",
+                "_chain_predecessor": "client1",
             }}
             sched._handle_chain_forward("master", msg)
             assert len(called_with) == 1
             assert called_with[0] == "master"
             assert ack_calls
             assert ack_calls[0]["task_id"] == "t1"
+            assert ack_calls[0]["assignment_id"] == "asg-client2"
             assert ack_calls[0]["from_node_id"] == "client1"
             assert ack_calls[0]["status"] == "received"
         finally:
@@ -5754,6 +6536,7 @@ class TestChainTopology:
         monkeypatch.setattr(_host, "_manager", MockModelManager())
         monkeypatch.setattr(sched, "_record_local_pipeline_participation", lambda *a, **kw: True)
         sched._active_layer_config = {
+            "assignment_id": "asg-forward",
             "config_id": "cfg-forward",
             "model_id": "qwen2-test",
             "model_sha256": "sha-forward",
@@ -5767,6 +6550,7 @@ class TestChainTopology:
                 "data": {
                     "task_id": "task_forward",
                     "step": 0,
+                    "assignment_id": "asg-forward",
                     "config_id": "cfg-forward",
                     "model_sha256": "sha-forward",
                     "model_type": "qwen2",
@@ -5819,6 +6603,7 @@ class TestChainTopology:
             ),
         )
         sched._active_layer_config = {
+            "assignment_id": "asg-qwen",
             "config_id": "cfg-qwen",
             "model_id": "qwen-1_8b-chat",
             "model_sha256": "sha-qwen",
@@ -5830,6 +6615,7 @@ class TestChainTopology:
         sched._handle_layer_forward("master", {"data": {
             "task_id": "task-qwen",
             "step": 0,
+            "assignment_id": "asg-qwen",
             "config_id": "cfg-qwen",
             "model_sha256": "sha-qwen",
             "model_type": "qwen",
@@ -5867,6 +6653,7 @@ class TestChainTopology:
         monkeypatch.setattr(sched, "_send_chain_forward_ack", lambda **_kwargs: True)
         monkeypatch.setattr(sched, "_record_local_pipeline_participation", lambda *a, **k: True)
         sched._active_layer_config = {
+            "assignment_id": "asg-current",
             "config_id": "cfg-current",
             "model_id": "deepseek",
             "model_sha256": "sha-current",
@@ -5876,7 +6663,8 @@ class TestChainTopology:
         }
 
         sched._handle_layer_forward("master", {"data": {
-            "task_id": "stale", "step": 0, "config_id": "cfg-old",
+            "task_id": "stale", "step": 0,
+            "assignment_id": "asg-current", "config_id": "cfg-old",
             "model_sha256": "sha-current", "model_type": "qwen2",
             "input_ids": [[1]], "use_kv_cache": False,
         }})
@@ -5885,7 +6673,8 @@ class TestChainTopology:
         sched._active_pipeline_task_ids.add("decode")
         sched._local_pipeline_steps["decode"] = 0
         sched._handle_layer_forward("master", {"data": {
-            "task_id": "decode", "step": 1, "config_id": "cfg-current",
+            "task_id": "decode", "step": 1,
+            "assignment_id": "asg-current", "config_id": "cfg-current",
             "model_sha256": "sha-current", "model_type": "qwen2",
             "input_ids": [[2]], "use_kv_cache": True,
         }})
@@ -5902,10 +6691,14 @@ class TestChainTopology:
         sched._send_to_worker = mock_send
         sched._pipeline_active_tasks.add("task_relay")
         sched._pipeline_task_contracts["task_relay"] = {
+            "execution_protocol": "legacy_layer_v1",
             "config_id": "cfg-relay",
             "model_sha256": "sha-relay",
             "model_type": "qwen2",
             "worker_ids": ["client1", "client2"],
+            "assignment_ids": {
+                "client1": "asg-client1", "client2": "asg-client2",
+            },
             "last_node_id": "client2",
             "current_step": 4,
         }
@@ -5918,6 +6711,7 @@ class TestChainTopology:
                         "task_id": "task_relay",
                         "step": 4,
                         "node_id": "client1",
+                        "assignment_id": "asg-client1",
                         "config_id": "cfg-relay",
                         "model_sha256": "sha-relay",
                         "model_type": "qwen2",
@@ -5928,9 +6722,11 @@ class TestChainTopology:
             )
 
             assert sent and sent[0][0] == "client2"
+            assert sent[0][1]["assignment_id"] == "asg-client2"
             state = sched._chain_ack_state["task_relay"][4]["client2"]
             assert state["status"] == "sent"
             assert state["reporter_node_id"] == "client1"
+            assert state["assignment_id"] == "asg-client1"
         finally:
             sched._send_to_worker = original
 
@@ -5939,10 +6735,15 @@ class TestChainTopology:
         sched._send_to_worker = lambda worker_id, data, msg_type: sent.append(worker_id)
         sched._pipeline_active_tasks.add("task-skip")
         sched._pipeline_task_contracts["task-skip"] = {
+            "execution_protocol": "legacy_layer_v1",
             "config_id": "cfg-skip",
             "model_sha256": "sha-skip",
             "model_type": "qwen2",
             "worker_ids": ["client1", "client2", "client3"],
+            "assignment_ids": {
+                "client1": "asg-client1", "client2": "asg-client2",
+                "client3": "asg-client3",
+            },
             "last_node_id": "client3",
             "current_step": 0,
         }
@@ -5951,6 +6752,7 @@ class TestChainTopology:
             "task_id": "task-skip",
             "node_id": "client1",
             "step": 0,
+            "assignment_id": "asg-client1",
             "config_id": "cfg-skip",
             "model_sha256": "sha-skip",
             "model_type": "qwen2",
@@ -5970,10 +6772,14 @@ class TestChainTopology:
         )
         sched._pipeline_active_tasks.add("task-relay-path")
         sched._pipeline_task_contracts["task-relay-path"] = {
+            "execution_protocol": "legacy_layer_v1",
             "config_id": "cfg-relay-path",
             "model_sha256": "sha-relay-path",
             "model_type": "qwen2",
             "worker_ids": ["client1", "client2"],
+            "assignment_ids": {
+                "client1": "asg-client1", "client2": "asg-client2",
+            },
             "last_node_id": "client2",
             "current_step": 0,
         }
@@ -5982,6 +6788,7 @@ class TestChainTopology:
             "task_id": "task-relay-path",
             "node_id": "client1",
             "step": 0,
+            "assignment_id": "asg-client1",
             "config_id": "cfg-relay-path",
             "model_sha256": "sha-relay-path",
             "model_type": "qwen2",
@@ -6000,10 +6807,15 @@ class TestChainTopology:
         )
         sched._pipeline_active_tasks.add("task-three-hop")
         sched._pipeline_task_contracts["task-three-hop"] = {
+            "execution_protocol": "legacy_layer_v1",
             "config_id": "cfg-three-hop",
             "model_sha256": "sha-three-hop",
             "model_type": "qwen2",
             "worker_ids": ["client1", "client2", "client3"],
+            "assignment_ids": {
+                "client1": "asg-client1", "client2": "asg-client2",
+                "client3": "asg-client3",
+            },
             "last_node_id": "client3",
             "current_step": 0,
         }
@@ -6013,6 +6825,7 @@ class TestChainTopology:
                 "task_id": "task-three-hop",
                 "node_id": node_id,
                 "step": 0,
+                "assignment_id": f"asg-{node_id}",
                 "config_id": "cfg-three-hop",
                 "model_sha256": "sha-three-hop",
                 "model_type": "qwen2",
@@ -6066,6 +6879,7 @@ class TestChainTopology:
         assert sched._last_layer_config_ack_payload is None
         assert sent == [({
             "node_id": sched.get_effective_node_id(),
+            "assignment_id": "",
             "config_id": "cfg-release",
             "generation": 2,
             "status": "released",
@@ -6115,12 +6929,12 @@ class TestChainTopology:
         assert sched._layer_config_inflight == set()
 
     def test_release_ack_clears_master_retry_state(self, sched):
-        sched._layer_config_expected["client1"] = {
+        expected = _install_layer_assignment(sched, "client1", {
             "node_id": "client1",
             "config_id": "cfg-release",
             "generation": 7,
             "release": True,
-        }
+        })
         sched._layer_config_retry_state["client1"] = {
             "attempts": 1,
             "next_retry": 0.0,
@@ -6128,13 +6942,14 @@ class TestChainTopology:
 
         sched._handle_layer_config_ack("client1", {"data": {
             "node_id": "client1",
+            "assignment_id": expected["assignment_id"],
             "config_id": "cfg-release",
             "generation": 7,
             "status": "released",
             "release": True,
         }})
 
-        assert "client1" not in sched._layer_config_expected
+        assert _layer_expected(sched, "client1") == {}
         assert "client1" not in sched._layer_config_retry_state
 
     def test_disconnect_drops_obsolete_layer_config_state(self, sched, monkeypatch):
@@ -6144,12 +6959,12 @@ class TestChainTopology:
         sched.nodes["client1"] = NodeInfo(
             node_id="client1", role="client", state=NodeState.ONLINE,
         )
-        sched._layer_config_expected["client1"] = {
+        _install_layer_assignment(sched, "client1", {
             "node_id": "client1", "config_id": "cfg-old", "generation": 7,
-        }
-        sched._layer_config_acks["client1"] = {
+        }, ack={
             "node_id": "client1", "config_id": "cfg-old", "status": "ready",
-        }
+            "generation": 7,
+        })
         _mark_layer_config_pushed(sched, "client1")
         sched._layer_config_retry_state["client1"] = {
             "attempts": 2, "next_retry": 0.0,
@@ -6165,8 +6980,8 @@ class TestChainTopology:
 
         sched._on_tcp_disconnect("client1")
 
-        assert "client1" not in sched._layer_config_expected
-        assert "client1" not in sched._layer_config_acks
+        assert _layer_expected(sched, "client1") == {}
+        assert _layer_ack(sched, "client1") == {}
         assert "client1" not in sched._layer_config_pushed
         assert "client1" not in sched._layer_config_retry_state
 
@@ -6187,7 +7002,10 @@ class TestChainTopology:
 
         sched._publish_layer_configs({"client1": release})
 
-        assert sched._layer_config_expected["client1"] == release
+        expected = _layer_expected(sched, "client1")
+        assert expected["config_id"] == release["config_id"]
+        assert expected["release"] is True
+        assert expected["assignment_id"]
         assert "client1" in sched._layer_config_retry_state
 
     def test_local_model_change_sends_worker_opt_out(self, sched):
@@ -6374,10 +7192,15 @@ class TestChainTopology:
     def test_last_result_rejects_incomplete_chain_path(self, sched):
         sched._pipeline_active_tasks.add("task-path")
         sched._pipeline_task_contracts["task-path"] = {
+            "execution_protocol": "legacy_layer_v1",
             "config_id": "cfg-path",
             "model_sha256": "sha-path",
             "model_type": "qwen2",
             "worker_ids": ["client1", "client2", "client3"],
+            "assignment_ids": {
+                "client1": "asg-client1", "client2": "asg-client2",
+                "client3": "asg-client3",
+            },
             "last_node_id": "client3",
             "current_step": 0,
         }
@@ -6386,6 +7209,7 @@ class TestChainTopology:
             "task_id": "task-path",
             "node_id": "client3",
             "step": 0,
+            "assignment_id": "asg-client3",
             "config_id": "cfg-path",
             "model_sha256": "sha-path",
             "model_type": "qwen2",
@@ -6407,14 +7231,18 @@ class TestChainTopology:
             "model_sha256": "sha-invalid",
             "model_type": "qwen2",
         }
-        sched._layer_config_expected["client1"] = expected
+        expected = _install_layer_assignment(sched, "client1", expected)
         _mark_layer_config_pushed(sched, "client1")
         sched._pipeline_active_tasks.add("task-invalid")
         sched._pipeline_task_contracts["task-invalid"] = {
+            "execution_protocol": "legacy_layer_v1",
             "config_id": "cfg-invalid",
             "model_sha256": "sha-invalid",
             "model_type": "qwen2",
             "worker_ids": ["client1"],
+            "assignment_ids": {
+                "client1": expected["assignment_id"],
+            },
             "last_node_id": "client1",
             "current_step": 1,
         }
@@ -6423,6 +7251,7 @@ class TestChainTopology:
             "task_id": "task-invalid",
             "node_id": "client1",
             "step": 1,
+            "assignment_id": expected["assignment_id"],
             "config_id": "cfg-invalid",
             "model_sha256": "sha-invalid",
             "model_type": "qwen2",
@@ -6431,7 +7260,7 @@ class TestChainTopology:
         }})
 
         assert "client1" not in sched._layer_config_pushed
-        assert sched._layer_config_acks["client1"]["status"] == "error"
+        assert _layer_ack(sched, "client1")["status"] == "error"
         sched._tcp_server.send_layer_config.assert_called_once_with(
             "client1", expected,
         )
@@ -6446,8 +7275,10 @@ class TestChainTopology:
                 {"node_id": "master", "start_layer": 0, "end_layer": 0,
                  "has_embedding": True, "has_lm_head": False},
                 {"node_id": "client1", "start_layer": 0, "end_layer": 12,
+                 "assignment_id": "asg-client1",
                  "has_embedding": True, "has_lm_head": False},
                 {"node_id": "client2", "start_layer": 12, "end_layer": 24,
+                 "assignment_id": "asg-client2",
                  "has_embedding": False, "has_lm_head": True},
             ],
         }
@@ -7201,21 +8032,30 @@ class TestPipelineOrchestrationIntegration:
                 "model_sha256": "sha-current",
                 "model_type": "qwen2",
             }
-            s._layer_config_expected[node_id] = expected
-            s._layer_config_acks[node_id] = {
-                "config_id": "cfg-current",
-                "status": "ready",
-                "layer_range": [assignment["start_layer"], assignment["end_layer"]],
-                "model_sha256": "sha-current",
-                "model_type": "qwen2",
-                "engine": "pytorch",
-            }
-            _mark_layer_config_pushed(s, node_id)
+            _install_layer_assignment(
+                s,
+                node_id,
+                expected,
+                ack={
+                    "status": "ready",
+                    "layer_range": [
+                        assignment["start_layer"], assignment["end_layer"],
+                    ],
+                    "model_sha256": "sha-current",
+                    "model_type": "qwen2",
+                    "engine": "pytorch",
+                },
+                phase="ready",
+            )
         return s
 
     def test_stale_layer_ack_does_not_make_pipeline_ready(self, sched_with_workers):
         """当前分配变化后，旧层范围 ACK 必须立即失效。"""
-        sched_with_workers._layer_config_acks["worker1"]["layer_range"] = [0, 1]
+        ack = _layer_ack(sched_with_workers, "worker1")
+        ack["layer_range"] = [0, 1]
+        assert sched_with_workers._worker_assignments.record_ack(
+            "worker1", ack,
+        ) is not None
         readiness = sched_with_workers._get_pipeline_readiness()
         assert readiness["ready"] is False
         assert readiness["reason_code"] == "worker_layer_loading"
@@ -7251,7 +8091,7 @@ class TestPipelineOrchestrationIntegration:
         }
 
         sched_master._push_layer_config_to_clients_locked()
-        assert sched_master._layer_config_expected == {}
+        assert sched_master._worker_assignments.expected_configs() == {}
 
     def test_layer_push_admits_peer_after_task_worker_hello_resolution(
             self, sched_master, monkeypatch):
@@ -7274,7 +8114,7 @@ class TestPipelineOrchestrationIntegration:
 
         # No capability admission yet: a pending connection is still fenced.
         sched_master._push_layer_config_to_clients_locked()
-        assert sched_master._layer_config_expected == {}
+        assert sched_master._worker_assignments.expected_configs() == {}
 
         sched_master._task_worker_control.resolve_worker_connection_pending(node.node_id)
         assert sched_master._task_worker_control.pending_worker_ids() == set()
@@ -7283,7 +8123,7 @@ class TestPipelineOrchestrationIntegration:
             lambda connected: {node.node_id} & connected,
         )
         sched_master._push_layer_config_to_clients_locked()
-        assert node.node_id not in sched_master._layer_config_expected
+        assert not sched_master._worker_assignments.expected(node.node_id)
 
     def test_model_metadata_gap_preserves_relay_assignment(
             self, sched_master, monkeypatch):
@@ -7716,9 +8556,33 @@ class TestPipelineOrchestrationIntegration:
         monkeypatch.setattr(_host, "_manager", mock_mgr)
 
         # 也需要 mock _send_to_worker 和 _wait_for_layer_result
+        from transport_port import MessageType
+
         send_calls = []
-        monkeypatch.setattr(sched_with_workers, "_send_to_worker",
-                           lambda wid, data, mtype: send_calls.append((wid, data, mtype)))
+        frozen_assignment_ids = {
+            node_id: _layer_expected(
+                sched_with_workers, node_id,
+            )["assignment_id"]
+            for node_id in ("worker1", "worker2")
+        }
+        reconfigured = set()
+
+        def record_send(worker_id, data, msg_type):
+            send_calls.append((worker_id, dict(data), msg_type))
+            if (
+                msg_type == MessageType.LAYER_FORWARD
+                and worker_id not in reconfigured
+            ):
+                current = _layer_expected(sched_with_workers, worker_id)
+                current.pop("assignment_id", None)
+                _install_layer_assignment(
+                    sched_with_workers, worker_id, current,
+                )
+                reconfigured.add(worker_id)
+
+        monkeypatch.setattr(
+            sched_with_workers, "_send_to_worker", record_send,
+        )
 
         # 模拟无 LM Head 的 worker 返回尾层 hidden states，由 master 执行输出头。
         # _wait_for_layer_result 内部已将 base64 解码为 bytes
@@ -7751,8 +8615,19 @@ class TestPipelineOrchestrationIntegration:
         # 验证 master 本地 forward 被调用
         assert len(forward_calls) >= 1, "master 本地 forward_layers 应被调用"
         # 验证发送了 LAYER_FORWARD 给 worker
-        layer_forwards = [c for c in send_calls if c[2] is not None]
+        layer_forwards = [
+            call for call in send_calls
+            if call[2] == MessageType.LAYER_FORWARD
+        ]
         assert len(layer_forwards) >= 1, "应发送 LAYER_FORWARD 给 worker"
+        assert all(
+            payload["assignment_id"] == frozen_assignment_ids[worker_id]
+            for worker_id, payload, _msg_type in layer_forwards
+        )
+        assert (
+            _layer_expected(sched_with_workers, "worker1")["assignment_id"]
+            != frozen_assignment_ids["worker1"]
+        )
         assert lm_head_calls, "worker 尾层 hidden states 应返回 master 执行 LM Head"
         # 验证分布式执行标记与主从任务统计来自同一条已完成流水线任务
         assert result["metrics"]["distributed_used"] is True

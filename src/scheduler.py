@@ -527,9 +527,9 @@ class PipelineQueue:
         if event is None:
             return {"status": "unknown", "error": f"未知任务: {task_id}"}
 
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
         while True:
-            remaining = deadline - time.time()
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return {"status": "timeout", "error": f"任务 {task_id} 超时 ({timeout}s)"}
             if event.wait(timeout=min(0.1, remaining)):
@@ -1033,17 +1033,9 @@ class Scheduler(
         self._nodes_lock = threading.RLock()    # Phase 2.1: 保护 self.nodes 并发读写（可重入）
         self._kv_cache_lock = threading.Lock()   # Phase 2.2: 保护 _kv_cache 并发读写
         self._kv_cache: dict = {}               # task_id → past_key_values（本节点层范围的 KV cache）
-        # 节点只有完成模型层加载并返回当前 config_id 的 ACK 后才进入该集合。
-        # 保留旧字段名，避免状态接口和测试夹具发生无关改动。
-        # ★ 2026-10-07（DIST-NEXT-3）：`_layer_config_pushed` 已**降级为派生视图**
-        #   （property，见 `scheduler_pipeline`）—— 事实源只有 `_worker_assignments`。
-        self._layer_config_expected: dict[str, dict] = {}
-        self._layer_config_acks: dict[str, dict] = {}
         self._layer_config_retry_state: dict[str, dict] = {}
-        # ★ 2026-10-07（DIST-NEXT-3）：assignment 的**权威视图**（`assignment_id` +
-        #   `config_id` + connection generation + lease + phase + 单一 reason code）。
-        #   本步**只写不读**（读路径后续切换）⇒ 零行为变化；它是「多集合交叉判定」
-        #   （pushed/expected/acks/transaction/recovery）的替代方向。
+        # ASSIGN-SOURCE-01: active wire contract, receipt and lifecycle live in
+        # one registry. `_layer_config_pushed` remains a derived property.
         self._worker_assignments = WorkerAssignmentRegistry()
         self._layer_config_lock = threading.Lock()
         self._layer_config_push_lock = threading.Lock()
@@ -1063,6 +1055,7 @@ class Scheduler(
         self._layer_config_receive_sequence = 0
         self._latest_layer_config_receive_sequence = 0
         self._latest_layer_config_generation = 0
+        self._latest_layer_assignment_id = ""
         self._pipeline_worker_reserved = False
         self._pipeline_worker_opted_out = False
         self._pipeline_worker_opt_out: set[str] = set()
@@ -4624,6 +4617,7 @@ class Scheduler(
                 self._layer_config_receive_sequence
             )
             self._latest_layer_config_generation = 0
+            self._latest_layer_assignment_id = ""
         for task_id in active_tasks:
             self._record_local_pipeline_participation(task_id, success=False)
         if active_tasks:

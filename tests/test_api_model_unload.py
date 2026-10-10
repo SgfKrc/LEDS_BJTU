@@ -21,8 +21,9 @@ def test_unload_model_is_idempotent_and_keeps_lazy_manager_cold(monkeypatch):
         #   （`_layer_config_pushed` 已降级为它的派生视图），fake scheduler 必须提供它。
         _worker_assignments=WorkerAssignmentRegistry(),
         _layer_config_pushed=set(),
-        _layer_config_expected={},
-        _layer_config_acks={},
+        _layer_config_retry_state={},
+        _pipeline_load_transaction=None,
+        _active_pipeline_capacity_plan=None,
         _active_layer_config=None,
         _last_layer_config_ack_payload=None,
         _local_pipeline_steps={},
@@ -63,8 +64,9 @@ def test_unload_model_releases_engine_runtime_and_worker_reservation(monkeypatch
         # ★ 2026-10-07（DIST-NEXT-3）：同上，卸载路径要求 assignment 权威视图存在。
         _worker_assignments=WorkerAssignmentRegistry(),
         _layer_config_pushed=set(),
-        _layer_config_expected={},
-        _layer_config_acks={},
+        _layer_config_retry_state={},
+        _pipeline_load_transaction=None,
+        _active_pipeline_capacity_plan=None,
         _active_layer_config=None,
         _last_layer_config_ack_payload=None,
         _local_pipeline_steps={},
