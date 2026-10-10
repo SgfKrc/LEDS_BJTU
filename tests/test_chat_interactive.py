@@ -9,6 +9,7 @@ start → token* → done（含 generation_id/request_id/session_id/history_comm
 import json
 import os
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -92,9 +93,21 @@ def interactive_env(monkeypatch):
     monkeypatch.setattr(api_server, "model_manager", fake_model_manager)
     monkeypatch.setattr(
         api_server, "model_host",
-        SimpleNamespace(model_loaded=True),
+        SimpleNamespace(
+            model_loaded=True,
+            full_chat_execution_lock=threading.RLock(),
+        ),
     )
     monkeypatch.setattr(api_server, "RUN_MODE", "local")
+    monkeypatch.setattr(api_server, "active_session_id", None)
+    monkeypatch.setattr(api_server, "session_histories", {})
+    monkeypatch.setattr(
+        api_server._chat_context,
+        "_load_history",
+        lambda _session_id: [],
+    )
+    api_server._chat_context.invalidate(clear_histories=True)
+    monkeypatch.setattr(api_server, "_init_kv_cache", lambda: None)
 
     def fake_commit(session_id, user_message, response_text, metrics):
         calls["commits"].append(
@@ -102,7 +115,8 @@ def interactive_env(monkeypatch):
         )
         return True
 
-    monkeypatch.setattr(api_server, "_commit_interactive_history", fake_commit)
+    monkeypatch.setattr(api_server, "_persist_conversation_turn", fake_commit)
+    monkeypatch.setattr(api_server._chat_context, "_persist_turn", fake_commit)
     monkeypatch.setattr(api_server, "_external_route_decision",
                         lambda req: SimpleNamespace(use_external=False))
 
@@ -217,6 +231,35 @@ class TestInteractiveContract:
         assert user_message == "提交测试"
         assert response_text == "你好，世界！"
         assert metrics["engine"] == "llama_cpp"
+        assert api_server.session_histories["sess_commit"] == [
+            {"role": "user", "content": "提交测试"},
+            {"role": "assistant", "content": "你好，世界！"},
+        ]
+
+    def test_interactive_uses_and_extends_canonical_history(self, interactive_env):
+        client, calls = interactive_env
+        api_server.session_histories["sess_context"] = [
+            {"role": "user", "content": "记住颜色"},
+            {"role": "assistant", "content": "蓝色"},
+        ]
+
+        response = client.post("/api/chat/stream", json={
+            "message": "颜色是什么",
+            "streaming_mode": "interactive",
+            "session_id": "sess_context",
+        })
+
+        assert response.status_code == 200
+        _message, kwargs = calls["run_pipeline_safe"]
+        assert kwargs["messages"] == [
+            {"role": "user", "content": "记住颜色"},
+            {"role": "assistant", "content": "蓝色"},
+            {"role": "user", "content": "颜色是什么"},
+        ]
+        assert api_server.session_histories["sess_context"][-2:] == [
+            {"role": "user", "content": "颜色是什么"},
+            {"role": "assistant", "content": "你好，世界！"},
+        ]
 
     def test_distributed_required_marks_requested(self, interactive_env, monkeypatch):
         client, calls = interactive_env
@@ -422,6 +465,183 @@ class TestRoutingPreference:
         assert "distributed_required" in error[0]["error"]
 
 
+class TestFastContextContract:
+    def test_fast_uses_and_commits_canonical_history(self, interactive_env):
+        client, calls = interactive_env
+        api_server.session_histories["sess_fast"] = [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "second"},
+        ]
+
+        response = client.post("/api/chat/stream", json={
+            "message": "third",
+            "streaming_mode": "fast",
+            "session_id": "sess_fast",
+        })
+
+        assert response.status_code == 200
+        _message, kwargs = calls["run_pipeline_safe"]
+        assert kwargs["messages"] == [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "second"},
+            {"role": "user", "content": "third"},
+        ]
+        done = _sse_events(response)[-1]
+        assert done["done"] is True
+        assert done["history_committed"] is True
+        assert api_server.session_histories["sess_fast"][-2:] == [
+            {"role": "user", "content": "third"},
+            {"role": "assistant", "content": "你好，世界！"},
+        ]
+
+
+class TestContextReload:
+    def test_same_active_session_reloads_after_model_state_reset(
+        self, interactive_env, monkeypatch,
+    ):
+        client, calls = interactive_env
+        rows = [
+            {"role": "user", "content": "persisted question"},
+            {"role": "assistant", "content": "persisted answer"},
+        ]
+        monkeypatch.setattr(
+            api_server._chat_context,
+            "_load_history",
+            lambda session_id: list(rows) if session_id == "sess_reload" else [],
+        )
+        api_server.active_session_id = "sess_reload"
+        api_server.session_histories = {
+            "sess_reload": [{"role": "user", "content": "stale"}],
+        }
+
+        api_server._reset_runtime_conversation_state(clear_histories=True)
+        response = client.post("/api/chat/stream", json={
+            "message": "continue",
+            "streaming_mode": "interactive",
+            "session_id": "sess_reload",
+        })
+
+        assert response.status_code == 200
+        _message, kwargs = calls["run_pipeline_safe"]
+        assert kwargs["messages"] == [
+            *rows,
+            {"role": "user", "content": "continue"},
+        ]
+
+
+class TestSessionCrudContextContract:
+    def test_activate_same_stale_session_reloads_canonical_history(
+        self, interactive_env, monkeypatch,
+    ):
+        client, _calls = interactive_env
+        rows = [
+            {"role": "user", "content": "persisted question"},
+            {"role": "assistant", "content": "persisted answer"},
+        ]
+        api_server.active_session_id = "sess_activate"
+        api_server.session_histories = {
+            "sess_activate": [{"role": "user", "content": "stale"}],
+        }
+        api_server._sync_chat_context_facade()
+        api_server._chat_context.invalidate_session("sess_activate")
+        api_server._publish_chat_context_facade()
+        monkeypatch.setattr(
+            api_server._chat_context,
+            "_load_history",
+            lambda session_id: list(rows) if session_id == "sess_activate" else [],
+        )
+
+        response = client.post("/api/sessions/sess_activate/activate")
+
+        assert response.status_code == 200
+        assert response.json()["messages"] == rows
+        assert api_server.session_histories["sess_activate"] == rows
+
+    def test_delete_active_session_clears_kv_before_dropping_facade(
+        self, interactive_env, monkeypatch,
+    ):
+        client, _calls = interactive_env
+        cleared = []
+        initialized = []
+        api_server.active_session_id = "sess_delete"
+        api_server.session_histories = {
+            "sess_delete": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "a"},
+            ],
+        }
+        monkeypatch.setattr(
+            api_server,
+            "kv_cache",
+            SimpleNamespace(clear=lambda: cleared.append(True)),
+        )
+        monkeypatch.setattr(
+            api_server._local_store,
+            "delete_local_session",
+            lambda session_id: 2 if session_id == "sess_delete" else 0,
+        )
+        monkeypatch.setattr(
+            api_server, "_init_kv_cache", lambda: initialized.append(True),
+        )
+
+        response = client.delete("/api/sessions/sess_delete")
+
+        assert response.status_code == 200
+        assert api_server.active_session_id is None
+        assert "sess_delete" not in api_server.session_histories
+        assert cleared == [True]
+        assert initialized == [True]
+
+    def test_delete_old_persisted_turn_invalidates_window_instead_of_splicing_it(
+        self, interactive_env, monkeypatch,
+    ):
+        client, _calls = interactive_env
+        warm_window = [
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": str(index),
+            }
+            for index in range(20, 220)
+        ]
+        reloaded_window = [
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": str(index),
+            }
+            for index in range(18, 218)
+        ]
+        api_server.active_session_id = "sess_window"
+        api_server.session_histories = {"sess_window": warm_window}
+        monkeypatch.setattr(
+            api_server._local_store,
+            "get_local_conversation_count",
+            lambda session_id: 220 if session_id == "sess_window" else 0,
+        )
+        deleted = []
+        monkeypatch.setattr(
+            api_server._local_store,
+            "delete_local_message_range",
+            lambda session_id, turn_index: deleted.append(
+                (session_id, turn_index)
+            ) or 2,
+        )
+        monkeypatch.setattr(
+            api_server._chat_context,
+            "_load_history",
+            lambda session_id: (
+                list(reloaded_window) if session_id == "sess_window" else []
+            ),
+        )
+
+        response = client.delete("/api/sessions/sess_window/turns/0")
+
+        assert response.status_code == 200
+        assert response.json()["remaining_turns"] == 109
+        assert deleted == [("sess_window", 0)]
+        assert api_server.session_histories["sess_window"] == reloaded_window
+        assert api_server.session_histories["sess_window"][0]["content"] == "18"
+
+
 class TestCommitFunction:
     """真实 _commit_interactive_history 的本地存储分支。"""
 
@@ -430,6 +650,7 @@ class TestCommitFunction:
 
         fake_store = SimpleNamespace(
             get_local_save_history=lambda: True,
+            load_local_conversation=lambda _session_id: [],
             save_local_conversation_turn=(
                 lambda sid, user, assistant, metrics=None, **kwargs:
                 saved.append((sid, user, assistant, metrics)) or True

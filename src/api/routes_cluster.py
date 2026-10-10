@@ -714,6 +714,8 @@ async def set_task_graph_config(req: TaskGraphConfigRequest):
             task_graph_enabled=req.enabled,
             task_worker_experimental_enabled=req.worker_experimental_enabled,
         )
+    except _api_module.HTTPException:
+        raise
     except Exception as exc:
         _api_module.logger.error("任务链运行时开关更新失败", exc_info=True)
         raise _api_module.HTTPException(500, f"任务链实验开关更新失败: {exc}") from exc

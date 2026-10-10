@@ -555,12 +555,14 @@ def save_local_conversation_turn(
         json.dumps(metrics, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         if metrics is not None else None
     )
+    # Idempotency identifies the semantic turn, not volatile diagnostics.
+    # Retries can legitimately receive a new generation_id, elapsed time or
+    # routing trace while still representing the same user/assistant pair.
     turn_payload = json.dumps(
         {
             "session_id": session_id,
             "user_message": str(user_message),
             "assistant_message": str(assistant_message),
-            "metrics": metrics,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -573,18 +575,55 @@ def save_local_conversation_turn(
         if normalized_operation_id:
             receipt = connection.execute(
                 """
-                SELECT session_id, turn_sha256
+                SELECT session_id, turn_sha256, committed_at
                 FROM python_conversation_turn_receipts
                 WHERE operation_id = ?
                 """,
                 (normalized_operation_id,),
             ).fetchone()
             if receipt is not None:
-                if (
-                    receipt["session_id"] != session_id
-                    or receipt["turn_sha256"] != turn_sha256
-                ):
+                if receipt["session_id"] != session_id:
                     raise ValueError("operation_id has conflicting conversation turn")
+                if receipt["turn_sha256"] != turn_sha256:
+                    # Compatibility for receipts written before the semantic
+                    # hash stopped including volatile metrics. Verify against
+                    # the durable adjacent pair, then upgrade the receipt.
+                    matching_turn = connection.execute(
+                        """
+                        SELECT 1
+                        FROM session_messages AS user_message
+                        JOIN session_messages AS assistant_message
+                          ON assistant_message.message_id = user_message.message_id + 1
+                         AND assistant_message.session_id = user_message.session_id
+                        WHERE user_message.session_id = ?
+                          AND user_message.created_at = ?
+                          AND user_message.role = 'user'
+                          AND user_message.content = ?
+                          AND assistant_message.role = 'assistant'
+                          AND assistant_message.content = ?
+                          AND assistant_message.created_at = ?
+                        LIMIT 1
+                        """,
+                        (
+                            session_id,
+                            receipt["committed_at"],
+                            str(user_message),
+                            str(assistant_message),
+                            receipt["committed_at"],
+                        ),
+                    ).fetchone()
+                    if matching_turn is None:
+                        raise ValueError(
+                            "operation_id has conflicting conversation turn"
+                        )
+                    connection.execute(
+                        """
+                        UPDATE python_conversation_turn_receipts
+                        SET turn_sha256 = ?
+                        WHERE operation_id = ?
+                        """,
+                        (turn_sha256, normalized_operation_id),
+                    )
                 return False
 
         connection.execute(

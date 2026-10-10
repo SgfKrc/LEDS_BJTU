@@ -16,6 +16,25 @@ import model_host as model_host_module
 from model_host import model_host
 
 
+def _isolated_api_probe_env(tmp_path: Path) -> dict[str, str]:
+    """Build a cold-start environment independent of developer runtime state."""
+
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env.update({
+        "QLH_INFERENCE_ENGINE": "llama_cpp",
+        "QLH_STATE_DIR": str(tmp_path / "state"),
+        "QLH_NODE_CONFIG_PATH": str(tmp_path / "node-config.json"),
+        "QLH_TASK_GRAPH_ENABLED": "false",
+        "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED": "false",
+        "QLH_TASK_GRAPH_INSTANCE_ID": f"cold-probe-{tmp_path.name}",
+    })
+    env["PYTHONPATH"] = os.pathsep.join(
+        item for item in (str(repo_root / "src"), env.get("PYTHONPATH", "")) if item
+    )
+    return env
+
+
 def test_shared_lifespans_reference_count_runtime(monkeypatch):
     """Two uvicorn servers must share one runtime lifetime and readiness state."""
     startup_calls = []
@@ -142,10 +161,11 @@ def test_frontend_bootstrap_endpoints_keep_model_manager_lazy(monkeypatch):
         assert response.status_code == 200, path
 
 
-def test_l_tier_cold_start_gguf_inference_and_tui_without_torch():
+def test_l_tier_cold_start_gguf_inference_and_tui_without_torch(tmp_path):
     """The L-tier must boot and run its GGUF path when torch cannot be imported."""
     repo_root = Path(__file__).resolve().parents[1]
     src_root = repo_root / "src"
+    env = _isolated_api_probe_env(tmp_path)
     probe = textwrap.dedent(
         """
         import importlib.abc
@@ -210,6 +230,7 @@ def test_l_tier_cold_start_gguf_inference_and_tui_without_torch():
     completed = subprocess.run(
         [sys.executable, "-c", probe],
         cwd=repo_root,
+        env=env,
         capture_output=True,
         text=True,
         # ★ 必须显式指定编码：`text=True` 缺 `encoding` 时按 **locale 默认**解码
@@ -224,14 +245,10 @@ def test_l_tier_cold_start_gguf_inference_and_tui_without_torch():
     assert "L_TIER_PROBE_OK" in completed.stdout
 
 
-def test_paged_kv_cache_import_keeps_torch_out_of_default_gguf_process():
+def test_paged_kv_cache_import_keeps_torch_out_of_default_gguf_process(tmp_path):
     """The default GGUF process must stay torch-free even when torch is installed."""
     repo_root = Path(__file__).resolve().parents[1]
-    env = os.environ.copy()
-    env["QLH_INFERENCE_ENGINE"] = "llama_cpp"
-    env["PYTHONPATH"] = os.pathsep.join(
-        item for item in (str(repo_root / "src"), env.get("PYTHONPATH", "")) if item
-    )
+    env = _isolated_api_probe_env(tmp_path)
     completed = subprocess.run(
         [
             sys.executable,
@@ -251,14 +268,10 @@ def test_paged_kv_cache_import_keeps_torch_out_of_default_gguf_process():
     assert "PAGED_IMPORT_OK" in completed.stdout
 
 
-def test_default_gguf_api_import_and_bootstrap_queries_do_not_load_torch():
+def test_default_gguf_api_import_and_bootstrap_queries_do_not_load_torch(tmp_path):
     """The installed Torch wheel must stay cold on the default llama.cpp path."""
     repo_root = Path(__file__).resolve().parents[1]
-    env = os.environ.copy()
-    env["QLH_INFERENCE_ENGINE"] = "llama_cpp"
-    env["PYTHONPATH"] = os.pathsep.join(
-        item for item in (str(repo_root / "src"), env.get("PYTHONPATH", "")) if item
-    )
+    env = _isolated_api_probe_env(tmp_path)
     probe = (
         "import asyncio, sys; "
         "import api_server; "

@@ -31,11 +31,21 @@ from contextvars import ContextVar
 from dataclasses import replace
 from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Optional, cast
+from typing import TYPE_CHECKING, Any, Literal, Mapping, Optional, cast
 
 # 确保 src 目录在 path 中
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from release_contract import (
+    FIXED_RELEASE_ENV,
+    PRODUCT_VERSION,
+    RELEASE_PROFILE_NAME,
+    release_profile_enforced,
+)
+from distributed_completion import (
+    DistributedCompletionError,
+    validate_distributed_completion,
+)
 from torch_runtime import LazyTorch, cuda_available, loaded_torch
 
 torch = LazyTorch()
@@ -148,6 +158,12 @@ _validate_pipeline_role_switches(
 
 # 主节点用户自持 SQLite；生产运行时不再加载远端 PostgreSQL 驱动。
 import local_store as _local_store
+from chat_context import (
+    ConversationContextConflict,
+    ConversationContextService,
+    PreparedChatContext,
+    TurnPersistenceResult,
+)
 # ★ 2026-10-07（DIST-NEXT-8）：请求相位/终态的单一来源 —— 取消、拒绝与链路错误
 #   不再被 `fallback` 或 error 语义吞掉（详见 `src/request_outcome.py`）。
 from request_outcome import (
@@ -178,6 +194,9 @@ from cluster_score import build_management_score_snapshot
 from node_config import load_node_config, write_node_config
 
 _request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
+_conversation_transaction_depth: ContextVar[int] = ContextVar(
+    "conversation_transaction_depth", default=0,
+)
 _LOG_BUFFER_MAXLEN = 5000
 _log_buffer: deque[dict] = deque(maxlen=_LOG_BUFFER_MAXLEN)
 # P7: the aggregate endpoint must have a bounded fan-out and one total wait
@@ -396,7 +415,7 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(
     title="轻量化大模型分布式边缘推理优化系统",
-    version="0.1.8.1",
+    version=PRODUCT_VERSION,
     description="北京交通大学 · 大学生创新创业训练计划",
     lifespan=_lifespan,
 )
@@ -602,8 +621,14 @@ from model_load_resolver import (
 
 model_manager = model_host
 kv_cache: "Optional[PagedKVCache]" = None  # PagedKVCache is D-tier (torch) only
-active_session_id: Optional[str] = None           # 当前活跃会话 ID
-session_histories: dict[str, list[dict]] = {}     # session_id → 对话历史列表
+_chat_context = ConversationContextService(
+    load_history=lambda session_id: _load_conversation_history(session_id),
+    persist_turn=lambda session_id, user, assistant, metrics: _persist_conversation_turn(
+        session_id, user, assistant, metrics,
+    ),
+)
+active_session_id: Optional[str] = None           # compatibility facade
+session_histories: dict[str, list[dict]] = _chat_context.histories
 conversation_stats: dict = {                    # 累计对话统计（实际消耗追踪）
     "total_prompt_tokens": 0,
     "total_generated_tokens": 0,
@@ -717,6 +742,45 @@ if NODE_ROLE == "auto":
     if scheduler._control_fence is not control_fence:
         control_fence = scheduler._control_fence
 _task_graph_runtime_lock = threading.RLock()
+_RUNTIME_FEATURE_ENV_NAMES = frozenset(FIXED_RELEASE_ENV)
+
+
+def _apply_runtime_feature_settings(
+    requested: Mapping[str, bool],
+) -> dict[str, bool]:
+    '''Validate hot feature changes against the immutable release profile.'''
+    normalized: dict[str, bool] = {}
+    for env_name, value in requested.items():
+        if env_name not in _RUNTIME_FEATURE_ENV_NAMES:
+            raise ValueError(f'unknown runtime feature setting: {env_name}')
+        if not isinstance(value, bool):
+            raise TypeError(f'runtime feature setting must be bool: {env_name}')
+        normalized[env_name] = value
+
+    if not release_profile_enforced():
+        return normalized
+
+    for env_name, value in normalized.items():
+        requested_value = '1' if value else '0'
+        required_value = FIXED_RELEASE_ENV[env_name]
+        if requested_value == required_value:
+            continue
+        raise coded_http_error(
+            409,
+            'RELEASE_PROFILE_FEATURE_LOCKED',
+            {
+                'code': 'RELEASE_PROFILE_FEATURE_LOCKED',
+                'message': (
+                    f'release profile {RELEASE_PROFILE_NAME!r} fixes '
+                    f'{env_name}={required_value}; requested {requested_value}'
+                ),
+                'feature': env_name,
+                'requested': requested_value,
+                'required': required_value,
+                'release_profile': RELEASE_PROFILE_NAME,
+            },
+        )
+    return normalized
 
 
 def _sync_task_worker_runtime_module(enabled: bool) -> None:
@@ -789,6 +853,12 @@ def _set_task_graph_runtime_settings(
             if task_worker_experimental_enabled is None
             else task_worker_experimental_enabled
         )
+        validated = _apply_runtime_feature_settings({
+            'QLH_TASK_GRAPH_ENABLED': next_graph,
+            'QLH_TASK_WORKER_EXPERIMENTAL_ENABLED': next_worker,
+        })
+        next_graph = validated['QLH_TASK_GRAPH_ENABLED']
+        next_worker = validated['QLH_TASK_WORKER_EXPERIMENTAL_ENABLED']
         graph_changed = next_graph != bool(TASK_GRAPH_ENABLED)
         TASK_GRAPH_ENABLED = next_graph
         TASK_WORKER_EXPERIMENTAL_ENABLED = next_worker
@@ -931,8 +1001,17 @@ def _serialized_conversation_mutation(func):
     """Run synchronous conversation mutations under the full-chat lock."""
     @wraps(func)
     def wrapper(*args, **kwargs):
-        with model_host.full_chat_execution_lock:
-            return func(*args, **kwargs)
+        depth = _conversation_transaction_depth.get(0)
+        if depth > 0:
+            with model_host.full_chat_execution_lock:
+                return func(*args, **kwargs)
+        with _chat_context.transaction():
+            token = _conversation_transaction_depth.set(depth + 1)
+            try:
+                with model_host.full_chat_execution_lock:
+                    return func(*args, **kwargs)
+            finally:
+                _conversation_transaction_depth.reset(token)
     return wrapper
 
 
@@ -1254,7 +1333,7 @@ class ChatRequest(BaseModel):
     )
     streaming_mode: str = Field(
         default="full",
-        description="流式模式（仅 /api/chat/stream 生效）: full=假流式完整功能（含历史/追问/持久化，默认） | fast=真流式逐token（低延迟，跳过持久化） | interactive=真流式逐token + 完成时会话事务提交（T9 聊天页）",
+        description="流式模式（仅 /api/chat/stream 生效）: full=假流式完整功能（默认） | fast=真流式逐token | interactive=真流式逐token + T9 事件契约；三者共用历史、裁剪和完成时会话提交",
     )
     routing_preference: Literal[
         "auto", "local_only", "distributed_preferred", "distributed_required"
@@ -1758,59 +1837,83 @@ def _format_model_response(text: str, show_thinking: bool,
 # 多会话管理
 # ================================================================
 
-def _get_active_history() -> list[dict]:
-    """
-    获取当前活跃会话的对话历史列表。
+def _sync_chat_context_facade() -> None:
+    _chat_context.adopt_facade_state(active_session_id, session_histories)
 
-    如果没有活跃会话，返回空列表（不自动创建会话）。
-    返回的列表对象可被原地修改（append、clear 等）。
-    """
+
+def _publish_chat_context_facade() -> None:
     global active_session_id, session_histories
-    if active_session_id is None:
-        return []  # 不自动创建——由前端在首次发消息时显式创建
-    if active_session_id not in session_histories:
-        session_histories[active_session_id] = []
-    return session_histories[active_session_id]
+    active_session_id = _chat_context.active_session_id
+    session_histories = _chat_context.histories
 
 
-def _switch_session(target_id: str) -> None:
-    """
-    切换到目标会话：暂存当前历史 → 加载目标历史 → 清 KV Cache。
+def _load_conversation_history(session_id: str) -> list[dict]:
+    """Load one canonical context window; storage failures are not empty chats."""
 
-    如果目标会话不在内存中，首先从主节点 SQLite 加载。
-    """
-    global active_session_id, kv_cache
-    if active_session_id == target_id:
-        return
+    try:
+        rows = _local_store.load_local_conversation(session_id)
+    except Exception:
+        logger.error(
+            "SQLite 会话历史加载失败: session=%s", session_id, exc_info=True,
+        )
+        raise
+    return [{"role": row["role"], "content": row["content"]} for row in rows]
 
-    active_session_id = target_id
 
-    # SQLite 是事实源；旧数据库仅用于迁移期只读兼容。
-    if target_id not in session_histories:
-        messages = []
-        try:
-            local_rows = _local_store.load_local_conversation(target_id)
-            messages = [{"role": r["role"], "content": r["content"]} for r in local_rows]
-        except Exception as exc:
-            logger.error("SQLite 切换会话加载失败: session=%s: %s", target_id, exc)
-        session_histories[target_id] = messages
+def _get_active_history() -> list[dict]:
+    """Return the active canonical history, reloading stale cache if needed."""
 
-    # 清 KV Cache（切换会话后 prompt 不同，必须重建）
-    if kv_cache:
-        kv_cache.clear()
-    _init_kv_cache()
-    logger.info(f"已切换到会话: {target_id}")
+    _sync_chat_context_facade()
+    history = _chat_context.active_history()
+    _publish_chat_context_facade()
+    return history
+
+
+def _prepare_chat_context(
+    requested_session_id: Optional[str],
+    first_message: Optional[str] = None,
+    *,
+    force_reload: bool = False,
+) -> PreparedChatContext:
+    """Resolve one request to the shared session snapshot used by every mode."""
+
+    global kv_cache
+    _sync_chat_context_facade()
+    prepared = _chat_context.prepare(
+        requested_session_id, force_reload=force_reload,
+    )
+    _publish_chat_context_facade()
+
+    if prepared.session_changed or prepared.reloaded:
+        if kv_cache:
+            kv_cache.clear()
+        _init_kv_cache()
+    if first_message and not prepared.history:
+        _auto_title_session(prepared.session_id, first_message)
+    return prepared
+
+
+def _switch_session(target_id: str, *, force_reload: bool = False) -> None:
+    """Activate a session, reloading it even when the ID did not change."""
+
+    prepared = _prepare_chat_context(target_id, force_reload=force_reload)
+    logger.info(
+        "已切换到会话: %s (reloaded=%s)",
+        prepared.session_id,
+        prepared.reloaded,
+    )
 
 
 def _reset_runtime_conversation_state(clear_histories: bool = True) -> None:
     """Clear in-memory conversation/KV state after a model change."""
-    global kv_cache, conversation_stats, session_histories
+    global kv_cache, conversation_stats
 
     if kv_cache:
         kv_cache.clear()
     kv_cache = None
-    if clear_histories:
-        session_histories = {}
+    _sync_chat_context_facade()
+    _chat_context.invalidate(clear_histories=clear_histories)
+    _publish_chat_context_facade()
     conversation_stats = {
         "total_prompt_tokens": 0,
         "total_generated_tokens": 0,
@@ -1835,24 +1938,66 @@ def _persist_conversation_turn(
     user_message: str,
     assistant_message: str,
     metrics: Optional[dict] = None,
-) -> bool:
+) -> TurnPersistenceResult:
     """Commit a completed turn to local SQLite, then optionally export it."""
     try:
         if not _local_store.get_local_save_history():
-            return False
+            return TurnPersistenceResult.SKIPPED
         request_id = _request_id_ctx.get("")
-        _local_store.save_local_conversation_turn(
+        committed = _local_store.save_local_conversation_turn(
             session_id,
             user_message,
             assistant_message,
             metrics,
             operation_id=request_id if request_id and request_id != "-" else None,
         )
+    except ValueError:
+        # Durable operation-id conflicts are contract violations, not a
+        # best-effort persistence failure. Keep them fail-closed.
+        raise
     except Exception as exc:
         logger.error("SQLite 对话提交失败: session=%s: %s", session_id, exc)
-        return False
+        raise RuntimeError("SQLite 对话提交失败") from exc
 
-    return True
+    return (
+        TurnPersistenceResult.COMMITTED
+        if committed
+        else TurnPersistenceResult.REPLAY
+    )
+
+
+def _commit_chat_context_turn(
+    session_id: Optional[str],
+    user_message: str,
+    assistant_message: str,
+    metrics: Optional[dict] = None,
+    *,
+    expected_revision: Optional[int] = None,
+    operation_id: Optional[str] = None,
+) -> bool:
+    """Publish one successful turn to memory and SQLite through one service."""
+
+    _sync_chat_context_facade()
+    resolved_operation_id = operation_id or _request_id_ctx.get("")
+    try:
+        persisted = _chat_context.commit_turn(
+            session_id,
+            user_message,
+            assistant_message,
+            metrics,
+            operation_id=(
+                resolved_operation_id
+                if resolved_operation_id and resolved_operation_id != "-"
+                else None
+            ),
+            expected_revision=expected_revision,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ConversationContextConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    _publish_chat_context_facade()
+    return persisted
 
 
 def _is_question(text: str) -> bool:
@@ -2576,23 +2721,26 @@ def _enforce_distributed_required(
     detail: str = "分布式执行未完成",
 ) -> None:
     """Reject silent local fallback for an explicitly required route."""
-    if req.routing_preference != "distributed_required":
-        return
-    if isinstance(metrics, dict) and metrics.get("distributed_used"):
-        return
-    raise HTTPException(
-        503,
-        f"distributed_required 执行失败：{detail}",
-    )
+    try:
+        validate_distributed_completion(
+            req.routing_preference, metrics, detail=detail,
+        )
+    except DistributedCompletionError as exc:
+        raise HTTPException(
+            503, f"distributed_required 执行失败：{exc}",
+        ) from exc
 
 
 def _external_route_decision(req: ChatRequest):
     """按当前配置 + 请求 flag 计算外部路由决策（纯函数包装，读实时配置）。"""
-    if req.routing_preference == "local_only":
+    if req.routing_preference in {"local_only", "distributed_required"}:
         # T9.5：local_only 覆盖一切外部路由意图，数据不出集群
         from types import SimpleNamespace as _SN
-        return _SN(use_external=False, eligible=False,
-                   reason="local_only_override")
+        return _SN(
+            use_external=False,
+            eligible=False,
+            reason=f"{req.routing_preference}_override",
+        )
     import config as _cfg
     from external_provider import decide_external_route
 
@@ -2640,6 +2788,7 @@ def _execute_external_chat(
     req: ChatRequest,
     history: list,
     target_session_id: Optional[str],
+    context_revision: int,
     cancel_event: Optional[threading.Event] = None,
 ) -> dict:
     """整请求路由到外部推理服务（与 llama.cpp/孤岛整请求路径同构）。"""
@@ -2701,18 +2850,14 @@ def _execute_external_chat(
         req,
     )
 
-    db_session_id = target_session_id or "default"
     # 追问生成不再二次外发（少一次数据出集群 + 少一次计费），用模板兜底
     followups = _fallback_followups(completed_history, [])
-    history.extend([
-        {"role": "user", "content": req.message},
-        {"role": "assistant", "content": response_text},
-    ])
 
     save_metrics = dict(metrics)
     save_metrics["followups"] = followups
-    _persist_conversation_turn(
-        db_session_id, req.message, response_text, save_metrics,
+    _commit_chat_context_turn(
+        target_session_id, req.message, response_text, save_metrics,
+        expected_revision=context_revision,
     )
 
     conversation_stats["total_generated_tokens"] += completion_tokens
@@ -2735,7 +2880,9 @@ def _execute_external_chat(
 
 
 def _external_stream_events(
-    req: ChatRequest, cancel_event: Optional[threading.Event] = None,
+    req: ChatRequest,
+    cancel_event: Optional[threading.Event] = None,
+    history: Optional[list[dict]] = None,
 ):
     """
     外部推理服务真流式事件生成器（fast 模式）。
@@ -2750,13 +2897,17 @@ def _external_stream_events(
     client.ensure_connected()
     parts: list[str] = []
     t0 = time.time()
-    for chunk in client.chat_stream(
-        [{
+    request_messages = [
+        *(history or []),
+        {
             "role": "user",
             "content": build_openai_user_content(
                 req.message, req.image_data_urls,
             ),
-        }],
+        },
+    ]
+    for chunk in client.chat_stream(
+        request_messages,
         max_tokens=req.max_new_tokens,
         temperature=req.temperature,
         top_p=req.top_p,
@@ -3263,12 +3414,9 @@ def _execute_task_graph_chat_with_slot(
                 "distributed_required 需要已启用的 PC Full Worker 实验调度。",
             )
 
-    target_session_id = req.session_id or active_session_id
-    if target_session_id and target_session_id != active_session_id:
-        _switch_session(target_session_id)
-    history = _get_active_history()
-    if target_session_id and len(history) == 0:
-        _auto_title_session(target_session_id, req.message)
+    prepared_context = _prepare_chat_context(req.session_id, req.message)
+    target_session_id = prepared_context.session_id
+    history = prepared_context.history
 
     base_messages = list(history) + [{"role": "user", "content": req.message}]
     root_input = {
@@ -3503,28 +3651,78 @@ def _execute_task_graph_chat_with_slot(
     if not response_text:
         raise HTTPException(500, "任务链最终聚合结果为空。")
 
-    history_start = len(history)
+    if distributed_task_required:
+        precommit_attempts = [
+            attempt
+            for stage in workflow.get("stages", [])
+            for attempt in stage.get("attempts", [])
+            if attempt.get("state") == "completed"
+        ]
+        precommit_remote_attempts = [
+            attempt
+            for attempt in precommit_attempts
+            if attempt.get("provider_kind") == "remote_full_worker"
+        ]
+        if not precommit_remote_attempts:
+            try:
+                task_graph_coordinator.discard_result(workflow["workflow_id"])
+            except TaskGraphUnavailable as exc:
+                raise HTTPException(
+                    503,
+                    {
+                        "message": "distributed_required 校验失败且结果无法丢弃。",
+                        "reason": str(exc),
+                    },
+                ) from exc
+            raise coded_http_error(
+                503,
+                "TASK_WORKER_REMOTE_STAGE_NOT_EXECUTED",
+                "distributed_required 未执行任何远端 Full Worker Stage。",
+            )
+        try:
+            validate_distributed_completion(
+                req.routing_preference,
+                {
+                    "distributed_used": True,
+                    "execution_mode": "task_graph",
+                    "workers_used": [
+                        str(attempt.get("provider_node_id", "") or "")
+                        for attempt in precommit_remote_attempts
+                        if attempt.get("provider_node_id")
+                    ],
+                },
+            )
+        except DistributedCompletionError as exc:
+            try:
+                task_graph_coordinator.discard_result(workflow["workflow_id"])
+            except TaskGraphUnavailable as discard_exc:
+                raise HTTPException(
+                    503,
+                    {
+                        "message": "发行 profile 拒绝任务图结果且结果无法丢弃。",
+                        "reason": str(discard_exc),
+                    },
+                ) from discard_exc
+            raise coded_http_error(
+                503,
+                "DISTRIBUTED_REQUIRED_RELEASE_ROUTE_FORBIDDEN",
+                f"distributed_required 发行路线校验失败：{exc}",
+            ) from exc
+
     try:
         with _generation_registry_lock:
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
-            history.extend([
-                {"role": "user", "content": req.message},
-                {"role": "assistant", "content": response_text},
-            ])
             if cancel_event is not None and cancel_event.is_set():
-                del history[history_start:]
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
             try:
                 workflow = task_graph_coordinator.commit_result(
                     workflow["workflow_id"],
                 )
             except WorkflowCancelled as exc:
-                del history[history_start:]
                 raise ChatGenerationCancelled(
                     req.generation_id or "gen_unknown",
                 ) from exc
             except TaskGraphUnavailable:
-                del history[history_start:]
                 raise
     except ChatGenerationCancelled:
         try:
@@ -3686,13 +3884,17 @@ def _execute_task_graph_chat_with_slot(
             else f"{_chat_origin(req)}_to_local_task_graph"
         ),
     )
-    followups = _fallback_followups(history, [])
+    completed_history = [
+        *history,
+        {"role": "user", "content": req.message},
+        {"role": "assistant", "content": response_text},
+    ]
+    followups = _fallback_followups(completed_history, [])
     save_metrics = dict(metrics)
     save_metrics["followups"] = followups
-
-    db_session_id = target_session_id or "default"
-    _persist_conversation_turn(
-        db_session_id, req.message, response_text, save_metrics,
+    _commit_chat_context_turn(
+        target_session_id, req.message, response_text, save_metrics,
+        expected_revision=prepared_context.revision,
     )
 
     conversation_stats["total_prompt_tokens"] += prompt_tokens
@@ -3736,14 +3938,9 @@ def _execute_chat_full(
     _raise_if_generation_cancelled(cancel_event, req.generation_id)
 
     # ---- 多会话支持 ----
-    target_session_id = req.session_id or active_session_id
-    if target_session_id and target_session_id != active_session_id:
-        _switch_session(target_session_id)
-
-    # ---- 首条消息自动生成标题 ----
-    history = _get_active_history()
-    if target_session_id and len(history) == 0:
-        _auto_title_session(target_session_id, req.message)
+    prepared_context = _prepare_chat_context(req.session_id, req.message)
+    target_session_id = prepared_context.session_id
+    history = prepared_context.history
 
     # ---- 路线 B：外部推理服务整请求路由（数据作用域门控，默认不出集群）----
     # 决策为纯函数（external_provider.decide_external_route）；不满足条件时
@@ -3772,9 +3969,15 @@ def _execute_chat_full(
     if _ext_decision.use_external:
         try:
             return _execute_external_chat(
-                req, history, target_session_id, cancel_event,
+                req,
+                history,
+                target_session_id,
+                prepared_context.revision,
+                cancel_event,
             )
         except ChatGenerationCancelled:
+            raise
+        except HTTPException:
             raise
         except Exception as exc:
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
@@ -3845,12 +4048,9 @@ def _execute_chat_full(
                     forward_metrics,
                     detail="从节点转发结果未标记为分布式执行",
                 )
-                history.append({"role": "user", "content": req.message})
-                history.append({"role": "assistant", "content": response_text})
-
-                db_session_id = target_session_id or "default"
-                _persist_conversation_turn(
-                    db_session_id, req.message, response_text, forward_metrics,
+                _commit_chat_context_turn(
+                    target_session_id, req.message, response_text, forward_metrics,
+                    expected_revision=prepared_context.revision,
                 )
 
                 conversation_stats["rounds"] += 1
@@ -3977,10 +4177,6 @@ def _execute_chat_full(
                         pipeline_metrics,
                         detail="流水线结果未标记为分布式执行",
                     )
-                    history.append({"role": "user", "content": req.message})
-                    history.append({"role": "assistant", "content": response_text})
-
-                    db_session_id = target_session_id or "default"
                     if external_fallback_reason and not pipeline_metrics.get(
                         "fallback_reason",
                     ):
@@ -3988,8 +4184,9 @@ def _execute_chat_full(
                         pipeline_metrics["fallback_reason"] = (
                             external_fallback_reason
                         )
-                    _persist_conversation_turn(
-                        db_session_id, req.message, response_text, pipeline_metrics,
+                    _commit_chat_context_turn(
+                        target_session_id, req.message, response_text, pipeline_metrics,
+                        expected_revision=prepared_context.revision,
                     )
 
                     conversation_stats["rounds"] += 1
@@ -4147,20 +4344,16 @@ def _execute_chat_full(
                 req,
             )
 
-            db_session_id = target_session_id or "default"
             followups = _generate_followups_llama(
                 completed_history, cancel_event,
             )
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
-            history.extend([
-                {"role": "user", "content": req.message},
-                {"role": "assistant", "content": response_text},
-            ])
 
             save_metrics = dict(metrics)
             save_metrics["followups"] = followups
-            _persist_conversation_turn(
-                db_session_id, req.message, response_text, save_metrics,
+            _commit_chat_context_turn(
+                target_session_id, req.message, response_text, save_metrics,
+                expected_revision=prepared_context.revision,
             )
 
             conversation_stats["total_generated_tokens"] += completion_tokens
@@ -4177,6 +4370,8 @@ def _execute_chat_full(
                 "followups": followups,
             }
         except ChatGenerationCancelled:
+            raise
+        except HTTPException:
             raise
         except Exception as e:
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
@@ -4323,8 +4518,6 @@ def _execute_chat_full(
             ),
         )
 
-        db_session_id = target_session_id or "default"
-
         followups = _generate_followups(
             completed_history,
             tokenizer,
@@ -4333,15 +4526,12 @@ def _execute_chat_full(
             cancel_event,
         )
         _raise_if_generation_cancelled(cancel_event, req.generation_id)
-        history.extend([
-            {"role": "user", "content": req.message},
-            {"role": "assistant", "content": response_text},
-        ])
 
         save_metrics = dict(metrics)
         save_metrics["followups"] = followups
-        _persist_conversation_turn(
-            db_session_id, req.message, response_text, save_metrics,
+        _commit_chat_context_turn(
+            target_session_id, req.message, response_text, save_metrics,
+            expected_revision=prepared_context.revision,
         )
 
         conversation_stats["total_prompt_tokens"] += prompt_len
@@ -4365,6 +4555,8 @@ def _execute_chat_full(
         }
 
     except ChatGenerationCancelled:
+        raise
+    except HTTPException:
         raise
     except torch.cuda.OutOfMemoryError:
         try:
@@ -4401,15 +4593,9 @@ def _commit_interactive_history(
     response_text: str,
     metrics: dict,
 ) -> bool:
-    """interactive 模式完成时的一次性会话事务提交（user + assistant）。
-
-    与 full 模式使用同一主节点 SQLite 持久化语义，
-    但只调用一次、一次写入两条消息，供 done 事件上报 history_committed。
-    返回是否实际写入。
-    """
-    db_session_id = session_id or "default"
-    return _persist_conversation_turn(
-        db_session_id, user_message, response_text, metrics,
+    """Compatibility wrapper for the shared completed-turn transaction."""
+    return _commit_chat_context_turn(
+        session_id, user_message, response_text, metrics,
     )
 
 
