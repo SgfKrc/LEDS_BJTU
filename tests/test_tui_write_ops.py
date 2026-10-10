@@ -226,14 +226,20 @@ def test_confirm_screen_gates_both_answers():
         answers = []
         async with app.run_test(size=(100, 30)) as pilot:
             app.push_screen(ConfirmScreen("标题", "正文"), answers.append)
-            await pilot.pause()
-            assert isinstance(app.screen, ConfirmScreen)
+            # ★ 用轮询等待替代单次 `pilot.pause()`：`push_screen` 的屏幕切换是
+            #   异步的，全量跑时消息泵被拖慢，单次 pause 未必已经切过去 ⇒ 假红
+            #   （实测单跑/整文件 6 次全绿，仅全量下 `app.screen` 仍是 MainScreen）。
+            assert await _wait_for(
+                pilot, lambda: isinstance(app.screen, ConfirmScreen)
+            ), "确认屏未在限定时间内成为当前屏幕"
             await pilot.press("n")
             assert await _wait_for(pilot, lambda: answers), "取消也应回调（值 False）"
             assert answers == [False]
 
             app.push_screen(ConfirmScreen("标题", "正文"), answers.append)
-            await pilot.pause()
+            assert await _wait_for(
+                pilot, lambda: isinstance(app.screen, ConfirmScreen)
+            ), "第二个确认屏未在限定时间内成为当前屏幕"
             await pilot.press("y")
             assert await _wait_for(pilot, lambda: len(answers) == 2)
             assert answers == [False, True]

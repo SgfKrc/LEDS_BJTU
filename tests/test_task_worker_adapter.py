@@ -3867,6 +3867,13 @@ def test_full_worker_stage_round_trips_through_independent_process(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            # ★ Windows 中文 locale 下 `text=True` 默认按 GBK 解码子进程输出；
+            #   子进程一旦打印非 GBK 字节（UTF-8 中文/符号），subprocess 的读取
+            #   线程会抛 UnicodeDecodeError 静默死掉 ⇒ `communicate()` 返回
+            #   `(None, None)`，握手诊断也一并失效（实测崩在 byte 0xa5）。
+            #   与本仓既有修法一致（见 `scripts/android_validation.py`）。
+            encoding="utf-8",
+            errors="replace",
         )
         # ★ 子进程要 import 整套生产代码，冷启动在负载高时（全量并行跑）会明显
         #   超过 8 秒 —— 实测全量耗时从 891s 涨到 1261s 时这里就 8s 超时假红，
@@ -3876,9 +3883,11 @@ def test_full_worker_stage_round_trips_through_independent_process(
         while not hello_received.wait(0.5):
             if process.poll() is not None:
                 out, err = process.communicate(timeout=5)
+                # 读取线程可能已因解码失败死掉 ⇒ communicate() 会给 (None, None)
                 raise AssertionError(
                     "worker process exited before hello handshake: "
-                    f"rc={process.returncode}\nstdout={out[-2000:]}\nstderr={err[-2000:]}"
+                    f"rc={process.returncode}\n"
+                    f"stdout={(out or '')[-2000:]}\nstderr={(err or '')[-2000:]}"
                 )
             if time.time() >= deadline:
                 raise AssertionError(
