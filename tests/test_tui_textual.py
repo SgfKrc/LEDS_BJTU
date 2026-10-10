@@ -378,7 +378,6 @@ def test_pages_refresh_lock_allows_only_one_inflight_worker(monkeypatch):
             screen.backend_available = True
             screen.runtime_ready = True
 
-            start = threading.Barrier(3)
             first_fetch = threading.Event()
             release = threading.Event()
             calls = []
@@ -389,27 +388,37 @@ def test_pages_refresh_lock_allows_only_one_inflight_worker(monkeypatch):
                     calls.append(path)
                     is_first = len(calls) == 1
                 if is_first:
+                    # 让第一轮刷新一直停在"在途"，好让第二次调用**确定**撞上
+                    # `_pages_inflight` 守卫。
                     first_fetch.set()
-                    assert release.wait(2)
+                    assert release.wait(5)
                 return {}
 
             monkeypatch.setattr(screen, "fetch_json", fetch_json)
             monkeypatch.setattr(screen, "fetch_json_params", lambda *args, **kwargs: {})
             monkeypatch.setattr(app, "call_from_thread", lambda *args, **kwargs: None)
 
-            def run_loader():
-                start.wait(timeout=2)
-                MainScreen.load_pages.__wrapped__(screen)
+            # ★ 不要用"两个线程靠 Barrier 同时撞锁"来验证：线程调度顺序没有保证，
+            #   若第二个线程在第一个释放锁**之后**才检查 `_pages_inflight`，它就会
+            #   再抓一整轮 —— 实测该写法单跑 8 次即 1 次 flaky（calls 变成 6 项）。
+            #   改为确定性构造：先启动一次刷新并等它真的进入在途，再在当前线程发
+            #   第二次刷新；此时 `_pages_inflight` 必为 True ⇒ 必被折叠。
+            loader = threading.Thread(
+                target=MainScreen.load_pages.__wrapped__, args=(screen,),
+            )
+            loader.start()
+            for _ in range(500):
+                if first_fetch.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert first_fetch.is_set(), "首次页面刷新未进入在途状态"
+            assert screen._pages_inflight is True
 
-            threads = [threading.Thread(target=run_loader) for _ in range(2)]
-            for thread in threads:
-                thread.start()
-            start.wait(timeout=2)
-            assert first_fetch.wait(2)
+            MainScreen.load_pages.__wrapped__(screen)   # 第二次：应被折叠为 no-op
+
             release.set()
-            for thread in threads:
-                thread.join(timeout=2)
-                assert not thread.is_alive()
+            loader.join(timeout=5)
+            assert not loader.is_alive()
 
             assert calls == [
                 "/cluster/nodes",

@@ -21,6 +21,8 @@ import os
 import random
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 
@@ -84,3 +86,81 @@ def pytest_runtest_setup(item) -> None:  # noqa: ARG001 - 需要 item 签名
         _install()  # 情况二：真模块但符号被删 ⇒ 直接补回
     except Exception:  # noqa: BLE001 - 兜底失败不应中断用例
         pass
+
+
+#: 运行期会被生产代码/用例直接改写的全局 config 名（详见下方 fixture 说明）。
+_CONFIG_BASELINE_NAMES = ("INFERENCE_ENGINE", "QUANT_TYPE", "USE_COMPILE")
+#: 首次用例开始前记录的基线值（= 会话起点状态），每个用例前后恢复。
+_CONFIG_BASELINE: dict = {}
+
+
+@pytest.fixture(autouse=True)
+def _reset_process_wide_chat_state():
+    """每个用例前后重置**进程级**聊天状态、request-id ContextVar 与被改写的全局 config。
+
+    为什么必须在 conftest 兜底（而不是靠各用例自觉）：
+
+    1. **request-id 是 ContextVar** —— 有用例直接 `.set()` 一个固定 id
+       （如 `test_api_logging.py` 设 `"abc123def456"`）后**不会自动复原**
+       （monkeypatch 不管 ContextVar）。后续用例经
+       `api_server._commit_chat_context_turn` 会拿到同一个 operation_id。
+    2. **`api_server._chat_context` 是模块级单例** —— 其
+       `_committed_operations`（operation_id → turn 的幂等表）跨用例累积：
+       同一个 operation_id 第二次带**不同**内容就会抛
+       `ConversationContextConflict` → API 409
+       `operation_id has conflicting conversation turn`。
+    3. **生产代码会在运行时改写全局 `config`** —— 例如
+       `api_server._auto_load_default_model()` 直接写
+       `cfg.INFERENCE_ENGINE = resolution.engine` /
+       `cfg.QUANT_TYPE = resolution.quant_type`（票 2 引入）。它是进程级副作用、
+       不随用例复原，于是任何触发过自动加载的用例都会改变后续用例看到的
+       "当前引擎"，使 `ModelManager.select_engine()` 类断言随机失败
+       （实测：`test_model_module.py::TestSelectEngine::test_manual_llama_cpp_override`
+       全量红 / 单跑绿）。
+
+    实测症状：全量下上述两类假红合计 25 例，单跑全绿。
+    """
+    # 首次调用时记录全局 config 基线（= 会话起点状态），之后每用例恢复。
+    if not _CONFIG_BASELINE:
+        try:
+            import config as _cfg
+            for _name in _CONFIG_BASELINE_NAMES:
+                if hasattr(_cfg, _name):
+                    _CONFIG_BASELINE[_name] = getattr(_cfg, _name)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _reset() -> None:
+        try:
+            import api_server
+        except Exception:  # noqa: BLE001 - 环境缺依赖时不该让用例中断
+            pass
+        else:
+            try:
+                service = getattr(api_server, "_chat_context", None)
+                if service is not None:
+                    with service._lock:
+                        # 只清"幂等/跨请求累积"的部分，保留 service 的身份与配置。
+                        service._committed_operations.clear()
+                        service._revisions.clear()
+                        service.histories.clear()
+                        service._history_generations.clear()
+                        service.active_session_id = None
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                ctx = getattr(api_server, "_request_id_ctx", None)
+                if ctx is not None:
+                    ctx.set("")
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            import config as _cfg
+            for _name, _value in _CONFIG_BASELINE.items():
+                setattr(_cfg, _name, _value)
+        except Exception:  # noqa: BLE001
+            pass
+
+    _reset()
+    yield
+    _reset()

@@ -4627,6 +4627,13 @@ class TestKVCacheManagement:
         """无模型时 _run_full_model_inference 返回 error"""
         from model_host import model_host as _host
 
+        # ★ 显式建立"没有任何已加载模型"这一前置条件，而不是指望全局恰好干净：
+        #   `ModelHost.has_loaded_model()` 先看 `model_loaded` 标志、再看惰性 manager，
+        #   任何一条为真都会走到"完整模型恢复"分支 ⇒ 报「完整模型恢复失败」而非
+        #   「模型未加载」（实测：与前序用例连跑时本断言落空）。
+        #   注意两条都在 `ModelHost._OWN_ATTRS` 里，才会落在宿主自身；
+        #   其它名字会被 `__setattr__` 代理给 manager（`_manager=None` 时会 AttributeError）。
+        monkeypatch.setattr(_host, "model_loaded", False)
         monkeypatch.setattr(_host, "_manager", None)
         result = sched._run_full_model_inference("测试")
         assert isinstance(result, dict)
@@ -5078,8 +5085,11 @@ class TestPipelineQueueIntegration:
         queued = threading.Event()
         original_enqueue = sched.pipeline_queue.enqueue
 
+        enqueued_task_ids: list = []
+
         def observed_enqueue(*args, **kwargs):
             task_id = original_enqueue(*args, **kwargs)
+            enqueued_task_ids.append(task_id)
             queued.set()
             return task_id
 
@@ -5089,21 +5099,23 @@ class TestPipelineQueueIntegration:
         sched.pipeline_queue._current_task_id = "fake_running"
 
         # 准备结果注入
+        # ★ 不要读 `pipeline_queue._queue`：MLFQ 重构后内部只有 _q0/_q1/_q2，
+        #   访问已不存在的 `_queue` 会让本线程抛 AttributeError 静默死掉，主线程
+        #   则在 wait_for_result 上干等到 PIPELINE_TIMEOUT（默认 120s）——实测全量
+        #   下表现为"卡死/超时"（单跑恰好走立即执行路径时侥幸为绿）。
+        #   改为沿用 enqueue 真正返回的 task_id 注入结果：不依赖内部队列结构，
+        #   也不依赖本次是否真的走了排队路径。
         def inject_result():
-            assert queued.wait(timeout=2.0)
-            tid = None
+            if not queued.wait(timeout=5.0) or not enqueued_task_ids:
+                return
+            tid_str = enqueued_task_ids[0]
             with sched.pipeline_queue._lock:
-                if sched.pipeline_queue._queue:
-                    tid = sched.pipeline_queue._queue.popleft()
-            if tid:
-                tid_str = tid[0]
-                with sched.pipeline_queue._lock:
-                    sched.pipeline_queue._results[tid_str] = {
-                        "status": "done",
-                        "result": {"response": "queued_result"},
-                    }
-                    if tid_str in sched.pipeline_queue._events:
-                        sched.pipeline_queue._events[tid_str].set()
+                sched.pipeline_queue._results[tid_str] = {
+                    "status": "done",
+                    "result": {"response": "queued_result"},
+                }
+                if tid_str in sched.pipeline_queue._events:
+                    sched.pipeline_queue._events[tid_str].set()
 
         # 模拟流水线节点可用
         original = sched._all_pipeline_nodes_ready
