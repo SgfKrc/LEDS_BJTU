@@ -16,6 +16,7 @@ scheduler 流水线段（_run_pipeline 等）复制为本宿主方法，源文�
   - 辅助纯函数：_format_model_response / _parse_thinking_response /
     _strip_native_thinking_tags（api_server.py:904-1088 复制，零改动）
 """
+import inspect
 import json
 import logging
 import re
@@ -25,6 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 import local_store as _local_store
+from api_errors import coded_http_error
 from chat_context import (
     ConversationContextConflict,
     ConversationContextService,
@@ -48,6 +50,43 @@ from model_load_resolver import (
     resolve_model_load,
 )
 from multimodal import materialize_image_data_url
+from request_deadline import (
+    REQUEST_DEADLINE_EXCEEDED,
+    DeadlineCancelEvent,
+    RequestDeadline,
+    RequestDeadlineExceeded,
+    coerce_request_deadline,
+    hold_lock_until_deadline,
+    request_stop_reason,
+)
+from request_outcome import (
+    REASON_GENERATION_CANCELLED,
+    REASON_REQUEST_REFUSED,
+)
+
+
+def _call_with_optional_request_deadline(
+    callback,
+    *args,
+    request_deadline: Optional[RequestDeadline],
+):
+    """Call an override while keeping pre-deadline test/plugin signatures valid."""
+
+    try:
+        parameters = inspect.signature(callback).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    deadline_parameter = parameters.get("request_deadline")
+    if deadline_parameter is not None:
+        if deadline_parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+            return callback(*args, request_deadline)
+        return callback(*args, request_deadline=request_deadline)
+    if any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    ):
+        return callback(*args, request_deadline=request_deadline)
+    return callback(*args)
 
 
 # ---- 复制自 api_server.py:887-904（常量，保真不变） ----
@@ -714,30 +753,161 @@ class EngineHost:
         req: ChatRequest,
         cancel_event: Optional[threading.Event],
         operation_id: str,
+        request_deadline: Optional[RequestDeadline] = None,
     ) -> Dict[str, Any]:
         """Run one complete chat transaction with an explicit HTTP identity."""
 
-        with self._chat_context.transaction():
-            token = _request_id_ctx.set(operation_id or "-")
-            try:
-                return self.chat_full(req, cancel_event)
-            finally:
-                _request_id_ctx.reset(token)
+        with self._chat_context.transaction(deadline=request_deadline):
+            with hold_lock_until_deadline(
+                self._model_lifecycle_lock(),
+                request_deadline,
+                operation="full chat execution lock",
+            ):
+                token = _request_id_ctx.set(operation_id or "-")
+                try:
+                    return _call_with_optional_request_deadline(
+                        self.chat_full,
+                        req,
+                        cancel_event,
+                        request_deadline=request_deadline,
+                    )
+                finally:
+                    _request_id_ctx.reset(token)
 
     def chat_stream_events_with_operation_id(
         self,
         req: ChatRequest,
         cancel_event: Optional[threading.Event],
         operation_id: str,
+        request_deadline: Optional[RequestDeadline] = None,
     ):
-        """Keep stream production serialized and preserve its request identity."""
+        """Bound stream consumption while the producer retains model ownership.
 
-        with self._chat_context.transaction():
-            token = _request_id_ctx.set(operation_id or "-")
+        A backend iterator can block inside ``next()`` and ignore cooperative
+        cancellation.  The caller must still observe the request deadline, but
+        the conversation/model locks must not be released until that backend
+        actually exits.  A dedicated owner thread therefore holds both locks;
+        this generator only consumes its bounded queue.
+        """
+
+        import queue
+        import time as _time
+
+        stream_cancel_event = cancel_event
+        if not isinstance(stream_cancel_event, DeadlineCancelEvent):
+            stream_cancel_event = DeadlineCancelEvent(
+                stream_cancel_event, request_deadline,
+            )
+        events: queue.Queue = queue.Queue(maxsize=1)
+        consumer_done = threading.Event()
+        demand = threading.Semaphore(0)
+        producer_done = object()
+
+        def put_event(item) -> bool:
+            while not consumer_done.is_set():
+                try:
+                    events.put(item, timeout=0.05)
+                    return True
+                except queue.Full:
+                    pass
+            return False
+
+        def produce() -> None:
             try:
-                yield from self.chat_stream_events(req, cancel_event)
+                with self._chat_context.transaction(deadline=request_deadline):
+                    with hold_lock_until_deadline(
+                        self._model_lifecycle_lock(),
+                        request_deadline,
+                        operation="full chat execution lock",
+                    ):
+                        token = _request_id_ctx.set(operation_id or "-")
+                        try:
+                            iterable = _call_with_optional_request_deadline(
+                                self.chat_stream_events,
+                                req,
+                                stream_cancel_event,
+                                request_deadline=request_deadline,
+                            )
+                            iterator = iter(iterable)
+                            while True:
+                                demand.acquire()
+                                if consumer_done.is_set():
+                                    return
+                                try:
+                                    event = next(iterator)
+                                except StopIteration:
+                                    break
+                                if not put_event((event, None)):
+                                    return
+                        finally:
+                            _request_id_ctx.reset(token)
+            except Exception as exc:
+                put_event((None, exc))
             finally:
-                _request_id_ctx.reset(token)
+                put_event((producer_done, None))
+
+        threading.Thread(
+            target=produce,
+            name="inference-svc-stream-owner",
+            daemon=True,
+        ).start()
+
+        completed_normally = False
+        cancel_grace_deadline = None
+        demand_outstanding = False
+        try:
+            while True:
+                stop_reason = request_stop_reason(
+                    stream_cancel_event, request_deadline,
+                )
+                if stop_reason == REQUEST_DEADLINE_EXCEEDED:
+                    yield {
+                        "done": True,
+                        "error": "request deadline exceeded",
+                        "reason_code": REQUEST_DEADLINE_EXCEEDED,
+                    }
+                    return
+                if stop_reason:
+                    if cancel_grace_deadline is None:
+                        cancel_grace_deadline = _time.monotonic() + 0.25
+                    elif _time.monotonic() >= cancel_grace_deadline:
+                        yield {
+                            "done": True,
+                            "error": "generation cancelled",
+                            "cancelled": True,
+                            "reason_code": REASON_GENERATION_CANCELLED,
+                        }
+                        return
+                wait_timeout = 0.1
+                if cancel_grace_deadline is not None:
+                    wait_timeout = min(
+                        wait_timeout,
+                        max(0.001, cancel_grace_deadline - _time.monotonic()),
+                    )
+                if not demand_outstanding:
+                    demand.release()
+                    demand_outstanding = True
+                if request_deadline is not None:
+                    remaining = request_deadline.remaining()
+                    if remaining <= 0:
+                        continue
+                    wait_timeout = min(wait_timeout, remaining)
+                try:
+                    event, error = events.get(timeout=wait_timeout)
+                except queue.Empty:
+                    continue
+                demand_outstanding = False
+                if event is producer_done:
+                    completed_normally = True
+                    return
+                if error is not None:
+                    raise error
+                yield event
+        finally:
+            consumer_done.set()
+            demand.release()
+            if not completed_normally:
+                stream_cancel_event.set()
 
     def commit_stream_event(
         self,
@@ -1349,7 +1519,10 @@ class EngineHost:
     # RUN_MODE → self._run_mode）
     # ------------------------------------------------------------------
     def chat_full(
-        self, req: ChatRequest, cancel_event: Optional[threading.Event] = None
+        self,
+        req: ChatRequest,
+        cancel_event: Optional[threading.Event] = None,
+        request_deadline: Optional[RequestDeadline] = None,
     ) -> Dict[str, Any]:
         """
         执行完整聊天流程 — 从 /api/chat 提取的共用核心逻辑。
@@ -1366,10 +1539,26 @@ class EngineHost:
         """
         import time as _time
         from fastapi import HTTPException
+        import config as _cfg
+
+        request_deadline = coerce_request_deadline(
+            request_deadline,
+            timeout_seconds=_cfg.PIPELINE_TIMEOUT,
+        )
+        request_deadline.require_remaining()
 
         # ---- task_graph 分支（1.2d：对齐 api_server._execute_requested_chat）----
         if req.execution_mode == "task_graph":
-            return self.execute_task_graph_chat(req, cancel_event)
+            try:
+                return self.execute_task_graph_chat(
+                    req,
+                    cancel_event,
+                    request_deadline=request_deadline,
+                )
+            except TypeError as exc:
+                if "request_deadline" not in str(exc):
+                    raise
+                return self.execute_task_graph_chat(req, cancel_event)
 
         # T9.5：distributed_required 无分布式路径时明确失败（full 模式）
         routing_gate = self._routing_gate_error(req)
@@ -1381,6 +1570,7 @@ class EngineHost:
 
         # ---- 多会话支持 ----
         prepared_context = self._prepare_chat_context(req.session_id, req.message)
+        request_deadline.require_remaining()
         target_session_id = prepared_context.session_id
         history = prepared_context.history
 
@@ -1469,8 +1659,15 @@ class EngineHost:
                     messages=list(history) + [{"role": "user", "content": req.message}],
                     request_id=_request_id_ctx.get("-"),
                     _cancel_event=cancel_event,
+                    _request_deadline=request_deadline,
                 )
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
+                if result.get("reason_code") == REQUEST_DEADLINE_EXCEEDED:
+                    raise coded_http_error(
+                        504,
+                        REQUEST_DEADLINE_EXCEEDED,
+                        result.get("error") or "request deadline exceeded",
+                    )
                 if result.get("status") == "ok":
                     response_text = result.get("content", "")
                     forward_metrics = _augment_chat_metrics(
@@ -1569,9 +1766,20 @@ class EngineHost:
                     _require_distributed=(req.routing_preference == "distributed_required"),
                     _force_distributed_assignment=True,
                     _cancel_event=cancel_event,
+                    _request_deadline=request_deadline,
                 )
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
                 if pipeline_result.get("error"):
+                    if (
+                        pipeline_result.get("reason_code")
+                        == REQUEST_DEADLINE_EXCEEDED
+                    ):
+                        raise coded_http_error(
+                            504,
+                            REQUEST_DEADLINE_EXCEEDED,
+                            pipeline_result.get("error")
+                            or "request deadline exceeded",
+                        )
                     pipeline_failure_reason = str(pipeline_result["error"])
                     logger.warning(f"流水线推理失败: {pipeline_result['error']}，回退到本地推理")
                     self._enforce_distributed_required(
@@ -1932,6 +2140,10 @@ class EngineHost:
 
         except ChatGenerationCancelled:
             raise
+        except RequestDeadlineExceeded as exc:
+            raise coded_http_error(
+                504, REQUEST_DEADLINE_EXCEEDED, str(exc),
+            ) from exc
         except HTTPException:
             raise
         except _torch.cuda.OutOfMemoryError:
@@ -1962,34 +2174,79 @@ class EngineHost:
             except Exception:
                 pass
 
-    def chat_stream_events(self, req: ChatRequest, cancel_event: Optional[threading.Event]):
+    def chat_stream_events(
+        self,
+        req: ChatRequest,
+        cancel_event: Optional[threading.Event],
+        request_deadline: Optional[RequestDeadline] = None,
+    ):
         """SSE 事件序列（1.1 薄实现；1.2 替换为 fast 模式副本）。
 
         Yields:
             dict 事件：{"token": ...} 或 {"done": True, "response": ..., "metrics": ...}
         """
+        import config as _cfg
+
+        request_deadline = coerce_request_deadline(
+            request_deadline,
+            timeout_seconds=_cfg.PIPELINE_TIMEOUT,
+        )
+        if not isinstance(cancel_event, DeadlineCancelEvent):
+            cancel_event = DeadlineCancelEvent(
+                cancel_event, request_deadline,
+            )
+        request_deadline.require_remaining()
         self._enforce_distributed_required(
             req, detail="inference-service interactive 仅实现本地流式执行",
         )
         if getattr(req, "image_data_urls", []):
             raise RuntimeError("图像请求仅支持 full 响应模式，禁止忽略图片后执行文本流式推理")
         prepared_context = self._prepare_chat_context(req.session_id, req.message)
+        request_deadline.require_remaining()
         messages = [
             *prepared_context.history,
             {"role": "user", "content": req.message},
         ]
         response_parts: list[str] = []
-        chunks = self._host.chat_stream(
-            messages=messages,
-            max_tokens=req.max_new_tokens,
-            temperature=req.temperature,
-            top_p=req.top_p,
-        )
+        try:
+            chunks = self._host.chat_stream(
+                messages=messages,
+                max_tokens=req.max_new_tokens,
+                temperature=req.temperature,
+                top_p=req.top_p,
+                _cancel_event=cancel_event,
+            )
+        except TypeError as exc:
+            if "_cancel_event" not in str(exc):
+                raise
+            chunks = self._host.chat_stream(
+                messages=messages,
+                max_tokens=req.max_new_tokens,
+                temperature=req.temperature,
+                top_p=req.top_p,
+            )
         for chunk in chunks:
-            if cancel_event is not None and cancel_event.is_set():
+            stop_reason = request_stop_reason(
+                cancel_event, request_deadline,
+            )
+            if stop_reason == REQUEST_DEADLINE_EXCEEDED:
+                yield {
+                    "done": True,
+                    "error": "request deadline exceeded",
+                    "reason_code": REQUEST_DEADLINE_EXCEEDED,
+                }
+                return
+            if stop_reason:
                 raise ChatGenerationCancelled(req.generation_id or "gen_unknown")
             response_parts.append(str(chunk))
             yield {"token": chunk}
+        if request_deadline.expired():
+            yield {
+                "done": True,
+                "error": "request deadline exceeded",
+                "reason_code": REQUEST_DEADLINE_EXCEEDED,
+            }
+            return
         _raise_if_generation_cancelled(cancel_event, req.generation_id)
         response_text = "".join(response_parts)
         metrics = {
@@ -2660,7 +2917,10 @@ class EngineHost:
 
 
     def execute_task_graph_chat(
-        self, req: ChatRequest, cancel_event: Optional[threading.Event] = None,
+        self,
+        req: ChatRequest,
+        cancel_event: Optional[threading.Event] = None,
+        request_deadline: Optional[RequestDeadline] = None,
     ) -> Dict[str, Any]:
         """Run the fixed local task graph without claiming multi-device execution.
         1.2d 复制自 api_server._execute_task_graph_chat（api_server.py:2571-2614）；
@@ -2691,15 +2951,24 @@ class EngineHost:
         if not self._task_graph_execution_slot.acquire(blocking=False):
             raise HTTPException(429, "已有任务链正在执行，请稍后重试。")
         try:
-            with self._host.full_chat_execution_lock:
-                return self.execute_task_graph_chat_with_slot(req, cancel_event)
+            with hold_lock_until_deadline(
+                self._model_lifecycle_lock(),
+                request_deadline,
+                operation="full chat execution lock",
+            ):
+                return self.execute_task_graph_chat_with_slot(
+                    req, cancel_event, request_deadline,
+                )
         finally:
             self._task_graph_execution_slot.release()
 
 
 
     def execute_task_graph_chat_with_slot(
-        self, req: ChatRequest, cancel_event: Optional[threading.Event] = None,
+        self,
+        req: ChatRequest,
+        cancel_event: Optional[threading.Event] = None,
+        request_deadline: Optional[RequestDeadline] = None,
     ) -> Dict[str, Any]:
         """Execute one workflow while the process-wide task-graph slot is held.
         1.2d 复制自 api_server._execute_task_graph_chat_with_slot
@@ -2722,10 +2991,16 @@ class EngineHost:
             TaskGraphError,
             TaskGraphUnavailable,
             WorkflowCancelled,
+            WorkflowDeadlineExceeded,
             WorkflowExecutionError,
             dual_candidate_template,
         )
         from task_provider import ProviderError
+        request_deadline = coerce_request_deadline(
+            request_deadline,
+            timeout_seconds=_cfg.PIPELINE_TIMEOUT,
+        )
+        request_deadline.require_remaining()
 
         remote_stage_id = str(req.task_graph_remote_stage or "")
         remote_provider_id = str(req.task_graph_remote_provider_id or "")
@@ -2771,6 +3046,7 @@ class EngineHost:
         prepared_context = self._prepare_chat_context(req.session_id, req.message)
         target_session_id = prepared_context.session_id
         history = prepared_context.history
+        request_deadline.require_remaining()
 
         base_messages = list(history) + [{"role": "user", "content": req.message}]
         root_input = {
@@ -2941,6 +3217,7 @@ class EngineHost:
                     runtime_context=runtime_context,
                     workflow_id=req.workflow_id,
                     cancel_event=cancel_event,
+                    request_deadline=request_deadline,
                 )
             else:
                 final_output, workflow = self._ensure_task_graph_coordinator().run(
@@ -2954,6 +3231,7 @@ class EngineHost:
                     runtime_context=runtime_context,
                     workflow_id=req.workflow_id,
                     cancel_event=cancel_event,
+                    request_deadline=request_deadline,
                 )
         except WorkflowCancelled as exc:
             raise HTTPException(
@@ -2961,13 +3239,23 @@ class EngineHost:
                 {"message": "任务链已取消", "workflow_id": exc.workflow_id},
             ) from exc
         except WorkflowExecutionError as exc:
+            status_code = 504 if exc.code == "request_deadline_exceeded" else 500
             raise coded_http_error(
-                500,
+                status_code,
                 exc.code,
                 {
                     "message": str(exc),
                     "workflow_id": exc.workflow_id,
                     "stage_id": exc.stage_id,
+                },
+            ) from exc
+        except WorkflowDeadlineExceeded as exc:
+            raise coded_http_error(
+                504,
+                exc.code,
+                {
+                    "message": str(exc),
+                    "workflow_id": exc.workflow_id,
                 },
             ) from exc
         except TaskGraphUnavailable as exc:
@@ -3002,6 +3290,7 @@ class EngineHost:
                 try:
                     self._ensure_task_graph_coordinator().discard_result(
                         workflow["workflow_id"],
+                        terminal_reason_code=REASON_REQUEST_REFUSED,
                     )
                 except TaskGraphUnavailable as exc:
                     raise HTTPException(
@@ -3033,6 +3322,7 @@ class EngineHost:
                 try:
                     self._ensure_task_graph_coordinator().discard_result(
                         workflow["workflow_id"],
+                        terminal_reason_code=REASON_REQUEST_REFUSED,
                     )
                 except TaskGraphUnavailable as discard_exc:
                     raise HTTPException(
@@ -3049,7 +3339,11 @@ class EngineHost:
                 ) from exc
 
         try:
-            with self._gen_lock:
+            with hold_lock_until_deadline(
+                self._gen_lock,
+                request_deadline,
+                operation="generation commit lock",
+            ):
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
                 if cancel_event is not None and cancel_event.is_set():
                     _raise_if_generation_cancelled(cancel_event, req.generation_id)
@@ -3060,6 +3354,10 @@ class EngineHost:
                 except WorkflowCancelled as exc:
                     raise ChatGenerationCancelled(
                         req.generation_id or "gen_unknown",
+                    ) from exc
+                except WorkflowDeadlineExceeded as exc:
+                    raise coded_http_error(
+                        504, REQUEST_DEADLINE_EXCEEDED, str(exc),
                     ) from exc
                 except TaskGraphUnavailable:
                     raise
@@ -3634,8 +3932,9 @@ class EngineHost:
                             )
                         with sched._layer_config_lock:
                             sched._worker_assignments.clear()
-                            sched._layer_config_expected.clear()
-                            sched._layer_config_acks.clear()
+                            sched._layer_config_retry_state.clear()
+                            sched._pipeline_load_transaction = None
+                            sched._active_pipeline_capacity_plan = None
                             sched._active_layer_config = None
                             sched._last_layer_config_ack_payload = None
                             sched._local_pipeline_steps.clear()

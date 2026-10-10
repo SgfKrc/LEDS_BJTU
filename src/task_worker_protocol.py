@@ -113,6 +113,11 @@ _LAYER_FORWARD_OFFER_FIELDS = {
 #: `_validate_payload` 里按「payload 是否真的出现」动态放宽。
 _LAYER_FORWARD_OPTIONAL_FIELDS = {"middle_channel", "seq_ids", "positions"}
 
+# Request deadlines are request-scoped and must not be encoded as worker
+# ownership leases. The field is optional so peers without an end-to-end
+# deadline continue to emit the existing stage_offer shape.
+_STAGE_OFFER_OPTIONAL_FIELDS = {"request_deadline_ms"}
+
 #: `middle_channel` 的允许值（协议两侧必须同集合）。
 #: * `extract_hidden` —— `llama_get_embeddings_ith` 通道，返回 `output_norm(H)`（旧默认）；
 #: * `keep_head_layer_out` —— `layer_inp` 的 `lid == n_layer` 槽位，返回**末层输出**。
@@ -968,6 +973,8 @@ def _validate_payload(
         else _PAYLOAD_FIELDS
     )
     required = fields[message_type]
+    if message_type == "stage_offer" and isinstance(payload, Mapping):
+        required = required | (_STAGE_OFFER_OPTIONAL_FIELDS & set(payload))
     # ★ 2026-09-20（v3）：层段字段**按 `stage_type` 动态并入**。
     #   只有声明 `layer_forward` 的 `stage_offer` 才要求 hidden 交接字段；
     #   非层段 stage 携带这些字段会被精确字段校验拒绝（既不漏也不多）。
@@ -1047,6 +1054,11 @@ def _validate_payload(
             payload["lease_expires_at_ms"], "payload.lease_expires_at_ms",
             minimum=1,
         )
+        if "request_deadline_ms" in payload:
+            _require_int(
+                payload["request_deadline_ms"], "payload.request_deadline_ms",
+                minimum=1,
+            )
         root_input = _require_object(payload["root_input"], "payload.root_input")
         dependencies = _require_object(
             payload["dependencies"], "payload.dependencies"

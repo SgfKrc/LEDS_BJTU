@@ -12,6 +12,8 @@ from enum import Enum
 from threading import Lock, RLock
 from typing import Callable, Iterable, Iterator, Mapping, MutableMapping, Optional
 
+from request_deadline import RequestDeadline, RequestDeadlineExceeded
+
 
 DEFAULT_SESSION_ID = "default"
 DEFAULT_CONTEXT_MESSAGES = 200
@@ -126,14 +128,51 @@ class ConversationContextService:
                 }
 
     @contextmanager
-    def transaction(self) -> Iterator[None]:
-        """Serialize a complete conversation transaction in this process."""
+    def transaction(
+        self,
+        *,
+        timeout: Optional[float] = None,
+        deadline: Optional[RequestDeadline] = None,
+    ) -> Iterator[None]:
+        """Serialize a complete conversation transaction in this process.
 
-        with self._transaction_lock:
+        When a request deadline is supplied, time spent queued behind another
+        conversation is part of the same end-to-end budget. The lock is never
+        acquired after that budget has expired.
+        """
+
+        self.acquire_transaction(timeout=timeout, deadline=deadline)
+        try:
             yield
+        finally:
+            self.release_transaction()
 
-    def acquire_transaction(self) -> None:
-        self._transaction_lock.acquire()
+    def acquire_transaction(
+        self,
+        *,
+        timeout: Optional[float] = None,
+        deadline: Optional[RequestDeadline] = None,
+    ) -> None:
+        if deadline is None and timeout is None:
+            self._transaction_lock.acquire()
+            return
+
+        wait_timeout = float("inf") if timeout is None else max(0.0, float(timeout))
+        if deadline is not None:
+            wait_timeout = min(wait_timeout, deadline.require_remaining())
+        acquired = self._transaction_lock.acquire(timeout=wait_timeout)
+        if acquired:
+            if deadline is not None and deadline.expired():
+                self._transaction_lock.release()
+                raise RequestDeadlineExceeded(
+                    "request deadline exceeded while acquiring conversation transaction"
+                )
+            return
+        if deadline is not None:
+            raise RequestDeadlineExceeded(
+                "request deadline exceeded while acquiring conversation transaction"
+            )
+        raise TimeoutError("conversation transaction lock acquisition timed out")
 
     def release_transaction(self) -> None:
         self._transaction_lock.release()

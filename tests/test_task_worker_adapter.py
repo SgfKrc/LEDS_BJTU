@@ -14,6 +14,8 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import tcp_comm as tcp_comm_mod
+import task_worker_adapter as task_worker_adapter_mod
+from request_deadline import RequestDeadline
 from task_worker_adapter import TaskWorkerControlPlane
 from task_worker_protocol import (
     WorkerProtocolError,
@@ -364,6 +366,221 @@ def _response_identity(offer):
     }
 
 
+def _start_accepted_remote_attempt(suffix):
+    coordinator_control, _worker_control = _admitted_control_plane()
+    sent = []
+    provider = RemoteFullWorkerProvider(
+        node_id="worker_01",
+        peer_snapshot=lambda: coordinator_control.worker_snapshot("worker_01"),
+        send_message=sent.append,
+    )
+    request = _remote_request(provider.provider_id)
+    reservation = provider.reserve(request)
+    attempt = StageAttempt(
+        attempt_id=f"att_terminal_{suffix}",
+        request=request,
+        provider_id=provider.provider_id,
+        lease_id=f"lease_terminal_{suffix}",
+        lease_epoch=1,
+        lease_expires_at=time.time() + 5.0,
+    )
+    outcome = {}
+    finished = threading.Event()
+
+    def execute():
+        try:
+            outcome["result"] = provider.execute(
+                attempt, reservation, threading.Event(),
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=execute, daemon=True)
+    thread.start()
+    assert _wait_until(
+        lambda: any(message.message_type == "stage_offer" for message in sent)
+    )
+    offer = next(
+        message for message in sent if message.message_type == "stage_offer"
+    )
+    identity = _response_identity(offer.payload)
+    provider.handle_message(build_message(
+        "stage_accept",
+        {**identity, "accepted": True, "reason_code": "", "retryable": False},
+        message_id=f"msg_terminal_accept_{suffix}",
+        sent_at_ms=int(time.time() * 1000),
+        version=3,
+    ).snapshot())
+    return (
+        provider, reservation, attempt, identity, outcome, finished, thread, sent,
+    )
+
+
+def test_remote_provider_request_deadline_caps_accept_wait():
+    coordinator_control, _worker_control = _admitted_control_plane()
+    sent = []
+    provider = RemoteFullWorkerProvider(
+        node_id="worker_01",
+        peer_snapshot=lambda: coordinator_control.worker_snapshot("worker_01"),
+        send_message=sent.append,
+    )
+    request = _remote_request(provider.provider_id)
+    reservation = provider.reserve(request)
+    deadline = RequestDeadline.start(0.08)
+    attempt = StageAttempt(
+        attempt_id="att_deadline_accept01",
+        request=request,
+        provider_id=provider.provider_id,
+        lease_id="lease_deadline_accept01",
+        lease_epoch=1,
+        lease_expires_at=time.time() + 5.0,
+        request_deadline=deadline,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(ProviderExecutionError) as captured:
+        provider.execute(attempt, reservation, threading.Event())
+
+    assert captured.value.code == "request_deadline_exceeded"
+    assert captured.value.retryable is False
+    assert time.monotonic() - started < 0.5
+    assert sent[0].message_type == "stage_offer"
+    assert sent[0].payload["lease_expires_at_ms"] == int(
+        attempt.lease_expires_at * 1000
+    )
+    assert sent[0].payload["request_deadline_ms"] == (
+        deadline.expires_at_epoch_ms
+    )
+    assert (
+        sent[0].payload["lease_expires_at_ms"]
+        > sent[0].payload["request_deadline_ms"]
+    )
+    assert _wait_until(
+        lambda: any(message.message_type == "stage_cancel" for message in sent)
+    )
+    provider.release(reservation.reservation_id)
+
+
+def test_remote_offer_timestamp_is_sampled_after_chunk_preparation(monkeypatch):
+    coordinator_control, _worker_control = _admitted_control_plane()
+    sent = []
+    provider = RemoteFullWorkerProvider(
+        node_id="worker_01",
+        peer_snapshot=lambda: coordinator_control.worker_snapshot("worker_01"),
+        send_message=sent.append,
+    )
+    request = _remote_request(provider.provider_id)
+    reservation = provider.reserve(request)
+    attempt = StageAttempt(
+        attempt_id="att_offer_timestamp01",
+        request=request,
+        provider_id=provider.provider_id,
+        lease_id="lease_offer_timestamp01",
+        lease_epoch=1,
+        lease_expires_at=time.time() + 5.0,
+    )
+    observed = {}
+
+    def prepare_chunks(_attempt):
+        time.sleep(0.03)
+        observed["completed_at_ms"] = int(time.time() * 1000)
+        return dict(request.root_input)
+
+    monkeypatch.setattr(provider, "_maybe_send_stage_chunks", prepare_chunks)
+    finished = threading.Event()
+
+    def execute():
+        try:
+            provider.execute(attempt, reservation, threading.Event())
+        except ProviderExecutionError:
+            pass
+        finally:
+            finished.set()
+
+    threading.Thread(target=execute, daemon=True).start()
+    assert _wait_until(
+        lambda: any(message.message_type == "stage_offer" for message in sent)
+    )
+    offer = next(
+        message for message in sent if message.message_type == "stage_offer"
+    )
+    assert offer.sent_at_ms >= observed["completed_at_ms"]
+
+    provider.cancel(attempt.attempt_id)
+    assert finished.wait(1.0)
+    provider.release(reservation.reservation_id)
+
+
+def test_remote_wait_is_not_shortened_by_wall_clock_jump(monkeypatch):
+    coordinator_control, _worker_control = _admitted_control_plane()
+    sent = []
+    provider = RemoteFullWorkerProvider(
+        node_id="worker_01",
+        peer_snapshot=lambda: coordinator_control.worker_snapshot("worker_01"),
+        send_message=sent.append,
+    )
+    request = _remote_request(provider.provider_id)
+    reservation = provider.reserve(request)
+    attempt = StageAttempt(
+        attempt_id="att_wall_jump01",
+        request=request,
+        provider_id=provider.provider_id,
+        lease_id="lease_wall_jump01",
+        lease_epoch=1,
+        lease_expires_at=time.time() + 1.0,
+    )
+    outcome = {}
+    finished = threading.Event()
+
+    def execute():
+        try:
+            outcome["result"] = provider.execute(
+                attempt, reservation, threading.Event(),
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            finished.set()
+
+    threading.Thread(target=execute, daemon=True).start()
+    assert _wait_until(lambda: bool(sent))
+    offer = sent[0].payload
+    identity = _response_identity(offer)
+    real_time = time.time
+    monkeypatch.setattr(
+        task_worker_adapter_mod.time,
+        "time",
+        lambda: real_time() + 10_000.0,
+    )
+    provider.handle_message(build_message(
+        "stage_accept",
+        {**identity, "accepted": True, "reason_code": "", "retryable": False},
+        message_id="msg_wall_jump_accept01",
+        sent_at_ms=int(real_time() * 1000),
+        version=2,
+    ).snapshot())
+    output = {"content": "monotonic wait survived"}
+    provider.handle_message(build_message(
+        "stage_result",
+        {
+            **identity,
+            "output": output,
+            "output_sha256": canonical_sha256(output),
+            "metadata": {},
+        },
+        message_id="msg_wall_jump_result01",
+        sent_at_ms=int(real_time() * 1000),
+        version=2,
+    ).snapshot())
+
+    assert finished.wait(1.0)
+    assert "error" not in outcome
+    assert outcome["result"].output == output
+    provider.release(reservation.reservation_id)
+
+
 def _v1_hello(node_id="worker_01"):
     return build_message(
         "hello",
@@ -404,6 +621,38 @@ def _stage_offer():
         sent_at_ms=1000,
         version=2,
     )
+
+
+def test_stage_offer_request_deadline_wire_field_is_optional_and_distinct():
+    without_deadline = _stage_offer()
+    assert "request_deadline_ms" not in without_deadline.payload
+
+    payload = {
+        **without_deadline.payload,
+        "request_deadline_ms": 1500,
+    }
+    with_deadline = build_message(
+        "stage_offer",
+        payload,
+        message_id="msg_offer_deadline01",
+        sent_at_ms=1000,
+        version=2,
+    )
+
+    assert with_deadline.payload["request_deadline_ms"] == 1500
+    assert with_deadline.payload["lease_expires_at_ms"] == 2000
+
+    payload["request_deadline_ms"] = 0
+    with pytest.raises(WorkerProtocolError) as captured:
+        build_message(
+            "stage_offer",
+            payload,
+            message_id="msg_offer_deadline02",
+            sent_at_ms=1000,
+            version=2,
+        )
+    assert captured.value.code == "invalid_integer"
+    assert captured.value.field == "payload.request_deadline_ms"
 
 
 def test_v2_hello_negotiates_and_reports_control_plane_only():
@@ -1661,7 +1910,7 @@ def test_route_a_android_assignment_never_publishes_legacy_layer_config(monkeypa
     scheduler.push_layer_config_to_clients()
 
     assert sent == []
-    assert scheduler._layer_config_expected == {}
+    assert scheduler._worker_assignments.expected_configs() == {}
 
 
 @pytest.mark.parametrize("previously_opted_out", [False, True])
@@ -2088,6 +2337,203 @@ def test_scheduler_worker_executes_one_admitted_stage_and_returns_result(
     assert sent[1][0]["payload"]["attempt_id"] == "att_workerexec01"
 
 
+@pytest.mark.parametrize(
+    (
+        "blocked_lock_name", "request_budget_ms", "lease_budget_ms",
+        "expected_reason",
+    ),
+    [
+        (
+            "full_chat_execution_lock", 120, 600,
+            "request_deadline_exceeded",
+        ),
+        ("_inference_lock", 600, 120, "lease_expired"),
+    ],
+)
+def test_scheduler_worker_lock_wait_stops_at_earliest_attempt_boundary(
+    monkeypatch,
+    blocked_lock_name,
+    request_budget_ms,
+    lease_budget_ms,
+    expected_reason,
+):
+    """Lock queues consume one request/lease budget and never call executor late."""
+    from scheduler import Scheduler
+
+    scheduler = Scheduler()
+    scheduler._role_override = "client"
+    monkeypatch.setattr(scheduler, "get_effective_node_id", lambda: "worker_01")
+    monkeypatch.setattr(scheduler, "_task_worker_capabilities", _capabilities)
+    coordinator = TaskWorkerControlPlane()
+    hello = scheduler._task_worker_control.begin_worker_hello(
+        node_id="worker_01", capabilities=_capabilities(),
+    )
+    assert hello is not None
+    ack = coordinator.receive_on_coordinator(
+        "worker_01", hello.snapshot(), coordinator_node_id="master",
+    )
+    scheduler._task_worker_control.receive_on_worker(ack.snapshot())
+
+    full_chat_lock = threading.Lock()
+    monkeypatch.setattr(scheduler, "_host", SimpleNamespace(
+        full_chat_execution_lock=full_chat_lock,
+    ))
+    executor_calls = []
+
+    def execute(request, _cancel_event):
+        executor_calls.append(request.stage_id)
+        return {"content": f"completed:{request.stage_id}"}
+
+    scheduler.configure_callbacks(_scheduler_callbacks(execute=execute))
+    sent = []
+    first_terminal = threading.Event()
+    followup_terminal = threading.Event()
+    delayed_terminal = threading.Event()
+
+    class Client:
+        is_registered = True
+
+        def send_data(self, data, message_type):
+            sent.append((data, message_type))
+            if (
+                data["payload"].get("attempt_id") == "att_lockwait01"
+                and data["message_type"] == "stage_error"
+            ):
+                first_terminal.set()
+            if (
+                data["payload"].get("attempt_id") == "att_lockfollow01"
+                and data["message_type"] == "stage_result"
+            ):
+                followup_terminal.set()
+            if (
+                data["payload"].get("attempt_id") == "att_delaydeadline01"
+                and data["message_type"] == "stage_error"
+            ):
+                delayed_terminal.set()
+
+    scheduler._tcp_client = Client()
+
+    def make_offer(
+        *,
+        attempt_id,
+        message_id,
+        lease_id,
+        lease_ms,
+        request_deadline_ms=None,
+    ):
+        sent_at_ms = int(time.time() * 1000)
+        root_input = {"message": "hello"}
+        payload = {
+            "workflow_id": f"wf_{attempt_id}",
+            "request_id": f"request-{attempt_id}",
+            "stage_id": "candidate_a",
+            "stage_type": "full_inference",
+            "attempt_id": attempt_id,
+            "lease_id": lease_id,
+            "lease_epoch": 1,
+            "lease_expires_at_ms": sent_at_ms + lease_ms,
+            "provider_id": remote_provider_id("worker_01"),
+            "root_input": root_input,
+            "dependencies": {},
+            "input_sha256": stage_input_sha256(root_input, {}),
+            "model_identity": _model_identity().snapshot(),
+        }
+        if request_deadline_ms is not None:
+            payload["request_deadline_ms"] = request_deadline_ms
+        return build_message(
+            "stage_offer", payload,
+            message_id=message_id,
+            sent_at_ms=sent_at_ms,
+            version=2,
+        )
+
+    first_sent_at_ms = int(time.time() * 1000)
+    first_offer = make_offer(
+        attempt_id="att_lockwait01",
+        message_id="msg_lockwaitoffer01",
+        lease_id="lease_lockwait01",
+        lease_ms=lease_budget_ms,
+        request_deadline_ms=first_sent_at_ms + request_budget_ms,
+    )
+    blocked_lock = (
+        full_chat_lock
+        if blocked_lock_name == "full_chat_execution_lock"
+        else scheduler._inference_lock
+    )
+    blocked_lock.acquire()
+    blocked_lock_held = True
+    try:
+        scheduler._handle_task_worker_message(
+            "master", {"data": first_offer.snapshot()},
+        )
+        assert first_terminal.wait(2)
+        assert _wait_until(lambda: not scheduler._task_worker_active_attempts)
+    finally:
+        if blocked_lock_held:
+            blocked_lock.release()
+            blocked_lock_held = False
+
+    first_error = next(
+        data for data, _message_type in sent
+        if data["message_type"] == "stage_error"
+        and data["payload"]["attempt_id"] == "att_lockwait01"
+    )
+    assert first_error["payload"]["error_code"] == expected_reason
+    assert first_error["payload"]["retryable"] is (
+        expected_reason == "lease_expired"
+    )
+    assert executor_calls == []
+
+    # When the second lock timed out, the first lock must also have been
+    # released before the attempt leaves the active registry.
+    assert full_chat_lock.acquire(blocking=False)
+    full_chat_lock.release()
+
+    followup_offer = make_offer(
+        attempt_id="att_lockfollow01",
+        message_id="msg_lockfollowoffer01",
+        lease_id="lease_lockfollow01",
+        lease_ms=1500,
+    )
+    scheduler._handle_task_worker_message(
+        "master", {"data": followup_offer.snapshot()},
+    )
+
+    assert followup_terminal.wait(2)
+    assert executor_calls == ["candidate_a"]
+    followup_types = [
+        data["message_type"] for data, _message_type in sent
+        if data["payload"].get("attempt_id") == "att_lockfollow01"
+    ]
+    assert followup_types == ["stage_accept", "stage_result"]
+
+    if expected_reason == "request_deadline_exceeded":
+        assert _wait_until(lambda: not scheduler._task_worker_active_attempts)
+        delayed_deadline_ms = int(time.time() * 1000) + 80
+        delayed_offer = make_offer(
+            attempt_id="att_delaydeadline01",
+            message_id="msg_delaydeadlineoffer01",
+            lease_id="lease_delaydeadline01",
+            lease_ms=1500,
+            request_deadline_ms=delayed_deadline_ms,
+        )
+        threading.Event().wait(0.12)
+        scheduler._handle_task_worker_message(
+            "master", {"data": delayed_offer.snapshot()},
+        )
+
+        assert delayed_terminal.wait(2)
+        delayed_error = next(
+            data for data, _message_type in sent
+            if data["message_type"] == "stage_error"
+            and data["payload"]["attempt_id"] == "att_delaydeadline01"
+        )
+        assert delayed_error["payload"]["error_code"] == (
+            "request_deadline_exceeded"
+        )
+        assert executor_calls == ["candidate_a"]
+
+
 def test_scheduler_worker_rechecks_model_identity_when_offer_arrives(
     monkeypatch,
 ):
@@ -2434,7 +2880,7 @@ def test_remote_cancel_is_deferred_until_blocked_offer_send_completes():
     provider.close()
 
 
-def test_remote_cancel_racing_failed_offer_does_not_leave_pending_attempt():
+def test_remote_cancel_racing_failed_offer_retains_terminal_tombstone():
     coordinator_control, _worker_control = _admitted_control_plane()
     offer_send_started = threading.Event()
     finish_offer_send = threading.Event()
@@ -2475,9 +2921,11 @@ def test_remote_cancel_racing_failed_offer_does_not_leave_pending_attempt():
     finish_offer_send.set()
     thread.join(2)
 
-    assert outcome["error"].code == "remote_worker_disconnected"
+    assert outcome["error"].code == "provider_cancelled"
     provider.release(reservation.reservation_id)
-    assert attempt.attempt_id not in provider._pending
+    pending = provider._pending[attempt.attempt_id]
+    assert pending.released is True
+    assert pending.terminal_snapshot()[0] == "provider_cancelled"
     provider.close()
 
 
@@ -3689,4 +4137,230 @@ def test_remote_provider_accepts_remote_initiated_cancellation():
     assert diagnostics["cancel_execution_stopped_confirmed"] == 1
     provider.release(reservation.reservation_id)
     assert provider.inspect().active_reservations == 0
+    provider.close()
+
+
+def test_remote_cancel_terminal_absorbs_late_result_and_error_tombstones():
+    (
+        provider, reservation, attempt, identity, outcome, finished, _thread, _sent,
+    ) = _start_accepted_remote_attempt("remote_cancel_late01")
+
+    provider.handle_message(_cancelled_ack(
+        identity,
+        reason_code="user_cancelled",
+        execution_state="execution_stopped",
+        message_id="msg_remote_cancel_first01",
+    ))
+    assert finished.wait(2.0)
+    assert outcome["error"].code == "user_cancelled"
+
+    # release() leaves a short-lived known tombstone so distinct late terminal
+    # messages are absorbed instead of becoming duplicate/unknown violations.
+    provider.release(reservation.reservation_id)
+    output = {"content": "too late"}
+    provider.handle_message(build_message(
+        "stage_result",
+        {
+            **identity,
+            "output": output,
+            "output_sha256": canonical_sha256(output),
+            "metadata": {},
+        },
+        message_id="msg_remote_cancel_late_result01",
+        sent_at_ms=int(time.time() * 1000),
+        version=3,
+    ).snapshot())
+    provider.handle_message(build_message(
+        "stage_error",
+        {
+            **identity,
+            "error_code": "remote_worker_disconnected",
+            "retryable": True,
+            "reason": "late error after remote cancellation",
+        },
+        message_id="msg_remote_cancel_late_error01",
+        sent_at_ms=int(time.time() * 1000),
+        version=3,
+    ).snapshot())
+
+    pending = provider._pending[attempt.attempt_id]
+    terminal_kind, terminal_result, terminal_error = pending.terminal_snapshot()
+    assert terminal_kind == "remote_cancel"
+    assert terminal_result is None
+    assert terminal_error is outcome["error"]
+    assert provider.cancel_diagnostics()["late_stage_responses_absorbed"] == 2
+    provider.close()
+
+
+def test_remote_result_is_not_overwritten_by_disconnect():
+    (
+        provider, _reservation, attempt, identity, outcome, finished, _thread, _sent,
+    ) = _start_accepted_remote_attempt("result_disconnect01")
+    output = {"content": "result won"}
+    provider.handle_message(build_message(
+        "stage_result",
+        {
+            **identity,
+            "output": output,
+            "output_sha256": canonical_sha256(output),
+            "metadata": {},
+        },
+        message_id="msg_result_before_disconnect01",
+        sent_at_ms=int(time.time() * 1000),
+        version=3,
+    ).snapshot())
+    provider.notify_disconnect()
+
+    assert finished.wait(2.0)
+    assert "error" not in outcome
+    assert outcome["result"].output == output
+    terminal_kind, terminal_result, terminal_error = (
+        provider._pending[attempt.attempt_id].terminal_snapshot()
+    )
+    assert terminal_kind == "stage_result"
+    assert terminal_result is outcome["result"]
+    assert terminal_error is None
+
+    provider.handle_message(build_message(
+        "stage_error",
+        {
+            **identity,
+            "error_code": "remote_worker_disconnected",
+            "retryable": True,
+            "reason": "late after disconnect cleanup",
+        },
+        message_id="msg_result_disconnect_late_error01",
+        sent_at_ms=int(time.time() * 1000),
+        version=3,
+    ).snapshot())
+    assert provider._pending[attempt.attempt_id].terminal_snapshot() == (
+        terminal_kind, terminal_result, terminal_error,
+    )
+    provider.close()
+
+
+def test_remote_stage_error_is_not_overwritten_by_renew_send_failure(monkeypatch):
+    (
+        provider, reservation, attempt, identity, outcome, finished, _thread, _sent,
+    ) = _start_accepted_remote_attempt("error_renew_failure01")
+    queued = {}
+
+    def capture_renew(_message, on_error):
+        queued["on_error"] = on_error
+        return True
+
+    monkeypatch.setattr(provider, "_queue_outbound_message", capture_renew)
+    assert provider.renew_lease(
+        attempt.attempt_id,
+        attempt.lease_id,
+        attempt.lease_epoch,
+        attempt.lease_expires_at + 1.0,
+    ) is True
+    assert "on_error" in queued
+
+    provider.handle_message(build_message(
+        "stage_error",
+        {
+            **identity,
+            "error_code": "remote_stage_failed",
+            "retryable": False,
+            "reason": "authoritative worker failure",
+        },
+        message_id="msg_stage_error_before_renew_failure01",
+        sent_at_ms=int(time.time() * 1000),
+        version=3,
+    ).snapshot())
+    queued["on_error"](ConnectionError("renew send failed later"))
+
+    assert finished.wait(2.0)
+    assert outcome["error"].code == "remote_stage_failed"
+    pending = provider._pending[attempt.attempt_id]
+    terminal_kind, terminal_result, terminal_error = pending.terminal_snapshot()
+    assert terminal_kind == "stage_error"
+    assert terminal_result is None
+    assert terminal_error is outcome["error"]
+    provider.release(reservation.reservation_id)
+    provider.close()
+
+
+def test_remote_cancel_result_disconnect_race_has_one_terminal():
+    (
+        provider, _reservation, attempt, identity, outcome, finished, _thread, _sent,
+    ) = _start_accepted_remote_attempt("terminal_race01")
+    output = {"content": "racing result"}
+    result_message = build_message(
+        "stage_result",
+        {
+            **identity,
+            "output": output,
+            "output_sha256": canonical_sha256(output),
+            "metadata": {},
+        },
+        message_id="msg_terminal_race_result01",
+        sent_at_ms=int(time.time() * 1000),
+        version=3,
+    ).snapshot()
+    barrier = threading.Barrier(4)
+    race_errors = []
+
+    def race(action):
+        try:
+            barrier.wait()
+            action()
+        except BaseException as exc:
+            race_errors.append(exc)
+
+    racers = [
+        threading.Thread(
+            target=race, args=(lambda: provider.cancel(attempt.attempt_id),),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=race,
+            args=(lambda: provider.handle_message(result_message),),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=race, args=(provider.notify_disconnect,), daemon=True,
+        ),
+    ]
+    for racer in racers:
+        racer.start()
+    barrier.wait()
+    for racer in racers:
+        racer.join(2.0)
+
+    assert all(not racer.is_alive() for racer in racers)
+    assert race_errors == []
+    assert finished.wait(2.0)
+    pending = provider._pending[attempt.attempt_id]
+    first_snapshot = pending.terminal_snapshot()
+    terminal_kind, terminal_result, terminal_error = first_snapshot
+    assert terminal_kind in {"provider_cancelled", "stage_result", "disconnect"}
+    assert (terminal_result is None) != (terminal_error is None)
+    if terminal_kind == "stage_result":
+        assert outcome["result"].output == output
+        assert "error" not in outcome
+    else:
+        assert outcome["error"] is terminal_error
+        assert outcome["error"].code in {
+            "provider_cancelled", "remote_worker_disconnected",
+        }
+
+    provider.cancel(attempt.attempt_id)
+    provider.notify_disconnect()
+    provider.handle_message(build_message(
+        "stage_error",
+        {
+            **identity,
+            "error_code": "remote_stage_failed",
+            "retryable": False,
+            "reason": "late terminal after three-way race",
+        },
+        message_id="msg_terminal_race_late_error01",
+        sent_at_ms=int(time.time() * 1000),
+        version=3,
+    ).snapshot())
+    assert pending.terminal_snapshot() == first_snapshot
+    assert provider.cancel_diagnostics()["late_stage_responses_absorbed"] >= 1
     provider.close()

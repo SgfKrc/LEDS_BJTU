@@ -2593,6 +2593,7 @@ class SchedulerClusterMixin:
                                      request_id: str = None,   # L5: 链路追踪
                                      routing_preference: str = "auto",
                                      _cancel_event: Optional[threading.Event] = None,
+                                     _request_deadline=None,
                                      timeout: float = 120.0) -> dict:
         """
         从节点将推理请求转发给主节点，并等待结果。
@@ -2644,6 +2645,10 @@ class SchedulerClusterMixin:
                 "routing_preference": routing_preference,
                 "forward_request_id": forward_request_id,
             }
+            if _request_deadline is not None:
+                infer_data["request_deadline_ms"] = (
+                    _request_deadline.expires_at_epoch_ms
+                )
             tcp_client.send_data(infer_data, MessageType.INFER_FORWARD)
             logger.info(
                 "event=infer_forward task_id=n/a request_id=%s forward_request_id=%s "
@@ -2652,6 +2657,11 @@ class SchedulerClusterMixin:
             )
 
             deadline = time.monotonic() + max(0.0, timeout)
+            if _request_deadline is not None:
+                deadline = min(
+                    deadline,
+                    _request_deadline.expires_at_monotonic,
+                )
             result_ready = False
             while True:
                 if _cancel_event is not None and _cancel_event.is_set():
@@ -2683,10 +2693,16 @@ class SchedulerClusterMixin:
                     len(result.get("content", "")),
                 )
                 if result.get("status") != "ok" or result.get("error"):
+                    metrics = result.get("metrics", {})
                     return {
                         "status": "error",
                         "error": result.get("error") or "主节点推理失败",
-                        "metrics": result.get("metrics", {}),
+                        "metrics": metrics,
+                        "reason_code": str(
+                            result.get("reason_code")
+                            or metrics.get("reason_code")
+                            or ""
+                        ),
                     }
                 return {
                     "status": "ok",
@@ -2697,6 +2713,10 @@ class SchedulerClusterMixin:
                 }
 
             # 超时
+            request_deadline_exceeded = bool(
+                _request_deadline is not None
+                and _request_deadline.expired()
+            )
             logger.warning(f"推理请求超时 ({timeout}s)")
             try:
                 tcp_client.send_data(
@@ -2705,7 +2725,18 @@ class SchedulerClusterMixin:
                 )
             except Exception:
                 logger.debug("发送转发推理取消失败", exc_info=True)
-            return {"status": "timeout", "error": f"等待主节点响应超时 ({timeout}s)"}
+            return {
+                "status": "timeout",
+                "error": (
+                    "request deadline exceeded"
+                    if request_deadline_exceeded
+                    else f"等待主节点响应超时 ({timeout}s)"
+                ),
+                "reason_code": (
+                    "request_deadline_exceeded"
+                    if request_deadline_exceeded else "forward_timeout"
+                ),
+            }
 
         except Exception as e:
             logger.error(f"转发推理请求失败: {e}")
@@ -3091,11 +3122,25 @@ class SchedulerClusterMixin:
                 del self.nodes[pid]
                 logger.info(f"  清理幽灵节点: {pid}")
         if phantoms:
+            invalidate_transaction = getattr(
+                self, "_invalidate_pipeline_load_transaction", None,
+            )
+            if callable(invalidate_transaction):
+                invalidate_transaction(
+                    reason_code="phantom_nodes_removed",
+                    reason=(
+                        "phantom nodes removed while updating cluster capacity: "
+                        + ", ".join(sorted(phantoms))
+                    ),
+                )
             with self._layer_config_lock:
-                # ★ 2026-10-07（DIST-NEXT-3）：清空 assignment 权威视图（派生视图随之空）。
+                # Phantom cleanup is a global control-plane reset. Keep the
+                # assignment registry, retry state, transaction and active
+                # route in one state: empty and therefore not routable.
                 self._worker_assignments.clear()
-                self._layer_config_expected.clear()
-                self._layer_config_acks.clear()
+                self._layer_config_retry_state.clear()
+                self._pipeline_load_transaction = None
+                self._active_pipeline_capacity_plan = None
 
         logger.info(f"最大节点数已更新: {old_max} → {new_max}"
                     + (f" (清理幽灵: {phantoms})" if phantoms else ""))

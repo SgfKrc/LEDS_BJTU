@@ -16,6 +16,8 @@ from typing import Any, Callable, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
+from request_deadline import REQUEST_DEADLINE_EXCEEDED
+
 from task_provider import (
     DEPENDENCY_FAILURES_KEY,
     ModelIdentity,
@@ -516,6 +518,7 @@ class TaskWorkerControlPlane:
 class _PendingRemoteAttempt:
     attempt: StageAttempt
     lease_expires_at: float
+    lease_deadline_monotonic: float
     accepted: bool = False
     accept_event: threading.Event = field(default_factory=threading.Event)
     result_event: threading.Event = field(default_factory=threading.Event)
@@ -535,6 +538,38 @@ class _PendingRemoteAttempt:
     cancel_remote_initiated: bool = False
     released: bool = False
     released_at: float = 0.0
+    terminal_kind: str = ""
+    terminal_decided_at_monotonic: float = 0.0
+    _terminal_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False,
+    )
+
+    def decide_terminal(
+        self,
+        kind: str,
+        *,
+        result: Optional[StageResult] = None,
+        error: Optional[BaseException] = None,
+    ) -> bool:
+        """Latch exactly one attempt outcome and wake every result waiter."""
+        if (result is None) == (error is None):
+            raise ValueError("attempt terminal requires exactly one outcome")
+        with self._terminal_lock:
+            if self.terminal_kind:
+                return False
+            self.terminal_kind = str(kind)
+            self.terminal_decided_at_monotonic = time.monotonic()
+            self.result = result
+            self.error = error
+            self.accept_event.set()
+            self.result_event.set()
+            return True
+
+    def terminal_snapshot(
+        self,
+    ) -> tuple[str, Optional[StageResult], Optional[BaseException]]:
+        with self._terminal_lock:
+            return self.terminal_kind, self.result, self.error
 
 
 class RemoteFullWorkerProvider:
@@ -686,13 +721,11 @@ class RemoteFullWorkerProvider:
                 if current is not None:
                     current.cancel_acknowledged = True
                     current.cancel_ack_event.set()
-                    if current.released:
-                        self._pending.pop(attempt_id, None)
 
         self._queue_outbound_message(message, on_send_error)
 
     def _prune_pending_locked(self) -> None:
-        now = time.time()
+        now = time.monotonic()
         expired = [
             attempt_id
             for attempt_id, pending in self._pending.items()
@@ -702,6 +735,49 @@ class RemoteFullWorkerProvider:
         ]
         for attempt_id in expired:
             self._pending.pop(attempt_id, None)
+
+    def _absorb_late_stage_response_locked(
+        self,
+        pending: _PendingRemoteAttempt,
+        message: WorkerMessage,
+    ) -> WorkerMessage:
+        self._remember_message_locked(message)
+        self._late_stage_responses += 1
+        logger.info(
+            "event=task_worker_late_stage_response_ignored node_id=%s "
+            "message_type=%s attempt_id=%s terminal_kind=%s",
+            self.node_id,
+            message.message_type,
+            pending.attempt.attempt_id,
+            pending.terminal_snapshot()[0],
+        )
+        return message
+
+    def _request_remote_cancel_locked(
+        self,
+        pending: _PendingRemoteAttempt,
+    ) -> Optional[WorkerMessage]:
+        if pending.cancel_requested:
+            return None
+        terminal_kind = pending.terminal_snapshot()[0]
+        if terminal_kind not in {
+            "provider_cancelled",
+            "remote_accept_timeout",
+            "lease_expired",
+            REQUEST_DEADLINE_EXCEEDED,
+        }:
+            return None
+        pending.cancel_requested = True
+        return self._take_cancel_message_locked(pending)
+
+    def _request_remote_cancel(self, attempt_id: str) -> None:
+        message = None
+        with self._lock:
+            pending = self._pending.get(attempt_id)
+            if pending is not None:
+                message = self._request_remote_cancel_locked(pending)
+        if message is not None:
+            self._queue_cancel_message(attempt_id, message)
 
     def _snapshot(self) -> dict[str, Any]:
         try:
@@ -1074,26 +1150,36 @@ class RemoteFullWorkerProvider:
         cancel_event: threading.Event,
         deadline: float | Callable[[], float],
         *,
-        timeout_code: str,
+        timeout_code: str | Callable[[], str],
         provider_id: str,
     ) -> None:
-        while not event.wait(0.05):
+        while True:
+            current_deadline = deadline() if callable(deadline) else deadline
+            remaining = current_deadline - time.monotonic()
+            if event.wait(max(0.0, min(0.05, remaining))):
+                break
             if cancel_event.is_set():
-                raise ProviderExecutionError(
+                error = ProviderExecutionError(
                     "remote Stage wait was cancelled locally",
                     code="provider_cancelled",
                     provider_id=provider_id,
                 )
+                pending.decide_terminal("provider_cancelled", error=error)
+                break
             current_deadline = deadline() if callable(deadline) else deadline
-            if time.time() >= current_deadline:
-                raise ProviderExecutionError(
+            if time.monotonic() >= current_deadline:
+                code = timeout_code() if callable(timeout_code) else timeout_code
+                error = ProviderExecutionError(
                     "remote Stage response timed out",
-                    code=timeout_code,
+                    code=code,
                     provider_id=provider_id,
-                    retryable=True,
+                    retryable=code != REQUEST_DEADLINE_EXCEEDED,
                 )
-        if pending.error is not None:
-            raise pending.error
+                pending.decide_terminal(code, error=error)
+                break
+        _kind, _result, error = pending.terminal_snapshot()
+        if error is not None:
+            raise error
 
     def execute(
         self,
@@ -1131,9 +1217,14 @@ class RemoteFullWorkerProvider:
                     code="model_identity_required",
                     provider_id=self.provider_id,
                 )
+            now_epoch = time.time()
+            now_monotonic = time.monotonic()
             pending = _PendingRemoteAttempt(
                 attempt=attempt,
                 lease_expires_at=attempt.lease_expires_at,
+                lease_deadline_monotonic=now_monotonic + max(
+                    0.0, attempt.lease_expires_at - now_epoch,
+                ),
             )
             self._pending[attempt.attempt_id] = pending
             self._reservation_attempts[reservation.reservation_id] = (
@@ -1141,12 +1232,15 @@ class RemoteFullWorkerProvider:
             )
             self._executed_reservations.add(reservation.reservation_id)
 
-        sent_at_ms = int(time.time() * 1000)
         lease_expires_at_ms = int(attempt.lease_expires_at * 1000)
         # ★ 2026-10-07（DIST-NEXT-2b）：超帧预算的 hidden 走**有序分片**（仅当对端声明
         #   `stage_chunked_input`）。分片必须在 offer **之前**发出：offer 只带 `hidden_ref`，
         #   worker 收到 offer 时要求分片已齐备。未声明能力/未超预算 ⇒ 原样返回（零行为变化）。
         root_input = self._maybe_send_stage_chunks(attempt)
+        # The worker derives a relative lease from this timestamp. Sampling it
+        # before a large chunk upload would silently add the whole upload time
+        # back to the execution lease/request budget.
+        sent_at_ms = int(time.time() * 1000)
         offer_payload = {
                     "workflow_id": attempt.request.workflow_id,
                     "request_id": attempt.request.request_id,
@@ -1165,6 +1259,10 @@ class RemoteFullWorkerProvider:
                     ),
                     "model_identity": attempt.request.model_identity.snapshot(),
                 }
+        if attempt.request_deadline is not None:
+            offer_payload["request_deadline_ms"] = (
+                attempt.request_deadline.expires_at_epoch_ms
+            )
         if attempt.request.stage_type == "layer_forward":
             offer_payload.update(attempt.request.stage_fields)
         elif attempt.request.stage_fields:
@@ -1192,20 +1290,26 @@ class RemoteFullWorkerProvider:
                 isinstance(root_input.get("hidden_ref"), dict),
             )
         except Exception as exc:
-            # A cancellation that raced with a failed offer send has no
-            # remote work left to acknowledge. Mark it terminal so release()
-            # can reclaim the pending entry immediately.
-            with self._lock:
-                current = self._pending.get(attempt.attempt_id)
-                if current is pending and pending.cancel_requested:
-                    pending.cancel_acknowledged = True
-                    pending.cancel_ack_event.set()
-            raise ProviderExecutionError(
+            error = ProviderExecutionError(
                 "failed to send Stage offer to the remote worker",
                 code="remote_worker_disconnected",
                 provider_id=self.provider_id,
                 retryable=True,
-            ) from exc
+            )
+            # The send failure and local cancellation can cross while the
+            # synchronous transport call is blocked. Whichever terminal was
+            # latched first remains authoritative.
+            with self._lock:
+                current = self._pending.get(attempt.attempt_id)
+                if current is pending:
+                    pending.decide_terminal("offer_send_failure", error=error)
+                    if pending.cancel_requested:
+                        pending.cancel_acknowledged = True
+                        pending.cancel_ack_event.set()
+                    terminal_error = pending.terminal_snapshot()[2]
+                else:
+                    terminal_error = None
+            raise terminal_error or error from exc
         cancel_message = None
         with self._lock:
             current = self._pending.get(attempt.attempt_id)
@@ -1214,13 +1318,30 @@ class RemoteFullWorkerProvider:
                 cancel_message = self._take_cancel_message_locked(pending)
         if cancel_message is not None:
             self._queue_cancel_message(attempt.attempt_id, cancel_message)
-        accept_deadline = min(
-            attempt.lease_expires_at,
-            time.time() + min(
-                self._accept_timeout_seconds,
-                max(0.001, float(attempt.accept_timeout_seconds)),
-            ),
+        accept_timeout_deadline = time.monotonic() + min(
+            self._accept_timeout_seconds,
+            max(0.001, float(attempt.accept_timeout_seconds)),
         )
+        request_deadline_monotonic = (
+            attempt.request_deadline.expires_at_monotonic
+            if attempt.request_deadline is not None else float("inf")
+        )
+
+        def accept_deadline() -> float:
+            return min(
+                pending.lease_deadline_monotonic,
+                accept_timeout_deadline,
+                request_deadline_monotonic,
+            )
+
+        def accept_timeout_code() -> str:
+            if request_deadline_monotonic <= min(
+                pending.lease_deadline_monotonic, accept_timeout_deadline,
+            ):
+                return REQUEST_DEADLINE_EXCEEDED
+            if pending.lease_deadline_monotonic <= accept_timeout_deadline:
+                return "lease_expired"
+            return "remote_accept_timeout"
         # ★ 2026-10-09（接口税量化 · 方向2）：把一次 stage 往返拆成「发出→accept」与
         #   「accept→result」两段。此前只有 stage 总耗时（docs #62 的 `s`），无法分辨
         #   固定开销落在哪一次往返上，也无法验证 WiFi lock 是否真的压低了层段 RTT。
@@ -1232,15 +1353,18 @@ class RemoteFullWorkerProvider:
                 pending,
                 cancel_event,
                 accept_deadline,
-                timeout_code="remote_accept_timeout",
+                timeout_code=accept_timeout_code,
                 provider_id=self.provider_id,
             )
         except ProviderExecutionError as exc:
             # ★ 2026-10-05（DIST-3「取消」场景，已知问题 #47）：本地取消必须
             #   **向对端传播** `stage_cancel`。本类 `cancel()` 里早就有构造与发送
             #   逻辑，但此前只在 `remote_accept_timeout` 这一条路径调用过。
-            if exc.code in ("remote_accept_timeout", "provider_cancelled"):
-                self.cancel(attempt.attempt_id)
+            if exc.code in (
+                "remote_accept_timeout", "lease_expired",
+                "provider_cancelled", REQUEST_DEADLINE_EXCEEDED,
+            ):
+                self._request_remote_cancel(attempt.attempt_id)
             raise
         if not pending.accepted:
             raise ProviderExecutionError(
@@ -1254,29 +1378,41 @@ class RemoteFullWorkerProvider:
                 pending.result_event,
                 pending,
                 cancel_event,
-                lambda: pending.lease_expires_at,
-                timeout_code="lease_expired",
+                lambda: min(
+                    pending.lease_deadline_monotonic,
+                    request_deadline_monotonic,
+                ),
+                timeout_code=lambda: (
+                    REQUEST_DEADLINE_EXCEEDED
+                    if request_deadline_monotonic
+                    <= pending.lease_deadline_monotonic
+                    else "lease_expired"
+                ),
                 provider_id=self.provider_id,
             )
         except ProviderExecutionError as exc:
             # ★ 2026-10-05（同上）：等结果阶段被取消（`provider_cancelled`）或租约
             #   过期时，同样要让对端停手 —— 否则 worker 白跑完整个 Stage，回传结果
             #   时本端已无对应 pending（`reason=unknown_attempt`）。
-            if exc.code in ("provider_cancelled", "lease_expired"):
-                self.cancel(attempt.attempt_id)
+            if exc.code in (
+                "provider_cancelled", "lease_expired",
+                REQUEST_DEADLINE_EXCEEDED,
+            ):
+                self._request_remote_cancel(attempt.attempt_id)
             raise
         logger.info(
             "perf2 a=%.0f r=%.0f",
             (_t_accept - _t_send) * 1000.0,
             (time.perf_counter() - _t_accept) * 1000.0,
         )
-        if pending.result is None:
+        _kind, result, _error = pending.terminal_snapshot()
+        if result is None:
             raise ProviderExecutionError(
                 "remote worker returned no Stage result",
                 code="invalid_provider_result",
                 provider_id=self.provider_id,
             )
-        return pending.result
+        return result
 
     def handle_message(
         self, raw: bytes | str | Mapping[str, Any],
@@ -1329,24 +1465,18 @@ class RemoteFullWorkerProvider:
                     code="attempt_identity_mismatch",
                     field="payload",
                 )
+            terminal_kind = pending.terminal_snapshot()[0]
+            if terminal_kind and message.message_type in {
+                "stage_accept", "stage_result", "stage_error",
+            }:
+                return self._absorb_late_stage_response_locked(pending, message)
             if (
-                pending.cancel_requested
-                and message.message_type in {
-                    "stage_accept", "stage_result", "stage_error",
-                }
+                terminal_kind
+                and message.message_type == "stage_cancelled"
+                and not pending.cancel_requested
+                and terminal_kind != "remote_cancel"
             ):
-                # A response already in flight can legally cross the local
-                # cancellation. Keep provider_cancelled authoritative and
-                # absorb the stale response idempotently instead of treating
-                # the peer as a protocol violator.
-                self._remember_message_locked(message)
-                self._late_stage_responses += 1
-                logger.info(
-                    "event=task_worker_late_stage_response_ignored node_id=%s "
-                    "message_type=%s attempt_id=%s",
-                    self.node_id, message.message_type, attempt_id,
-                )
-                return message
+                return self._absorb_late_stage_response_locked(pending, message)
             if message.message_type == "stage_accept":
                 if pending.accept_event.is_set():
                     raise WorkerProtocolError(
@@ -1356,13 +1486,14 @@ class RemoteFullWorkerProvider:
                     )
                 if payload["accepted"]:
                     pending.accepted = True
+                    pending.accept_event.set()
                 else:
                     # ★ 2026-10-03：把 worker 给的 `reason_code` 带进消息。此前只塞进
                     #   `code` 字段，异常在别处被转述成一层笼统的
                     #   `route_a_stage_execution_failed: remote worker rejected the Stage offer`
                     #   ⇒ 跨机层段失败时完全看不出是「身份不符」「租约过期」还是
                     #   「不支持该 stage」，只能靠逐层加日志去猜。
-                    pending.error = ProviderReservationError(
+                    error = ProviderReservationError(
                         "remote worker rejected the Stage offer"
                         f" (reason_code={payload['reason_code']}"
                         f", retryable={bool(payload['retryable'])})",
@@ -1370,47 +1501,51 @@ class RemoteFullWorkerProvider:
                         provider_id=self.provider_id,
                         retryable=bool(payload["retryable"]),
                     )
-                pending.accept_event.set()
+                    if not pending.decide_terminal(
+                        "reservation_rejected", error=error,
+                    ):
+                        return self._absorb_late_stage_response_locked(
+                            pending, message,
+                        )
             elif message.message_type == "stage_result":
                 if not pending.accepted:
+                    if pending.terminal_snapshot()[0]:
+                        return self._absorb_late_stage_response_locked(
+                            pending, message,
+                        )
                     raise WorkerProtocolError(
                         "Stage result arrived before acceptance",
                         code="result_before_accept",
                         field="message_type",
                     )
-                if pending.result_event.is_set():
-                    raise WorkerProtocolError(
-                        "Stage attempt already has a terminal response",
-                        code="duplicate_stage_response",
-                        field="message_type",
-                    )
-                pending.result = StageResult(
+                result = StageResult(
                     output=payload["output"],
                     provider_id=payload["provider_id"],
                     metadata=payload["metadata"],
                     attempt_id=payload["attempt_id"],
                     lease_epoch=payload["lease_epoch"],
                 )
-                pending.result_event.set()
-            elif message.message_type == "stage_error":
-                if pending.result_event.is_set():
-                    raise WorkerProtocolError(
-                        "Stage attempt already has a terminal response",
-                        code="duplicate_stage_response",
-                        field="message_type",
+                if not pending.decide_terminal("stage_result", result=result):
+                    return self._absorb_late_stage_response_locked(
+                        pending, message,
                     )
+            elif message.message_type == "stage_error":
                 # ★ 2026-10-09（稳定性 #73）：带上 worker 回传的 `reason`（新增字段；
                 #   老 worker 不带 ⇒ 退化为原文案，兼容）。否则真因（例如 hidden 维度不匹配
                 #   `[2048]` vs `(33, 896)`）会在顶层被吞掉，用户只看到「禁止整模回退」
                 #   这类与真因无关的二次错误，换模型也修不好。
                 _stage_reason = str(payload.get("reason") or "").strip()
-                pending.error = ProviderExecutionError(
+                error = ProviderExecutionError(
                     "remote worker reported a Stage error"
                     + (f": {_stage_reason[:200]}" if _stage_reason else ""),
                     code=payload["error_code"],
                     provider_id=self.provider_id,
                     retryable=bool(payload["retryable"]),
                 )
+                if not pending.decide_terminal("stage_error", error=error):
+                    return self._absorb_late_stage_response_locked(
+                        pending, message,
+                    )
                 # ★ 2026-10-07（DIST-NEXT-1d 真机复测发现）：此前只把泛化消息抛出，
                 #   worker 回传的 `error_code` / `retryable` **没有落日志** ⇒ 现场只能看到
                 #   「remote worker reported a Stage error」，无法区分是身份不匹配、预算超限
@@ -1424,26 +1559,17 @@ class RemoteFullWorkerProvider:
                     payload["error_code"],
                     payload["retryable"],
                 )
-                pending.accept_event.set()
-                pending.result_event.set()
             else:
                 # ★ 2026-10-07（DIST-NEXT-1）：取消合同。
                 #   `execution_state` 可选：旧对端不带 ⇒ `unknown`（不冒充已停止）。
                 execution_state = str(payload.get("execution_state") or "unknown")
-                if not pending.cancel_requested:
+                terminal_kind = pending.terminal_snapshot()[0]
+                if not pending.cancel_requested and terminal_kind != "remote_cancel":
                     # 对端**主动**取消（Android 本地用户取消 / Service 回收）。
                     # 此前一律按 `unexpected_stage_cancelled` 拒绝 ⇒ master 只能等到
                     # 租约/步骤超时，且在 coordinator 侧看不出是谁取消的。现在收敛成
                     # 单一 reason：该 attempt 由对端终止，本端以可重试的远端取消结束等待。
-                    pending.cancel_remote_initiated = True
-                    pending.cancel_acknowledged = True
-                    pending.cancel_ack_execution_state = execution_state
-                    pending.cancel_execution_stopped = (
-                        execution_state == "execution_stopped"
-                    )
-                    if pending.cancel_execution_stopped:
-                        self._cancel_execution_stopped += 1
-                    pending.error = ProviderExecutionError(
+                    error = ProviderExecutionError(
                         "remote worker cancelled the Stage",
                         code=str(
                             payload.get("reason_code") or "remote_worker_cancelled"
@@ -1451,11 +1577,12 @@ class RemoteFullWorkerProvider:
                         provider_id=self.provider_id,
                         retryable=True,
                     )
-                    pending.accept_event.set()
-                    pending.result_event.set()
-                    pending.cancel_ack_event.set()
+                    if not pending.decide_terminal("remote_cancel", error=error):
+                        return self._absorb_late_stage_response_locked(
+                            pending, message,
+                        )
+                    pending.cancel_remote_initiated = True
                     self._cancel_remote_initiated += 1
-                    self._cancel_ack_states[execution_state] += 1
                     logger.info(
                         "event=task_worker_stage_cancel_remote_initiated node_id=%s "
                         "workflow_id=%s stage_id=%s attempt_id=%s reason_code=%s "
@@ -1467,8 +1594,6 @@ class RemoteFullWorkerProvider:
                         payload.get("reason_code", ""),
                         execution_state,
                     )
-                    self._remember_message_locked(message)
-                    return message
                 if pending.cancel_acknowledged and not pending.cancel_execution_stopped:
                     # 第二条 ACK 可以把「仍在执行」升级为「已停止」——这是取消合同
                     # 允许的唯一迟到的正向更新（其余迟到响应走上面的吸收分支）。
@@ -1512,8 +1637,6 @@ class RemoteFullWorkerProvider:
                         attempt_id,
                         execution_state,
                     )
-                if pending.released:
-                    self._pending.pop(attempt_id, None)
             self._remember_message_locked(message)
         return message
 
@@ -1544,6 +1667,15 @@ class RemoteFullWorkerProvider:
                     code="stale_lease",
                     provider_id=self.provider_id,
                 )
+            if (
+                attempt.request_deadline is not None
+                and deadline > attempt.request_deadline.expires_at_epoch
+            ):
+                raise ProviderExecutionError(
+                    "remote lease renewal exceeds the request deadline",
+                    code="lease_exceeds_request_deadline",
+                    provider_id=self.provider_id,
+                )
             message = build_message(
                 "lease_renew",
                 {
@@ -1559,6 +1691,9 @@ class RemoteFullWorkerProvider:
                 version=PROTOCOL_VERSION,
             )
             pending.lease_expires_at = deadline
+            pending.lease_deadline_monotonic = time.monotonic() + max(
+                0.0, deadline - time.time(),
+            )
 
         def on_send_error(_exc: Exception) -> None:
             error = ProviderExecutionError(
@@ -1570,9 +1705,9 @@ class RemoteFullWorkerProvider:
             with self._lock:
                 current = self._pending.get(attempt_id)
                 if current is not None:
-                    current.error = error
-                    current.accept_event.set()
-                    current.result_event.set()
+                    current.decide_terminal(
+                        "renew_send_failure", error=error,
+                    )
 
         if not self._queue_outbound_message(message, on_send_error):
             raise ProviderExecutionError(
@@ -1589,15 +1724,14 @@ class RemoteFullWorkerProvider:
             pending = self._pending.get(attempt_id)
             if pending is None or pending.cancel_requested:
                 return
-            pending.cancel_requested = True
-            pending.error = ProviderExecutionError(
+            error = ProviderExecutionError(
                 "remote Stage was cancelled locally",
                 code="provider_cancelled",
                 provider_id=self.provider_id,
             )
-            pending.accept_event.set()
-            pending.result_event.set()
-            message = self._take_cancel_message_locked(pending)
+            if not pending.decide_terminal("provider_cancelled", error=error):
+                return
+            message = self._request_remote_cancel_locked(pending)
 
         if message is not None:
             self._queue_cancel_message(attempt_id, message)
@@ -1623,21 +1757,15 @@ class RemoteFullWorkerProvider:
         `remote_worker_disconnected`（等待方语义不变）。
         """
         with self._lock:
-            released = []
-            for attempt_id, pending in self._pending.items():
-                pending.error = ProviderExecutionError(
+            for pending in self._pending.values():
+                error = ProviderExecutionError(
                     "remote worker disconnected",
                     code="remote_worker_disconnected",
                     provider_id=self.provider_id,
                     retryable=True,
                 )
-                pending.accept_event.set()
-                pending.result_event.set()
+                pending.decide_terminal("disconnect", error=error)
                 pending.cancel_ack_event.set()
-                if pending.released:
-                    released.append(attempt_id)
-            for attempt_id in released:
-                self._pending.pop(attempt_id, None)
             reservation_ids = list(self._reservations.keys())
         # `release()` 内部自己取 `self._lock` ⇒ 必须在锁外调用（这里是普通 Lock，
         # 锁内再取会自锁）。
@@ -1681,12 +1809,7 @@ class RemoteFullWorkerProvider:
             pending = self._pending.get(attempt_id)
             if pending is not None:
                 pending.released = True
-                pending.released_at = time.time()
-                if (
-                    not pending.cancel_requested
-                    or pending.cancel_acknowledged
-                ):
-                    self._pending.pop(attempt_id, None)
+                pending.released_at = time.monotonic()
 
     def close(self) -> None:
         with self._lock:

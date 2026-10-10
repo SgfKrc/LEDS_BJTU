@@ -412,6 +412,53 @@ def test_chat_stream_full_single_done(client):
     assert events[0]["generation_id"].startswith("gen_")
 
 
+def test_chat_json_deadline_returns_504_with_stable_code():
+    from request_deadline import RequestDeadlineExceeded
+
+    class DeadlineHost(FakeEngineHost):
+        def chat_full_with_operation_id(
+                self, req, cancel_event, operation_id, request_deadline=None):
+            del req, cancel_event, operation_id, request_deadline
+            raise RequestDeadlineExceeded("request deadline exceeded")
+
+    with TestClient(make_app(engine_host=DeadlineHost())) as deadline_client:
+        resp = deadline_client.post("/v1/chat", json={"message": "deadline"})
+
+    assert resp.status_code == 504
+    assert resp.json()["error_code"] == "request_deadline_exceeded"
+    assert resp.headers["X-QLH-Error-Code"] == "request_deadline_exceeded"
+
+
+def test_chat_stream_deadline_sse_preserves_reason_code():
+    from request_deadline import RequestDeadlineExceeded
+
+    class DeadlineHost(FakeEngineHost):
+        def chat_stream_events_with_operation_id(
+                self, req, cancel_event, operation_id, request_deadline=None):
+            del req, cancel_event, operation_id, request_deadline
+            raise RequestDeadlineExceeded("request deadline exceeded")
+            yield  # pragma: no cover - keep this method a generator
+
+    with TestClient(make_app(engine_host=DeadlineHost())) as deadline_client:
+        resp = deadline_client.post(
+            "/v1/chat/stream",
+            json={"message": "deadline", "streaming_mode": "fast"},
+        )
+
+    events = [
+        json.loads(line[6:])
+        for line in resp.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert resp.status_code == 200
+    assert events == [{
+        "done": True,
+        "error": "request deadline exceeded",
+        "request_id": "-",
+        "reason_code": "request_deadline_exceeded",
+    }]
+
+
 def test_chat_cancel_semantics(client):
     # 格式无效 → 400（对齐 api_server generation_id 格式校验）
     resp = client.post("/v1/chat/cancel", json={"generation_id": "bad!"})
@@ -1469,6 +1516,62 @@ def test_chat_full_partial_pipeline_local_only_fails_closed(engine):
     assert host._host.calls == []
 
 
+def test_engine_host_pipeline_deadline_never_enters_local_fallback(monkeypatch):
+    import inference_service.engine_host as engine_host_module
+    from request_deadline import RequestDeadline
+
+    calls = {"chat": 0, "ensure": 0}
+
+    class DeadlineModel(FakeModel):
+        _engine_type = "pytorch"
+
+        def ensure_full_model(self):
+            calls["ensure"] += 1
+            pytest.fail("deadline terminal must not restore a full model")
+
+        def chat(self, *_args, **_kwargs):
+            calls["chat"] += 1
+            pytest.fail("deadline terminal must not enter local chat")
+
+    host = make_full_host(DeadlineModel)
+    host._run_mode = "distributed"
+    host._scheduler = SimpleNamespace(
+        get_distributed_inference_enabled=lambda: True,
+        _effective_role=lambda: "master",
+        has_pipeline_worker_reservation=lambda: False,
+        run_pipeline_safe=lambda *_a, **_k: {
+            "response": "",
+            "error": "request deadline exceeded",
+            "reason_code": "request_deadline_exceeded",
+            "metrics": {"fallback": False},
+        },
+    )
+    monkeypatch.setattr(
+        engine_host_module,
+        "runtime_supports",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        host,
+        "_prepare_chat_context",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            session_id="default", history=[], revision=0,
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        host.chat_full(
+            ChatRequest(message="deadline fence"),
+            request_deadline=RequestDeadline.start(1.0),
+        )
+
+    assert exc_info.value.status_code == 504
+    assert getattr(exc_info.value, "error_code", "") == (
+        "request_deadline_exceeded"
+    )
+    assert calls == {"chat": 0, "ensure": 0}
+
+
 # ----------------------------------------------------------------------
 # 14.5 1.2d task_graph 执行段（复制自 api_server._execute_task_graph_chat
 #      + _execute_task_graph_chat_with_slot + 5 个辅助函数）
@@ -1641,7 +1744,7 @@ def test_task_graph_with_slot_real_execution(monkeypatch):
                     "partial_result": False, "stage_count": 0,
                     "attempt_count": 0, "duration_seconds": 0.5}
 
-        def discard_result(self, workflow_id):
+        def discard_result(self, workflow_id, **_kwargs):
             return None
 
         def provider_status(self):
@@ -1725,9 +1828,9 @@ def test_engine_host_release_profile_discards_task_graph_required_before_commit(
                 },
             )
 
-        def discard_result(self, workflow_id):
-            self.discarded.append(workflow_id)
-            return {"workflow_id": workflow_id, "state": "cancelled"}
+        def discard_result(self, workflow_id, **kwargs):
+            self.discarded.append((workflow_id, kwargs))
+            return {"workflow_id": workflow_id, "state": "failed"}
 
         def commit_result(self, _workflow_id):
             pytest.fail("release route rejection must happen before commit")
@@ -1751,7 +1854,10 @@ def test_engine_host_release_profile_discards_task_graph_required_before_commit(
         captured.value.error_code
         == "DISTRIBUTED_REQUIRED_RELEASE_ROUTE_FORBIDDEN"
     )
-    assert coordinator.discarded == ["wf_releaseenginehost01"]
+    assert coordinator.discarded == [(
+        "wf_releaseenginehost01",
+        {"terminal_reason_code": "request_refused"},
+    )]
 
 
 def test_task_graph_auto_remote_identity_path(monkeypatch):
@@ -1801,7 +1907,7 @@ def test_task_graph_auto_remote_identity_path(monkeypatch):
                     "partial_result": False, "stage_count": 0,
                     "attempt_count": 0, "duration_seconds": 0.3}
 
-        def discard_result(self, workflow_id):
+        def discard_result(self, workflow_id, **_kwargs):
             return None
 
         def provider_status(self):
@@ -2236,6 +2342,56 @@ def test_inference_stream_producer_does_not_commit_before_terminal_consumption(
 
     assert writes == []
     assert host.session_history("stream-session") == []
+
+
+def test_inference_stream_blocked_backend_returns_deadline_but_retains_lock():
+    import time
+
+    from request_deadline import RequestDeadline
+
+    class BlockingStreamingModel(FakeModel):
+        def __init__(self):
+            super().__init__()
+            self.full_chat_execution_lock = threading.Lock()
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def chat_stream(self, messages, **_kwargs):
+            del messages
+            self.started.set()
+            assert self.release.wait(5)
+            yield "late"
+
+    host = make_full_host(BlockingStreamingModel)
+    model = host._host
+    events = host.chat_stream_events_with_operation_id(
+        ChatRequest(message="blocked stream", session_id="blocked-session"),
+        threading.Event(),
+        "req-blocked-stream",
+        RequestDeadline.start(0.08),
+    )
+
+    started_at = time.monotonic()
+    terminal = next(events)
+    elapsed = time.monotonic() - started_at
+    events.close()
+
+    assert model.started.is_set()
+    assert elapsed < 0.5
+    assert terminal["done"] is True
+    assert terminal["reason_code"] == "request_deadline_exceeded"
+    assert model.full_chat_execution_lock.acquire(blocking=False) is False
+
+    model.release.set()
+    released = False
+    wait_until = time.monotonic() + 2.0
+    while time.monotonic() < wait_until:
+        if model.full_chat_execution_lock.acquire(blocking=False):
+            model.full_chat_execution_lock.release()
+            released = True
+            break
+        time.sleep(0.01)
+    assert released is True
 
 
 def test_build_app_master_role(monkeypatch, tmp_path):

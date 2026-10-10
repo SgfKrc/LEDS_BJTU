@@ -250,6 +250,9 @@ async def chat(req: ChatRequest, request: Request = None):
     """
     generation_id, cancel_event = _api_module._register_generation(req.generation_id)
     req.generation_id = generation_id
+    request_deadline = _api_module.RequestDeadline.start(
+        _api_module.PIPELINE_TIMEOUT,
+    )
     # 路线 B：请求带外部 flag 但被数据作用域拒绝时记一条 INFO（每请求一次）
     _api_module._maybe_log_external_scope_denial(req, _api_module._external_route_decision(req))
 
@@ -282,8 +285,14 @@ async def chat(req: ChatRequest, request: Request = None):
                     409,
                     "任务链实验要求先加载本地完整模型。",
                 )
-            return _api_module._execute_requested_chat(req, cancel_event)
-        with _api_module.model_host.full_chat_execution_lock:
+            return _api_module._execute_requested_chat(
+                req, cancel_event, request_deadline,
+            )
+        with _api_module.hold_lock_until_deadline(
+            _api_module.model_host.full_chat_execution_lock,
+            request_deadline,
+            operation="full chat execution lock",
+        ):
             if (
                 not _api_module.model_host.model_loaded
                 or not _api_module.model_manager.is_loaded
@@ -304,10 +313,14 @@ async def chat(req: ChatRequest, request: Request = None):
                         500,
                         f"自动加载模型失败: {exc}。请手动在控制面板中加载模型。",
                     ) from exc
-            return _api_module._execute_requested_chat(req, cancel_event)
+            return _api_module._execute_requested_chat(
+                req, cancel_event, request_deadline,
+            )
 
     def _run_chat_request():
-        with _api_module._chat_context.transaction():
+        with _api_module._chat_context.transaction(
+            deadline=request_deadline,
+        ):
             token = _api_module._request_id_ctx.set(
                 _api_module._request_id_ctx.get("-"),
             )
@@ -325,6 +338,12 @@ async def chat(req: ChatRequest, request: Request = None):
             _watch_client_disconnect(request, cancel_event, generation_id))
     try:
         result = await _api_module.run_in_threadpool(_run_chat_request)
+    except _api_module.RequestDeadlineExceeded as exc:
+        raise _api_module.coded_http_error(
+            504,
+            _api_module.REQUEST_DEADLINE_EXCEEDED,
+            str(exc),
+        ) from exc
     except _api_module.ChatGenerationCancelled as exc:
         # ★ 2026-10-07（DIST-NEXT-8）：非流式取消同样带独立终态与稳定 reason code，
         #   与其它 409/拒绝响应的风格一致（此前只有一个中文 message）。
@@ -377,6 +396,9 @@ async def chat_stream(req: ChatRequest, request: Request):
     request_id = _api_module._request_id_ctx.get("-")
     generation_id, cancel_event = _api_module._register_generation(req.generation_id)
     req.generation_id = generation_id
+    request_deadline = _api_module.RequestDeadline.start(
+        _api_module.PIPELINE_TIMEOUT,
+    )
 
     async def _generate():
         previous_request_id = _api_module._request_id_ctx.get("-")
@@ -386,7 +408,10 @@ async def chat_stream(req: ChatRequest, request: Request):
         try:
             loop = _asyncio.get_running_loop()
             acquire_future = loop.run_in_executor(
-                None, _api_module._chat_context.acquire_transaction,
+                None,
+                lambda: _api_module._chat_context.acquire_transaction(
+                    deadline=request_deadline,
+                ),
             )
             try:
                 await _asyncio.shield(acquire_future)
@@ -402,6 +427,12 @@ async def chat_stream(req: ChatRequest, request: Request):
                 raise
             async for chunk in _generate_events():
                 yield chunk
+            completed_normally = True
+        except _api_module.RequestDeadlineExceeded as exc:
+            yield _error_event(
+                str(exc),
+                reason_code=_api_module.REQUEST_DEADLINE_EXCEEDED,
+            )
             completed_normally = True
         finally:
             if not completed_normally:
@@ -430,6 +461,12 @@ async def chat_stream(req: ChatRequest, request: Request):
         其余为链路/执行失败。两者以前只有一段 `error` 文本，聚合时分不开。
         """
         if isinstance(message, dict):
+            reason_code = reason_code or str(
+                message.get("reason_code")
+                or message.get("error_code")
+                or message.get("code")
+                or ""
+            )
             message = message.get("message") or _api_module.json.dumps(
                 message, ensure_ascii=False,
             )
@@ -533,11 +570,12 @@ async def chat_stream(req: ChatRequest, request: Request):
             thinking_parts: list[str] = []
             metrics: dict = {}
             error: _api_module.Optional[str] = None
+            terminal_reason_code = ""
             cancelled = False
             distributed_used = False
 
             def _append_event(event: dict) -> None:
-                nonlocal metrics, error
+                nonlocal metrics, error, terminal_reason_code
                 if event.get("token"):
                     response_parts.append(str(event["token"]))
                 if event.get("thinking"):
@@ -546,6 +584,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                     metrics.update(event["metrics"])
                 if event.get("error"):
                     error = str(event["error"])
+                    terminal_reason_code = str(
+                        event.get("reason_code") or terminal_reason_code
+                    )
 
             loop = _asyncio.get_running_loop()
 
@@ -627,6 +668,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                                 _require_distributed=(req.routing_preference == "distributed_required"),
                                 _force_distributed_assignment=True,
                                 _cancel_event=cancel_event,
+                                _request_deadline=request_deadline,
                             )):
                                 _append_event(event)
                                 frame = _token_frame(event)
@@ -648,6 +690,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                                     messages=request_messages,
                                     show_thinking=req.show_thinking,
                                     _cancel_event=cancel_event,
+                                    _request_deadline=request_deadline,
                                 ),
                             ):
                                 _append_event(event)
@@ -665,6 +708,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                                 messages=request_messages,
                                 show_thinking=req.show_thinking,
                                 _cancel_event=cancel_event,
+                                _request_deadline=request_deadline,
                             )):
                                 _append_event(event)
                                 frame = _token_frame(event)
@@ -684,6 +728,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                                     _require_distributed=(req.routing_preference == "distributed_required"),
                                     _force_distributed_assignment=(req.routing_preference != "local_only"),
                                     _cancel_event=cancel_event,
+                                    _request_deadline=request_deadline,
                                 ),
                             )
                             if isinstance(result.get("metrics"), dict):
@@ -722,7 +767,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                 yield f"data: {_json.dumps(payload, ensure_ascii=False)}\n\n"
                 return
             if error:
-                yield _error_event(error)
+                yield _error_event(
+                    error, reason_code=terminal_reason_code,
+                )
                 return
 
             response_text = "".join(response_parts)
@@ -809,15 +856,23 @@ async def chat_stream(req: ChatRequest, request: Request):
                             409,
                             "任务链实验要求先加载本地完整模型。",
                         )
-                    return _api_module._execute_requested_chat(req, cancel_event)
-                with _api_module.model_host.full_chat_execution_lock:
+                    return _api_module._execute_requested_chat(
+                        req, cancel_event, request_deadline,
+                    )
+                with _api_module.hold_lock_until_deadline(
+                    _api_module.model_host.full_chat_execution_lock,
+                    request_deadline,
+                    operation="full chat execution lock",
+                ):
                     if (
                         not _api_module.model_host.model_loaded
                         or not _api_module.model_manager.is_loaded
                         or _api_module._pipeline_model_is_prepared()
                     ):
                         _api_module._ensure_chat_model_or_forwarding(req)
-                    return _api_module._execute_requested_chat(req, cancel_event)
+                    return _api_module._execute_requested_chat(
+                        req, cancel_event, request_deadline,
+                    )
 
             try:
                 result = await _run_with_request_id(
@@ -832,8 +887,16 @@ async def chat_stream(req: ChatRequest, request: Request):
                     'request_id': request_id,
                 }, ensure_ascii=False)
                 yield f"data: {_done_payload}\n\n"
+            except _api_module.RequestDeadlineExceeded as e:
+                yield _error_event(
+                    str(e),
+                    reason_code=_api_module.REQUEST_DEADLINE_EXCEEDED,
+                )
             except _api_module.HTTPException as e:
-                yield _error_event(e.detail)
+                yield _error_event(
+                    e.detail,
+                    reason_code=_api_module.error_code_from_exception(e),
+                )
             except Exception as e:
                 _api_module.logger.error(f"full 模式推理失败: {e}", exc_info=True)
                 yield _error_event(str(e))
@@ -1054,6 +1117,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     _require_distributed=(req.routing_preference == "distributed_required"),
                     _force_distributed_assignment=True,
                     _cancel_event=cancel_event,
+                    _request_deadline=request_deadline,
                 )):
                     event = _capture_fast_event(event)
                     yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
@@ -1078,6 +1142,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                         messages=request_messages,
                         show_thinking=req.show_thinking,
                         _cancel_event=cancel_event,
+                        _request_deadline=request_deadline,
                     ),
                 ):
                     event = _capture_fast_event(event)
@@ -1098,6 +1163,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     messages=request_messages,
                     show_thinking=req.show_thinking,
                     _cancel_event=cancel_event,
+                    _request_deadline=request_deadline,
                 )):
                     event = _capture_fast_event(event)
                     yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
@@ -1120,6 +1186,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     _require_distributed=(req.routing_preference == "distributed_required"),
                     _force_distributed_assignment=(req.routing_preference != "local_only"),
                     _cancel_event=cancel_event,
+                    _request_deadline=request_deadline,
                 )
             )
             # 一次性返回完整结果（SSE 格式，单事件）
@@ -1132,6 +1199,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                 'done': True,
                 'response': result.get('response', ''),
                 'error': result.get('error'),
+                'reason_code': result.get('reason_code'),
                 'metrics': metrics,
                 'request_id': request_id,
             })

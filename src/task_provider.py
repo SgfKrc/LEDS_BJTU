@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Protocol
 
 from koakuma_engine import normalize_backend_request
+from request_deadline import RequestDeadline
 
 
 PROVIDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -42,12 +43,33 @@ def canonical_model_engine(value: object) -> str:
 
 
 class _CombinedCancelEvent(threading.Event):
-    def __init__(self, workflow_event: threading.Event):
+    def __init__(
+        self,
+        workflow_event: threading.Event,
+        request_deadline: Optional[RequestDeadline] = None,
+    ):
         super().__init__()
         self._workflow_event = workflow_event
+        self._request_deadline = request_deadline
+
+    def set(self) -> None:
+        """Preserve the callback contract that setting this cancels workflow."""
+        self._workflow_event.set()
+        super().set()
+
+    def set_local(self) -> None:
+        """Stop only this Provider attempt without inventing a user cancel."""
+        super().set()
 
     def is_set(self) -> bool:
-        return super().is_set() or self._workflow_event.is_set()
+        return bool(
+            super().is_set()
+            or self._workflow_event.is_set()
+            or (
+                self._request_deadline is not None
+                and self._request_deadline.expired()
+            )
+        )
 
     def wait(self, timeout: Optional[float] = None) -> bool:
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -204,6 +226,9 @@ class StageAttempt:
     lease_epoch: int = 0
     lease_expires_at: float = 0.0
     accept_timeout_seconds: float = 10.0
+    request_deadline: Optional[RequestDeadline] = field(
+        default=None, compare=False, repr=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -379,10 +404,8 @@ class LocalFullModelProvider:
         reservation: Reservation,
         cancel_event: threading.Event,
     ) -> StageResult:
-        attempt_cancel_event = (
-            cancel_event
-            if self._provider_kind == "callback_compatibility"
-            else _CombinedCancelEvent(cancel_event)
+        attempt_cancel_event = _CombinedCancelEvent(
+            cancel_event, attempt.request_deadline,
         )
         with self._lock:
             owned = self._reservations.get(reservation.reservation_id)
@@ -442,7 +465,7 @@ class LocalFullModelProvider:
         with self._lock:
             event = self._active_attempts.get(attempt_id)
             if event is not None:
-                event.set()
+                event.set_local()
 
     def renew_lease(
         self,

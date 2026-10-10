@@ -836,7 +836,10 @@ def test_release_profile_discards_task_graph_required_result_before_commit(
         captured.value.error_code
         == "DISTRIBUTED_REQUIRED_RELEASE_ROUTE_FORBIDDEN"
     )
-    assert coordinator.get("wf_releasetaskroute01")["state"] == "cancelled"
+    rejected = coordinator.get("wf_releasetaskroute01")
+    assert rejected["state"] == "failed"
+    assert rejected["cancel_requested"] is False
+    assert rejected["terminal_reason"]["reason_code"] == "request_refused"
     assert len(manager.calls) == 2
 
 

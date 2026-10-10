@@ -13,6 +13,7 @@ import api_server
 from model_host import model_host
 import model_config as mc
 from model_module import ModelManager
+from worker_assignment_state import WorkerAssignmentRegistry
 
 
 def test_pipeline_capacity_endpoint_returns_scheduler_plan(monkeypatch):
@@ -453,6 +454,22 @@ def test_register_model_rejects_empty_or_missing_assets(monkeypatch, tmp_path):
 
 def test_exclusive_local_model_change_opts_out_pipeline_worker(monkeypatch):
     calls = []
+    assignments = WorkerAssignmentRegistry()
+    assignments.begin(
+        "worker",
+        expected_config={"config_id": "cfg-old", "generation": 7},
+    )
+    retry_state = {"worker": {"attempts": 2, "next_retry": 10.0}}
+    transaction = {
+        "config_id": "cfg-old",
+        "phase": "ready",
+        "plan": {"admitted": True, "plan_id": "plan-old"},
+    }
+    active_plan = {"admitted": True, "plan_id": "plan-old"}
+    monkeypatch.setattr(api_server.scheduler, "_worker_assignments", assignments)
+    monkeypatch.setattr(api_server.scheduler, "_layer_config_retry_state", retry_state)
+    monkeypatch.setattr(api_server.scheduler, "_pipeline_load_transaction", transaction)
+    monkeypatch.setattr(api_server.scheduler, "_active_pipeline_capacity_plan", active_plan)
     monkeypatch.setattr(
         api_server.scheduler,
         "release_pipeline_worker_for_local_model",
@@ -467,15 +484,32 @@ def test_exclusive_local_model_change_opts_out_pipeline_worker(monkeypatch):
 
     assert result == {"success": True}
     assert calls == ["released"]
+    assert assignments.snapshot() == {}
+    assert retry_state == {}
+    assert api_server.scheduler._pipeline_load_transaction is None
+    assert api_server.scheduler._active_pipeline_capacity_plan is None
 
 
 def test_failed_exclusive_model_change_preserves_active_control_state(monkeypatch):
     calls = []
-    expected = {"worker": {"config_id": "cfg-old"}}
-    active_config = {"config_id": "cfg-old"}
-    monkeypatch.setattr(
-        api_server.scheduler, "_layer_config_expected", dict(expected),
+    assignments = WorkerAssignmentRegistry()
+    assignments.begin(
+        "worker",
+        expected_config={"config_id": "cfg-old", "generation": 7},
     )
+    assignment_snapshot = assignments.snapshot()
+    retry_state = {"worker": {"attempts": 2, "next_retry": 10.0}}
+    transaction = {
+        "config_id": "cfg-old",
+        "phase": "ready",
+        "plan": {"admitted": True, "plan_id": "plan-old"},
+    }
+    active_plan = {"admitted": True, "plan_id": "plan-old"}
+    active_config = {"config_id": "cfg-old"}
+    monkeypatch.setattr(api_server.scheduler, "_worker_assignments", assignments)
+    monkeypatch.setattr(api_server.scheduler, "_layer_config_retry_state", retry_state)
+    monkeypatch.setattr(api_server.scheduler, "_pipeline_load_transaction", transaction)
+    monkeypatch.setattr(api_server.scheduler, "_active_pipeline_capacity_plan", active_plan)
     monkeypatch.setattr(
         api_server.scheduler, "_active_layer_config", dict(active_config),
     )
@@ -496,7 +530,10 @@ def test_failed_exclusive_model_change_preserves_active_control_state(monkeypatc
     )
 
     assert result["success"] is False
-    assert api_server.scheduler._layer_config_expected == expected
+    assert assignments.snapshot() == assignment_snapshot
+    assert retry_state == {"worker": {"attempts": 2, "next_retry": 10.0}}
+    assert api_server.scheduler._pipeline_load_transaction == transaction
+    assert api_server.scheduler._active_pipeline_capacity_plan == active_plan
     assert api_server.scheduler._active_layer_config == active_config
     assert calls == []
 
@@ -1166,6 +1203,74 @@ def test_mixed_pipeline_failure_cannot_bypass_partial_gguf_guard(monkeypatch):
     assert exc_info.value.status_code == 503
     assert "整模回退已拒绝" in str(exc_info.value.detail)
     assert calls == {"chat": 0, "ensure": 1}
+
+
+def test_pipeline_deadline_is_504_and_never_enters_local_fallback(monkeypatch):
+    from request_deadline import RequestDeadline
+
+    calls = {"chat": 0, "ensure": 0}
+
+    class DeadlineManager:
+        is_loaded = True
+        model_loaded = True
+        _engine_type = "pytorch"
+
+        def ensure_full_model(self):
+            calls["ensure"] += 1
+            pytest.fail("deadline terminal must not restore a full model")
+
+        def chat(self, **_kwargs):
+            calls["chat"] += 1
+            pytest.fail("deadline terminal must not enter local chat")
+
+    req = api_server.ChatRequest(message="deadline fence")
+    monkeypatch.setattr(api_server, "model_manager", DeadlineManager())
+    monkeypatch.setattr(api_server.model_host, "model_loaded", True)
+    monkeypatch.setattr(api_server, "RUN_MODE", "distributed")
+    monkeypatch.setattr(api_server, "runtime_supports", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        api_server,
+        "_external_route_decision",
+        lambda _req: types.SimpleNamespace(use_external=False, reason="disabled"),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "_prepare_chat_context",
+        lambda *_a, **_k: types.SimpleNamespace(
+            session_id="default", history=[], revision=0,
+        ),
+    )
+    monkeypatch.setattr(
+        api_server.scheduler, "get_distributed_inference_enabled", lambda: True,
+    )
+    monkeypatch.setattr(
+        api_server.scheduler, "_effective_role", lambda: "master",
+    )
+    monkeypatch.setattr(
+        api_server.scheduler, "has_pipeline_worker_reservation", lambda: False,
+    )
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "run_pipeline_safe",
+        lambda *_a, **_k: {
+            "response": "",
+            "error": "request deadline exceeded",
+            "reason_code": "request_deadline_exceeded",
+            "metrics": {"fallback": False},
+        },
+    )
+
+    with pytest.raises(api_server.HTTPException) as exc_info:
+        api_server._execute_chat_full(
+            req,
+            request_deadline=RequestDeadline.start(1.0),
+        )
+
+    assert exc_info.value.status_code == 504
+    assert getattr(exc_info.value, "error_code", "") == (
+        "request_deadline_exceeded"
+    )
+    assert calls == {"chat": 0, "ensure": 0}
 
 
 @pytest.mark.parametrize("engine", ["pytorch", "llama_cpp"])

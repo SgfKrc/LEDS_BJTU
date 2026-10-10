@@ -99,9 +99,17 @@ from task_graph import (
     TaskGraphError,
     TaskGraphUnavailable,
     WorkflowCancelled,
+    WorkflowDeadlineExceeded,
     WorkflowExecutionError,
     WorkflowNotFound,
     dual_candidate_template,
+)
+from request_deadline import (
+    REQUEST_DEADLINE_EXCEEDED,
+    RequestDeadline,
+    RequestDeadlineExceeded,
+    coerce_request_deadline,
+    hold_lock_until_deadline,
 )
 from task_journal import SQLiteTaskJournal, TaskJournalError
 from task_provider import (
@@ -125,6 +133,7 @@ from config import (
     TASK_GRAPH_MAX_PARALLEL_STAGES, TASK_GRAPH_JOURNAL_PATH,
     TASK_GRAPH_RETENTION_DAYS, TASK_GRAPH_RETENTION_MAX_RECORDS,
     TASK_WORKER_EXPERIMENTAL_ENABLED,
+    PIPELINE_TIMEOUT,
     PIPELINE_RELAY_ENABLED,
     PIPELINE_RELAY_PROBE_ONLY,
 )
@@ -928,7 +937,61 @@ def _create_task_graph_coordinator() -> TaskGraphCoordinator:
         return coordinator
 
 
-task_graph_coordinator = _create_task_graph_coordinator()
+class _LazyTaskGraphCoordinator:
+    """惰性提供 TaskGraph writer —— import 副作用不得争用生产 journal 锁。
+
+    单写者独占锁必须只由「真正承担任务图写服务」的进程持有。探针、
+    pytest 冷启动子进程以及 Windows ``multiprocessing`` spawn worker 往往只是
+    **import** 本模块（拿一些常量/工具函数），并不需要执行任务链；它们若在
+    import 阶段就去获取 journal 锁，就会和已经在跑的生产服务争锁，进而被错误
+    记录为「任务图 journal 初始化失败，任务图已禁用」。
+
+    因此把 writer 的物化（获取独占锁 + 启动恢复 + 保留清理）推迟到**首次真实
+    使用**：真正执行任务链、查询任务工作流状态或运行时热切换时才初始化。
+    失败关闭（fail-closed）语义保持不变：若此刻锁已被另一个进程持有，物化出的
+    coordinator 会携带 availability_error，后续任务链执行全部经
+    ``journal_status()['available'] == False`` 被拒绝，绝不出现双写者。
+    """
+
+    def __init__(self, factory: Any) -> None:
+        self._factory = factory
+        self._lock = threading.RLock()
+        self._coordinator: Optional[TaskGraphCoordinator] = None
+
+    def _ensure(self) -> TaskGraphCoordinator:
+        with self._lock:
+            if self._coordinator is None:
+                self._coordinator = self._factory()
+            return self._coordinator
+
+    def _is_materialized(self) -> bool:
+        """True 表示 writer 已被真实构造（即 journal 锁已被本进程持有）。"""
+        with self._lock:
+            return self._coordinator is not None
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._ensure(), name)
+
+    def close(self) -> None:
+        coordinator = None
+        with self._lock:
+            if self._coordinator is not None:
+                coordinator, self._coordinator = self._coordinator, None
+        if coordinator is not None:
+            coordinator.close()
+
+    def __repr__(self) -> str:
+        return f"<_LazyTaskGraphCoordinator materialized={self._is_materialized()}>"
+
+
+# 模块 import 阶段只创建惰性代理；journal 锁的获取推迟到首次真实使用，
+# 避免 Windows/pytest 冷启动子进程在 import api_server 时与生产 writer 争锁。
+task_graph_coordinator: TaskGraphCoordinator = cast(
+    TaskGraphCoordinator,
+    _LazyTaskGraphCoordinator(_create_task_graph_coordinator),
+)
 _task_graph_execution_slot = threading.BoundedSemaphore(1)
 _generation_registry_lock = threading.RLock()
 _generation_cancel_events: dict[str, threading.Event] = {}
@@ -1062,8 +1125,9 @@ def _run_exclusive_model_change(
                         )
                     with scheduler._layer_config_lock:
                         scheduler._worker_assignments.clear()
-                        scheduler._layer_config_expected.clear()
-                        scheduler._layer_config_acks.clear()
+                        scheduler._layer_config_retry_state.clear()
+                        scheduler._pipeline_load_transaction = None
+                        scheduler._active_pipeline_capacity_plan = None
                         scheduler._active_layer_config = None
                         scheduler._last_layer_config_ack_payload = None
                         scheduler._local_pipeline_steps.clear()
@@ -1077,15 +1141,6 @@ def _run_exclusive_model_change(
                             release()
                         else:
                             scheduler._pipeline_worker_reserved = False
-                    _tx = getattr(
-                        scheduler, "_pipeline_load_transaction", None,
-                    )
-                    if (
-                        isinstance(_tx, dict)
-                        and str(_tx.get("phase") or "")
-                        in {"aborted", "rejected"}
-                    ):
-                        scheduler._pipeline_load_transaction = None
                     _refresh_pipeline_layer_config()
                 finally:
                     if transition_started:
@@ -3014,7 +3069,9 @@ def _run_speculative_experiment(req: SpeculativeExperimentRequest) -> dict:
 
 
 def _execute_task_graph_chat(
-    req: ChatRequest, cancel_event: Optional[threading.Event] = None,
+    req: ChatRequest,
+    cancel_event: Optional[threading.Event] = None,
+    request_deadline: Optional[RequestDeadline] = None,
 ) -> dict:
     """Run the fixed local task graph without claiming multi-device execution."""
     global conversation_stats
@@ -3040,8 +3097,14 @@ def _execute_task_graph_chat(
     if not _task_graph_execution_slot.acquire(blocking=False):
         raise HTTPException(429, "已有任务链正在执行，请稍后重试。")
     try:
-        with model_host.full_chat_execution_lock:
-            return _execute_task_graph_chat_with_slot(req, cancel_event)
+        with hold_lock_until_deadline(
+            model_host.full_chat_execution_lock,
+            request_deadline,
+            operation="full chat execution lock",
+        ):
+            return _execute_task_graph_chat_with_slot(
+                req, cancel_event, request_deadline,
+            )
     finally:
         _task_graph_execution_slot.release()
 
@@ -3369,9 +3432,17 @@ _LAYER_STAGE_HOST = None
 
 
 def _execute_task_graph_chat_with_slot(
-    req: ChatRequest, cancel_event: Optional[threading.Event] = None,
+    req: ChatRequest,
+    cancel_event: Optional[threading.Event] = None,
+    request_deadline: Optional[RequestDeadline] = None,
 ) -> dict:
     """Execute one workflow while the process-wide task-graph slot is held."""
+
+    request_deadline = coerce_request_deadline(
+        request_deadline,
+        timeout_seconds=PIPELINE_TIMEOUT,
+    )
+    request_deadline.require_remaining()
 
     remote_stage_id = str(req.task_graph_remote_stage or "")
     remote_provider_id = str(req.task_graph_remote_provider_id or "")
@@ -3415,6 +3486,7 @@ def _execute_task_graph_chat_with_slot(
             )
 
     prepared_context = _prepare_chat_context(req.session_id, req.message)
+    request_deadline.require_remaining()
     target_session_id = prepared_context.session_id
     history = prepared_context.history
 
@@ -3606,6 +3678,7 @@ def _execute_task_graph_chat_with_slot(
                 runtime_context=runtime_context,
                 workflow_id=req.workflow_id,
                 cancel_event=cancel_event,
+                request_deadline=request_deadline,
             )
         else:
             final_output, workflow = task_graph_coordinator.run(
@@ -3619,6 +3692,7 @@ def _execute_task_graph_chat_with_slot(
                 runtime_context=runtime_context,
                 workflow_id=req.workflow_id,
                 cancel_event=cancel_event,
+                request_deadline=request_deadline,
             )
     except WorkflowCancelled as exc:
         raise HTTPException(
@@ -3626,13 +3700,23 @@ def _execute_task_graph_chat_with_slot(
             {"message": "任务链已取消", "workflow_id": exc.workflow_id},
         ) from exc
     except WorkflowExecutionError as exc:
+        status_code = 504 if exc.code == "request_deadline_exceeded" else 500
         raise coded_http_error(
-            500,
+            status_code,
             exc.code,
             {
                 "message": str(exc),
                 "workflow_id": exc.workflow_id,
                 "stage_id": exc.stage_id,
+            },
+        ) from exc
+    except WorkflowDeadlineExceeded as exc:
+        raise coded_http_error(
+            504,
+            exc.code,
+            {
+                "message": str(exc),
+                "workflow_id": exc.workflow_id,
             },
         ) from exc
     except TaskGraphUnavailable as exc:
@@ -3665,7 +3749,10 @@ def _execute_task_graph_chat_with_slot(
         ]
         if not precommit_remote_attempts:
             try:
-                task_graph_coordinator.discard_result(workflow["workflow_id"])
+                task_graph_coordinator.discard_result(
+                    workflow["workflow_id"],
+                    terminal_reason_code=REASON_REQUEST_REFUSED,
+                )
             except TaskGraphUnavailable as exc:
                 raise HTTPException(
                     503,
@@ -3694,7 +3781,10 @@ def _execute_task_graph_chat_with_slot(
             )
         except DistributedCompletionError as exc:
             try:
-                task_graph_coordinator.discard_result(workflow["workflow_id"])
+                task_graph_coordinator.discard_result(
+                    workflow["workflow_id"],
+                    terminal_reason_code=REASON_REQUEST_REFUSED,
+                )
             except TaskGraphUnavailable as discard_exc:
                 raise HTTPException(
                     503,
@@ -3710,7 +3800,11 @@ def _execute_task_graph_chat_with_slot(
             ) from exc
 
     try:
-        with _generation_registry_lock:
+        with hold_lock_until_deadline(
+            _generation_registry_lock,
+            request_deadline,
+            operation="generation commit lock",
+        ):
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
             if cancel_event is not None and cancel_event.is_set():
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
@@ -3721,6 +3815,10 @@ def _execute_task_graph_chat_with_slot(
             except WorkflowCancelled as exc:
                 raise ChatGenerationCancelled(
                     req.generation_id or "gen_unknown",
+                ) from exc
+            except WorkflowDeadlineExceeded as exc:
+                raise coded_http_error(
+                    504, REQUEST_DEADLINE_EXCEEDED, str(exc),
                 ) from exc
             except TaskGraphUnavailable:
                 raise
@@ -3915,7 +4013,9 @@ def _execute_task_graph_chat_with_slot(
 
 
 def _execute_chat_full(
-    req: ChatRequest, cancel_event: Optional[threading.Event] = None,
+    req: ChatRequest,
+    cancel_event: Optional[threading.Event] = None,
+    request_deadline: Optional[RequestDeadline] = None,
 ) -> dict:
     """
     执行完整聊天流程 — 从 /api/chat 提取的共用核心逻辑。
@@ -3931,6 +4031,11 @@ def _execute_chat_full(
         HTTPException: 模型未加载、OOM、推理失败
     """
     global kv_cache, conversation_stats
+    request_deadline = coerce_request_deadline(
+        request_deadline,
+        timeout_seconds=PIPELINE_TIMEOUT,
+    )
+    request_deadline.require_remaining()
     # T9.5：distributed_required 无分布式路径时明确失败（full 模式）
     routing_gate = _routing_gate_error(req)
     if routing_gate:
@@ -3939,6 +4044,7 @@ def _execute_chat_full(
 
     # ---- 多会话支持 ----
     prepared_context = _prepare_chat_context(req.session_id, req.message)
+    request_deadline.require_remaining()
     target_session_id = prepared_context.session_id
     history = prepared_context.history
 
@@ -4026,8 +4132,15 @@ def _execute_chat_full(
                 messages=list(history) + [{"role": "user", "content": req.message}],
                 request_id=_request_id_ctx.get("-"),   # L5: 链路追踪
                 _cancel_event=cancel_event,
+                _request_deadline=request_deadline,
             )
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
+            if result.get("reason_code") == REQUEST_DEADLINE_EXCEEDED:
+                raise coded_http_error(
+                    504,
+                    REQUEST_DEADLINE_EXCEEDED,
+                    result.get("error") or "request deadline exceeded",
+                )
             if result.get("status") == "ok":
                 response_text = result.get("content", "")
                 forward_metrics = _augment_chat_metrics(
@@ -4134,9 +4247,20 @@ def _execute_chat_full(
                 _require_distributed=(req.routing_preference == "distributed_required"),
                 _force_distributed_assignment=True,
                 _cancel_event=cancel_event,
+                _request_deadline=request_deadline,
             )
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
             if pipeline_result.get("error"):
+                if (
+                    pipeline_result.get("reason_code")
+                    == REQUEST_DEADLINE_EXCEEDED
+                ):
+                    raise coded_http_error(
+                        504,
+                        REQUEST_DEADLINE_EXCEEDED,
+                        pipeline_result.get("error")
+                        or "request deadline exceeded",
+                    )
                 pipeline_failure_reason = str(pipeline_result["error"])
                 # ★ 2026-10-05（DIST-4）：pipeline 失败时除了 `error` 字符串，还要
                 #   保住 `metrics.pipeline_readiness` —— 那里带**具名 reason_code**
@@ -4212,6 +4336,10 @@ def _execute_chat_full(
                     }
         except ChatGenerationCancelled:
             raise
+        except RequestDeadlineExceeded as exc:
+            raise coded_http_error(
+                504, REQUEST_DEADLINE_EXCEEDED, str(exc),
+            ) from exc
         except HTTPException:
             raise
         except Exception as e:
@@ -4556,6 +4684,10 @@ def _execute_chat_full(
 
     except ChatGenerationCancelled:
         raise
+    except RequestDeadlineExceeded as exc:
+        raise coded_http_error(
+            504, REQUEST_DEADLINE_EXCEEDED, str(exc),
+        ) from exc
     except HTTPException:
         raise
     except torch.cuda.OutOfMemoryError:
@@ -4580,11 +4712,15 @@ def _execute_chat_full(
 
 
 def _execute_requested_chat(
-    req: ChatRequest, cancel_event: Optional[threading.Event] = None,
+    req: ChatRequest,
+    cancel_event: Optional[threading.Event] = None,
+    request_deadline: Optional[RequestDeadline] = None,
 ) -> dict:
     if req.execution_mode == "task_graph":
-        return _execute_task_graph_chat(req, cancel_event)
-    return _execute_chat_full(req, cancel_event)
+        return _execute_task_graph_chat(
+            req, cancel_event, request_deadline,
+        )
+    return _execute_chat_full(req, cancel_event, request_deadline)
 
 
 def _commit_interactive_history(

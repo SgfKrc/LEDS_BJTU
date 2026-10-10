@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
+import time
+
+import pytest
 
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -11,6 +15,36 @@ from chat_context import (
     ConversationContextService,
     TurnPersistenceResult,
 )
+from request_deadline import RequestDeadline, RequestDeadlineExceeded
+
+
+def test_transaction_lock_wait_is_capped_by_request_deadline():
+    service = ConversationContextService(
+        load_history=lambda _session_id: [],
+        persist_turn=lambda *_args: True,
+    )
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_transaction():
+        with service.transaction():
+            acquired.set()
+            release.wait(1.0)
+
+    thread = threading.Thread(target=hold_transaction)
+    thread.start()
+    assert acquired.wait(0.5)
+
+    started = time.monotonic()
+    with pytest.raises(RequestDeadlineExceeded):
+        service.acquire_transaction(
+            deadline=RequestDeadline.start(0.05),
+        )
+    assert time.monotonic() - started < 0.3
+
+    release.set()
+    thread.join(1.0)
+    assert not thread.is_alive()
 
 
 def test_same_session_reloads_after_invalidation():

@@ -37,6 +37,8 @@ logger = logging.getLogger("scheduler")
 
 _LAYER_ARTIFACT_DIGEST_LOCK = threading.Lock()
 _LAYER_ARTIFACT_DIGEST_CACHE: dict[str, tuple[tuple[int, int, int], str]] = {}
+_TASK_WORKER_LOCK_WAIT_SLICE_SECONDS = 0.05
+_REQUEST_DEADLINE_EXCEEDED = "request_deadline_exceeded"
 
 
 def _verified_layer_artifact_sha256(path) -> str:
@@ -80,10 +82,14 @@ class _TaskWorkerActiveAttempt:
     provider_id: str
     lease_expires_at_ms: int
     lease_deadline_monotonic: float
+    request_deadline_ms: Optional[int] = None
+    request_deadline_monotonic: Optional[float] = None
     cancel_event: threading.Event = field(default_factory=threading.Event)
     done_event: threading.Event = field(default_factory=threading.Event)
     lease_expired: bool = False
     cancel_reason: str = ""
+    terminal_reason: str = ""
+    terminal_decided_at_monotonic: float = 0.0
 
 
 class SchedulerTaskWorkerMixin:
@@ -558,21 +564,121 @@ class SchedulerTaskWorkerMixin:
         ))
 
 
+    @staticmethod
+    def _task_worker_next_boundary_monotonic(
+        active: _TaskWorkerActiveAttempt,
+    ) -> float:
+        request_deadline = active.request_deadline_monotonic
+        if request_deadline is None:
+            return active.lease_deadline_monotonic
+        return min(active.lease_deadline_monotonic, request_deadline)
+
+
+    @staticmethod
+    def _task_worker_decide_stop_locked(
+        active: _TaskWorkerActiveAttempt,
+        *,
+        now: Optional[float] = None,
+    ) -> str:
+        """Latch the first observed attempt stop without merging its causes."""
+        if active.terminal_reason:
+            return active.terminal_reason
+
+        observed_at = time.monotonic() if now is None else now
+        due_boundaries = []
+        request_deadline = active.request_deadline_monotonic
+        if (
+            request_deadline is not None
+            and request_deadline <= observed_at
+        ):
+            # Request timeout is the immutable workflow boundary, while the
+            # lease only fences ownership of this one attempt.  An unlatching
+            # disconnect observation must not overwrite either boundary.
+            due_boundaries.append((
+                request_deadline, 0, _REQUEST_DEADLINE_EXCEEDED,
+            ))
+        if active.lease_deadline_monotonic <= observed_at:
+            due_boundaries.append((
+                active.lease_deadline_monotonic, 1, "lease_expired",
+            ))
+        if due_boundaries:
+            reason = min(due_boundaries)[2]
+        elif active.lease_expired:
+            reason = "lease_expired"
+        elif active.cancel_reason:
+            reason = active.cancel_reason
+        elif active.cancel_event.is_set():
+            reason = "provider_cancelled"
+        else:
+            return ""
+
+        active.terminal_reason = reason
+        active.terminal_decided_at_monotonic = observed_at
+        if reason == "lease_expired":
+            active.lease_expired = True
+        active.cancel_event.set()
+        return reason
+
+
+    def _acquire_task_worker_execution_lock(
+        self,
+        execution_lock,
+        active: _TaskWorkerActiveAttempt,
+    ) -> str:
+        """Acquire one model lock in bounded slices or return the stop reason."""
+        while True:
+            with self._task_worker_stage_lock:
+                current = self._task_worker_active_attempts.get(
+                    active.attempt_id,
+                )
+                if current is not active:
+                    if not active.terminal_reason:
+                        active.terminal_reason = "provider_cancelled"
+                        active.terminal_decided_at_monotonic = time.monotonic()
+                        active.cancel_event.set()
+                    return active.terminal_reason
+                now = time.monotonic()
+                stop_reason = self._task_worker_decide_stop_locked(
+                    active, now=now,
+                )
+                if stop_reason:
+                    return stop_reason
+                remaining = (
+                    self._task_worker_next_boundary_monotonic(active) - now
+                )
+                wait_seconds = min(
+                    _TASK_WORKER_LOCK_WAIT_SLICE_SECONDS,
+                    max(0.001, remaining),
+                )
+
+            if not execution_lock.acquire(timeout=wait_seconds):
+                continue
+
+            with self._task_worker_stage_lock:
+                stop_reason = self._task_worker_decide_stop_locked(active)
+            if stop_reason:
+                execution_lock.release()
+                return stop_reason
+            return ""
+
+
     def _watch_task_worker_lease(self, attempt_id: str) -> None:
         while True:
             with self._task_worker_stage_lock:
                 active = self._task_worker_active_attempts.get(attempt_id)
                 if active is None:
                     return
-                remaining = (
-                    active.lease_deadline_monotonic - time.monotonic()
-                )
-                if remaining <= 0:
-                    active.lease_expired = True
-                    active.cancel_event.set()
+                now = time.monotonic()
+                if self._task_worker_decide_stop_locked(active, now=now):
                     return
+                remaining = (
+                    self._task_worker_next_boundary_monotonic(active) - now
+                )
                 done_event = active.done_event
-            if done_event.wait(min(0.05, remaining)):
+            if done_event.wait(min(
+                _TASK_WORKER_LOCK_WAIT_SLICE_SECONDS,
+                max(0.001, remaining),
+            )):
                 return
 
 
@@ -595,15 +701,11 @@ class SchedulerTaskWorkerMixin:
                     code="attempt_identity_mismatch",
                     field="payload",
                 )
-            if (
-                active.lease_expired
-                or active.lease_deadline_monotonic <= time.monotonic()
-            ):
-                active.lease_expired = True
-                active.cancel_event.set()
+            stop_reason = self._task_worker_decide_stop_locked(active)
+            if stop_reason:
                 raise WorkerProtocolError(
-                    "an expired Stage lease cannot be renewed",
-                    code="lease_expired",
+                    "a stopped Stage attempt cannot be renewed",
+                    code=stop_reason,
                     field="payload.lease_expires_at_ms",
                 )
             deadline = int(payload["lease_expires_at_ms"])
@@ -648,13 +750,20 @@ class SchedulerTaskWorkerMixin:
                     code="attempt_identity_mismatch",
                     field="payload",
                 )
-            active.cancel_reason = str(payload["reason_code"])
-            active.cancel_event.set()
+            terminal_reason = self._task_worker_decide_stop_locked(active)
+            active.cancel_reason = active.cancel_reason or str(
+                payload["reason_code"]
+            )
+            if not terminal_reason:
+                terminal_reason = active.cancel_reason
+                active.terminal_reason = terminal_reason
+                active.terminal_decided_at_monotonic = time.monotonic()
+                active.cancel_event.set()
             provider_id = active.provider_id
         response_payload = self._task_worker_attempt_payload(
             payload, provider_id=provider_id,
         )
-        response_payload["reason_code"] = str(payload["reason_code"])
+        response_payload["reason_code"] = terminal_reason
         response = build_task_worker_message(
             "stage_cancelled",
             response_payload,
@@ -843,6 +952,14 @@ class SchedulerTaskWorkerMixin:
                 reject_reason = "remote_worker_busy"
                 reject_retryable = True
             if not reject_reason:
+                received_at_monotonic = time.monotonic()
+                received_at_epoch = time.time()
+                lease_expires_at_ms = int(offer["lease_expires_at_ms"])
+                request_deadline_value = offer.get("request_deadline_ms")
+                request_deadline_ms = (
+                    int(request_deadline_value)
+                    if request_deadline_value is not None else None
+                )
                 active = _TaskWorkerActiveAttempt(
                     workflow_id=str(offer["workflow_id"]),
                     stage_id=str(offer["stage_id"]),
@@ -850,11 +967,17 @@ class SchedulerTaskWorkerMixin:
                     lease_id=str(offer["lease_id"]),
                     lease_epoch=int(offer["lease_epoch"]),
                     provider_id=expected_provider,
-                    lease_expires_at_ms=int(offer["lease_expires_at_ms"]),
-                    lease_deadline_monotonic=time.monotonic() + (
-                        int(offer["lease_expires_at_ms"])
-                        - message.sent_at_ms
+                    lease_expires_at_ms=lease_expires_at_ms,
+                    lease_deadline_monotonic=received_at_monotonic + (
+                        lease_expires_at_ms - message.sent_at_ms
                     ) / 1000.0,
+                    request_deadline_ms=request_deadline_ms,
+                    request_deadline_monotonic=(
+                        received_at_monotonic + (
+                            request_deadline_ms / 1000.0 - received_at_epoch
+                        )
+                        if request_deadline_ms is not None else None
+                    ),
                 )
                 self._task_worker_active_attempts[attempt_id] = active
 
@@ -926,26 +1049,40 @@ class SchedulerTaskWorkerMixin:
                     if key in offer
                 },
             )
-            with self._host.full_chat_execution_lock:
-                with self._inference_lock:
-                    output = self._require_callbacks().execute_task_worker_stage(
-                        request, active.cancel_event,
-                    )
+            acquired_full_chat_lock = False
+            acquired_inference_lock = False
+            try:
+                stop_reason = self._acquire_task_worker_execution_lock(
+                    self._host.full_chat_execution_lock, active,
+                )
+                if stop_reason:
+                    raise RuntimeError(stop_reason)
+                acquired_full_chat_lock = True
+
+                stop_reason = self._acquire_task_worker_execution_lock(
+                    self._inference_lock, active,
+                )
+                if stop_reason:
+                    raise RuntimeError(stop_reason)
+                acquired_inference_lock = True
+
+                output = self._require_callbacks().execute_task_worker_stage(
+                    request, active.cancel_event,
+                )
+            finally:
+                if acquired_inference_lock:
+                    self._inference_lock.release()
+                if acquired_full_chat_lock:
+                    self._host.full_chat_execution_lock.release()
             if not isinstance(output, dict):
                 raise RuntimeError("remote Stage executor returned non-object output")
             with self._task_worker_stage_lock:
                 current = self._task_worker_active_attempts.get(attempt_id)
                 if current is None:
                     raise RuntimeError("remote Stage attempt is no longer active")
-                if (
-                    current.lease_expired
-                    or current.lease_deadline_monotonic <= time.monotonic()
-                ):
-                    current.lease_expired = True
-                    current.cancel_event.set()
-                    raise RuntimeError("remote Stage lease expired")
-                if current.cancel_reason:
-                    raise RuntimeError("remote Stage was cancelled")
+                stop_reason = self._task_worker_decide_stop_locked(current)
+                if stop_reason:
+                    raise RuntimeError(stop_reason)
             result_payload = self._task_worker_attempt_payload(
                 offer, provider_id=expected_provider,
             )
@@ -976,21 +1113,24 @@ class SchedulerTaskWorkerMixin:
         except Exception as exc:
             with self._task_worker_stage_lock:
                 current = self._task_worker_active_attempts.get(attempt_id)
-                lease_expired = bool(
-                    current is not None and current.lease_expired
+                terminal_reason = (
+                    self._task_worker_decide_stop_locked(current)
+                    if current is not None else active.terminal_reason
                 )
                 cancelled_by_coordinator = bool(
                     current is not None and current.cancel_reason
                 )
-            if cancelled_by_coordinator and not lease_expired:
+            if cancelled_by_coordinator and terminal_reason != "lease_expired":
                 logger.info(
                     "event=task_worker_stage_cancelled workflow_id=%s stage_id=%s attempt_id=%s",
                     offer["workflow_id"], offer["stage_id"], attempt_id,
                 )
                 return
             error_code = (
-                "lease_expired"
-                if lease_expired
+                terminal_reason
+                if terminal_reason in {
+                    "lease_expired", _REQUEST_DEADLINE_EXCEEDED,
+                }
                 else "provider_cancelled"
                 if active.cancel_event.is_set()
                 else "remote_stage_execution_failed"

@@ -507,7 +507,7 @@ PREFER_PYTORCH = _env_bool("QLH_PREFER_PYTORCH", False)
 GRAPH_ORCHESTRATOR_THRESHOLD = 5         # 节点数 > 5 启用图算法，≤ 5 使用简单排序
 
 # 流水线推理超时与并发控制
-PIPELINE_TIMEOUT = 120                   # 流水线单步超时（秒），含网络传输 + 前向计算
+PIPELINE_TIMEOUT = 120                   # 请求端到端预算（秒）；queue/prepare/step/fallback 共用
 PIPELINE_MODEL_SYNC_TIMEOUT = _env_float(
     "QLH_PIPELINE_MODEL_SYNC_TIMEOUT", 60.0, min_val=1.0, max_val=600.0,
 )                                           # 等待从节点同步模型和分层 ACK

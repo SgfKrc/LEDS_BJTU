@@ -25,7 +25,13 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from api_errors import coded_http_error
+import config as _cfg
 from model_api_access import require_model_api_source
+from request_deadline import (
+    REQUEST_DEADLINE_EXCEEDED,
+    RequestDeadline,
+    RequestDeadlineExceeded,
+)
 from model_load_resolver import (
     ModelLoadFacts,
     ModelLoadResolutionError,
@@ -68,7 +74,11 @@ def _normalize_operation_id(value: Optional[str]) -> str:
     return cleaned[:256] or "-"
 
 
-async def _iterate_sync_generator(iterable, cancel_event=None):
+async def _iterate_sync_generator(
+    iterable,
+    cancel_event=None,
+    request_deadline: RequestDeadline | None = None,
+):
     """桥接阻塞式生成器而不阻塞 ASGI 事件循环（复制自
     api_server.py:4132 的等价实现；生成期间 /v1/chat/cancel、/v1/health
     仍可被处理——取消功能依赖此桥接）。"""
@@ -103,7 +113,22 @@ async def _iterate_sync_generator(iterable, cancel_event=None):
     completed_normally = False
     try:
         while True:
-            item, error = await queue.get()
+            wait_timeout = 0.1
+            if request_deadline is not None:
+                remaining = request_deadline.remaining()
+                if remaining <= 0:
+                    if cancel_event is not None:
+                        cancel_event.set()
+                    raise RequestDeadlineExceeded(
+                        "request deadline exceeded while streaming"
+                    )
+                wait_timeout = min(wait_timeout, remaining)
+            try:
+                item, error = await asyncio.wait_for(
+                    queue.get(), timeout=wait_timeout,
+                )
+            except asyncio.TimeoutError:
+                continue
             if item is done:
                 completed_normally = True
                 break
@@ -153,10 +178,23 @@ def _sse_event(payload: Dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def _sse_error(message: Any, request_id: str = "-") -> str:
+def _sse_error(
+    message: Any,
+    request_id: str = "-",
+    reason_code: str = "",
+) -> str:
     if isinstance(message, dict):
+        reason_code = reason_code or str(
+            message.get("reason_code")
+            or message.get("error_code")
+            or message.get("code")
+            or ""
+        )
         message = message.get("message") or json.dumps(message, ensure_ascii=False)
-    return _sse_event({"done": True, "error": message, "request_id": request_id})
+    payload = {"done": True, "error": message, "request_id": request_id}
+    if reason_code:
+        payload["reason_code"] = reason_code
+    return _sse_event(payload)
 
 
 def _encode_tensor(tensor) -> str:
@@ -389,11 +427,16 @@ def chat(req: ChatRequest, request: Request):
     request_id = _normalize_operation_id(
         request.headers.get("X-QLH-Request-ID"),
     )
+    request_deadline = RequestDeadline.start(_cfg.PIPELINE_TIMEOUT)
     generation_id, cancel_event = host.register_generation(req.generation_id)
     try:
         result = host.chat_full_with_operation_id(
-            req, cancel_event, request_id,
+            req, cancel_event, request_id, request_deadline,
         )
+    except RequestDeadlineExceeded as exc:
+        raise coded_http_error(
+            504, REQUEST_DEADLINE_EXCEEDED, str(exc),
+        ) from exc
     except HTTPException:
         raise
     except Exception as e:
@@ -413,6 +456,7 @@ async def chat_stream(req: ChatRequest, request: Request):
     request_id = _normalize_operation_id(
         request.headers.get("X-QLH-Request-ID"),
     )
+    request_deadline = RequestDeadline.start(_cfg.PIPELINE_TIMEOUT)
     generation_id, cancel_event = host.register_generation(req.generation_id)
 
     # T9.5：distributed_required 无分布式路径时明确失败（所有模式）
@@ -433,6 +477,14 @@ async def chat_stream(req: ChatRequest, request: Request):
                 req,
                 cancel_event,
                 request_id,
+                request_deadline,
+            )
+        except RequestDeadlineExceeded as e:
+            return StreamingResponse(
+                iter([_sse_error(
+                    str(e), request_id, REQUEST_DEADLINE_EXCEEDED,
+                )]),
+                media_type="text/event-stream",
             )
         except HTTPException as e:
             return StreamingResponse(
@@ -474,9 +526,10 @@ async def chat_stream(req: ChatRequest, request: Request):
             try:
                 async for event in _iterate_sync_generator(
                     host.chat_stream_events_with_operation_id(
-                        req, cancel_event, request_id,
+                        req, cancel_event, request_id, request_deadline,
                     ),
                     cancel_event,
+                    request_deadline,
                 ):
                     if event.get("done"):
                         event["request_id"] = request_id
@@ -499,6 +552,10 @@ async def chat_stream(req: ChatRequest, request: Request):
                         )
                     yield _sse_event(event)
                 completed_normally = True
+            except RequestDeadlineExceeded as e:
+                yield _sse_error(
+                    str(e), request_id, REQUEST_DEADLINE_EXCEEDED,
+                )
             except Exception as e:
                 yield _sse_error(str(e), request_id)
             finally:
@@ -516,9 +573,10 @@ async def chat_stream(req: ChatRequest, request: Request):
         try:
             async for event in _iterate_sync_generator(
                 host.chat_stream_events_with_operation_id(
-                    req, cancel_event, request_id,
+                    req, cancel_event, request_id, request_deadline,
                 ),
                 cancel_event,
+                request_deadline,
             ):
                 if event.get("done"):
                     # engine_host 薄实现的 done 事件带 "-" 占位，此处覆盖为真实值
@@ -529,6 +587,10 @@ async def chat_stream(req: ChatRequest, request: Request):
                     )
                 yield _sse_event(event)
             completed_normally = True
+        except RequestDeadlineExceeded as e:
+            yield _sse_error(
+                str(e), request_id, REQUEST_DEADLINE_EXCEEDED,
+            )
         except Exception as e:
             yield _sse_error(str(e), request_id)
         finally:

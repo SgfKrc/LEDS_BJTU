@@ -92,6 +92,7 @@ class _RegistrationRejected(Exception):
 # ================================================================
 HEADER_LEN = 4          # 长度头字节数（大端序 uint32）
 MAX_PACKET_SIZE = 256 * 1024 * 1024  # 最大包大小 256MB（特征张量可能较大）
+_CLIENT_SOCKET_TIMEOUT_SECONDS = HEARTBEAT_INTERVAL + 5
 
 
 # ================================================================
@@ -1910,6 +1911,14 @@ class TCPServer:
 class TCPClient:
     """TCP 客户端：从节点使用，连接主节点"""
 
+    # A healthy peer must answer within at least one socket receive-timeout
+    # window.  Counting heartbeat periods keeps the watchdog deterministic
+    # when recv() repeatedly returns socket.timeout on a half-open connection.
+    MAX_HEARTBEAT_ACK_MISSED = max(
+        3,
+        math.ceil(_CLIENT_SOCKET_TIMEOUT_SECONDS / HEARTBEAT_INTERVAL),
+    )
+
     def __init__(self, server_host: str = None, server_port: int = None,
                  client_id: str = None, role: str = None,
                  node_type: str = "pc",
@@ -1943,6 +1952,8 @@ class TCPClient:
         self.last_register_error: str = ""
         self.avg_rtt_ms: float = 0.0            # 滑动平均 RTT（指数加权）
         self._last_heartbeat_send: float = 0.0  # 最近一次心跳发送时间
+        self._last_heartbeat_ack_send: float = 0.0
+        self._heartbeat_ack_missed: int = 0
         self._heartbeat_quality = HeartbeatQualityWindow()
         self._connect_lock = threading.Lock()   # Phase 5.4: 防止并发 connect()
         self._send_lock = threading.Lock()      # 心跳和推理消息共享同一 TCP 字节流
@@ -2069,7 +2080,7 @@ class TCPClient:
             sock: Optional[socket.socket] = None
             try:
                 sock = socket.socket(family, socket.SOCK_STREAM)
-                sock.settimeout(HEARTBEAT_INTERVAL + 5)
+                sock.settimeout(_CLIENT_SOCKET_TIMEOUT_SECONDS)
                 sock.connect(sockaddr)
                 return sock
             except OSError as e:
@@ -2234,6 +2245,8 @@ class TCPClient:
                         connection_sock = self.sock
                         self._disconnect_notified = False
                         self._last_heartbeat_send = 0.0
+                        self._last_heartbeat_ack_send = 0.0
+                        self._heartbeat_ack_missed = 0
                         self._heartbeat_quality.begin_generation(connection_generation)
                         self._transport_runtime_call(
                             "connected", connection_generation,
@@ -2473,15 +2486,22 @@ class TCPClient:
             if connection_generation is None
             else connection_generation
         )
-        rtt_ms = self._heartbeat_quality.record_ack(generation, t_echo, t_now)
-        if rtt_ms is None:
-            return
+        with self._disconnect_callback_lock:
+            if generation != self._connection_generation:
+                return
+            rtt_ms = self._heartbeat_quality.record_ack(
+                generation, t_echo, t_now,
+            )
+            if rtt_ms is None:
+                return
+            self._last_heartbeat_ack_send = float(t_echo)
+            self._heartbeat_ack_missed = 0
 
-        # 指数加权滑动平均（α=0.1），平滑网络抖动
-        if self.avg_rtt_ms > 0:
-            self.avg_rtt_ms = 0.9 * self.avg_rtt_ms + 0.1 * rtt_ms
-        else:
-            self.avg_rtt_ms = rtt_ms
+            # 指数加权滑动平均（α=0.1），平滑网络抖动
+            if self.avg_rtt_ms > 0:
+                self.avg_rtt_ms = 0.9 * self.avg_rtt_ms + 0.1 * rtt_ms
+            else:
+                self.avg_rtt_ms = rtt_ms
 
     def _heartbeat_loop(
         self,
@@ -2498,17 +2518,50 @@ class TCPClient:
                     break
                 if self.sock is not connection_sock:
                     break
-            try:
-                self._last_heartbeat_send = time.time()
                 generation = (
                     self._connection_generation
                     if connection_generation is None
                     else connection_generation
                 )
-                self._heartbeat_quality.record_send(
-                    generation,
-                    self._last_heartbeat_send,
+                if (
+                    self._last_heartbeat_send > 0
+                    and self._last_heartbeat_ack_send
+                    != self._last_heartbeat_send
+                ):
+                    self._heartbeat_ack_missed += 1
+                else:
+                    self._heartbeat_ack_missed = 0
+                heartbeat_ack_timed_out = (
+                    self._heartbeat_ack_missed
+                    >= self.MAX_HEARTBEAT_ACK_MISSED
                 )
+                if not heartbeat_ack_timed_out:
+                    self._last_heartbeat_send = time.time()
+                    self._heartbeat_quality.record_send(
+                        generation,
+                        self._last_heartbeat_send,
+                    )
+
+            if heartbeat_ack_timed_out:
+                logger.warning(
+                    "heartbeat ACK timed out: client=%s generation=%s "
+                    "missed=%s; reconnecting",
+                    self.client_id, generation, self._heartbeat_ack_missed,
+                )
+                self._notify_disconnect(
+                    generation,
+                    connection_sock=connection_sock,
+                )
+                with self._disconnect_callback_lock:
+                    should_reconnect = bool(
+                        self._running
+                        and generation == self._connection_generation
+                        and self.sock is connection_sock
+                    )
+                if should_reconnect:
+                    self._reconnect()
+                break
+            try:
                 heartbeat_data = {"t_send": self._last_heartbeat_send}
                 if self.avg_rtt_ms > 0:
                     heartbeat_data["rtt_ms"] = round(self.avg_rtt_ms, 3)
