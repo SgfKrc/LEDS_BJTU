@@ -3868,7 +3868,22 @@ def test_full_worker_stage_round_trips_through_independent_process(
             stderr=subprocess.PIPE,
             text=True,
         )
-        assert hello_received.wait(8.0)
+        # ★ 子进程要 import 整套生产代码，冷启动在负载高时（全量并行跑）会明显
+        #   超过 8 秒 —— 实测全量耗时从 891s 涨到 1261s 时这里就 8s 超时假红，
+        #   而单跑 5/5 全绿。改为最长 30 秒轮询，并区分两种失败：
+        #   子进程**提前退出**（给出 stderr）与单纯**握手过慢**。
+        deadline = time.time() + 30.0
+        while not hello_received.wait(0.5):
+            if process.poll() is not None:
+                out, err = process.communicate(timeout=5)
+                raise AssertionError(
+                    "worker process exited before hello handshake: "
+                    f"rc={process.returncode}\nstdout={out[-2000:]}\nstderr={err[-2000:]}"
+                )
+            if time.time() >= deadline:
+                raise AssertionError(
+                    "worker process did not complete hello handshake within 30s"
+                )
         coordinator.register_provider(provider)
         output, workflow = coordinator.run(
             stages=[StageSpec(
