@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+import base64
+from collections import OrderedDict
 import json
 import logging
 import socket
@@ -93,6 +95,20 @@ class _RegistrationRejected(Exception):
 HEADER_LEN = 4          # 长度头字节数（大端序 uint32）
 MAX_PACKET_SIZE = 256 * 1024 * 1024  # 最大包大小 256MB（特征张量可能较大）
 _CLIENT_SOCKET_TIMEOUT_SECONDS = HEARTBEAT_INTERVAL + 5
+_TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
+_TAILNET_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+
+
+def _protected_cluster_peer(host: str) -> bool:
+    try:
+        address = ipaddress.ip_address(str(host).split("%", 1)[0])
+    except ValueError:
+        return False
+    return bool(
+        address.is_loopback
+        or address in _TAILNET_V4
+        or address in _TAILNET_V6
+    )
 
 
 # ================================================================
@@ -107,7 +123,54 @@ def _get_cluster_secret() -> str:
         return os.environ.get("QLH_CLUSTER_SECRET", "")
 
 
-def build_auth_signature(node_id: str, timestamp: float = None) -> dict:
+def _get_cluster_secret_epoch() -> int:
+    try:
+        import config as cfg
+        value = getattr(
+            cfg,
+            "CLUSTER_SECRET_EPOCH",
+            os.environ.get("QLH_CLUSTER_SECRET_EPOCH", "1"),
+        )
+    except Exception:
+        value = os.environ.get("QLH_CLUSTER_SECRET_EPOCH", "1")
+    try:
+        return max(1, int(value or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+class RegistrationReplayGuard:
+    """Bounded nonce fence shared by every registration on one server."""
+
+    def __init__(self, *, max_entries: int = 4096) -> None:
+        self.max_entries = max(128, int(max_entries))
+        self._lock = threading.Lock()
+        self._seen: OrderedDict[tuple[int, str], float] = OrderedDict()
+
+    def consume(self, *, nonce: str, epoch: int, expires_at: float) -> bool:
+        now = time.time()
+        key = (int(epoch), str(nonce))
+        with self._lock:
+            while self._seen:
+                oldest, expiry = next(iter(self._seen.items()))
+                if expiry >= now and len(self._seen) < self.max_entries:
+                    break
+                self._seen.pop(oldest, None)
+            if key in self._seen:
+                return False
+            self._seen[key] = float(expires_at)
+            while len(self._seen) > self.max_entries:
+                self._seen.popitem(last=False)
+            return True
+
+
+def build_auth_signature(
+    node_id: str,
+    timestamp: float = None,
+    *,
+    nonce: str | None = None,
+    secret_epoch: int | None = None,
+) -> dict:
     """
     为注册消息构建 HMAC 认证签名。
 
@@ -117,15 +180,28 @@ def build_auth_signature(node_id: str, timestamp: float = None) -> dict:
     Returns:
         {"auth_timestamp": float, "auth_signature": str}
     """
-    ts = timestamp or time.time()
-    message = f"{node_id}:{ts:.6f}".encode("utf-8")
+    ts = time.time() if timestamp is None else float(timestamp)
+    auth_nonce = nonce or base64.urlsafe_b64encode(os.urandom(18)).decode("ascii").rstrip("=")
+    epoch = _get_cluster_secret_epoch() if secret_epoch is None else int(secret_epoch)
+    message = f"v2\n{node_id}\n{ts:.6f}\n{auth_nonce}\n{epoch}".encode("utf-8")
     sig = hmac.new(
         _get_cluster_secret().encode("utf-8"), message, hashlib.sha256
     ).hexdigest()
-    return {"auth_timestamp": ts, "auth_signature": sig}
+    return {
+        "auth_version": 2,
+        "auth_timestamp": ts,
+        "auth_nonce": auth_nonce,
+        "auth_secret_epoch": epoch,
+        "auth_signature": sig,
+    }
 
 
-def verify_auth_signature(node_id: str, auth_data: dict) -> tuple:
+def verify_auth_signature(
+    node_id: str,
+    auth_data: dict,
+    *,
+    replay_guard: RegistrationReplayGuard | None = None,
+) -> tuple:
     """
     验证 HMAC 认证签名。
 
@@ -143,13 +219,34 @@ def verify_auth_signature(node_id: str, auth_data: dict) -> tuple:
     if not auth_data:
         return False, "缺少认证签名（auth_timestamp/auth_signature）"
 
+    if not isinstance(auth_data, dict):
+        return False, "认证字段格式无效"
     ts = auth_data.get("auth_timestamp")
+    nonce = auth_data.get("auth_nonce", "")
+    epoch = auth_data.get("auth_secret_epoch")
     sig = auth_data.get("auth_signature", "")
 
     if ts is None:
         return False, "缺少时间戳（auth_timestamp）"
     if not sig:
         return False, "缺少签名（auth_signature）"
+    if auth_data.get("auth_version") != 2:
+        return False, "认证协议版本不受支持"
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not math.isfinite(float(ts)):
+        return False, "认证时间戳必须是有限数值"
+    if not isinstance(nonce, str):
+        return False, "认证 nonce 无效"
+    try:
+        nonce_raw = base64.urlsafe_b64decode(nonce + ("=" * (-len(nonce) % 4)))
+    except (ValueError, TypeError):
+        return False, "认证 nonce 无效"
+    if len(nonce_raw) != 18:
+        return False, "认证 nonce 无效"
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+        return False, "认证密钥代次无效"
+    current_epoch = _get_cluster_secret_epoch()
+    if epoch != current_epoch:
+        return False, "认证凭据已过期（cluster secret epoch mismatch）"
 
     secret = _get_cluster_secret()
     if not secret:
@@ -165,13 +262,20 @@ def verify_auth_signature(node_id: str, auth_data: dict) -> tuple:
         )
 
     # 2. HMAC 签名校验
-    message = f"{node_id}:{ts:.6f}".encode("utf-8")
+    message = f"v2\n{node_id}\n{float(ts):.6f}\n{nonce}\n{epoch}".encode("utf-8")
     expected = hmac.new(
         secret.encode("utf-8"), message, hashlib.sha256
     ).hexdigest()
 
     if not hmac.compare_digest(expected, sig):
         return False, "HMAC 签名不匹配 — 集群密钥不一致"
+
+    if replay_guard is not None and not replay_guard.consume(
+        nonce=nonce,
+        epoch=epoch,
+        expires_at=float(ts) + AUTH_TIMESTAMP_WINDOW,
+    ):
+        return False, "认证 nonce 已被消费（replay rejected）"
 
     return True, "ok"
 
@@ -1085,6 +1189,7 @@ class TCPServer:
         self._recv_threads: dict[str, threading.Thread] = {}
         self._registration_epochs: dict[str, int] = {}
         self._registration_context = threading.local()
+        self._auth_replay_guard = RegistrationReplayGuard()
         self.on_message: Optional[Callable] = None    # 消息回调
         self.on_disconnect: Optional[Callable] = None # 断连回调
         # Called only after a successful REGISTER ACK has been written to the
@@ -1286,6 +1391,51 @@ class TCPServer:
             client.sock.close()
         except OSError:
             pass
+
+    def disconnect_all_clients(
+        self,
+        reason: str,
+        *,
+        before_disconnect: Callable[[], Any] | None = None,
+    ) -> tuple[Any, int]:
+        """Atomically fence credentials and detach every authenticated peer."""
+        with self._clients_lock:
+            action_result = before_disconnect() if before_disconnect is not None else None
+            client_items = list(self.clients.items())
+            pending_items = list(self._pending_registrations.items())
+            self.clients.clear()
+            self._pending_registrations.clear()
+
+        unique_connections: dict[int, ClientConn] = {}
+        for _client_id, client in client_items + pending_items:
+            unique_connections[id(client.sock)] = client
+        for client in unique_connections.values():
+            try:
+                client.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                client.sock.close()
+            except OSError:
+                pass
+
+        if self.on_disconnect:
+            for client_id, _client in client_items:
+                try:
+                    self.on_disconnect(client_id)
+                except Exception:
+                    logger.error(
+                        "disconnect callback failed during credential cutover: client=%s reason=%s",
+                        client_id,
+                        reason,
+                        exc_info=True,
+                    )
+        logger.warning(
+            "disconnected all cluster TCP clients: count=%s reason=%s",
+            len(unique_connections),
+            reason,
+        )
+        return action_result, len(unique_connections)
 
     # ---- Accept 循环 ----
 
@@ -1550,9 +1700,23 @@ class TCPServer:
             advertised_port = SERVER_PORT
         advertised_address = format_host_port(advertised_host, advertised_port)
 
+        allow_unprotected = os.environ.get(
+            "QLH_ALLOW_UNPROTECTED_CLUSTER_TCP", ""
+        ).strip().lower() in {"1", "true", "yes"}
+        if not allow_unprotected and not _protected_cluster_peer(addr[0]):
+            reason = (
+                "生产集群 TCP 只允许 loopback/Tailnet 受保护路径；"
+                "直接 LAN 明文链路需显式不安全开关"
+            )
+            self._send_register_ack(conn, "rejected", reason=reason)
+            raise _RegistrationRejected(reason)
+
         # ★ 阶段 7：HMAC 集群认证
+        auth_data = data.get("auth", {})
         auth_ok, auth_reason = verify_auth_signature(
-            client_id, data.get("auth", {})
+            client_id,
+            auth_data,
+            replay_guard=self._auth_replay_guard,
         )
         if not auth_ok:
             logger.error(
@@ -1654,6 +1818,16 @@ class TCPServer:
         # but the old socket is closed only after leaving the lock.
         previous = None
         with self._clients_lock:
+            authenticated_epoch = int(auth_data.get("auth_secret_epoch", 0) or 0)
+            if authenticated_epoch != _get_cluster_secret_epoch():
+                reason = "cluster credential rotated during registration"
+                try:
+                    self._send_register_ack(
+                        conn, "rejected", client_id=client_id, reason=reason,
+                    )
+                except OSError:
+                    pass
+                raise _RegistrationRejected(reason)
             previous = self.clients.get(client_id)
             if previous is not None and not previous.registration_confirmed:
                 reason = "该节点已有注册正在确认"

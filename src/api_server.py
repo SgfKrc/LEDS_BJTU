@@ -1577,6 +1577,19 @@ class ClusterJoinGrantIssue(BaseModel):
     ttl_seconds: int = Field(default=300, ge=60, le=900)
 
 
+class ClusterSecretRotateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    otp_code: Optional[str] = Field(default=None, max_length=16)
+    tailnet_revocation_completed: bool = Field(
+        default=False,
+        description=(
+            "Operator attestation that the revoked node was removed from the Tailnet; "
+            "the service does not query or prove Tailscale control-plane state"
+        ),
+    )
+
+
 class ClusterJoinConsume(BaseModel):
     grant_code: str = Field(..., min_length=12, max_length=16 * 1024)
 
@@ -1589,6 +1602,9 @@ class FirstConnectBootstrapRequest(BaseModel):
     app_variant: str = Field(default="", max_length=32, description="Android full | lite")
     app_version: str = Field(default="", max_length=64, description="客户端版本")
     capabilities: dict = Field(default_factory=dict, description="设备画像/能力")
+    credential_public_key: str = Field(..., min_length=128, max_length=2048)
+    credential_request_nonce: str = Field(..., min_length=16, max_length=128)
+    credential_requested_at: int = Field(..., ge=0)
 
 
 # ============================================================

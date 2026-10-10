@@ -46,6 +46,10 @@ try:
     from node_config import apply_node_config_to_env, resolve_initial_node_role
     _NODE_CONFIG = apply_node_config_to_env()
 except Exception:
+    # Credential-store corruption or migration failure must not fall back to
+    # a stale .env secret. Leave cluster authentication unavailable instead.
+    os.environ.pop("QLH_CLUSTER_SECRET", None)
+    os.environ.pop("QLH_CLUSTER_SECRET_EPOCH", None)
     _NODE_CONFIG = {}
     resolve_initial_node_role = None
 
@@ -601,9 +605,9 @@ REVIEW_REJECT_THRESHOLD = -2         # 阻止阈值: score <= -2
 # ============================================================
 # 6. 集群安全
 # ============================================================
-# 集群共享密钥 — 所有节点必须使用相同密钥才能加入集群
-# 通过环境变量 QLH_CLUSTER_SECRET 设置（必须设置，否则集群通信将拒绝认证）
-# 生产部署时务必使用随机字符串（建议 32+ 字符）
+# 集群共享密钥 — 所有节点必须使用相同密钥才能加入集群。
+# node_config 启动阶段会让加密存储中的 (secret, epoch) 覆盖旧环境投影；
+# QLH_CLUSTER_SECRET 只保留首次导入/开发兼容语义，不能回滚已轮换凭据。
 CLUSTER_SECRET = os.environ.get("QLH_CLUSTER_SECRET", "")
 if not CLUSTER_SECRET and NODE_ROLE == "master" and release_profile_enforced():
     try:
@@ -619,6 +623,10 @@ if not CLUSTER_SECRET:
         RuntimeWarning,
         stacklevel=2,
     )
+try:
+    CLUSTER_SECRET_EPOCH = max(1, int(os.environ.get("QLH_CLUSTER_SECRET_EPOCH", "1") or 1))
+except ValueError:
+    CLUSTER_SECRET_EPOCH = 1
 # HMAC 签名时间窗口（秒）— 防重放攻击
 AUTH_TIMESTAMP_WINDOW = 300  # ±5 分钟
 

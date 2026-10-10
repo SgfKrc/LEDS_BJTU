@@ -76,6 +76,7 @@ def _sqlite_path() -> str:
 
 def _connect_raw(path: str) -> sqlite3.Connection:
     connection = sqlite3.connect(path, timeout=5.0, isolation_level=None)
+    _restrict_sqlite_files(path)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA busy_timeout=5000")
@@ -84,6 +85,16 @@ def _connect_raw(path: str) -> sqlite3.Connection:
     # SQLite build default for WAL mode.
     connection.execute("PRAGMA synchronous=FULL")
     return connection
+
+
+def _restrict_sqlite_files(path: str) -> None:
+    for candidate in (path, path + "-wal", path + "-shm"):
+        if not os.path.exists(candidate):
+            continue
+        try:
+            os.chmod(candidate, 0o600)
+        except OSError:
+            pass
 
 
 def _read_legacy_json(path: str, default):
@@ -343,6 +354,7 @@ def initialize_local_store() -> str:
             connection.rollback()
         finally:
             connection.close()
+            _restrict_sqlite_files(path)
         _initialized_paths.add(path)
     return path
 
